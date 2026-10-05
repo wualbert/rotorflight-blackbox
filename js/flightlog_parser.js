@@ -1068,7 +1068,7 @@ var FlightLogParser = function(logData) {
                     }
                 } else {
                     console.log("Ignoring unsupported header \"" + fieldName + "\"");
-                    if(that.sysConfig.unknownHeaders==null) that.sysConfig.unknownHeaders = new Array();
+                    if(!Object.prototype.hasOwnProperty.call(that.sysConfig, 'unknownHeaders')) that.sysConfig.unknownHeaders = []; // own array per log: the default one is shared by every log
                     that.sysConfig.unknownHeaders.push({ name: fieldName, value: fieldValue });// Save the unknown headers
                 }
             break;
