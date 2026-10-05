@@ -157,6 +157,14 @@ html.has-log .rf-nav-icon.open-flight-analysis-dialog {
     display: inline-flex;
 }
 
+.rf-nav-icon.open-tuning-dialog {
+    display: none;
+}
+
+html.has-log .rf-nav-icon.open-tuning-dialog {
+    display: inline-flex;
+}
+
 .rf-export-menu .dropdown-menu {
     min-width: 160px;
     width: auto;

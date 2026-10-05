@@ -301,6 +301,7 @@ function dist() {
         './css/main.css',
         './css/user_settings_dialog.css',
         './css/flight_analysis_dialog.css',
+        './css/tuning_dialog.css',
 
         // JavaScript
         './index.js',
@@ -344,6 +345,9 @@ function dist() {
         './js/user_settings_dialog.js',
         './js/flight_analysis.js',
         './js/flight_analysis_dialog.js',
+        './js/tuning_plot.js',
+        './js/tuning_dialog.js',
+        './js/tuning_worker.js',
         './js/video_export_dialog.js',
         './js/csv-exporter.js',
         './js/webworkers/csv-export-worker.js',
@@ -365,6 +369,19 @@ function dist() {
         './resources/models/bell_cw.gltf',
         './resources/models/bell_cw.png',
         './resources/models/bell_cw.bin',
+
+        // Tuning toolkit, fetched as text by js/tuning_worker.js
+        './tools/autotune/lib.cjs',
+        './tools/autotune/health.cjs',
+        './tools/autotune/health_setup.cjs',
+        './tools/autotune/health_gov.cjs',
+        './tools/autotune/health_loop.cjs',
+        './tools/autotune/health_report.cjs',
+        './tools/autotune/extract.cjs',
+        './tools/autotune/report.cjs',
+        './tools/autotune/health_track.cjs',
+        './tools/autotune/health_more.cjs',
+        './tools/autotune/advice.cjs',
 
         // everything else
         './package.json', // For NW.js

@@ -1516,6 +1516,24 @@ function BlackboxLogViewer() {
 
                 flightAnalysisDialog = new FlightAnalysisDialog($("#dlgFlightAnalysis"));
 
+        var tuningDialog = new TuningDialog($("#dlgTuning"), {
+            seek: function(us) {
+                setCurrentBlackboxTime(clampToLog(us));
+                setGraphState(GRAPH_STATE_PAUSED);
+            },
+            selectLog: function(logIndex) {
+                selectLog(logIndex);
+                if (graph) { // as the log index picker does
+                    (hasAnalyserFullscreen)?html.addClass("has-analyser-fullscreen"):html.removeClass("has-analyser-fullscreen");
+                    graph.setAnalyser(hasAnalyserFullscreen);
+                }
+            },
+            getBytes: function() { return flightLogDataArray; },
+            getFlightLog: function() { return flightLog; },
+            getFileName: function() { return currentOffsetCache.log; },
+            getCurrentLogIndex: function() { return flightLog ? flightLog.getLogIndex() : null; }
+        });
+
         $(".open-graph-configuration-dialog").click(function(e) {
             e.preventDefault();
 
@@ -1543,6 +1561,12 @@ function BlackboxLogViewer() {
             e.preventDefault();
 
             flightAnalysisDialog.show(flightLog);
+        });
+
+        $(".open-tuning-dialog").click(function(e) {
+            e.preventDefault();
+
+            tuningDialog.show(flightLog);
         });
 
         $(".marker-offset", statusBar).click(function(e) {

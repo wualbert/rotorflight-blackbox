@@ -33,6 +33,10 @@ node --max-old-space-size=12000 tools/autotune/health.cjs <out dir> <log files..
 node tools/autotune/health_report.cjs <out dir>
 node --test test/health_gov.test.cjs test/health_loop.test.cjs test/health_setup.test.cjs
 
+# Tuning dialog (in the app; DEVELOPMENT.md section 13): new checks, advice, worker, plots, dialog
+node --test test/health_track.test.cjs test/health_more.test.cjs test/advice.test.cjs test/tuning_plot.test.cjs test/tuning_dialog.test.cjs
+AUTOTUNE_REAL_LOG=<RTFL_BLACKBOX_LOG_20261004_113720.BBL> node --max-old-space-size=8000 --test test/tuning_worker.test.cjs   # parity with health.cjs + health_report.cjs; without it the real-log tests skip
+
 # Gaui X4 II: every measurement of one dump in about 4 min (cache + toolkit + 12 area run.sh), no agents;
 # then the saved workflow x4-new-dump interprets it against the previous dump
 bash analysis/gaui-x4/run_all.sh <dump.BBL> <out dir> [groups.json]
@@ -54,7 +58,10 @@ python3 tools/flash_read.py /dev/cu.usbmodemXXXX --out log.bbl [--resume]
 - Handle missing fields: what a log contains depends on the pilot's blackbox settings.
 - CI builds installers only. It runs no tests and no lint, so run tests locally.
 - Tuning work is quantitative. Every recommendation needs a number, its uncertainty and the rule it
-  passed; thresholds live in `RULES` at the top of `tools/autotune/report.cjs`, `wag_report.cjs` and `health_report.cjs`. See
-  section 12 of the guide.
+  passed; thresholds live in `RULES` at the top of `tools/autotune/report.cjs`, `wag_report.cjs` and `health_report.cjs`
+  (and in `DEFAULT_RULES` / `RULES` of `health_track.cjs`, `health_more.cjs`, `advice.cjs`). See sections 12 and 13 of the guide.
+- The app loads `tools/autotune/*.cjs` as text through a CommonJS shim in `js/tuning_worker.js`. In those files, no Node
+  API calls at module load, and keep `module.exports` then `if (require.main !== module) return`. A file the worker loads
+  needs a `distSources` entry too.
 - Viewer only: there is no connection to a flight controller. Tuning output is advice and
   CLI text for the pilot to review, never applied automatically.

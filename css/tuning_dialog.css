@@ -1,0 +1,691 @@
+/* Tuning dialog (js/tuning_dialog.js). Status colours as in css/flight_analysis_dialog.css; plot panels dark like the analyser. */
+
+.tuning-dialog .modal-dialog {
+    width: auto;
+    margin: 10px;
+}
+
+.tuning-dialog .modal-header {
+    padding: 10px 15px;
+}
+
+.tuning-dialog .modal-body {
+    max-height: calc(100vh - 72px);
+    overflow-y: auto;
+    padding: 10px 15px 14px;
+    font-size: 13px;
+    color: #303030;
+}
+
+@media (min-width: 768px) {
+    .tuning-dialog .modal-dialog {
+        width: 90%;
+        max-width: 1200px;
+        margin: 30px auto;
+    }
+
+    .tuning-dialog .modal-body {
+        max-height: calc(100vh - 115px);
+    }
+}
+
+.tuning-hide {
+    display: none !important;
+}
+
+.tuning-muted {
+    color: #808080;
+}
+
+/* Context, controls, progress, notices */
+
+.tuning-context {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 14px;
+    margin-bottom: 8px;
+    color: #606060;
+    font-size: 12px;
+}
+
+.tuning-context strong {
+    color: #303030;
+    font-size: 13px;
+}
+
+.tuning-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 14px;
+    padding-top: 8px;
+    border-top: 1px solid #e5e5e5;
+}
+
+.tuning-field {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    font-weight: normal;
+    color: #505050;
+    white-space: nowrap;
+}
+
+.tuning-controls .form-control,
+.tuning-filters .form-control,
+.tuning-plot-toolbar .form-control {
+    display: inline-block;
+    width: auto;
+}
+
+.tuning-controls .tuning-rpm {
+    width: 104px;
+}
+
+.tuning-cli-name a {
+    margin-left: 2px;
+    color: #909090;
+    font-size: 15px;
+    text-decoration: none;
+}
+
+.tuning-actions {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: auto;
+}
+
+.tuning-progress {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 24px;
+    margin: 4px 0 6px;
+}
+
+.tuning-progress-track {
+    flex: 0 0 160px;
+    height: 6px;
+    border-radius: 3px;
+    background: #e9e9e9;
+    overflow: hidden;
+}
+
+.tuning-progress-bar {
+    width: 0;
+    height: 100%;
+    background: #4da8da;
+    transition: width 0.3s ease;
+}
+
+.tuning-progress.is-done .tuning-progress-bar {
+    background: #3c9d40;
+}
+
+.tuning-progress.is-failed .tuning-progress-bar {
+    width: 100% !important;
+    background: #c9483f;
+}
+
+.tuning-progress.is-busy .tuning-progress-bar {
+    background: repeating-linear-gradient(45deg, #4da8da 0 6px, #80c5eb 6px 12px);
+    background-size: 17px 17px;
+    animation: tuning-busy 0.8s linear infinite;
+}
+
+@keyframes tuning-busy {
+    to { background-position: 17px 0; }
+}
+
+.tuning-progress-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: #505050;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.tuning-notice {
+    margin-bottom: 6px;
+    padding: 6px 10px;
+    border-left: 4px solid #3a7fc1;
+    border-radius: 3px;
+    background: #eef5fb;
+    font-size: 12.5px;
+}
+
+.tuning-notice.is-warn {
+    border-left-color: #d99a1f;
+    background: #fdf7ea;
+}
+
+.tuning-notice.is-error {
+    border-left-color: #c9483f;
+    background: #fbeeed;
+}
+
+.tuning-notice details {
+    margin-top: 4px;
+}
+
+.tuning-stack {
+    max-height: 160px;
+    margin: 4px 0 0;
+    overflow: auto;
+    font-size: 11px;
+}
+
+/* Tabs; the strip stays visible while the body scrolls */
+
+.tuning-tabs {
+    position: sticky;
+    top: -10px;
+    z-index: 3;
+    display: flex;
+    margin: 4px -15px 12px;
+    padding: 0 15px;
+    overflow-x: auto;
+    border-bottom: 1px solid #ddd;
+    background: #fff;
+}
+
+.tuning-tab {
+    flex: none;
+    margin-bottom: -1px;
+    padding: 8px 10px 6px;
+    border-bottom: 2px solid transparent;
+    color: #606060;
+    white-space: nowrap;
+}
+
+.tuning-tab:hover,
+.tuning-tab:focus {
+    color: #303030;
+    background: #f5f7f9;
+    text-decoration: none;
+}
+
+.tuning-tab.active {
+    color: #1d5f86;
+    border-bottom-color: #4da8da;
+}
+
+.tuning-tab-count {
+    margin-left: 5px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: #ebebeb;
+    color: #505050;
+    font-size: 10.5px;
+}
+
+.tuning-tab-count:empty {
+    display: none;
+}
+
+.tuning-tabs::-webkit-scrollbar {
+    display: none;
+}
+
+@media (max-width: 900px) {
+    .tuning-tab {
+        padding: 8px 6px 6px;
+        font-size: 12px;
+    }
+
+    .tuning-tab-count {
+        margin-left: 3px;
+        padding: 0 4px;
+    }
+}
+
+.tuning-pane {
+    display: none;
+}
+
+.tuning-pane.active {
+    display: block;
+}
+
+.tuning-intro {
+    max-width: 760px;
+    padding: 12px 2px;
+    color: #404040;
+}
+
+.tuning-summary {
+    margin: 0 0 10px;
+    font-size: 14px;
+}
+
+.tuning-summary .tuning-muted {
+    display: block;
+    margin-top: 2px;
+    font-size: 12px;
+}
+
+.tuning-h {
+    margin: 16px 0 6px;
+    color: #303030;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.tuning-na-text,
+.tuning-na {
+    color: #808080;
+    font-style: italic;
+}
+
+/* Status colours */
+
+.tuning-card,
+.tuning-rec {
+    border: 1px solid #ddd;
+    border-left: 4px solid #b0b0b0;
+    border-radius: 4px;
+}
+
+.tuning-card.st-good { border-left-color: #3c9d40; background: #f2f9f2; }
+.tuning-card.st-watch { border-left-color: #d99a1f; background: #fdf7ea; }
+.tuning-card.st-attention { border-left-color: #c9483f; background: #fbeeed; }
+.tuning-card.st-info { border-left-color: #3a7fc1; background: #eef5fb; }
+.tuning-card.st-insufficient { border-left-color: #b0b0b0; background: #f5f5f5; }
+.tuning-card.st-error { border-left-color: #8e2a23; background: #f8e4e2; }
+
+.tuning-rec.st-watch { border-left-color: #d99a1f; }
+.tuning-rec.st-attention { border-left-color: #c9483f; }
+.tuning-rec.st-info { border-left-color: #3a7fc1; }
+
+.tuning-badge {
+    display: inline-block;
+    min-width: 46px;
+    padding: 0 6px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    background: #f5f5f5;
+    color: #707070;
+    font-size: 10.5px;
+    font-weight: 600;
+    line-height: 16px;
+    letter-spacing: 0.3px;
+    text-align: center;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.tuning-badge.st-attention { border-color: #ecc3bf; background: #fbeeed; color: #a3362e; }
+.tuning-badge.st-watch { border-color: #efd9a8; background: #fdf7ea; color: #8a5d0b; }
+.tuning-badge.st-good { border-color: #c4e2c5; background: #f2f9f2; color: #2b7230; }
+.tuning-badge.st-info { border-color: #c3daf0; background: #eef5fb; color: #2a5f94; }
+.tuning-badge.st-error { border-color: #8e2a23; background: #8e2a23; color: #fff; }
+
+/* Overview */
+
+.tuning-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 8px;
+}
+
+.tuning-card {
+    padding: 8px 10px;
+    cursor: pointer;
+}
+
+.tuning-card:hover {
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+
+.tuning-card-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+}
+
+.tuning-card-title {
+    font-weight: 600;
+}
+
+.tuning-card-status {
+    color: #707070;
+    font-size: 10.5px;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.tuning-card-counts {
+    margin-top: 3px;
+    color: #505050;
+    font-size: 12px;
+}
+
+.tuning-card-ids,
+.tuning-card-recs {
+    margin-top: 2px;
+    font-size: 11.5px;
+}
+
+.tuning-card-recs {
+    color: #1d5f86;
+}
+
+.tuning-top-recs {
+    padding-left: 22px;
+}
+
+.tuning-top-recs li {
+    margin-bottom: 4px;
+}
+
+.tuning-top-blocked {
+    color: #a3362e;
+}
+
+.tuning-notes {
+    padding-left: 18px;
+    color: #505050;
+    font-size: 12px;
+}
+
+/* Tables */
+
+.tuning-table-wrap {
+    margin-bottom: 8px;
+    overflow-x: auto;
+}
+
+.tuning-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.tuning-table th {
+    padding: 4px 6px;
+    border-bottom: 1px solid #ddd;
+    background: #f5f5f5;
+    color: #505050;
+    font-weight: 600;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.tuning-table td {
+    padding: 4px 6px;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+}
+
+.tuning-table .row-good td,
+.tuning-table .row-insufficient td {
+    color: #707070;
+}
+
+.tuning-table .tuning-id {
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.tuning-table .tuning-num {
+    font-variant-numeric: tabular-nums;
+}
+
+.tuning-table .tuning-times {
+    min-width: 52px;
+    font-variant-numeric: tabular-nums;
+}
+
+.tuning-times a {
+    display: inline-block;
+    white-space: nowrap;
+}
+
+.tuning-table .tuning-rule,
+.tuning-table .tuning-text-value {
+    min-width: 110px;
+    max-width: 200px;
+}
+
+.tuning-table .tuning-text {
+    min-width: 180px;
+}
+
+.tuning-table .tuning-params {
+    max-width: 260px;
+    font-family: Menlo, Consolas, monospace;
+    font-size: 11px;
+}
+
+.tuning-table .tuning-muted {
+    font-size: 11px;
+    font-weight: normal;
+}
+
+.tuning-sortable {
+    cursor: pointer;
+    user-select: none;
+}
+
+.tuning-sortable:hover {
+    color: #303030;
+}
+
+.tuning-sortable.is-sorted::after {
+    content: " \25B2";
+    font-size: 9px;
+}
+
+.tuning-sortable.is-desc::after {
+    content: " \25BC";
+}
+
+.tuning-evidence {
+    margin-top: 6px;
+}
+
+.tuning-evidence-text td {
+    padding-top: 0;
+    color: #606060;
+    font-size: 11.5px;
+}
+
+.tuning-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.tuning-filters .tuning-f-query {
+    flex: 1 1 180px;
+    min-width: 160px;
+}
+
+.tuning-count {
+    margin: 0 0 4px;
+    font-size: 11.5px;
+}
+
+.tuning-coverage-summary .tuning-badge {
+    margin: 0 4px 4px 0;
+}
+
+/* Recommendations */
+
+.tuning-disclaimer {
+    padding: 6px 10px;
+    border-left: 4px solid #3a7fc1;
+    background: #eef5fb;
+    color: #2a5f94;
+    font-weight: 600;
+}
+
+.tuning-rec {
+    margin-bottom: 10px;
+    padding: 8px 12px 10px;
+    background: #fff;
+    scroll-margin-top: 48px; /* a Top recommendations link scrolls the card to below the sticky tab strip (33-35 px) */
+}
+
+.tuning-rec-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+}
+
+.tuning-rec-title {
+    font-size: 13.5px;
+    font-weight: 600;
+}
+
+.tuning-rec-head .tuning-muted {
+    margin-left: auto;
+    font-size: 11.5px;
+}
+
+.tuning-rec-text {
+    margin-top: 5px;
+    color: #404040;
+}
+
+.tuning-rec-param {
+    margin-top: 6px;
+}
+
+.tuning-rec-param code {
+    background: #eef5fb;
+    color: #1d5f86;
+}
+
+.tuning-rec-rule,
+.tuning-rec-list {
+    margin-top: 4px;
+    color: #404040;
+    font-size: 12px;
+}
+
+.tuning-rec-list {
+    display: flex;
+}
+
+.tuning-rec-list ul {
+    margin: 0;
+    padding-left: 16px;
+}
+
+.tuning-rec-list.is-blocked {
+    color: #a3362e;
+}
+
+.tuning-rec-list.is-caveat {
+    color: #8a5d0b;
+}
+
+.tuning-label {
+    flex: none;
+    display: inline-block;
+    min-width: 72px;
+    margin-right: 6px;
+    color: #909090;
+    font-size: 10.5px;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+}
+
+.tuning-cli {
+    position: relative;
+    margin: 8px 0 4px;
+}
+
+.tuning-cli pre {
+    margin: 0;
+    padding: 8px 64px 8px 10px;
+    border: 1px solid #dde1e5;
+    border-radius: 4px;
+    background: #f6f8fa;
+    color: #24292e;
+    font-family: Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.tuning-cli .tuning-copy {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+}
+
+.tuning-cli-none {
+    margin-top: 6px;
+    font-size: 12px;
+    font-style: italic;
+}
+
+/* Plots */
+
+.tuning-plot-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    margin-bottom: 8px;
+}
+
+.tuning-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 5px;
+    border-radius: 50%;
+}
+
+.tuning-plots {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+    gap: 10px;
+}
+
+.tuning-plot {
+    min-width: 0;
+    padding: 4px;
+    border-radius: 4px;
+    background: rgb(20, 20, 20);
+}
+
+.tuning-plot-canvas {
+    display: block;
+    width: 100%;
+    height: 220px;
+}
+
+@media (max-height: 600px) {
+    .tuning-plot-canvas {
+        height: 180px;
+    }
+}
+
+.tuning-plot.is-na {
+    min-height: 64px;
+    padding: 8px 12px;
+}
+
+.tuning-plot-title {
+    margin-bottom: 6px;
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 12px;
+}
+
+.tuning-plot .tuning-na {
+    color: #9da5b1;
+    font-size: 12px;
+}

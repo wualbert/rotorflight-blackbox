@@ -20,6 +20,7 @@ commit `5009e5e`. Anything not executed is marked as such.
 10. [Automatic tuning: status and next steps](#10-automatic-tuning-status-and-next-steps)
 11. [Known issues](#11-known-issues)
 12. [Tuning analysis toolkit](#12-tuning-analysis-toolkit)
+13. [The Tuning dialog](#13-the-tuning-dialog)
 
 ---
 
@@ -491,7 +492,7 @@ rest on one metric.
 | 0. Foundations: headless loader, ground-truth tests | Done. `tools/autotune/lib.cjs`, `test/autotune.test.cjs` |
 | 1. Metrics: gains in effect, frequency responses with uncertainty, tracking and disturbance measures | Done, as offline scripts. See section 12 |
 | 2. Advice: validated predictions and rule-based recommendations | Done, as offline scripts. See section 12 |
-| 3. In the app: a Flight Analysis lab that shows the same numbers | Not started |
+| 3. In the app: a Flight Analysis lab that shows the same numbers | Done: the Tuning dialog runs the toolkit unchanged in the app. See section 13 |
 
 Next steps, in order:
 
@@ -676,3 +677,125 @@ quiet and the second to oscillate at the predicted frequency.
 - When a change makes tracking worse, the disturbance prediction was off by up to 12 % in simulation. Such
   candidates fail the rule anyway.
 - Step-response figures are not used for decisions. The estimator in the app is biased (section 6).
+
+## 13. The Tuning dialog
+
+The toolbar button with the sliders icon opens it. It runs the toolkit of section 12 inside the app, shows error curves and
+lists every check with its number, uncertainty and rule. It also gives recommendations, with CLI text for the pilot to review.
+Nothing is sent to the flight controller.
+
+### Files
+
+| File | Role |
+|---|---|
+| `js/tuning_worker.js` | Web Worker. Loads the decoder scripts (`importScripts`) and the toolkit `.cjs` files (`fetch`, then a CommonJS shim), analyses, posts progress and one result |
+| `js/tuning_dialog.js`, `css/tuning_dialog.css` | The modal: context bar, scope (this log / all flights in the file), flight rpm, CLI dump, tabs, plots, save report |
+| `js/tuning_plot.js` | Canvas plots: linear and log axes, two y axes, NaN gaps, uncertainty bands, hover readout, click to seek |
+| `tools/autotune/health_track.cjs` | New checks: C12/T11 tracking error, C13/T12 lag, R1 stick-to-setpoint lag, C5/T1 fast oscillation; `curves()` for the error-curve tab |
+| `tools/autotune/health_more.cjs` | `normalMask` and D6 (rescue, level modes, failsafe, ground contact), F10 D-term and control noise, F11 measured gyro filter delay, T13 hover tail I, C14 pitch vs collective, T14 yaw at headspeed ramps, G14 governor states; `curves()` for governor, vibration and tail |
+| `tools/autotune/advice.cjs` | Findings and `report.cjs` decisions to recommendations: tuning order, guards, CLI text; the coverage matrix of every Rotorflight parameter group |
+| `test/health_track.test.cjs`, `test/health_more.test.cjs`, `test/advice.test.cjs` | Simulated ground truth per check, one test per advice generator and guard, real-data smoke tests |
+| `test/tuning_worker.test.cjs`, `test/helpers/bbl_encode.cjs` | The worker in a Node realm: byte parity with `health.cjs` + `health_report.cjs` on a synthetic `.bbl`; with `AUTOTUNE_REAL_LOG` set to the path of the Gaui X4 dump `RTFL_BLACKBOX_LOG_20261004_113720.BBL`, also on its log #50 |
+| `test/tuning_plot.test.cjs`, `test/tuning_dialog.test.cjs` | Plots on a fake canvas; the dialog on a synthetic result (every tab, escaping, worker protocol, seeking, registration in `index.html` and `gulpfile.js`) |
+
+### How it reuses the toolkit
+
+The toolkit files are not copied. The worker fetches them as text and compiles each one as a function expression
+through an indirect eval, `(0, eval)('(function (require, module, exports, process, __dirname, __filename, console) {...})')`,
+with a `sourceURL` so that stack traces name the file:
+- `require` returns sibling modules, a virtual in-memory `node:fs`, a posix `node:path` and a `node:vm` whose
+  `runInContext` is an indirect `eval` in the worker.
+- `process.env.AUTOTUNE_FLIGHT_RPM` carries the flight rpm. Each flight rpm gets its own module registry, because the toolkit
+  reads it at load.
+- `require.main` is undefined for library use. `health_report.cjs`, `extract.cjs` and `report.cjs` run as "virtual CLIs" over
+  the in-memory fs.
+- Rules for anyone editing `tools/autotune`:
+  - no Node API calls when a module loads (the `require('node:*')` lines are fine);
+  - keep `module.exports` followed by `if (require.main !== module) return`;
+  - add every file the worker loads to `distSources` in `gulpfile.js` (`APP_ASSET_SOURCES` on the web-app branch).
+- `test/tuning_worker.test.cjs` fails on drift. With `excludeAbnormal: false` the worker's records and findings must equal the
+  CLI's byte for byte.
+
+**This log** (a few seconds):
+1. The dialog slices the selected log out of the file (`FlightLogIndex.getLogBeginOffset`) and transfers the slice.
+2. The worker decodes it with unmodified `lib.segments`.
+3. It derives the flight rpm: 85 % of the lowest per-profile governor target in flight, in 100 rpm steps (1900 on the Gaui X4,
+   2900 on the Fireball). The user can override it.
+4. It runs `health_setup`, `health_gov`, `health_loop`, `health_track` and `health_more`. Rescue, angle/horizon/trainer,
+   failsafe and ground contact are ANDed out of the flying mask (`normalMask`).
+5. It judges with the virtual `health_report.cjs`, then runs advice, then curves.
+
+**All flights in the file:**
+- Every log is run as above, with one flight rpm for the file, and judged together.
+- `extract.cjs` and `report.cjs` then add the gain decisions (three or more flights per gain set, section 12).
+- Cost in Node: about 40 s for the 108 MB Gaui file and 110 s for a 131 MB Fireball file, 1.7 GB peak. NW.js under Rosetta
+  is about twice as slow.
+
+### Checks added for the dialog
+
+Thresholds are in `DEFAULT_RULES` at the top of each module, each with its source. They are pipeline choices, not
+validated in flight. Flags that have a standard error must pass a 2-SE test.
+
+| ID | Measures | Rule |
+|---|---|---|
+| C12 roll, pitch / T11 yaw | rms(gyro(t + τ) − setpoint) / rms(setpoint), low-passed at 30 Hz, samples with \|setpoint\| > 5 deg/s, τ the best delay in 0-150 ms; jackknife over 10 s blocks | note 0.30, flag 0.45 (the levels of the PID lab in `js/flight_analysis.js`) |
+| C13 / T12 | that τ, the setpoint-to-gyro lag | report; flag above 120 ms |
+| R1 | rcCommand to setpoint lag (rate shaping) | report; flag above 40 ms |
+| C5 / T1 | stick-free band-passed error in the `wag.cjs` bands; shares at 10/20/40 deg/s; bursts that grow from < 30 to >= 150 deg/s | flag on a self-excited burst; note when the 20 deg/s share passes 0.05 |
+| D6 | seconds excluded by `normalMask` | note; flag failsafe while airborne |
+| F10 | share of axisD power above 30 Hz (yaw too); mixer rms above 30 Hz | flag yaw D share above 0.5 |
+| F11 | gyroRAW to gyroADC delay at 8-16 Hz | report; flag above 10 ms |
+| T13 | median hover yaw I as a share of the yaw authority | flag above 0.15 |
+| C14 | pitch I + O against collective, the implied `pitch_collective_ff_gain` change | flag at 20 per 1000 collective and a change of 10 or more |
+| T14 | yaw at governor headspeed ramps, regressed to a `yaw_inertia_precomp_gain` change | 3 or more events, 80 % of one sign, change above max(15, 0.15 x header gain) |
+| G14 | time and entries per governor state, spool-up ramp | note; flag airborne bailout, or autorotation above hover collective for more than 0.5 s |
+
+### Recommendations
+
+`advice.advise(input)` is pure. The dialog shows the recommendations in the order of `TUNING_KNOWLEDGE.md` section 9.1: preconditions, then
+filters, governor, cyclic, tail, rates. Guards, each with a test in `test/advice.test.cjs`:
+- filters first: no gain raise while a filter check flags;
+- motor poles and gear first;
+- authority before gains;
+- the 2-SE gate;
+- steps of at most 20 %, except the documented absolute steps (governor F 10, I 25, P 10; TTA 10; tail D 10);
+- never a gyro LPF below 60 Hz or a notch Q below 2.0;
+- log profile p is CLI `profile p-1`, with no CLI text when the arming profile is unknown;
+- no governor gains in DIRECT;
+- known misleading raw flags (loop stalls after disarm, F5 without a CLI dump) become checks, never actions.
+
+The worker adds two fields to toolkit findings:
+- `filterPass` on F5: the measured gyroRAW to gyroADC transmission at each line. A strongest line the filters pass under 5 % of
+  is information, not a filter problem.
+- `explained`: a flag that every recommendation on it treats as information. The dialog shows it as report-only.
+
+The Coverage tab lists every parameter group with what was assessed, or why not: needs a CLI dump, needs fields, needs
+more flights, or not assessable from a log.
+
+### Error curves
+
+| Plot | Data |
+|---|---|
+| Tracking error over time | setpoint, error, error at the best delay (rms per 0.1 s), unusable spans shaded, finding times as markers; a click seeks the viewer |
+| Band-passed error amplitude | the C5/T1 statistic over time with the 10/20/40 deg/s lines; stick-driven windows shaded |
+| Error and response spectrum | \|error\| / \|setpoint\|, \|T\| from setpoint to gyro, coherence; \|T\| is drawn solid only where its random error sqrt(1 − coh) / sqrt(2 n coh) is under 20 % |
+| Phase | phase of T (same mask) against the fitted delay line −360 f τ |
+| Mean \|error\| by \|setpoint\| | the error against stick rate, raw and at the best delay |
+| Governor | headspeed and target with the governor states, error % with ±1/±2 % lines, throttle and collective |
+| Filters and vibration | gyroRAW against gyroADC per axis and profile with rotor harmonics, notches and LPF cutoffs; transmission; D-term and control spectra |
+| Tail | mixer[2] against its limits; yaw error |
+
+### Verified
+
+- The tests listed above all pass (237 tests including the pre-existing ones, 2026-10-05).
+- In NW.js 0.62.2 (Chromium 99) the worker gives the same findings as Node.
+- The web build was tried in Chrome, from a merge with the fork's web-app commits #85-#87. Every tab rendered real Gaui X4 data, and
+  click-to-seek and "All flights" worked, with no console errors.
+- Against the peer analysis of the Gaui X4 (`analysis/gaui-x4/`):
+  - rescue excluded 10.59 s against 10.60 s;
+  - gyro filter delay 7.0-7.6 ms against 7.15-7.23 ms;
+  - pitch lag 70-79 ms against 72-75 ms;
+  - yaw at ramps 35.5 ± 2.1 against 34.8 ± 1.6 deg/s;
+  - the roll mode is not flagged as self-excited;
+  - the 4.06 x rotor line is reported as already filtered out (0.1-0.5 % passed; the peer measured 0.0-0.2 %).
+- Merging the fork's origin/master conflicts only in `gulpfile.js`: move the new entries into `APP_ASSET_SOURCES`.
