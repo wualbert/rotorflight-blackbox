@@ -16,6 +16,7 @@
  */
 
 const lib = require('./lib.cjs');
+const POWER = (() => { try { return require('./health_power.cjs'); } catch (e) { return null; } })(); // the firmware rule of the cell count (autoCells)
 
 // Measurement parameters only. Nothing here decides good or bad; that is DEFAULT_RULES.
 const RULE = {
@@ -29,8 +30,10 @@ const RULE = {
     ceiling: { fraction: 0.995, minSamples: 20, pile: 3, minRunS: 0.02 },
     cliCheck: { request: 1.02, ceilingCounts: 2 }, // a CLI value the log contradicts (request above gov_headspeed, motor[0] above gov_max_throttle) is not used
     unsat: { below: 0.98, minSum: 100, unity: 0.002, vcompOffShare: 0.99 }, // vcompOffShare: G7 takes vcomp as off (1) when this share of the ratios is 1
-    // cell count, when neither the CLI nor ctx gives it: the counts that put the resting voltage over the first startS
-    // seconds within startCell V/cell; more than one such count = ambiguous, and per-cell verdicts are not given
+    // cell count, when ctx (a CLI battery_cell_count) does not give it: the rule of the firmware (battery.c batteryUpdatePresence,
+    // health_power.cjs autoCells) on the resting voltage over the first startS seconds with the cell levels that the pilot set
+    // (the log header vbatcellvoltage, else the CLI), so that no CLI dump is necessary; without those levels, the counts that put
+    // the resting voltage within startCell V/cell: more than one such count = ambiguous, and per-cell verdicts are not given
     vbat: { stepS: 0.01, reportStep: 0.5, startS: 1, startCell: [3.6, 4.35], histogram: [2, 4.5, 0.01] },
     g2: { blockS: 2 },
     g9: { decimate: 8, N: 1024, maxHz: 12, bands: { I: [0.3, 3], P: [3, 10] } },
@@ -215,7 +218,10 @@ function analyse(w, ctx) {
         const v0 = median(Array.from({ length: Math.max(1, Math.min(n, S(B.startS))) }, (_, i) => V(i)));
         const fits = []; for (let k = Math.max(1, Math.ceil(v0 / B.startCell[1])); k <= Math.floor(v0 / B.startCell[0]); k++) fits.push(k);
         let cells, cellsSource, cellsAmbiguous = false;
+        const L = !ctx.cells && POWER && typeof POWER.limitsOf === 'function' ? POWER.limitsOf(h, ctx.cliParsed || null) : null;
+        const fw = L && /^(log header|CLI)/.test(L.source) && v0 >= 1 ? POWER.autoCells(v0, L.min, L.max) : null;
         if (ctx.cells) { cells = ctx.cells; cellsSource = ctx.cellsSource || 'CLI battery_cell_count'; }
+        else if (fw) { cells = fw; cellsSource = `firmware rule (battery.c): resting ${r(v0, 2)} V at log start, ${L.min}-${L.max} V/cell (${L.source})`; }
         else { cells = fits.length ? fits.reduce((a, k) => Math.abs(v0 / k - 3.95) < Math.abs(v0 / a - 3.95) ? k : a) : Math.max(1, Math.round(v0 / 3.95));
             cellsAmbiguous = fits.length !== 1;
             cellsSource = `inferred, low confidence: resting ${r(v0, 2)} V at log start fits ${fits.length ? fits.join(' or ') : 'no'} cell count${fits.length === 1 ? '' : 's'} at ${B.startCell[0]}-${B.startCell[1]} V/cell${cellsAmbiguous ? ': ambiguous' : ''}`; }
@@ -523,7 +529,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
         }
         // G13
         if (m.G13.skipped) add('G13', 'skipped', L, null, null, null, 0, R.G13, m.G13.skipped);
-        else if (m.G13.cellsAmbiguous) add('G13', 'note', L, null, null, null, m.G13.n, R.G13.minCell, `no finding: cell count ambiguous (${m.G13.cellsSource}); Vbat in flight ${m.G13.startV} -> ${m.G13.endV} V. Give the cell count (CLI battery_cell_count)`);
+        else if (m.G13.cellsAmbiguous) add('G13', 'note', L, null, null, null, m.G13.n, R.G13.minCell, `no finding: cell count ambiguous (${m.G13.cellsSource}); Vbat in flight ${m.G13.startV} -> ${m.G13.endV} V. The log does not record the cell count`);
         else add('G13', m.G13.p1Cell < R.G13.minCell ? 'flag' : 'ok', L, null, m.G13.p1Cell, null, m.G13.n, R.G13.minCell,
             `p1 of Vbat in flight ${m.G13.p1Cell} V/cell (min ${m.G13.minCell}, median ${m.G13.medianCell}; ${m.G13.cells} cells, ${m.G13.cellsSource || ''}; ${m.G13.startV} -> ${m.G13.endV} V)`);
         // G0

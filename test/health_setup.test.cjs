@@ -190,7 +190,10 @@ test('CLI: parsed, compared with the header, gear ratios used, governor mode che
     // agreeing header: the only flag left is the governor mode
     const w2 = makeW({ seconds: 4, raw: false, hdr: header({ yawPID: [70, 120, 10, 0, 0] }) }), c2 = ctxOf(w2, { cli: CLI }); delete c2.gear;
     const m2 = hs.analyse(w2, c2); assert.equal(m2.D4.mismatches.length, 0); assert.ok(m2.D4.compared > 40);
-    assert.equal(hs.analyse(w2, ctxOf(w2)).D4.skipped, 'no CLI dump given (ctx.cli undefined)');
+    // no CLI dump (an optional input, user rule 2026-10-06): no D4 metric and no D4 result, not a result that was not done
+    const m3 = hs.analyse(w2, ctxOf(w2));
+    assert.equal(m3.D4, undefined);
+    assert.deepEqual(hs.judge([{ log: 0, start: 'x', header: w2.flight.header, metrics: m3 }], hs.DEFAULT_RULES).filter(f => f.id === 'D4'), []);
 });
 
 test('header change table: gains that changed between logs on the same starting profile', () => {

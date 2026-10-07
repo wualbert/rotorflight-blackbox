@@ -148,21 +148,108 @@
     outline: 0;
 }
 
-/* Only shown once a log is loaded, not for a video on its own */
-.rf-nav-icon.open-flight-analysis-dialog {
+/* View tabs (js/main.js showView): only once a log is loaded, not for a video on its own */
+.rf-view-tabs {
     display: none;
+    flex: none;
+    align-items: center;
+    gap: 2px;
+    height: 32px;
+    padding: 2px;
+    border: 1px solid var(--rf-chrome-border);
+    border-radius: 7px;
+    background: var(--rf-chrome-bg-sunken);
 }
 
-html.has-log .rf-nav-icon.open-flight-analysis-dialog {
+html.has-log .rf-view-tabs {
     display: inline-flex;
 }
 
-.rf-nav-icon.open-tuning-dialog {
-    display: none;
+.rf-view-tab {
+    height: 26px;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--rf-text-muted);
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background 0.15s ease, color 0.15s ease;
 }
 
-html.has-log .rf-nav-icon.open-tuning-dialog {
+.rf-view-tab:hover,
+.rf-view-tab:focus-visible {
+    background: var(--rf-chrome-bg-raised);
+    color: #fff;
+    outline: 0;
+}
+
+.rf-view-tab.is-active,
+.rf-view-tab.is-active:hover {
+    background: var(--rf-accent);
+    color: #181818;
+}
+
+/* The text size of the Analysis and Tuning views (js/main.js setTextSize): next to the view tabs, only with those views */
+.rf-view-text {
+    display: none;
+    flex: none;
+    align-items: center;
+    gap: 2px;
+    height: 32px;
+    margin-left: 8px;
+    padding: 2px 4px 2px 8px;
+    border: 1px solid var(--rf-chrome-border);
+    border-radius: 7px;
+    background: var(--rf-chrome-bg-sunken);
+    color: var(--rf-text-muted);
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+html.has-log[data-view="analysis"] .rf-view-text,
+html.has-log[data-view="tuning"] .rf-view-text {
     display: inline-flex;
+}
+
+.rf-view-text-label {
+    margin-right: 4px;
+    font-weight: 600;
+    cursor: default;
+}
+
+.rf-view-text-step,
+.rf-view-text-value {
+    height: 26px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--rf-text);
+    font-size: 13px;
+    font-weight: 600;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.rf-view-text-value {
+    min-width: 54px;
+    color: var(--rf-text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.rf-view-text-step:hover:not(:disabled),
+.rf-view-text-step:focus-visible,
+.rf-view-text-value:hover,
+.rf-view-text-value:focus-visible {
+    background: var(--rf-chrome-bg-raised);
+    color: #fff;
+    outline: 0;
+}
+
+.rf-view-text-step:disabled {
+    opacity: 0.35;
+    cursor: default;
 }
 
 .rf-export-menu .dropdown-menu {
@@ -177,6 +264,15 @@ html.has-log .rf-export-menu .btn-video-export {
 
 @media (max-width: 900px) {
     .rf-nav-label {
+        display: none;
+    }
+
+    .rf-view-tab {
+        padding: 0 8px;
+        font-size: 12px;
+    }
+
+    .rf-view-text-label {
         display: none;
     }
 

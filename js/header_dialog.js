@@ -1,5 +1,30 @@
 'use strict';
 
+// Names and values come from the log file: escape them before they go into HTML. No DOM (test/param_log.test.cjs).
+function escapeHeaderText(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// The header lines of the parameter journal (sysConfig.paramHeader, [name, value] in log order): a box after the unknown
+// header fields, with the lines in a table that the pilot opens and closes. No DOM (test/param_log.test.cjs).
+function paramHeaderHtml(paramHeader) {
+    var rows = '';
+
+    for (var i = 0; i < paramHeader.length; i++) {
+        rows += '<tr><td><code>' + escapeHeaderText(paramHeader[i][0]) + '</code></td>' +
+            '<td><code>' + escapeHeaderText(paramHeader[i][1]) + '</code></td></tr>';
+    }
+
+    return '<div class="gui_box_titlebar"><div class="spacer_box_title">Parameter log</div></div>' +
+        '<div class="spacer_box">' +
+        '<p>The flight controller wrote these lines in the header of the log. ' +
+        'The parameter records of the log show the changes after these lines.</p>' +
+        '<details><summary>Header lines of the parameter log (' + paramHeader.length + ')</summary>' +
+        '<table class="parameter cf"><tr><td>Name</td><td>Value</td></tr>' + rows + '</table>' +
+        '</details></div>';
+}
+
 function HeaderDialog(dialog, onSave) {
 
         // Private Variables
@@ -450,14 +475,14 @@ function HeaderDialog(dialog, onSave) {
         function renderUnknownHeaders(unknownHeaders) {
                 // Build a table of unknown header entries
                 try {
-                        if(unknownHeaders!=0) {
+                        if(unknownHeaders && unknownHeaders.length) {
                                 var table = $('.unknown table');
                                 var elem = '';
                                 $("tr:not(:first)", table).remove(); // clear the entries (not the first row which has the title bar)
 
                                 for(var i=0; i<unknownHeaders.length; i++) {
-                                        elem += '<tr><td>' + unknownHeaders[i].name + '</td>' +
-                                                                '<td>' + unknownHeaders[i].value + '</td></tr>';
+                                        elem += '<tr><td data-ste="quoted">' + escapeHeaderText(unknownHeaders[i].name) + '</td>' +
+                                                                '<td data-ste="quoted">' + escapeHeaderText(unknownHeaders[i].value) + '</td></tr>';
                                 }
 
                                 table.append(elem);
@@ -467,6 +492,25 @@ function HeaderDialog(dialog, onSave) {
                         }
                 } catch(e) {
                         $('.unknown').hide();
+                }
+        }
+
+        function renderParamHeader(paramHeader) {
+                var box = $('.param_header', dialog);
+
+                try {
+                        if (Array.isArray(paramHeader) && paramHeader.length) {
+                                if (!box.length) {
+                                        box = $('<div class="gui_box grey param_header"></div>');
+                                        box.insertAfter($('.unknown', dialog).first());
+                                }
+                                box.html(paramHeaderHtml(paramHeader));
+                                box.show();
+                        } else {
+                                box.hide();
+                        }
+                } catch(e) {
+                        box.hide();
                 }
         }
 
@@ -1076,6 +1120,9 @@ function HeaderDialog(dialog, onSave) {
 
         /* Show Unknown Fields */
         renderUnknownHeaders(sysConfig.unknownHeaders);
+
+        /* Show the header lines of the parameter journal */
+        renderParamHeader(sysConfig.paramHeader);
 
         /* Remove some version specific headers */
         if(activeSysConfig.firmwareType == FIRMWARE_TYPE_BETAFLIGHT && semver.gte(activeSysConfig.firmwareVersion, '3.1.0')) {

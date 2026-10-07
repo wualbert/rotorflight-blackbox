@@ -1775,3 +1775,185 @@ dialog h3 {
   max-height: calc(100vh - 250px);
   overflow-y: auto;
 }
+
+/*
+ Views at the level of the log viewer (js/main.js showView). The active one covers everything below the 50 px
+ navbar (branding.css .rf-navbar), above the toolbar (z-index 10) and below the navbar (1030), Bootstrap's modals
+ (1040, 1050), tooltips (1070) and the context menu (2000). The viewer stays laid out underneath, so its canvases
+ keep their size; visibility takes its controls out of the tab order.
+*/
+.rf-view {
+    display: none;
+}
+
+/*
+ The text of the Analysis and Tuning views (SPEC3 C). js/main.js sets --rf-text-scale from the "Text" control of the navbar
+ (90 % to 160 %, kept in the preferences). The view CSS gives each size in --rf-px: calc(15 * var(--rf-px)) is 15 px at
+ 100 %. The diagram of the Tuning view is HTML in the same units (SPEC3 A, B), and the canvas plots use the same scale
+ (js/tuning_plot.js TuningPlot.setTextScale).
+*/
+:root {
+    --rf-text-scale: 1;
+    --rf-px: calc(var(--rf-text-scale) * 1px);
+}
+
+/* The Bootstrap controls and headings in the views: the same scale as the text. :where() keeps the specificity of the
+   Bootstrap rules, so the classes of the view CSS (later files) keep their own sizes */
+:where(.rf-view) .btn,
+:where(.rf-view) .form-control {
+    font-size: calc(15 * var(--rf-px));
+}
+
+:where(.rf-view) .btn-sm,
+:where(.rf-view) .btn-group-sm > .btn {
+    padding: 0.33em 0.75em;
+    font-size: calc(14 * var(--rf-px));
+}
+
+:where(.rf-view) .btn-xs,
+:where(.rf-view) .btn-group-xs > .btn {
+    padding: 0.1em 0.45em;
+    font-size: calc(13 * var(--rf-px));
+}
+
+:where(.rf-view) .input-sm {
+    height: calc(32 * var(--rf-px));
+    padding: 0.2em 0.55em;
+    font-size: calc(14 * var(--rf-px));
+    line-height: 1.4;
+}
+
+:where(.rf-view) select.input-sm {
+    height: calc(32 * var(--rf-px));
+    line-height: normal;
+}
+
+:where(.rf-view) h5 {
+    font-size: calc(16 * var(--rf-px));
+}
+
+:where(.rf-view) h6 {
+    font-size: calc(14 * var(--rf-px));
+}
+
+html.has-log[data-view="analysis"] #viewAnalysis,
+html.has-log[data-view="tuning"] #viewTuning {
+    display: block;
+    position: fixed;
+    top: 50px;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 1020;
+    overflow-y: auto;
+    background: #fff;
+    outline: 0;
+}
+
+html.has-log[data-view="analysis"] .main-pane,
+html.has-log[data-view="analysis"] .log-seek-bar,
+html.has-log[data-view="analysis"] #status-bar,
+html.has-log[data-view="tuning"] .main-pane,
+html.has-log[data-view="tuning"] .log-seek-bar,
+html.has-log[data-view="tuning"] #status-bar {
+    visibility: hidden;
+}
+
+html.is-dragging .rf-view {
+    box-shadow: inset 0 0 0 3px var(--rf-accent);
+}
+
+/* "Show in the log": what the graphs show and the way back, over the top of the graph */
+.log-evidence {
+    display: none;
+}
+
+html.has-evidence .log-evidence {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    z-index: 11;
+    max-width: 80%;
+    padding: 5px 6px 5px 12px;
+    transform: translateX(-50%);
+    border: 1px solid var(--rf-accent);
+    border-radius: 6px;
+    background: rgba(20, 22, 26, 0.9);
+    color: #f4f5f7;
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.log-evidence-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* The legend of the curves (SPEC3 E): one group for each graph, always open while the bar shows */
+.log-evidence-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 14px;
+    padding-top: 4px;
+    border-top: 1px solid rgba(255, 255, 255, 0.15);
+    font-size: 12.5px;
+}
+
+.log-evidence-legend:empty {
+    display: none;
+}
+
+.log-evidence-graph {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 10px;
+}
+
+.log-evidence-graph-name {
+    color: #9da5b1;
+    font-weight: 600;
+}
+
+.log-evidence-curve {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+}
+
+.log-evidence-curve code {
+    padding: 0;
+    background: transparent;
+    color: #fff;
+    font-size: 12px;
+}
+
+.log-evidence-swatch {
+    display: inline-block;
+    width: 16px;
+    height: 4px;
+    border-radius: 1px;
+}
+
+.log-evidence-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2; /* the whole text is in its title */
+    overflow: hidden;
+}
+
+.log-evidence-text strong {
+    color: #fff;
+}
+
+.log-evidence .btn {
+    flex: none;
+}

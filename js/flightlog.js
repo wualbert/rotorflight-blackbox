@@ -330,6 +330,17 @@ function FlightLog(logData) {
                 // Parse the log file to create this chunk since it wasn't cached
                 chunkStartOffset = iframeDirectory.offsets[chunkIndex];
 
+                /*
+                 * Chunk 0 starts at the end of the header, so that it keeps the events before the first I-frame
+                 * (SYNC_BEEP, GOVSTATE, the parameter journal). They get the time of the first frame. The frames
+                 * before the first I-frame cannot be decoded and make no gap, and the log bounds do not change.
+                 */
+                var firstIFrameOffset = iframeDirectory.offsets[0];
+
+                if (chunkIndex === 0 && iframeDirectory.dataStart !== undefined && iframeDirectory.dataStart < firstIFrameOffset) {
+                    chunkStartOffset = iframeDirectory.dataStart;
+                }
+
                 if (chunkIndex + 1 < iframeDirectory.offsets.length)
                     chunkEndOffset = iframeDirectory.offsets[chunkIndex + 1];
                 else // We're at the end so parse till end-of-log
@@ -366,7 +377,8 @@ function FlightLog(logData) {
 
                 parser.onFrameReady = function(frameValid, frame, frameType, frameOffset, frameSize) {
                     var
-                        destFrame;
+                        destFrame,
+                        beforeFirstIFrame = chunkIndex === 0 && frameOffset < firstIFrameOffset;
 
                     // The G frames need to be processed always. They are "invalid" if not H (Home) has been detected
                     // before, but if not processed the viewer shows cuts and gaps. This happens if the quad takes off before
@@ -410,7 +422,7 @@ function FlightLog(logData) {
 
                             break;
                             case 'E':
-                                if (frame.event == FlightLogEvent.LOGGING_RESUME) {
+                                if (frame.event == FlightLogEvent.LOGGING_RESUME && !beforeFirstIFrame) {
                                     chunk.gapStartsHere[mainFrameIndex - 1] = true;
                                 }
 
@@ -420,9 +432,11 @@ function FlightLog(logData) {
                                 * end of the loop).
                                 *
                                 * So we want to use the timestamp of that later frame as the timestamp of the loop
-                                * iteration this event was logged in.
+                                * iteration this event was logged in. An event before the first I-frame gets the
+                                * time of the first frame, also when it has a time of its own (SYNC_BEEP keeps it
+                                * in data.time).
                                 */
-                                if (!frame.time) {
+                                if (!frame.time || beforeFirstIFrame) {
                                     eventNeedsTimestamp.push(frame);
                                 }
                                 chunk.events.push(frame);
@@ -439,7 +453,7 @@ function FlightLog(logData) {
                                 // But other data from the G frame can be valid (time, num sats)
                             break;
                         }
-                    } else {
+                    } else if (!beforeFirstIFrame) {
                         chunk.gapStartsHere[mainFrameIndex - 1] = true;
                     }
                 };

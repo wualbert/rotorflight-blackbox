@@ -32,10 +32,17 @@
  *   format         { x, y }: value -> text, for the tick labels and the readout (the y2 axis keeps the default)
  * step, onHover, format and dot markers are supported, but the Tuning dialog does not use them yet.
  *
+ * Text size (SPEC3 C): the fonts, the line height, the margins and the tick spacing are the sizes at 100 % x TEXT_BASE
+ * (12 px tick labels) x the text scale of the views, TuningPlot.setTextScale(s) (js/main.js, the "Text" control: 0.9 to
+ * 1.6). A new scale draws every plot that is on the page again. TuningPlot.textMetrics() gives the fonts and the factor
+ * to the other canvases of the views (the timeline of js/log_lens.js), and onTextScale(cb) calls cb after each change.
+ *
  * Hovering shows a crosshair and a readout: x, each series' value at it (with its lo..hi band), and the labels of
- * the marker and the vlines under the mouse and of the bands around it. Band labels, then vline labels, go along the
- * top in spec order, each on the first of a few rows with room and clear of the legend; those that find none show
- * only here.
+ * the marker, the vlines and hlines under the mouse and of the bands around it. The labels are drawn after the curves,
+ * each on a dark box, and no label covers another or the legend: an hline label goes above its line on the right, else
+ * on the left, else under the line; then band labels and vline labels go along the top in spec order, each on the first
+ * of a few rows with room. Those that find no room show only in the readout. A title that is wider than the plot goes
+ * on two lines, the second one cut with "…".
  *
  * Series with more than 4 points per pixel column are drawn through the first, last, lowest and highest point of
  * each column (M4 decimation: the same picture, every extreme kept). The plot is drawn into a cached canvas once
@@ -48,8 +55,20 @@ var TuningPlot = (function () {
 
     var BACKGROUND = "rgb(20,20,20)", TEXT = "rgba(255,255,255,0.85)", GRID = "rgba(255,255,255,0.12)",
         GRID_MINOR = "rgba(255,255,255,0.05)", FRAME = "rgba(255,255,255,0.3)", CURSOR = "rgba(0,255,0,0.66)",
-        HALO = "rgba(0,0,0,0.8)", FONT = "10px Verdana, Arial, sans-serif", TITLE_FONT = "bold 11px Verdana, Arial, sans-serif",
-        ROW = 13, LOG_STEPS = [1, 2, 5]; // ROW: text line height, css px
+        HALO = "rgba(0,0,0,0.8)", FAMILY = "Verdana, Arial, sans-serif", LOG_STEPS = [1, 2, 5];
+
+    // The text size: K = TEXT_BASE x the scale of the views; FONT (10 px x K), TITLE_FONT (11 px x K), ROW (the text line
+    // height, 13 css px x K). setTextScale changes them and draws the live plots again
+    var TEXT_BASE = 1.2, SCALE_MIN = 0.5, SCALE_MAX = 3, textScale = 1, K, FONT, TITLE_FONT, ROW, live = [], scaleListeners = [];
+    function metricsFor(scale) {
+        var k = TEXT_BASE * scale;
+        return { scale: scale, k: k, font: Math.round(10 * k) + "px " + FAMILY, title: "bold " + Math.round(11 * k) + "px " + FAMILY, row: Math.round(13 * k) };
+    }
+    function useScale(scale) {
+        var m = metricsFor(scale);
+        textScale = scale; K = m.k; FONT = m.font; TITLE_FONT = m.title; ROW = m.row;
+    }
+    useScale(1);
 
     var finite = Number.isFinite;
     function positive(v) { return v > 0 && v < Infinity; }
@@ -214,6 +233,28 @@ var TuningPlot = (function () {
     }
     function axisTitle(opt) { return opt.label && opt.unit ? opt.label + " (" + opt.unit + ")" : opt.label || opt.unit || ""; }
 
+    // s cut to `max` px in the font of c: whole words while they fit, then "…"; a first word that is too wide loses letters
+    function fitText(c, s, max) {
+        if (c.measureText(s).width <= max) return s;
+        var words = s.split(" "), out = "";
+        while (words.length > 1) {
+            words.pop();
+            out = words.join(" ").replace(/[,:;]$/, "") + "…";
+            if (c.measureText(out).width <= max) return out;
+        }
+        for (out = s; out.length > 1 && c.measureText(out + "…").width > max;) out = out.slice(0, -1);
+        return out + "…";
+    }
+
+    // A title on one line, or on two when it is wider than `max` px: the words that fit, then the others (cut with "…")
+    function wrapTitle(c, s, max) {
+        if (!(max > 0) || c.measureText(s).width <= max) return [s];
+        var words = s.split(" "), k = 1;
+        while (k < words.length && c.measureText(words.slice(0, k + 1).join(" ")).width <= max) k++;
+        if (k >= words.length) return [s];
+        return [fitText(c, words.slice(0, k).join(" "), max), fitText(c, words.slice(k).join(" "), max)];
+    }
+
     // Adds the line through the points idx (-1 = gap) to the path; with a baseline each run is closed down to it.
     // A step value holds until the next x, so the last one of a run reaches the next x (bin edges: x one longer).
     function tracePath(c, d, idx, X, base) {
@@ -342,37 +383,76 @@ var TuningPlot = (function () {
                 return axisRange(opt, parts.concat([[hv, 0, hv.length - 1]]), 0.05);
             }
 
-            // layout: the left and right margins fit the widest tick label
+            // layout: the left and right margins fit the widest tick label; a title that is wider than the plot goes on two
+            // lines, the second one cut with "…" (V10)
             var tx = fmt.x || format6, ty = fmt.y || format6, ty2 = format6;
-            var T = spec.title ? 22 : 8, B = H - (axisTitle(xo) ? 34 : 20);
-            var Y = makeAxis(yo, yRange(yo, false), B, T), Y2 = y2o && makeAxis(y2o, yRange(y2o, true), B, T);
-            var yTicks = axisTicks(Y, B - T, 20, 32), y2Ticks = Y2 ? axisTicks(Y2, B - T, 20, 32) : [];
+            var B = H - Math.round((axisTitle(xo) ? 34 : 20) * K), T, Y, Y2, yTicks, y2Ticks, left, right, titleLines = [];
             function widest(ticks, f) {
                 return ticks.reduce(function (w, t) { return t.label ? Math.max(w, c.measureText(f(t.v)).width) : w; }, 0);
             }
-            var left = Math.round(8 + widest(yTicks, ty) + (axisTitle(yo) ? 14 : 0)),
-                right = Math.round(W - (Y2 ? 8 + widest(y2Ticks, ty2) + (axisTitle(y2o) ? 14 : 0) : 14));
+            function layout(top) {
+                T = top;
+                Y = makeAxis(yo, yRange(yo, false), B, T);
+                Y2 = y2o && makeAxis(y2o, yRange(y2o, true), B, T);
+                yTicks = axisTicks(Y, B - T, 20 * K, 32 * K);
+                y2Ticks = Y2 ? axisTicks(Y2, B - T, 20 * K, 32 * K) : [];
+                left = Math.round(8 * K + widest(yTicks, ty) + (axisTitle(yo) ? 14 * K : 0));
+                right = Math.round(W - (Y2 ? 8 * K + widest(y2Ticks, ty2) + (axisTitle(y2o) ? 14 * K : 0) : 14 * K));
+            }
+            layout(Math.round((spec.title ? 22 : 8) * K));
+            if (spec.title) {
+                c.font = TITLE_FONT;
+                titleLines = wrapTitle(c, String(spec.title), W - left - 8);
+                c.font = FONT; // the tick labels of the layout
+                if (titleLines.length > 1) {
+                    layout(Math.round(22 * K) + ROW);
+                    c.font = TITLE_FONT;
+                    titleLines = titleLines.map(function (l) { return fitText(c, l, W - left - 8); });
+                    c.font = FONT;
+                }
+            }
             if (right - left < 20 || B - T < 20) return null; // too small for a plot
-            var X = makeAxis(xo, xr, left, right), xTicks = axisTicks(X, right - left, 45, 70);
+            var X = makeAxis(xo, xr, left, right), xTicks = axisTicks(X, right - left, 45 * K, 70 * K);
             list.forEach(function (d) { d.A = d.y2 ? Y2 : Y; d.dense = d.i1 - d.i0 + 1 > 4 * (right - left); });
 
             // the legend box (drawn last) comes first, so that the labels along the top keep clear of it
             var entries = spec.legend === false ? [] : meta.filter(function (d, k) {
                 return d.n && d.s.name && !meta.slice(0, k).some(function (e) { return e.n && e.s.name === d.s.name; });
             });
-            var lw = entries.length ? 32 + entries.reduce(function (w, e) { return Math.max(w, c.measureText(e.s.name).width); }, 0) : 0,
+            var lw = entries.length ? Math.round(32 * K) + entries.reduce(function (w, e) { return Math.max(w, c.measureText(e.s.name).width); }, 0) : 0,
                 lx = right - lw - 4, lb = T + 10 + entries.length * ROW; // left edge and bottom of the legend box
 
-            // inside the plot box: bands, grid, reference lines, series, markers
+            // inside the plot box: bands, grid, reference lines, series, markers, then the labels of the bands and lines on top
             c.save(); c.beginPath(); c.rect(left, T, right - left, B - T); c.clip();
-            var rows = [-Infinity, -Infinity, -Infinity]; // right ends of the label rows along the top
-            while (lw && T + 3 + (rows.length - 1) * ROW < lb) rows.push(-Infinity); // more, down to one below the legend
-            function topLabel(s, x, color) { // on the first row with room, clear of the legend, else only in the readout
+            var placed = [], tops = [], hlabels = [], nRows = 3; // the boxes of the labels drawn; the labels to place
+            while (lw && T + 3 + (nRows - 1) * ROW < lb) nRows++; // more rows, down to one below the legend
+            function free(x0, y0, w) { // in the plot box, clear of the legend and of the labels drawn so far
+                var x1 = x0 + w, y1 = y0 + ROW - 1;
+                if (x0 < left + 1 || x1 > right - 1 || y0 < T || y1 > B) return false;
+                if (lw && x1 >= lx - 2 && x0 <= lx + lw && y0 < lb) return false;
+                return !placed.some(function (q) { return x0 < q.x1 + 4 && x1 + 4 > q.x0 && y0 < q.y1 && y1 > q.y0; });
+            }
+            function put(s, x0, y0, w, color, toRight) { // a dark box under the text: no line or curve crosses a label
+                placed.push({ x0: x0, y0: y0, x1: x0 + w, y1: y0 + ROW - 1 });
+                c.fillStyle = "rgba(20,20,20,0.72)";
+                c.fillRect(x0 - 2, y0 - 1, w + 4, ROW);
+                haloText(c, s, toRight ? x0 + w : x0, y0, toRight ? "right" : "left", "top", color);
+            }
+            // band and vline labels go along the top: on the first row with room, else only in the readout
+            function topLabel(s, x, color) {
                 var w = c.measureText(s).width, at = x + 3 + w > right ? x - 3 - w : x + 3;
-                for (var r = 0, y = T + 3; r < rows.length; r++, y += ROW) {
-                    if (!(at > rows[r] + 4 && (!lw || at + w < lx - 2 || y >= lb))) continue;
-                    rows[r] = at + w;
-                    return haloText(c, s, at, y, "left", "top", color);
+                for (var r = 0, y = T + 3; r < nRows; r++, y += ROW) {
+                    if (free(at, y, w)) return put(s, at, y, w, color);
+                }
+            }
+            // an hline label: above its line on the right, else on the left, else under the line (V10: clear of the other
+            // labels and of the legend); one that finds no room shows only in the readout
+            function lineLabel(h, p) {
+                var s = h.label, w = c.measureText(s).width, above = p - 2 - ROW, below = p + 2, k, q;
+                var spots = [[right - 4 - w, above], [left + 4, above], [right - 4 - w, below], [left + 4, below]];
+                for (k = 0; k < spots.length; k++) {
+                    q = spots[k];
+                    if (free(q[0], q[1], w)) return put(s, q[0], q[1], w, h.color, k % 2 === 0);
                 }
             }
             (spec.bands || []).forEach(function (b) {
@@ -380,7 +460,7 @@ var TuningPlot = (function () {
                 var a = X.ok(b.x0) && b.x0 > X.min ? X.px(b.x0) : left, z = b.x1 < X.max ? X.px(b.x1) : right;
                 c.fillStyle = b.color || "rgba(255,255,255,0.08)";
                 c.fillRect(a, T, Math.max(1, z - a), B - T);
-                if (b.label) topLabel(b.label, a);
+                if (b.label) tops.push([b.label, a, undefined]);
             });
             c.lineWidth = 1;
             xTicks.forEach(function (t) { var p = crisp(X.px(t.v)); c.strokeStyle = t.major ? GRID : GRID_MINOR; seg(c, p, T, p, B); });
@@ -393,15 +473,13 @@ var TuningPlot = (function () {
                 var A = h.axis === "y2" && Y2 ? Y2 : Y, p = A.ok(h.y) && h.y >= A.min && h.y <= A.max ? crisp(A.px(h.y)) : NaN;
                 if (!finite(p)) return;
                 refLine(c, h.color, h.dash, left, p, right, p);
-                if (!h.label) return;
-                var top = p - 2 - ROW < T ? p + 2 : p - 2 - ROW, onLeft = lw && top < lb; // above the line; the top right is the legend's
-                haloText(c, h.label, onLeft ? left + 4 : right - 4, top, onLeft ? "left" : "right", "top", h.color);
+                if (h.label) hlabels.push([h, p]);
             });
             (spec.vlines || []).forEach(function (v) {
                 var p = X.ok(v.x) && v.x >= X.min && v.x <= X.max ? crisp(X.px(v.x)) : NaN;
                 if (!finite(p)) return;
                 refLine(c, v.color, v.dash, p, T, p, B);
-                if (v.label) topLabel(v.label, p, v.color);
+                if (v.label) tops.push([v.label, p, v.color]);
             });
             list.forEach(function (d) {
                 var s = d.s, A = d.A;
@@ -448,6 +526,8 @@ var TuningPlot = (function () {
                 c.fill(); c.stroke();
                 markers.push({ k: k, x: px, y: tri ? py - 4 : py });
             });
+            hlabels.forEach(function (q) { lineLabel(q[0], q[1]); }); // the labels after the curves: no line crosses them
+            tops.forEach(function (q) { topLabel(q[0], q[1], q[2]); });
             if (!meta.some(function (d) { return d.n; })) {
                 text(c, "no data", (left + right) / 2, (T + B) / 2, "center", "middle", "rgba(255,255,255,0.4)");
             }
@@ -469,7 +549,11 @@ var TuningPlot = (function () {
                 text(c, axisTitle(a[0]), 0, 0, "center", "top");
                 c.restore();
             });
-            if (spec.title) { c.font = TITLE_FONT; text(c, spec.title, left, 6, "left", "top"); c.font = FONT; }
+            if (titleLines.length) {
+                c.font = TITLE_FONT;
+                titleLines.forEach(function (l, i) { text(c, l, left, 6 + i * ROW, "left", "top"); });
+                c.font = FONT;
+            }
 
             // legend: every named series with data, hidden ones dimmed
             var legend = [];
@@ -480,14 +564,14 @@ var TuningPlot = (function () {
                     var y = T + 7 + k * ROW + ROW / 2;
                     c.globalAlpha = hidden[e.s.name] ? 0.35 : 1;
                     c.strokeStyle = c.fillStyle = e.color;
-                    if (e.s.width === 0) c.fillRect(lx + 8, y - 3, 10, 6);
-                    else { c.lineWidth = 2; c.setLineDash(e.s.dash || []); seg(c, lx + 5, y, lx + 21, y); c.setLineDash([]); }
-                    text(c, e.s.name, lx + 26, y, "left", "middle");
+                    if (e.s.width === 0) c.fillRect(lx + 8 * K, y - 3 * K, 10 * K, 6 * K);
+                    else { c.lineWidth = 2; c.setLineDash(e.s.dash || []); seg(c, lx + 5 * K, y, lx + 21 * K, y); c.setLineDash([]); }
+                    text(c, e.s.name, lx + 26 * K, y, "left", "middle");
                     legend.push({ x: lx, y: y - ROW / 2, w: lw, h: ROW, name: e.s.name });
                 });
                 c.globalAlpha = 1;
             }
-            return { X: X, left: left, right: right, top: T, bottom: B, list: list, markers: markers, legend: legend,
+            return { X: X, Y: Y, Y2: Y2, left: left, right: right, top: T, bottom: B, list: list, markers: markers, legend: legend,
                 tx: fmt.x || format4, ty: fmt.y || format4, ty2: format4 };
         }
 
@@ -539,17 +623,21 @@ var TuningPlot = (function () {
                     lines.push({ text: String(v.label), swatch: v.color || TEXT });
                 }
             });
+            (spec.hlines || []).forEach(function (h) {
+                var A = h.axis === "y2" && L.Y2 ? L.Y2 : L.Y;
+                if (h.label && A && A.ok(h.y) && h.y >= A.min && h.y <= A.max && Math.abs(crisp(A.px(h.y)) - mouse.y) <= 4) lines.push({ text: String(h.label), swatch: h.color || TEXT });
+            });
             (spec.bands || []).forEach(function (b) { if (b.label && p.x >= b.x0 && p.x <= b.x1) lines.push({ text: String(b.label) }); });
             g.font = FONT;
-            var bw = 26 + lines.reduce(function (w, l) { return Math.max(w, g.measureText(l.text).width); }, 0), bh = lines.length * ROW + 6;
+            var bw = Math.round(26 * K) + lines.reduce(function (w, l) { return Math.max(w, g.measureText(l.text).width); }, 0), bh = lines.length * ROW + 6;
             var bx = Math.max(0, mouse.x + 12 + bw > L.right ? mouse.x - 12 - bw : mouse.x + 12), // right of the cursor if it fits
                 by = Math.max(L.top, Math.min(mouse.y + 12, L.bottom - bh));
             g.fillStyle = "rgba(0,0,0,0.75)";
             g.fillRect(bx, by, bw, bh);
             lines.forEach(function (l, k) {
                 var y = by + 3 + k * ROW + ROW / 2;
-                if (l.swatch) { g.fillStyle = l.swatch; g.fillRect(bx + 6, y - 2, 10, 4); }
-                text(g, l.text, bx + 20, y, "left", "middle", l.color);
+                if (l.swatch) { g.fillStyle = l.swatch; g.fillRect(bx + 6 * K, y - 2 * K, 10 * K, 4 * K); }
+                text(g, l.text, bx + 20 * K, y, "left", "middle", l.color);
             });
         }
 
@@ -597,6 +685,7 @@ var TuningPlot = (function () {
         function destroy() {
             if (dead) return;
             dead = true;
+            live = live.filter(function (h) { return h !== handle; });
             if (observer) observer.disconnect();
             canvas.removeEventListener("mousemove", onMove);
             canvas.removeEventListener("mouseleave", onLeave);
@@ -606,8 +695,9 @@ var TuningPlot = (function () {
             L = null;
         }
 
-        var handle = { update: update, destroy: destroy };
+        var handle = { update: update, destroy: destroy, redraw: function () { if (!dead) draw(); }, canvas: canvas };
         canvas._tuningPlot = handle;
+        live = live.filter(function (h) { return h.canvas.isConnected !== false; }).concat([handle]); // a plot taken off the page without destroy() goes
         canvas.addEventListener("mousemove", onMove);
         canvas.addEventListener("mouseleave", onLeave);
         canvas.addEventListener("click", onClick);
@@ -623,9 +713,32 @@ var TuningPlot = (function () {
         return handle;
     }
 
+    // The text scale of the views (1 = 100 %): every plot on the page draws again, then the listeners of onTextScale
+    function setTextScale(scale) {
+        var s = Number(scale);
+        s = isFinite(s) && s > 0 ? Math.min(Math.max(s, SCALE_MIN), SCALE_MAX) : 1;
+        if (s === textScale) return textScale;
+        useScale(s);
+        live = live.filter(function (h) { return h.canvas.isConnected !== false; });
+        live.slice().forEach(function (h) { try { h.redraw(); } catch (e) { console.error(e); } });
+        scaleListeners.slice().forEach(function (cb) { try { cb(s); } catch (e) { console.error(e); } });
+        return textScale;
+    }
+
+    // cb(scale) after each change of the text scale; returns a function that removes cb
+    function onTextScale(cb) {
+        if (typeof cb !== "function") return function () {};
+        scaleListeners.push(cb);
+        return function () { scaleListeners = scaleListeners.filter(function (x) { return x !== cb; }); };
+    }
+
     return {
         attach: attach,
+        setTextScale: setTextScale, onTextScale: onTextScale,
+        textScale: function () { return textScale; },
+        textMetrics: function (scale) { return metricsFor(isFinite(scale) && scale > 0 ? scale : textScale); },
+        livePlots: function () { return live.length; },
         // helpers, for the tests and for callers that want the same number format
-        niceTicks: niceTicks, logTicks: logTicks, decimate: decimate, nearest: nearest, formatNumber: formatNumber
+        niceTicks: niceTicks, logTicks: logTicks, decimate: decimate, nearest: nearest, formatNumber: formatNumber, wrapTitle: wrapTitle, fitText: fitText
     };
 })();

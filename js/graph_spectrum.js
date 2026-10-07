@@ -41,6 +41,11 @@ var
         var spectrumTypeElem = $("#spectrumTypeSelect");
         var overdrawSpectrumTypeElem = $("#overdrawSpectrumTypeSelect");
 
+        // The handlers of this analyser on the shared controls, in one event namespace, so that destroy() removes them. Each
+        // log that the viewer opens makes a new analyser (main.js selectLog); a handler of an old one that never drew threw
+        // at the next spectrum type change (dataBuffer.curve is 0) and stopped the handler of the new one
+        var ns = ".analyser" + (FlightLogAnalyser.seq = (FlightLogAnalyser.seq || 0) + 1);
+
         this.setFullscreen = function(size) {
             isFullscreen = (size==true);
             GraphSpectrumPlot.setFullScreen(isFullscreen);
@@ -146,8 +151,11 @@ var
         };
 
         this.destroy = function() {
-            $(analyserCanvas).off("mousemove", trackFrequency);
-            $(analyserCanvas).off("touchmove", trackFrequency);
+            $(analyserCanvas).off(ns);
+            analyserZoomXElem.off(ns);
+            analyserZoomYElem.off(ns);
+            spectrumTypeElem.off(ns);
+            overdrawSpectrumTypeElem.off(ns);
         };
 
         this.refresh = function() {
@@ -159,28 +167,28 @@ var
         };
 
         /* Add mouse/touch over event to read the frequency */
-        $(analyserCanvas).on('mousemove', function (e) {
+        $(analyserCanvas).on('mousemove' + ns, function (e) {
             trackFrequency(e, that);
         });
-        $(analyserCanvas).on('touchmove', function (e) {
+        $(analyserCanvas).on('touchmove' + ns, function (e) {
             trackFrequency(e, that);
         });
 
         /* add zoom controls */
         const DEFAULT_ZOOM = 100;
-        analyserZoomXElem.on('input', $.debounce(100, function() {
+        analyserZoomXElem.on('input' + ns, $.debounce(100, function() {
             analyserZoomX = (analyserZoomXElem.val() / 100);
             GraphSpectrumPlot.setZoom(analyserZoomX, analyserZoomY);
             that.refresh();
-        })).dblclick(function() {
+        })).on('dblclick' + ns, function() {
             $(this).val(DEFAULT_ZOOM).trigger("input");
         }).val(DEFAULT_ZOOM);;
 
-        analyserZoomYElem.on('input', $.debounce(100, function() {
+        analyserZoomYElem.on('input' + ns, $.debounce(100, function() {
             analyserZoomY = 1 / (analyserZoomYElem.val() / 100);
             GraphSpectrumPlot.setZoom(analyserZoomX, analyserZoomY);
             that.refresh();
-        })).dblclick(function() {
+        })).on('dblclick' + ns, function() {
             $(this).val(DEFAULT_ZOOM).trigger("input");
         }).val(DEFAULT_ZOOM);
 
@@ -188,7 +196,7 @@ var
         userSettings.spectrumType = userSettings.spectrumType || SPECTRUM_TYPE.FREQUENCY;
         spectrumTypeElem.val(userSettings.spectrumType);
 
-        spectrumTypeElem.change(function() {
+        spectrumTypeElem.on('change' + ns, function() {
             var optionSelected = parseInt(spectrumTypeElem.val(), 10);
 
             if (optionSelected != userSettings.spectrumType) {
@@ -204,14 +212,14 @@ var
             const pidErrorVsSetpointSelected = optionSelected === SPECTRUM_TYPE.PIDERROR_VS_SETPOINT;
             overdrawSpectrumTypeElem.toggle(!pidErrorVsSetpointSelected);
             analyserZoomYElem.toggleClass('onlyFullScreenException', pidErrorVsSetpointSelected);
-        }).change();
+        }).trigger('change' + ns);
 
         // Spectrum overdraw to show
         userSettings.overdrawSpectrumType = userSettings.overdrawSpectrumType || SPECTRUM_OVERDRAW_TYPE.ALL_FILTERS;
         overdrawSpectrumTypeElem.val(userSettings.overdrawSpectrumType);
         GraphSpectrumPlot.setOverdraw(userSettings.overdrawSpectrumType);
 
-        overdrawSpectrumTypeElem.change(function() {
+        overdrawSpectrumTypeElem.on('change' + ns, function() {
             var optionSelected = parseInt(overdrawSpectrumTypeElem.val(), 10);
 
             if (optionSelected != userSettings.overdrawSpectrumType) {

@@ -131,7 +131,7 @@ test('a clean flight raises no flag, and its delays, error and stick lag are the
         assert.ok(s.above.hz === 30 && s.above.value < 0.05 && s.above.se > 0, `${ax} p${p}: no vibration, ${JSON.stringify(s.above)}`);
     }
     for (const id of ['C12', 'T11']) assert.ok(find(clean.findings, id).every(f => f.severity === 'ok'), `${id} ok`);
-    for (const id of ['C13', 'T12', 'R1']) assert.ok(find(clean.findings, id).every(f => f.severity === 'note' && /report only/.test(f.text)), `${id} report only`);
+    for (const id of ['C13', 'T12', 'R1']) assert.ok(find(clean.findings, id).every(f => f.severity === 'note' && !f.thin && /This value is for information\./.test(f.text)), `${id} report only`);
     // R1: response_time 50 ms = PT1 at 10 Hz, time constant 15.9 ms; none on pitch; 100 ms on yaw, 31.8 ms
     within(m.stick.roll.delayMs, 50 / Math.PI, 3, 'roll stick to setpoint lag');
     within(m.stick.pitch.delayMs, 0, 3, 'pitch stick to setpoint lag');
@@ -141,9 +141,10 @@ test('a clean flight raises no flag, and its delays, error and stick lag are the
     // the PID gyro low-pass (first order, 50 Hz) delays 10 Hz by 3.0 ms; named for the start profile only, as a setting of
     // the feedback path: the logged gyro is taken before it, so it is no part of the measured delay
     within(m.track.roll.pidLpf.ms, 1000 / (2 * Math.PI * 50) / (1 + (10 / 50) ** 2), 0.1, 'PID gyro low-pass group delay at 10 Hz');
-    const c13 = find(clean.findings, 'C13', 'roll', 1)[0].text;
-    assert.ok(/PID gyro low-pass \(50 Hz, header; 3\.0 ms group delay at 10 Hz\) filters only the feedback/.test(c13) && /not part of this delay/.test(c13) && !/accounts for/.test(c13), c13);
-    assert.ok(!/PID gyro low-pass/.test(find(clean.findings, 'C13', 'roll', 2)[0].text));
+    const c13 = find(clean.findings, 'C13', 'roll', 1)[0];
+    within(c13.pidLpfMs, m.track.roll.pidLpf.ms, 1e-9, 'the PID gyro low-pass named on the start profile');
+    assert.match(c13.text, /The gyro low-pass filter of the PID loop \(50 Hz in the header\) causes a time delay of 3\.0 ms at 10 Hz\. This filter is only in the feedback.* the measured time delay does not include it\./);
+    assert.equal(find(clean.findings, 'C13', 'roll', 2)[0].pidLpfMs, null); assert.doesNotMatch(find(clean.findings, 'C13', 'roll', 2)[0].text, /low-pass filter of the PID loop/);
     for (const ax of AX) for (const p of [1, 2]) { const s = m.osc[ax].byProfile[p]; assert.ok(s.shares[10] < 0.05 && s.shares[20] < 0.01 && !s.selfExcitedBursts.length, `${ax} p${p} quiet: ${JSON.stringify(s.shares)}`); }
     assert.ok(find(clean.findings, 'C5').concat(find(clean.findings, 'T1')).every(f => f.severity === 'ok'));
 });
@@ -154,7 +155,7 @@ test('no spectrum peak is claimed on a clean flight; a weak sustained oscillatio
         const s = clean.metrics.osc[ax].byProfile[p], f = find(clean.findings, ax === 'yaw' ? 'T1' : 'C5', ax, p)[0];
         assert.ok(s.spectrumWindows > 0 && s.peak && !s.peak.clear && s.peakHz === null && s.peakHzSe === null && s.peakInBand === null, `${ax} p${p}: ${JSON.stringify(s.peak)}`);
         assert.ok(s.peak.excessDb < H.RULE.osc.peakMinDb || s.peak.z < H.RULE.osc.peakZ);
-        assert.match(f.text, /no clear peak in the stick-free error spectrum at 4-30 Hz \(\d+ windows; the local maximum nearest to one at [\d.]+ Hz is -?[\d.]+ dB above its local trend, z -?[\d.]+; a peak needs >= 3 dB and z >= 5\.5\)/);
+        assert.match(f.text, /The error spectrum of these windows has no clear peak at 4-30 Hz \(\d+ windows\)\. The local maximum nearest to a peak is at [\d.]+ Hz\. It is -?[\d.]+ dB more than a line through the spectrum 2-4 Hz from it on each side \(-?[\d.]+ SE\)\. A local maximum is a peak if it is 3 dB or more and 5\.5 SE or more\./);
     }
     // a sustained 2 deg/s sine at 12 Hz on the pitch gyro: well under the 10 deg/s share level, but a line in the spectrum
     const weak = run(5, (c) => { c.events = [{ axis: 1, every: 1, on: [-1, 2], amp: 2, hz: 12 }]; });
@@ -162,7 +163,7 @@ test('no spectrum peak is claimed on a clean flight; a weak sustained oscillatio
         const s = weak.metrics.osc.pitch.byProfile[p], f = find(weak.findings, 'C5', 'pitch', p)[0];
         within(s.peakHz, 12, 0.5, `pitch p${p} peak`); assert.ok(s.peakInBand && s.peak.clear && s.peakHzSe > 0 && s.peakHzSe < 0.3, JSON.stringify(s.peak));
         assert.ok(s.shares[10] < 0.05, 'below the share levels');
-        assert.match(f.text, /stick-free error spectrum peaks at 1[12]\.\d \+- \d\.\d Hz, [\d.]+ dB above its local trend \(z [\d.]+, \d+ windows; a peak needs >= 3 dB and z >= 5\.5\)/);
+        assert.match(f.text, /The error spectrum of these windows has a peak at 1[12]\.\d ± \d\.\d Hz \(\d+ windows\)\. The peak is [\d.]+ dB more than a line through the spectrum 2-4 Hz from it on each side \([\d.]+ SE\)\. A local maximum is a peak if it is 3 dB or more and 5\.5 SE or more\./);
     }
 });
 
@@ -176,14 +177,15 @@ test('a known tracking error is measured to 0.02 with an honest standard error',
     }
     assert.equal(find(track.findings, 'C12', 'roll').map(f => f.severity).join(), 'note,note', 'roll 0.35: above the note level, not 2 SE past the flag level');
     assert.equal(find(track.findings, 'C12', 'pitch').map(f => f.severity).join(), 'flag,flag', show(track.findings));
-    assert.match(find(track.findings, 'C12', 'pitch')[0].text, /does not follow the setpoint, at the frequencies of the largest bands/);
+    assert.match(find(track.findings, 'C12', 'pitch')[0].text, /The error is more than 45 % by more than 2 SE\. The gyro does not follow the setpoint at the frequencies of the largest bands\./);
     // a gain deficit shows where the stick is: at 0.5-3 Hz the in-band ratio is at least 1 - gain, against the gusts alone
     // when the gain is 1; and the bands below 3 Hz hold most of the error power
     for (const p of [1, 2]) { const t = track.metrics.track.pitch.byProfile[p], c = clean.metrics.track.pitch.byProfile[p], b = bandOf(t, 0.5, 3).ratio, q = bandOf(c, 0.5, 3).ratio;
         assert.ok(b >= 0.5 && q < 0.3, `pitch p${p} 0.5-3 Hz ratio ${b} with gain 0.5, ${q} with gain 1`);
         const low = (s) => bandOf(s, 0, 0.5).share + bandOf(s, 0.5, 3).share;
         assert.ok(low(t) > 0.85 && low(t) > low(c) + 0.15, `pitch p${p}: error power below 3 Hz ${low(t)} with gain 0.5, ${low(c)} with gain 1`);
-        assert.match(find(track.findings, 'C12', 'pitch', p)[0].text, /error power by band 0-0\.5 Hz \d+ \+- \d+ %, 0\.5-3 Hz \d+ \+- \d+ %, 3-8 Hz \d+ \+- \d+ %, 8-20 Hz \d+ \+- \d+ %, 20-30 Hz \d+ \+- \d+ %/); }
+        const f = find(track.findings, 'C12', 'pitch', p)[0]; assert.deepEqual(f.bands, t.bands, 'the bands on the finding');
+        assert.match(f.text, /The parts of the error power in the frequency bands are \d+ ± \d+ % \(0-0\.5 Hz\), \d+ ± \d+ % \(0\.5-3 Hz\), \d+ ± \d+ % \(3-8 Hz\), \d+ ± \d+ % \(8-20 Hz\) and \d+ ± \d+ % \(20-30 Hz\)\./); }
     // Standard errors against the spread over 30 independent flights of 45 s (5 blocks each). The pitch response time
     // keeps the RC frames from making the setpoint a staircase, which quantises the delay. The bounds catch a halved SE
     // (the dangerous direction: flags are 2-SE tests): over random sets of 30 of 120 flights an honest SE passes 100 %
@@ -207,7 +209,8 @@ test('gyro vibration above 30 Hz is reported apart, not as tracking error', () =
         assert.ok(s.above.value > 0.15 && s.above.se > 0, JSON.stringify(s.above));
         const f = find(vib.findings, ax === 'yaw' ? 'T11' : 'C12', ax, p)[0];
         assert.equal(f.severity, 'ok', f.text);
-        assert.match(f.text, /gyro content above 30 Hz, left out as vibration \(F1, F5, F6\): \d+\.\d \+- \d+\.\d % of the setpoint rms/);
+        assert.deepEqual(f.above, s.above);
+        assert.match(f.text, /The gyro at more than 30 Hz is \d+\.\d ± \d+\.\d % of the setpoint rms, and the check does not include this vibration \(F1, F5, F6\)\./);
     }
     // the error curves have it left out too
     const cv = H.curves(vib.w, vib.ctx, vib.metrics), cc = H.curves(clean.w, clean.ctx, clean.metrics), ss = (x) => x.reduce((q, v) => q + (isFinite(v) ? v * v : 0), 0);
@@ -266,7 +269,7 @@ test('a slow stick to setpoint filter is flagged, a fast one reported', () => {
     const s = track.metrics.stick.roll, f = find(track.findings, 'R1', 'roll')[0];
     assert.ok(s.delayMs > 55 && s.delayMs < 80, `roll lag ${s.delayMs} ms`);
     assert.equal(f.severity, 'flag', f.text);
-    assert.match(f.text, /response_time 250/);
+    assert.match(f.text, /In the header, response_time is 250 \(a PT1 filter with a time constant of 79\.6 ms\)/);
     assert.equal(find(track.findings, 'R1', 'pitch')[0].severity, 'note');
 });
 
@@ -276,12 +279,12 @@ test('a self-excited roll oscillation is flagged; the same amplitude driven by t
     assert.equal(p1.value, 1);
     assert.equal(p1.unit, 'count');
     within(p1.events[0].t, 30, 1.2, 'onset time of the self-excited burst');
-    assert.match(p1.text, /self-excited/);
+    assert.match(p1.text, /^The number of roll oscillations at 10-20 Hz that increase with no stick input is 1 of \d+\. /);
     const ev = osc.metrics.osc.roll.events, self = ev.find(e => e.selfExcited), driven = ev.find(e => e.t > 89 && e.t < 92), jolt = ev.find(e => e.t > 74 && e.t < 76);
     within(self.hz, 12, 0.5, 'burst frequency');
     // its size is band-passed (the 10-20 Hz band passes 0.60 of a 12 Hz sine); as a sine it is the 220 deg/s simulated
     within(self.value, 220 * H.bandGain(12, [10, 20], RATE), 15, 'band-passed peak'); within(self.sine, 220, 15, 'as a sine');
-    assert.match(p1.text, /the largest \d+ deg\/s band-passed, about 2\d\d deg\/s as a sine, at 12\.0 Hz at 3\d\.\d s/);
+    assert.match(p1.text, /The largest is \d+ deg\/s after the filter \(approximately 2\d\d deg\/s before the filter\), at 12\.0 Hz at 3\d\.\d s\./);
     assert.ok(driven && !driven.selfExcited && driven.stickShare > 0.5, `driven burst ${JSON.stringify(driven)}`);
     within(driven.value / self.value, 1, 0.2, 'the driven burst is as large as the self-excited one');
     assert.ok(!jolt || !jolt.selfExcited, `roll jolt ${JSON.stringify(jolt)}`);
@@ -304,7 +307,8 @@ test('shares of stick-free time at 10, 20 and 40 deg/s match a sustained oscilla
         assert.ok(r.peakInBand && q.peakInBand && r.peakHzSe < 0.3 && q.peakHzSe < 0.3);
         assert.equal(find(shares.findings, 'C5', 'roll', p)[0].severity, 'ok', 'roll: under 20 deg/s');
         const f = find(shares.findings, 'C5', 'pitch', p)[0];
-        assert.equal(f.severity, 'note'); assert.match(f.text, /^oscillation present: pitch 8-16 Hz band-passed error amplitude, which passes 0\.47-0\.64 of a sine in the band: /);
+        assert.ok(f.severity === 'note' && !f.thin, JSON.stringify(f)); assert.match(f.text, /^The pitch error has an oscillation at 8-16 Hz\. /);
+        assert.match(f.text, /\nThe analysis applies a filter to the pitch error \(the gyro minus the setpoint\) and keeps only the 8-16 Hz band\. The gain of this filter is 0\.47 to 0\.64 in the band\.\n/);
     }
     assert.equal(flagged(shares.findings).filter(f => /C5|T1/.test(f.id)).length, 0, 'sustained but not growing: no flag');
 });
@@ -315,8 +319,9 @@ test('stick-free windows from a single block are thin: no standard error, no jud
     const one = run(5, (c) => { c.switchS = 108; c.events = [{ axis: 1, hz: 12, amp: 30 / GAIN[1], every: 10, on: [2, 5] }]; });
     const s = one.metrics.osc.pitch.byProfile[2], f = find(one.findings, 'C5', 'pitch', 2)[0];
     assert.ok(s.blocks === 1 && s.stickFree >= H.DEFAULT_RULES.C5.minWindows && s.shares[20] > 0.2 && s.sharesSe[20] === null, JSON.stringify(s.shares));
-    assert.equal(f.severity, 'note'); assert.match(f.text, new RegExp(`^no finding: 1 blocks with stick-free windows, fewer than ${H.DEFAULT_RULES.C5.minBlocks}, no standard error; `));
-    assert.match(find(one.findings, 'C5', 'pitch', 1)[0].text, /^oscillation present: /, 'profile 1 has the blocks');
+    assert.ok(f.severity === 'note' && f.thin === true, JSON.stringify(f));
+    assert.match(f.text, new RegExp(`^The data is not sufficient for a result\\. The number of periods of 10 s with windows where the stick does not cause the error is 1\\. A minimum of ${H.DEFAULT_RULES.C5.minBlocks} is necessary for a standard error\\.\n`));
+    const q = find(one.findings, 'C5', 'pitch', 1)[0]; assert.ok(q.severity === 'note' && !q.thin && /^The pitch error has an oscillation/.test(q.text), 'profile 1 has the blocks');
 });
 
 test('two blocks are thin too: a jackknife over two has one degree of freedom', () => {
@@ -324,25 +329,27 @@ test('two blocks are thin too: a jackknife over two has one degree of freedom', 
         spectrumWindows: 0, peak: null, peakHz: null, peakHzSe: null, peakInBand: null, bursts: 0, selfExcitedBursts: [] };
     const F = H.judge([{ log: 0, metrics: { osc: { pitch: { band: [8, 16], gain: [0.47, 0.64], byProfile: { 1: s }, all: s } } } }]), f = find(F, 'C5', 'pitch', 1)[0];
     assert.deepEqual([H.RULE.minJack, H.DEFAULT_RULES.C5.minBlocks, H.DEFAULT_RULES.T1.minBlocks], [3, 3, 3]);
-    assert.equal(f.severity, 'note'); assert.match(f.text, /^no finding: 2 blocks with stick-free windows, fewer than 3, no standard error; /);
+    assert.ok(f.severity === 'note' && f.thin === true); assert.match(f.text, /^The data is not sufficient for a result\. The number of periods of 10 s with windows where the stick does not cause the error is 2\. A minimum of 3 is necessary for a standard error\./);
 });
 
 test('thin data and missing fields are said, not judged', () => {
     const cfg = BASE(); cfg.seconds = 25; cfg.switchS = null;
     const { w, ctx } = simulate(7, cfg), F = H.judge([{ log: 0, metrics: H.analyse(w, ctx) }]);
-    assert.ok(find(F, 'C12').concat(find(F, 'T11'), find(F, 'C13'), find(F, 'R1')).every(f => f.severity === 'note' && /^no finding/.test(f.text)), F.map(f => `${f.id} ${f.severity} ${f.text}`).join('\n'));
+    assert.ok(find(F, 'C12').concat(find(F, 'T11'), find(F, 'C13'), find(F, 'R1')).every(f => f.severity === 'note' && f.thin === true && /^The data is not sufficient for a result\. The number of periods of 10 s with /.test(f.text)), F.map(f => `${f.id} ${f.severity} ${f.text}`).join('\n'));
+    assert.match(find(F, 'C12', 'roll')[0].text, /^The data is not sufficient for a result\. The number of periods of 10 s with a roll setpoint of 20 deg\/s rms or more is [0-3] of 3\. A minimum of 4 is necessary\.$/);
     // no rcCommand, no GOVSTATE
     const w2 = Object.assign({}, clean.w, { extra: {} }), ctx2 = Object.assign({}, clean.ctx, { govState: null }), m = H.analyse(w2, ctx2);
-    assert.ok(AX.every(ax => m.stick[ax].skipped === `rcCommand[${AX.indexOf(ax)}] not logged`));
-    assert.ok(m.notes.some(s => /GOVSTATE/.test(s)) && m.notes.some(s => /rcCommand/.test(s)));
+    assert.ok(AX.every(ax => m.stick[ax].skipped === `The log does not have rcCommand[${AX.indexOf(ax)}].`));
+    assert.ok(m.notes.some(s => /^The log does not record GOVSTATE\./.test(s)) && m.notes.includes('The log does not have rcCommand for roll, pitch and yaw. Thus, the analysis does not do check R1 for these axes.'), m.notes.join('\n'));
     const G = H.judge([{ log: 0, metrics: m }]);
-    assert.deepEqual(find(G, 'R1').map(f => f.severity), ['skipped', 'skipped', 'skipped']);
+    assert.deepEqual(find(G, 'R1').map(f => [f.severity, f.unit]), [['skipped', 'ms'], ['skipped', 'ms'], ['skipped', 'ms']]);
     assert.ok(find(G, 'C12').length && find(G, 'C12').every(f => f.severity !== 'skipped'), 'the rest still runs');
     // under 5 s usable: every check skipped, with the reason
     const ctx3 = Object.assign({}, clean.ctx, { flying: new Uint8Array(clean.w.n) }); ctx3.flying.fill(1, 0, 3000);
     const S = H.judge([{ log: 0, metrics: H.analyse(clean.w, ctx3) }]);
     assert.deepEqual([...new Set(S.map(f => f.severity))], ['skipped']); assert.deepEqual(S.map(f => f.id).sort(), Object.keys(H.DEFAULT_RULES).sort());
-    assert.match(S[0].text, /only 3 s in flight/);
+    assert.equal(S[0].text, 'The log has only 3 s of flight data that the checks can use. A minimum of 5 s is necessary.');
+    assert.deepEqual(S.map(f => f.unit).sort(), ['fraction', 'fraction', 'fraction', 'fraction', 'ms', 'ms', 'ms'], 'skipped findings carry the unit of their check');
     // a log the module never saw (no metrics) gives nothing
     assert.deepEqual(H.judge([{ log: 1, metrics: null }]), []);
 });
@@ -359,10 +366,10 @@ test('a 250 Hz log and a missing FFT host', () => {
     const c = H.curves(w, ctx, m); assert.ok(c.roll.spectrum.f[c.roll.spectrum.f.length - 1] <= 60 && c.roll.time.t.length === 1200);
     // without an FFT host the spectra are left out and said so; the rest stands
     const ctx0 = Object.assign({}, osc.ctx, { app: null }), m0 = H.analyse(osc.w, ctx0);
-    assert.ok(m0.notes.some(q => /no FFT/.test(q)) && m0.osc.roll.all.peakHz === null && m0.osc.roll.all.peak === null && H.curves(osc.w, ctx0, m0).roll.spectrum === null);
+    assert.ok(m0.notes.some(q => /^The FFT is not available/.test(q)) && m0.osc.roll.all.peakHz === null && m0.osc.roll.all.peak === null && H.curves(osc.w, ctx0, m0).roll.spectrum === null);
     const F0 = H.judge([{ log: 0, metrics: m0 }]);
     assert.equal(find(F0, 'C5', 'roll', 1)[0].severity, 'flag');
-    assert.match(find(F0, 'C5', 'roll', 2)[0].text, /no stick-free error spectrum \(no 2 s run of stick-free windows, or no FFT host\)/);
+    assert.match(find(F0, 'C5', 'roll', 2)[0].text, /\nThe analysis cannot calculate an error spectrum for these windows\. The log has no period of 2 s with only these windows, or the FFT is not available\.$/);
 });
 
 test('findings carry number, uncertainty, rule, source and unit; metrics are JSON-safe; inputs are not changed', () => {
@@ -375,6 +382,8 @@ test('findings carry number, uncertainty, rule, source and unit; metrics are JSO
             const lvl = H.DEFAULT_RULES[f.id].flag;
             if (f.severity === 'flag' && typeof lvl === 'number') assert.ok(typeof f.se === 'number' && f.value - 2 * f.se > lvl, JSON.stringify(f));
             if (f.events) assert.ok(f.events.length <= 200 && f.events.every(e => typeof e.t === 'number'));
+            assert.equal(!!f.thin, /^The data is not sufficient for a result\./.test(f.text), `thin is a field: ${JSON.stringify(f)}`);
+            assert.doesNotMatch(f.text, /;|\+-|>=|<=|no finding/, `${f.id}: ${f.text}`);
         }
     }
     assert.ok(flagged(track.findings).some(f => f.id === 'C12') && flagged(track.findings).some(f => f.id === 'R1'), 'the 2-SE check above saw flags');
@@ -382,6 +391,43 @@ test('findings carry number, uncertainty, rule, source and unit; metrics are JSO
     const before = sumOf(clean.w) + sumOf(clean.w.extra) + sumOf(clean.ctx);
     H.analyse(clean.w, clean.ctx); H.curves(clean.w, clean.ctx, clean.metrics);
     assert.equal(sumOf(clean.w) + sumOf(clean.w.extra) + sumOf(clean.ctx), before);
+});
+
+test('C12 and C13 keep their worst blocks with times: a gain deficit in one block of 10 s is the first', () => {
+    // the clean flight with the roll gyro at half the setpoint in 30-40 s (profile 1): error there (1 - 0.5) x setpoint and the gusts
+    const lag = Math.round(clean.cfg.axes[0].tau * RATE), w = Object.assign({}, clean.w, { gyro: clean.w.gyro.map(v => Float64Array.from(v)) });
+    for (let i = 30 * RATE + lag; i < 40 * RATE + lag; i++) w.gyro[0][i] = Math.round(w.gyro[0][i] - 0.5 * clean.w.sp[0][i - lag]);
+    const m = H.analyse(w, clean.ctx), s = m.track.roll.byProfile[1], c = clean.metrics.track.roll.byProfile[1];
+    assert.equal(s.worst.length, H.RULE.worst);
+    assert.deepEqual([s.worst[0].t0, s.worst[0].t1], [30, 40], 'the block with the deficit, in index time (fromS 0, 1 kHz)');
+    within(s.worst[0].value, Math.hypot(0.5, c.value), 0.04, 'its error: the deficit and the gusts of the clean flight');
+    assert.ok(s.worst.every((q, k) => q.t1 > q.t0 && q.t0 >= 0 && q.t1 <= 59 && q.setpointRms > 20 && (k === 0 || q.value <= s.worst[k - 1].value)), JSON.stringify(s.worst));
+    assert.ok(s.worst[1].value < 0.25, 'the other blocks have the clean error');
+    const all = m.track.roll.all.worst[0]; // at the delay fitted on all profiles
+    assert.deepEqual([all.t0, all.t1], [30, 40], 'all profiles: the same block first'); within(all.value, s.worst[0].value, 0.01, 'at the pooled delay');
+    // profile 2 (60-120 s, 1 s guard at the switch) and the clean flight: their blocks, the largest error first
+    assert.ok(m.track.roll.byProfile[2].worst.every(q => q.t0 >= 61 && q.t1 <= 120), JSON.stringify(m.track.roll.byProfile[2].worst));
+    assert.ok(c.worst[0].value < 0.25 && c.worst.every(q => q.value <= c.worst[0].value));
+    assert.deepEqual([s.worst[0].seconds, s.worst[0].runs], [10, [[30, 40]]], 'a block of one run');
+    // profile 2 flown in 33-37 s (unusable 32-38 s with the guard): the profile 1 block from 30 s continues at 38 s, in two runs
+    const prof = Uint8Array.from(clean.ctx.profile); prof.fill(2, 33 * RATE, 37 * RATE);
+    const split = H.analyse(w, Object.assign({}, clean.ctx, { profile: prof })).track.roll.byProfile[1].worst[0]; // the deficit (30-40 s) is in it
+    assert.ok(split.t0 === 30 && split.t1 === 46 && split.seconds === 10, JSON.stringify(split));
+    assert.deepEqual(split.runs, [[38, 46], [30, 32]], 'its runs, the longest first');
+    // the blocks of usable(): first and last sample, a block of the profile of the switch ends at the guard
+    const U = H.usable(clean.w, clean.ctx);
+    assert.deepEqual(U.blocks.map(b => [b.i0, b.i1]).slice(0, 6), [[0, 10000], [10000, 20000], [20000, 30000], [30000, 40000], [40000, 50000], [50000, 59000]]);
+});
+
+test('R1 keeps its blocks with times and their share of the stick motion', () => {
+    // the roll stick at 3 times its movement in 40-50 s: that block has about 9 times the stick-rate power of another block
+    const rc = Float64Array.from(clean.w.extra['rcCommand[0]']); for (let i = 40 * RATE; i < 50 * RATE; i++) rc[i] *= 3;
+    const w = Object.assign({}, clean.w, { extra: Object.assign({}, clean.w.extra, { 'rcCommand[0]': rc }) }), st = H.analyse(w, clean.ctx).stick.roll, B = st.blocksAt;
+    assert.equal(B.length, st.blocks); within(B.reduce((x, q) => x + q.value, 0), 1, 0.002, 'shares add up');
+    assert.deepEqual([B[0].t0, B[0].t1], [40, 50]); assert.ok(B[0].value > 0.3 && B.every((q, k) => k === 0 || q.value <= B[k - 1].value), JSON.stringify(B.slice(0, 3)));
+    assert.ok(B.every(q => q.movingS > 1 && q.movingS <= 10.0001 && q.t1 - q.t0 >= 9), JSON.stringify(B));
+    within(st.delayMs, 50 / Math.PI, 3, 'the lag is the same');
+    assert.ok(clean.metrics.stick.roll.blocksAt.length === clean.metrics.stick.roll.blocks && !clean.metrics.stick.pitch.blocksAt.some(q => q.value > 0.5));
 });
 
 test('curves: series, spectra and error by setpoint size, JSON-safe and compact, within the time budget', () => {

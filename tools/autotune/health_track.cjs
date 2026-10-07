@@ -37,6 +37,12 @@
  * leave-one-block-out jackknife over RULE.minJack blocks or more, with the delay fitted again in every replicate of C12 and C13 (the bands and the
  * vibration share keep the fitted delay). Rates in deg/s, lags in ms, times in s from log start (w.fromS + i / ctx.rate).
  * Frequencies use ctx.rate.
+ *
+ * Evidence for the app (the spans behind a finding, index time): track[axis].byProfile[p].worst, the RULE.worst blocks with the
+ * largest error at the fitted delay (C12, C13); stick[axis].blocksAt, the blocks of the R1 fit, the largest share of the
+ * stick-rate power first; each block { t0, t1, seconds, runs, value }. Finding texts are ASD-STE100 (docs/STE_GLOSSARY.md),
+ * a note on thin data has thin: true, and every finding has phase 'flight' (the engine ANDs the flight phase of
+ * health_phase.cjs into ctx.flying, SPEC2 D13).
  */
 
 const lib = require('./lib.cjs');
@@ -68,6 +74,7 @@ const RULE = {
     },
     curve: { stepS: 0.1, specS: 2, hopS: 1, maxHz: 60, edges: [0, 25, 50, 100, 150, 200, 300, 400, 600] },
     maxEvents: 200,
+    worst: 3,                      // C12, C13 (T11, T12): blocks kept per profile as evidence, the largest error first
 };
 
 const EXTRA = ['rcCommand[0]', 'rcCommand[1]', 'rcCommand[2]'];
@@ -85,6 +92,8 @@ const quantile = (sorted, q) => sorted.length ? sorted[Math.min(sorted.length - 
 const largest = (ev) => ev.slice().sort((a, b) => b.value - a.value).slice(0, RULE.maxEvents);
 const lagSteps = (S, rate) => { const step = Math.max(1, Math.round(S.stepS * rate)), max = Math.round(S.maxS * rate); return { step, max, K: Math.floor(max / step) + 1 }; };
 const lagSe = (ms, step, rate) => ms.length >= RULE.minJack ? Math.hypot(jackSe(ms), step / rate * 1000 / Math.sqrt(12)) : null; // jackknife, with the step of the delay grid in quadrature
+const series = (v) => v.length > 1 ? `${v.slice(0, -1).join(', ')} and ${v[v.length - 1]}` : v.join(''); // "a, b and c"
+const many = (k, w) => `${k} ${w}${k === 1 ? '' : 's'}`;                                    // "1 window", "2 windows"
 const smooth = (m) => { for (const p of [2, 3]) while (m % p === 0) m /= p; return m === 1; };
 const fftSize = (N) => { for (let d = 0; ; d++) { if (N - d > 1 && smooth(N - d)) return N - d; if (smooth(N + d)) return N + d; } }; // the app's FFT (js/complex.js) has fast butterflies for factors 2, 3 and 4 only
 
@@ -106,7 +115,8 @@ function bandGain(f, band, rate) {
 }
 const gainRange = (band, rate) => { let lo = Infinity, hi = 0; for (let k = 0; k <= 100; k++) { const v = bandGain(band[0] * (band[1] / band[0]) ** (k / 100), band, rate); lo = Math.min(lo, v); hi = Math.max(hi, v); } return [r(lo, 2), r(hi, 2)]; };
 
-// usable samples (health_loop analyse, and out of rescue) and their blocks; id[i] is the block of sample i or -1
+// usable samples (health_loop analyse, and out of rescue) and their blocks { profile, n, i0, i1 } (samples i0 to i1 - 1,
+// not all of them usable: a block keeps its profile across a switch away and back); id[i] is the block of sample i or -1
 function usable(w, ctx) {
     const rate = ctx.rate || w.rate, n = w.n, prof = ctx.profile || w.profileAt, gov = ctx.govState, ok = new Uint8Array(n), guard = Math.max(1, Math.round(RULE.guardS * rate));
     for (let i = 0; i < n; i++) ok[i] = ctx.flying[i] && (!gov || gov[i] === 4) ? 1 : 0;
@@ -120,8 +130,17 @@ function usable(w, ctx) {
     const to = raw.map((_, k) => k); for (const k of open.values()) if (raw[k].n < RULE.minBlockS * rate) to[k] = raw[k].prev;
     const blocks = [], at = new Int32Array(raw.length).fill(-1);
     for (let i = 0; i < n; i++) { if (id[i] < 0) continue; const k = to[id[i]]; if (k < 0) { id[i] = -1; continue; }
-        if (at[k] < 0) { at[k] = blocks.length; blocks.push({ profile: prof[i], n: 0, i0: i }); } id[i] = at[k]; blocks[at[k]].n++; }
+        if (at[k] < 0) { at[k] = blocks.length; blocks.push({ profile: prof[i], n: 0, i0: i, i1: i }); } id[i] = at[k]; blocks[at[k]].n++; blocks[at[k]].i1 = i + 1; }
     return { rate, ok, id, blocks, prof };
+}
+
+// block b in index time (s from log start): t0 its first sample, t1 the sample after its last one, seconds its usable time,
+// runs its contiguous runs of samples [t0, t1], the longest first (RULE.worst or fewer): a block of a profile flown again
+// after a switch, or with rescue in it, spans more than its seconds
+function blockSpan(w, U, b) {
+    const { i0, i1, n } = U.blocks[b], t = (i) => r(w.fromS + i / U.rate, 3), runs = [];
+    for (let i = i0; i < i1;) { if (U.id[i] !== b) { i++; continue; } let j = i; while (j < i1 && U.id[j] === b) j++; runs.push([i, j]); i = j; }
+    return { t0: t(i0), t1: t(i1), seconds: r(n / U.rate, 1), runs: runs.sort((x, y) => (y[1] - y[0]) - (x[1] - x[0])).slice(0, RULE.worst).map(([a, c]) => [t(a), t(c)]) };
 }
 
 // statistic of every profile and of all blocks together; list: block indices that qualify
@@ -176,7 +195,10 @@ function tracking(w, a, U, H, startProfile) {
         if (!sel.length) return { blocks: 0, usableBlocks };
         const jk = sel.length > 1 ? sel.map(b => fit(sel, b)) : [], X = p === null ? 'A' : 'P', eL = new Float64Array(B); for (const b of sel) eL[b] = E[b * K + f.k];
         const above = (skip) => Math.sqrt(ratio(hf[X], S2, sel, skip));
-        return { blocks: sel.length, usableBlocks, seconds: r(sum(sel.map(b => N2[b])) / rate, 1), setpointRms: r(Math.sqrt(sum(sel.map(b => S2[b])) / sum(sel.map(b => N2[b]))), 2),
+        // the blocks with the largest error at the fitted delay, as the evidence of C12 and C13
+        const worst = sel.map(b => [b, Math.sqrt(eL[b] / S2[b])]).sort((x, y) => y[1] - x[1]).slice(0, RULE.worst)
+            .map(([b, v]) => Object.assign(blockSpan(w, U, b), { value: r(v, 4), setpointRms: r(Math.sqrt(S2[b] / N2[b]), 2) }));
+        return { blocks: sel.length, usableBlocks, seconds: r(sum(sel.map(b => N2[b])) / rate, 1), setpointRms: r(Math.sqrt(sum(sel.map(b => S2[b])) / sum(sel.map(b => N2[b]))), 2), worst,
             tauMs: r(f.ms, 2), tauSe: r(lagSe(jk.map(q => q.ms), step, rate), 2), atMaxDelay: f.k === K - 1, value: r(f.value, 4), se: r(jackSe(jk.map(q => q.value)), 4),
             raw: r(f.raw, 4), rawSe: r(jackSe(jk.map(q => q.raw)), 4), above: { hz: r(lpHz, 1), value: r(above(-1), 4), se: jack(above, sel) },
             // share: of the error power below lpHz, the bands add up to 1; ratio: in-band error / in-band setpoint, which rises wherever the stick puts little
@@ -198,7 +220,7 @@ function stickLag(w, a, U, H) {
     const header = { responseTime: Array.isArray(H.response_time) ? H.response_time[a] : null, accelLimit: Array.isArray(H.accel_limit) ? H.accel_limit[a] : null };
     // response time sets a PT1 at 500 / response_time Hz (TUNING_KNOWLEDGE 2.12): time constant response_time / pi ms
     const expectedMs = typeof header.responseTime === 'number' ? r(header.responseTime / Math.PI, 1) : null;
-    if (!rc) return { skipped: `rcCommand[${a}] not logged`, header, expectedMs };
+    if (!rc) return { skipped: `The log does not have rcCommand[${a}].`, header, expectedMs };
     const { rate, id, blocks } = U, n = w.n, B = blocks.length, { step, max, K } = lagSteps(R, rate);
     const diff = (v) => { const y = lib.bandpass(v, R.band[0], R.band[1], rate), d = new Float64Array(n); for (let i = 1; i < n - 1; i++) d[i] = (y[i + 1] - y[i - 1]) * rate / 2; return d; };
     const x = diff(rc), y = diff(w.sp[a]), xx = new Float64Array(B), xy = new Float64Array(B * K), yy = new Float64Array(B * K), moving = new Float64Array(B);
@@ -212,7 +234,9 @@ function stickLag(w, a, U, H) {
         if (k0 < 0) return { k: -1, ms: NaN, corr: NaN }; // the setpoint never moves
         const off = k0 > 0 && k0 < K - 1 ? vertex(Math.abs(c[k0 - 1]), Math.abs(c[k0]), Math.abs(c[k0 + 1])) : 0;
         return { k: k0, ms: (k0 + off) * step / rate * 1000, corr: c[k0] }; };
-    const out = { blocks: sel.length, movingS: r(sum(Array.from(moving)) / rate, 1), header, expectedMs };
+    // blocksAt: the blocks the lag is fitted on, the largest share of the stick-rate power (their weight in the fit) first
+    const sx = sum(sel.map(b => xx[b])), blocksAt = sel.map(b => Object.assign(blockSpan(w, U, b), { value: r(xx[b] / sx, 4), movingS: r(moving[b] / rate, 1) })).sort((p, q) => q.value - p.value);
+    const out = { blocks: sel.length, movingS: r(sum(Array.from(moving)) / rate, 1), header, expectedMs, blocksAt };
     if (!sel.length) return out;
     const f = fit(-1), jk = sel.length > 1 ? sel.map(fit).filter(q => q.k >= 0) : [];
     // rcCommand[2] and setpoint[2] have opposite signs (setpoint.c:291-292): the sign of the peak is reported, its size used
@@ -256,7 +280,7 @@ function prominentPeak(psd, k0, df, K) {
 
 function oscillation(w, a, U, app) {
     const O = RULE.osc, band = O.bands[AXES[a]], { rate, id, ok, blocks, prof } = U, n = w.n;
-    if (band[1] >= 0.45 * rate) return { band, skipped: `logging rate ${r(rate, 0)} Hz too low for the ${band.join('-')} Hz band` };
+    if (band[1] >= 0.45 * rate) return { band, skipped: `The log rate (${r(rate, 0)} Hz) is too low for the ${band.join('-')} Hz band.` };
     const e = new Float64Array(n); for (let i = 0; i < n; i++) e[i] = w.gyro[a][i] - w.sp[a][i];
     const bursts = lib.oscillationBursts(e, rate, { band }), be = bursts.filtered, bs = lib.bandpass(w.sp[a], band[0], band[1], rate);
     // half-second windows of usable time on one profile (wag.cjs windows); stick-driven as wag_report.cjs `driven`
@@ -312,16 +336,16 @@ function oscillation(w, a, U, app) {
 function analyse(w, ctx) {
     const U = usable(w, ctx), rate = U.rate, n = w.n, H = ctx.header || (w.flight && w.flight.header) || {}, notes = [];
     let usableN = 0; for (let i = 0; i < n; i++) usableN += U.ok[i];
-    if (!ctx.govState) notes.push('no GOVSTATE events: all in-flight samples used, not only governor ACTIVE');
+    if (!ctx.govState) notes.push('The log does not record GOVSTATE. Thus, the analysis uses all samples in flight, not only the samples with the governor ACTIVE.');
     const byProfile = {}; for (const b of U.blocks) byProfile[b.profile] = (byProfile[b.profile] || 0) + 1;
     const out = { module: 'health_track', rule: RULE, rate: r(rate, 2), fromS: r(w.fromS, 3), seconds: { total: r(n / rate, 1), usable: r(usableN / rate, 1), inBlocks: r(sum(U.blocks.map(b => b.n)) / rate, 1) },
         blocks: { count: U.blocks.length, byProfile }, notes };
-    if (usableN < 5 * rate) { out.skipped = `only ${r(usableN / rate, 1)} s in flight with the governor active`; return out; }
-    if (!U.blocks.length) { out.skipped = `no ${RULE.minBlockS} s of usable time on one profile`; return out; }
+    if (usableN < 5 * rate) { out.skipped = `The log has only ${r(usableN / rate, 1)} s of flight data that the checks can use. A minimum of 5 s is necessary.`; return out; }
+    if (!U.blocks.length) { out.skipped = `No PID profile has ${RULE.minBlockS} s of flight data that the checks can use.`; return out; }
     out.track = {}; out.stick = {}; out.osc = {};
     AXES.forEach((name, a) => { out.track[name] = tracking(w, a, U, H, U.prof[0]); out.stick[name] = stickLag(w, a, U, H); out.osc[name] = oscillation(w, a, U, ctx.app); });
-    if (!(ctx.app && ctx.app.FFT)) notes.push('no FFT host (ctx.app): stick-free error spectra left out');
-    const noRc = AXES.filter(name => out.stick[name].skipped); if (noRc.length) notes.push(`rcCommand not logged on ${noRc.join(', ')}: R1 skipped there`);
+    if (!(ctx.app && ctx.app.FFT)) notes.push('The FFT is not available (ctx.app). Thus, the analysis does not calculate the error spectra.');
+    const noRc = AXES.filter(name => out.stick[name].skipped); if (noRc.length) notes.push(`The log does not have rcCommand for ${series(noRc)}. Thus, the analysis does not do check R1 for ${noRc.length > 1 ? 'these axes' : 'this axis'}.`);
     return out;
 }
 
@@ -329,11 +353,13 @@ function analyse(w, ctx) {
 // judge
 // ---------------------------------------------------------------------------------------------
 
-const TRACK_SOURCE = `pipeline, unvalidated; the levels of the PID lab of js/flight_analysis.js (30 % / 45 %) for its formula (samples with |setpoint| > ${RULE.track.minAbsSetpoint} deg/s, best delay 0-${RULE.track.maxS * 1000} ms); ` +
+// the sources are shown to the pilot (quoted, review V3): no file name (the PID lab: js/flight_analysis.js; the bands and the
+// onset rule: wag.cjs RULE.bands, wag_report.cjs RULES.stickDriven and RULES.onset)
+const TRACK_SOURCE = `pipeline, unvalidated; the levels of the PID lab of the Flight analysis dialog (30 % / 45 %) for its formula (samples with |setpoint| > ${RULE.track.minAbsSetpoint} deg/s, best delay 0-${RULE.track.maxS * 1000} ms); ` +
     `here with gyro and setpoint low-passed at ${RULE.track.lpHz} Hz, per profile, on ${RULE.blockS} s blocks with setpoint rms >= ${RULE.track.minSetpointRms.roll} (yaw ${RULE.track.minSetpointRms.yaw}) deg/s, where the PID lab pools its steadiest stable-flight window`;
 const LAG_SOURCE = 'pipeline, unvalidated; report only, no documented threshold: the flag is generous and catches broken setups only';
-const OSC_SOURCE = 'pipeline, unvalidated; bands wag.cjs RULE.bands, stick-driven wag_report.cjs RULES.stickDriven, onset wag_report.cjs RULES.onset {small 30, high 150, minHalfCycles 6}; ' +
-    'spectrum peak RULE.osc.peakMinDb and peakZ, set on simulated flights';
+const OSC_SOURCE = 'pipeline, unvalidated; the bands, the stick rule and the onset rule (small 30, high 150, minHalfCycles 6) of the tail oscillation analysis; ' +
+    'the limits of the spectrum peak, set on simulated flights';
 const DEFAULT_RULES = {
     C12: { note: 0.30, flag: 0.45, minBlocks: 4, source: TRACK_SOURCE },
     T11: { note: 0.30, flag: 0.45, minBlocks: 4, source: TRACK_SOURCE },
@@ -344,12 +370,20 @@ const DEFAULT_RULES = {
     T1: { level: 20, share: 0.05, minWindows: 20, minBlocks: 3, source: OSC_SOURCE },
 };
 
+// Finding texts follow ASD-STE100 (docs/STE_GLOSSARY.md): sentences of 25 words or less, paragraphs of 6 sentences or
+// less, joined by '\n'. A note on thin data has thin: true. Code reads the fields of a finding, never its text.
+const UNITS = { C12: 'fraction', T11: 'fraction', C13: 'ms', T12: 'ms', R1: 'ms', C5: 'fraction', T1: 'fraction' };
+
 function judge(flights, RULES = DEFAULT_RULES) {
-    const F = [], fmt = (v, d = 2) => v === null || v === undefined ? 'n/a' : (+v).toFixed(d), pm = (v, se, d) => `${fmt(v, d)} +- ${fmt(se, d)}`, pct = (v) => typeof v === 'number' ? v * 100 : null;
+    const F = [], fmt = (v, d = 2) => typeof v === 'number' && isFinite(v) ? v.toFixed(d) : 'unknown', pct = (v) => typeof v === 'number' ? v * 100 : null;
+    const pm = (v, se, d) => typeof se === 'number' && isFinite(se) ? `${fmt(v, d)} ± ${fmt(se, d)}` : fmt(v, d), lv = (x) => `${fmt(x * 100, 0)} %`;
     const rule = (id) => RULES[id] || DEFAULT_RULES[id];
-    const add = (id, severity, f, profile, o) => F.push(Object.assign({ id, severity, log: f.log, profile: profile === undefined || profile === null ? null : +profile, value: null, se: null, n: null, threshold: null, source: rule(id).source || null, unit: null }, o));
-    const thin = (n, min, what) => `no finding: ${n} ${what}, fewer than ${min}`;
+    const add = (id, severity, f, profile, o) => F.push(Object.assign({ id, severity, log: f.log, profile: profile === undefined || profile === null ? null : +profile, value: null, se: null, n: null, threshold: null, source: rule(id).source || null, unit: UNITS[id],
+        phase: 'flight' }, o)); // every check of this module uses the flight phase only (SPEC2 D13 correction)
+    const thin = (what, n, min, why) => `The data is not sufficient for a result. The number of ${what} is ${n}. A minimum of ${min} is necessary${why ? ` for ${why}` : ''}.`;
     const past = (v, se, t) => typeof v === 'number' && typeof se === 'number' && v - 2 * se > t;
+    const para = (...p) => p.map(q => q && q.trim()).filter(Boolean).join('\n'), BL = `periods of ${RULE.blockS} s`, bl = (k) => `${many(k, 'period')} of ${RULE.blockS} s`;
+    const info = (t) => `This value is for information. Only a time delay of more than ${t} ms by more than 2 SE is a problem.`;
 
     for (const f of flights) {
         const M = f.metrics; if (!M) continue;
@@ -359,49 +393,63 @@ function judge(flights, RULES = DEFAULT_RULES) {
             // C12 / T11 and C13 / T12
             const [idE, idL] = yaw ? ['T11', 'T12'] : ['C12', 'C13'], RE = rule(idE), RL = rule(idL);
             if (tr) for (const [p, s] of Object.entries(tr.byProfile)) {
-                if (s.blocks < RE.minBlocks) { const why = thin(s.blocks, RE.minBlocks, `blocks of ${RULE.blockS} s with ${ax} setpoint rms >= ${tr.minSetpointRms} deg/s`) + ` (${s.usableBlocks} usable blocks)`;
-                    add(idE, 'note', f, p, { axis: ax, value: s.value === undefined ? null : s.value, se: s.se === undefined ? null : s.se, n: s.blocks, unit: 'fraction', text: why });
-                    add(idL, 'note', f, p, { axis: ax, value: s.tauMs === undefined ? null : s.tauMs, se: s.tauSe === undefined ? null : s.tauSe, n: s.blocks, unit: 'ms', text: why }); continue; }
-                const lp = `${fmt(tr.lpHz, 0)} Hz`, band = (s.bands || []).map(q => `${q.hz.join('-')} Hz ${fmt(pct(q.share), 0)} +- ${fmt(pct(q.shareSe), 0)} %`).join(', ');
-                const above = s.above ? `; gyro content above ${lp}, left out as vibration (F1, F5, F6): ${pm(pct(s.above.value), pct(s.above.se), 1)} % of the setpoint rms` : '';
+                if (s.blocks < RE.minBlocks) { const why = thin(`${BL} with a ${ax} setpoint of ${tr.minSetpointRms} deg/s rms or more`, `${s.blocks} of ${s.usableBlocks}`, RE.minBlocks);
+                    add(idE, 'note', f, p, { axis: ax, value: s.value === undefined ? null : s.value, se: s.se === undefined ? null : s.se, n: s.blocks, unit: 'fraction', thin: true, text: why });
+                    add(idL, 'note', f, p, { axis: ax, value: s.tauMs === undefined ? null : s.tauMs, se: s.tauSe === undefined ? null : s.tauSe, n: s.blocks, unit: 'ms', thin: true, text: why }); continue; }
+                const lp = fmt(tr.lpHz, 0), m = fmt(tr.minAbsSetpoint, 0), bands = series((s.bands || []).map(q => `${pm(pct(q.share), pct(q.shareSe), 0)} % (${q.hz.join('-')} Hz)`));
                 const flag = past(s.value, s.se, RE.flag), note = !flag && s.value > RE.note;
+                const verdict = flag ? `The error is more than ${lv(RE.flag)} by more than 2 SE. The gyro does not follow the setpoint at the frequencies of the largest bands. Possible causes are an oscillation (C5, T1) or an output limit (C2, T8).`
+                    : note ? `The error is more than ${lv(RE.note)}, but it is not more than ${lv(RE.flag)} by more than 2 SE.` : `The error is not more than ${lv(RE.note)}.`;
                 add(idE, flag ? 'flag' : note ? 'note' : 'ok', f, p, { axis: ax, value: s.value, se: s.se, n: s.blocks, unit: 'fraction', threshold: `value - 2 SE > ${RE.flag} flag, value > ${RE.note} note`, tauMs: s.tauMs, raw: s.raw, above: s.above || null, bands: s.bands,
-                    text: `${ax} tracking error ${pm(pct(s.value), pct(s.se), 1)} % of the setpoint (${fmt(s.setpointRms, 1)} deg/s rms) after removing the ${fmt(s.tauMs, 1)} ms delay, ${fmt(pct(s.raw), 1)} % without; ` +
-                        `gyro and setpoint below ${lp}, ${fmt(s.seconds, 0)} s with |setpoint| > ${fmt(tr.minAbsSetpoint, 0)} deg/s in ${s.blocks} blocks; error power by band ${band}${above}` +
-                        (flag ? ': the gyro does not follow the setpoint, at the frequencies of the largest bands (oscillation: C5, T1; authority: C2, T8)' : note ? ': mild' : '') });
-                const lpf = tr.pidLpf && +tr.pidLpf.profile === +p ? `; the PID gyro low-pass (${tr.pidLpf.hz} Hz, header; ${fmt(tr.pidLpf.ms, 1)} ms group delay at ${tr.pidLpf.atHz} Hz) filters only the feedback, and the logged gyro is taken before it: it is not part of this delay` : '', lag = past(s.tauMs, s.tauSe, RL.flag);
+                    text: para(`The ${ax} tracking error is ${pm(pct(s.value), pct(s.se), 1)} % of the setpoint (${fmt(s.setpointRms, 1)} deg/s rms), after the analysis removes a time delay of ${fmt(s.tauMs, 1)} ms. ` +
+                        `If the analysis does not remove the time delay, the error is ${fmt(pct(s.raw), 1)} %. ${verdict}`,
+                        `The analysis applies a low-pass filter of ${lp} Hz to the gyro and the setpoint. It uses ${fmt(s.seconds, 0)} s in ${bl(s.blocks)}, and only the samples where the setpoint is more than ${m} deg/s or less than -${m} deg/s.`,
+                        (bands ? `The parts of the error power in the frequency bands are ${bands}. ` : '') + (s.above ? `The gyro at more than ${lp} Hz is ${pm(pct(s.above.value), pct(s.above.se), 1)} % of the setpoint rms, and the check does not include this vibration (F1, F5, F6).` : '')) });
+                const lpf = tr.pidLpf && +tr.pidLpf.profile === +p ? `The gyro low-pass filter of the PID loop (${tr.pidLpf.hz} Hz in the header) causes a time delay of ${fmt(tr.pidLpf.ms, 1)} ms at ${tr.pidLpf.atHz} Hz. ` +
+                    'This filter is only in the feedback, and the log records the gyro before it. Thus, the measured time delay does not include it.' : '', lag = past(s.tauMs, s.tauSe, RL.flag);
                 add(idL, lag ? 'flag' : 'note', f, p, { axis: ax, value: s.tauMs, se: s.tauSe, n: s.blocks, unit: 'ms', threshold: `delay - 2 SE > ${RL.flag} ms flag, else report only`, pidLpfMs: lpf ? tr.pidLpf.ms : null,
-                    text: `${ax} setpoint to gyro delay ${pm(s.tauMs, s.tauSe, 1)} ms over ${s.blocks} blocks${s.atMaxDelay ? ` (at the end of the ${RULE.track.maxS * 1000} ms search range)` : ''}${lpf}` + (lag ? ': far beyond a working loop, not a gain matter (check the gyro filters and the servos)' : '; report only') });
+                    text: para(`The ${ax} gyro follows the setpoint after a time delay of ${pm(s.tauMs, s.tauSe, 1)} ms (${bl(s.blocks)}).` + (s.atMaxDelay ? ` This is the maximum time delay that the analysis examines (${fmt(RULE.track.maxS * 1000, 0)} ms).` : '') +
+                        (lag ? ` The time delay is more than ${RL.flag} ms by more than 2 SE. This is too much for a loop that operates correctly, and the cause is not the loop gains. Examine the gyro filters and the servos.` : ` ${info(RL.flag)}`), lpf) });
             }
             // R1
-            if (st) { const R = rule('R1'), hdr = `header response_time ${st.header.responseTime === null ? 'n/a' : st.header.responseTime} (expected PT1 ${fmt(st.expectedMs, 1)} ms), accel_limit ${st.header.accelLimit === null ? 'n/a' : st.header.accelLimit}`;
+            if (st) { const R = rule('R1'), h = st.header, how = `The analysis uses ${bl(st.blocks)} with ${fmt(st.movingS, 0)} s of stick movement.`;
+                const hdr = `In the header, response_time is ${h.responseTime ?? 'unknown'}` + (typeof st.expectedMs === 'number' ? ` (a PT1 filter with a time constant of ${fmt(st.expectedMs, 1)} ms)` : '') + ` and accel_limit is ${h.accelLimit ?? 'unknown'}.`;
                 if (st.skipped) add('R1', 'skipped', f, null, { axis: ax, unit: 'ms', text: st.skipped });
-                else if (st.blocks < R.minBlocks) add('R1', 'note', f, null, { axis: ax, value: st.delayMs === undefined ? null : st.delayMs, se: st.se === undefined ? null : st.se, n: st.blocks, unit: 'ms', text: thin(st.blocks, R.minBlocks, `blocks with ${RULE.stick.minMovingS} s of ${ax} stick motion`) + `; ${hdr}` });
+                else if (st.blocks < R.minBlocks) add('R1', 'note', f, null, { axis: ax, value: st.delayMs === undefined ? null : st.delayMs, se: st.se === undefined ? null : st.se, n: st.blocks, unit: 'ms', thin: true,
+                    text: para(thin(`${BL} with ${RULE.stick.minMovingS} s of ${ax} stick movement or more`, st.blocks, R.minBlocks), hdr) });
                 else { const flag = past(st.delayMs, st.se, R.flag);
                     add('R1', flag ? 'flag' : 'note', f, null, { axis: ax, value: st.delayMs, se: st.se, n: st.blocks, unit: 'ms', threshold: `delay - 2 SE > ${R.flag} ms flag, else report only`, corr: st.corr,
-                        text: `${ax} stick to setpoint lag ${pm(st.delayMs, st.se, 1)} ms (correlation ${fmt(st.corr, 3)}) over ${st.blocks} blocks, ${fmt(st.movingS, 0)} s of stick motion; ${hdr}; the rate profile is not logged, all of the log pooled` +
-                            (flag ? ': input delay from rate shaping (lower response_time or accel_limit, check rc_smoothness)' : '; report only') }); } }
+                        text: para(`The ${ax} setpoint follows the stick after a time delay of ${pm(st.delayMs, st.se, 1)} ms (correlation ${fmt(st.corr, 3)}).` +
+                            (flag ? ` The time delay is more than ${R.flag} ms by more than 2 SE. The adjustments of the rate profile cause it. Decrease response_time or accel_limit. Examine rc_smoothness.` : ` ${info(R.flag)}`),
+                            `${how} ${hdr} The log does not record the rate profile. Thus, the analysis uses all of the log.`) }); } }
             // C5 / T1
             if (os) { const id = yaw ? 'T1' : 'C5', R = rule(id), lvl = R.level, O = RULE.osc;
                 if (os.skipped) { add(id, 'skipped', f, null, { axis: ax, text: os.skipped }); continue; }
-                const at = `${os.band.join('-')} Hz`, gain = os.gain ? `, which passes ${fmt(os.gain[0], 2)}-${fmt(os.gain[1], 2)} of a sine in the band` : '';
+                const at = `${os.band.join('-')} Hz`, free = 'windows where the stick does not cause the error', flank = `a line through the spectrum ${O.peakFlankHz.join('-')} Hz from it on each side`;
+                const filt = `The analysis applies a filter to the ${ax} error (the gyro minus the setpoint) and keeps only the ${at} band.` + (os.gain ? ` The gain of this filter is ${fmt(os.gain[0], 2)} to ${fmt(os.gain[1], 2)} in the band.` : '');
                 for (const [p, s] of Object.entries(os.byProfile)) {
-                    const pk = s.peak, need = `>= ${O.peakMinDb} dB and z >= ${O.peakZ}`;
-                    const peak = !s.spectrumWindows ? (s.stickFree ? '; no stick-free error spectrum (no 2 s run of stick-free windows, or no FFT host)' : '')
-                        : s.peakHz !== null ? `; stick-free error spectrum peaks at ${pm(s.peakHz, s.peakHzSe, 1)} Hz, ${fmt(pk.excessDb, 1)} dB above its local trend (z ${fmt(pk.z, 1)}, ${s.spectrumWindows} windows; a peak needs ${need})${s.peakInBand ? '' : `, outside the ${at} band`}`
-                        : `; no clear peak in the stick-free error spectrum at ${O.psd.join('-')} Hz (${s.spectrumWindows} windows; the local maximum nearest to one ${pk ? `at ${fmt(pk.hz, 1)} Hz is ${fmt(pk.excessDb, 1)} dB above its local trend, z ${fmt(pk.z, 1)}` : 'has no flanks'}; a peak needs ${need})`;
-                    const desc = `${ax} ${at} band-passed error amplitude${gain}: >= ${O.thresholds.map(v => `${v} deg/s ${fmt(pct(s.shares[v]), 1)} %`).join(', ')} of ${s.stickFree} stick-free windows (${s.stickDriven} stick-driven left out), median ${fmt(s.median, 1)}, p99 ${fmt(s.p99, 1)} deg/s` + peak;
-                    if (s.selfExcitedBursts.length) { const list = s.selfExcitedBursts, big = list[0], sine = typeof big.sine === 'number' ? `, about ${fmt(big.sine, 0)} deg/s as a sine,` : '';
+                    const pk = s.peak, need = `A local maximum is a peak if it is ${O.peakMinDb} dB or more and ${O.peakZ} SE or more.`, sh = O.thresholds.map((v, k) => `${v} deg/s or more in ${fmt(pct(s.shares[v]), 1)} %${k ? '' : ' of these windows'}`);
+                    const win = `The analysis uses ${many(s.stickFree, 'window')} of ${O.windowS} s where the stick does not cause the error.` + (s.stickDriven ? ` It does not use the ${many(s.stickDriven, 'window')} where the stick causes it.` : '') +
+                        (s.stickFree ? ` The amplitude is ${series(sh)}. The median amplitude is ${fmt(s.median, 1)} deg/s, and 99 % of the windows have ${fmt(s.p99, 1)} deg/s or less.` : '');
+                    const peak = !s.spectrumWindows ? (s.stickFree ? `The analysis cannot calculate an error spectrum for these windows. The log has no period of ${O.psdS} s with only these windows, or the FFT is not available.` : '')
+                        : s.peakHz !== null ? `The error spectrum of these windows has a peak at ${pm(s.peakHz, s.peakHzSe, 1)} Hz (${many(s.spectrumWindows, 'window')}). The peak is ${fmt(pk.excessDb, 1)} dB more than ${flank} (${fmt(pk.z, 1)} SE). ${need}` + (s.peakInBand ? '' : ` This peak is not in the ${at} band.`)
+                        : `The error spectrum of these windows has no clear peak at ${O.psd.join('-')} Hz (${many(s.spectrumWindows, 'window')}). ` + (pk ? `The local maximum nearest to a peak is at ${fmt(pk.hz, 1)} Hz. It is ${fmt(pk.excessDb, 1)} dB more than ${flank} (${fmt(pk.z, 1)} SE). ` : 'The spectrum has no local maximum with sufficient data on each side. ') + need;
+                    if (s.selfExcitedBursts.length) { const list = s.selfExcitedBursts, big = list[0];
                         add(id, 'flag', f, p, { axis: ax, value: list.length, n: s.bursts, unit: 'count', threshold: `any burst growing from < ${O.onset.small} to >= ${O.onset.high} deg/s over >= ${O.onset.minHalfCycles} half cycles (in ${O.cycleBand.join('-')} Hz) with the stick below ${O.stickDriven} of it`,
                             events: list.map(q => ({ t: q.onsetT === null ? q.t : q.onsetT, value: q.value })),
-                            text: `${ax}: ${list.length} self-excited oscillation burst${list.length > 1 ? 's' : ''} in ${at} (of ${s.bursts} bursts), the largest ${fmt(big.value, 0)} deg/s band-passed${sine} at ${fmt(big.hz, 1)} Hz at ${fmt(big.onsetT === null ? big.t : big.onsetT, 1)} s, grew by itself: loop gain too high at that frequency, or mechanics${list.length > 1 ? '' : ' (one burst cannot tell them apart from a load or a low battery)'}. ${desc}` }); continue; }
+                            text: para(`The number of ${ax} oscillations at ${at} that increase with no stick input is ${list.length} of ${s.bursts}. ` +
+                                `The largest is ${fmt(big.value, 0)} deg/s after the filter${typeof big.sine === 'number' ? ` (approximately ${fmt(big.sine, 0)} deg/s before the filter)` : ''}, at ${fmt(big.hz, 1)} Hz at ${fmt(big.onsetT === null ? big.t : big.onsetT, 1)} s. ` +
+                                'Possible causes are a loop gain that is too high at this frequency, or a mechanical problem.' +
+                                (list.length > 1 ? '' : ' A load or a low battery can also cause 1 oscillation of this type.'), filt, win, peak) }); continue; }
                     // thin: too few stick-free windows, or all of them in one block (no standard error for the share)
                     if (s.stickFree < R.minWindows || s.blocks < R.minBlocks || typeof s.sharesSe[lvl] !== 'number') {
-                        const why = s.stickFree < R.minWindows ? thin(s.stickFree, R.minWindows, 'stick-free windows') : s.blocks < R.minBlocks ? `${thin(s.blocks, R.minBlocks, 'blocks with stick-free windows')}, no standard error` : 'no finding: no standard error of the share';
-                        add(id, 'note', f, p, { axis: ax, value: s.shares[lvl], se: s.sharesSe[lvl], n: s.stickFree, unit: 'fraction', text: `${why}; ${desc}` }); continue; }
+                        const why = s.stickFree < R.minWindows ? thin(free, s.stickFree, R.minWindows) : s.blocks < R.minBlocks ? thin(`${BL} with ${free}`, s.blocks, R.minBlocks, 'a standard error')
+                            : 'The data is not sufficient for a result. The analysis cannot calculate a standard error for the time with oscillation.';
+                        add(id, 'note', f, p, { axis: ax, value: s.shares[lvl], se: s.sharesSe[lvl], n: s.stickFree, unit: 'fraction', thin: true, text: para(why, filt, win, peak) }); continue; }
                     const present = past(s.shares[lvl], s.sharesSe[lvl], R.share);
                     add(id, present ? 'note' : 'ok', f, p, { axis: ax, value: s.shares[lvl], se: s.sharesSe[lvl], n: s.stickFree, unit: 'fraction', threshold: `share >= ${lvl} deg/s - 2 SE > ${R.share} note`, peakHz: s.peakHz,
-                        text: `${present ? 'oscillation present: ' : ''}${desc}; share at >= ${lvl} deg/s ${pm(pct(s.shares[lvl]), pct(s.sharesSe[lvl]), 1)} % over ${s.blocks} blocks; no self-excited burst (${s.bursts} bursts)` });
+                        text: para((present ? `The ${ax} error has an oscillation at ${at}. ` : '') + `The amplitude is ${lvl} deg/s or more in ${pm(pct(s.shares[lvl]), pct(s.sharesSe[lvl]), 1)} % of the ${free} (${bl(s.blocks)}). ` +
+                            `This is ${present ? '' : 'not '}more than ${lv(R.share)} by more than 2 SE. ` + (s.bursts ? `The number of oscillations that increase with no stick input is 0 of ${s.bursts}.` : 'The analysis finds no oscillation in the band.'), filt, win, peak) });
                 } }
         }
     }

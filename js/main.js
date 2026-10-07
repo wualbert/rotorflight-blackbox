@@ -291,7 +291,7 @@ function BlackboxLogViewer() {
         var
             now = Date.now();
 
-        if (!graph) {
+        if (!graph || activeView !== "viewer") { // another view covers the viewer: showView draws again on return
             animationFrameIsQueued = false;
             return;
         }
@@ -358,6 +358,38 @@ function BlackboxLogViewer() {
         }
     }
 
+    // The text of a log in the log picker: "Log 4 of 16: 00:06 - 01:07 [01:00]". A log is the data from one header to the
+    // next header in the file. A new arm in blackbox_grace_period continues the log, thus a log can have more than one
+    // flight. flights: the log in TuningDialog flightsOf (null: not known) adds ", 2 flights" or ", Bench run (no analysis)"
+    function logPickerText(flightLog, index, flights) {
+        var text = "Log " + (index + 1) + " of " + flightLog.getLogCount() + ": ",
+            error = flightLog.getLogError(index),
+            n = flights && !flights.noData && !flights.bench ? flights.flights.length : 0;
+
+        if (error) {
+            return text + error;
+        }
+        text += formatTime(flightLog.getMinTime(index) / 1000, false)
+            + " - " + formatTime(flightLog.getMaxTime(index) / 1000, false)
+            + " [" + formatTime(Math.ceil((flightLog.getMaxTime(index) - flightLog.getMinTime(index)) / 1000), false) + "]";
+        if (flights && flights.bench && !flights.noData) {
+            return text + ", Bench run (no analysis)";
+        }
+        return n ? text + ", " + n + (n === 1 ? " flight" : " flights") : text;
+    }
+
+    // The log picker again, with the flights of each log when the analysis of the open file knows them
+    function updateLogPicker() {
+        var result = flightLog && views.tuning ? views.tuning.getResult() : null,
+            known = result ? TuningDialog.internals.flightsOf(result) : null;
+
+        $("select.log-index option").each(function() {
+            var index = parseInt(this.value, 10);
+            $(this).text(logPickerText(flightLog, index, known ? known.logs[index] || null : null));
+        });
+        $("div.log-index > .form-control-static").text(flightLog ? logPickerText(flightLog, 0, known ? known.logs[0] || null : null) : "");
+    }
+
     function renderLogFileInfo(file) {
         $(".log-filename").text(file.name);
 
@@ -388,19 +420,12 @@ function BlackboxLogViewer() {
                 error;
 
             error = flightLog.getLogError(index);
-
-            if (error) {
-                logLabel = error;
-            } else {
-                logLabel = formatTime(flightLog.getMinTime(index) / 1000, false)
-                    + " - " + formatTime(flightLog.getMaxTime(index) / 1000 , false)
-                    + " [" + formatTime(Math.ceil((flightLog.getMaxTime(index) - flightLog.getMinTime(index)) / 1000), false) + "]";
-            }
+            logLabel = logPickerText(flightLog, index, null);
 
             if (logCount > 1) {
                 option = $("<option></option>");
 
-                option.text((index + 1) + "/" + (flightLog.getLogCount()) + ": " + logLabel);
+                option.text(logLabel);
                 option.attr("value", index);
 
                 if (error)
@@ -419,6 +444,7 @@ function BlackboxLogViewer() {
             logIndexPicker.val(0);
             logIndexContainer.append(logIndexPicker);
         }
+        updateLogPicker(); // a result of this file that the Tuning view kept
     }
 
     /**
@@ -505,6 +531,10 @@ function BlackboxLogViewer() {
         }
 
         invalidateGraph();
+    }
+
+    function clampToLog(time) {
+        return Math.min(Math.max(time, flightLog.getMinTime()), flightLog.getMaxTime());
     }
 
     function setVideoTime(newTime) {
@@ -789,6 +819,8 @@ function BlackboxLogViewer() {
 
             setTimeout(function(){$(window).resize();}, 500 ); // refresh the window size;
 
+            endEvidence("graphs"); // the user's graphs for the new file
+
             selectLog(null);
 
             if (graph) {
@@ -796,6 +828,9 @@ function BlackboxLogViewer() {
                 graph.setAnalyser(hasAnalyserFullscreen);
             }
 
+            if (activeView !== "viewer") {
+                showView(activeView); // the view on display analyses the new file
+            }
         };
 
         reader.readAsArrayBuffer(file);
@@ -864,6 +899,392 @@ function BlackboxLogViewer() {
     function setFullscreen(state) { // update fullscreen status
         isFullscreen = state;
         html.toggleClass("is-fullscreen",state);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Views at the level of the log viewer: "viewer", "analysis" (the verdict of the analysis, js/analysis_view.js) and "tuning", chosen with the navbar tabs. The active view covers everything below the navbar (css/main.css "Views");
+    // the viewer stays laid out underneath with visibility: hidden, so its canvases keep their size.
+
+    var
+        activeView = "viewer",
+        views = {},       // "analysis", "tuning": { show(flightLog), hide() }, set in $(document).ready
+        evidence = null;  // "Show in the log" on display: { saved (the user's viewer state), from (the view to go back to), keepGraphs, legendTitle (set by the user since) }
+
+    function showView(name) {
+        if ((name !== "analysis" && name !== "tuning") || !hasLog || !views[name]) {
+            name = "viewer";
+        }
+        var from = activeView;
+
+        if (from === "viewer" && name !== "viewer") {
+            setGraphState(GRAPH_STATE_PAUSED); // stops playback, the video and the animation loop
+            ContextMenu.close();
+            $(".dropdown.open").removeClass("open");
+            $(".tooltip").remove();
+            if ($(document.activeElement).closest(".main-pane, .log-seek-bar").length) {
+                document.activeElement.blur();
+            }
+            endEvidence("all"); // the graphs of "Show in the log" live only while the viewer shows them
+        }
+        if (from !== name && views[from] && views[from].hide) {
+            views[from].hide();
+        }
+
+        activeView = name;
+        html.attr("data-view", name);
+        $(".rf-view-tab").each(function() {
+            var on = this.getAttribute("data-view") === name;
+            $(this).toggleClass("is-active", on).attr("aria-selected", on ? "true" : "false");
+        });
+
+        if (name === "viewer") {
+            if (graph) {
+                updateValuesChart(); // the legend values at this time: the legend width sets the graph width
+            }
+            updateCanvasSize(); // also draws again: animationLoop draws only while the viewer is on display
+        } else {
+            views[name].show(flightLog);
+            document.getElementById(name === "analysis" ? "viewAnalysis" : "viewTuning").focus({preventScroll: true}); // the keys scroll the view
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The text of the Analysis and Tuning views (SPEC3 C): the "Text" control of the navbar (.rf-view-text, shown with those
+    // views), 90 % to 160 % in steps of 10 %, kept in the preferences ('viewTextSize'). The view CSS is in units of --rf-px
+    // (css/main.css), also the diagram of the Tuning view, and the canvas plots read the same scale
+    // (TuningPlot.setTextScale draws them again). A change applies at once.
+
+    var TEXT_SIZES = [90, 100, 110, 120, 130, 140, 150, 160],
+        textSize = 100;
+
+    // The text size (percent) `step` steps from `size` (-1 smaller, 1 larger, 0 the nearest size of TEXT_SIZES); 100 for a
+    // value that is not a number
+    function textSizeStep(size, step) {
+        var at = TEXT_SIZES.indexOf(100), v = Number(size);
+        if (size !== null && size !== "" && isFinite(v)) {
+            for (var i = 0; i < TEXT_SIZES.length; i++) {
+                if (Math.abs(TEXT_SIZES[i] - v) < Math.abs(TEXT_SIZES[at] - v)) {
+                    at = i;
+                }
+            }
+        }
+        at = Math.min(Math.max(at + (Number(step) || 0), 0), TEXT_SIZES.length - 1);
+        return TEXT_SIZES[at];
+    }
+
+    // The views at text size `size` (percent, the nearest of TEXT_SIZES); save: also into the preferences. Returns the size
+    function setTextSize(size, save) {
+        textSize = textSizeStep(size, 0);
+        document.documentElement.style.setProperty("--rf-text-scale", String(textSize / 100));
+        $(".rf-view-text-value").text(textSize + " %");
+        $('.rf-view-text-step[data-text-step="-1"]').prop("disabled", textSize <= TEXT_SIZES[0]);
+        $('.rf-view-text-step[data-text-step="1"]').prop("disabled", textSize >= TEXT_SIZES[TEXT_SIZES.length - 1]);
+        if (typeof TuningPlot !== "undefined" && TuningPlot.setTextScale) {
+            TuningPlot.setTextScale(textSize / 100);
+        }
+        if (save) {
+            prefs.set('viewTextSize', textSize);
+        }
+        return textSize;
+    }
+
+    // The two filters of the result lists of the Tuning view (SPEC3 E): "Show results with not
+    // sufficient data" (thin) and "Show satisfactory results" (ok), off at first, kept in the preferences ('resultFilter').
+    // A change goes to each view that listens (hooks.onResultFilter), so that the lists of the two views agree.
+
+    var resultFilter = {thin: false, ok: false},
+        resultFilterListeners = [];
+
+    function setResultFilter(next, save) {
+        resultFilter = {thin: !!(next && next.thin), ok: !!(next && next.ok)};
+        if (save) {
+            prefs.set('resultFilter', resultFilter);
+        }
+        resultFilterListeners.slice().forEach(function(cb) {
+            try {
+                cb({thin: resultFilter.thin, ok: resultFilter.ok});
+            } catch (e) {
+                console.error(e);
+            }
+        });
+        return resultFilter;
+    }
+
+    // The graph zoom for a window `width` us wide: the width held in the zoom range (0.1 s to 100 s, the ends of
+    // GRAPH_ZOOM_LEVEL), the exact zoom (js/grapher.js setGraphZoom: the window is 1 s / zoom) and the nearest level on a
+    // log scale, for the slider, the wheel and Z (a tie goes to the wider level)
+    function zoomForWidth(width) {
+        var
+            widest = 1e6 / (GRAPH_ZOOM_LEVEL[GRAPH_MIN_ZOOM] / 100),
+            narrowest = 1e6 / (GRAPH_ZOOM_LEVEL[GRAPH_MAX_ZOOM] / 100),
+            w = Math.min(Math.max(width, narrowest), widest),
+            zoom = 1e6 / w,
+            level = GRAPH_MIN_ZOOM;
+
+        for (var i = GRAPH_MIN_ZOOM + 1; i <= GRAPH_MAX_ZOOM; i++) {
+            if (Math.abs(Math.log(GRAPH_ZOOM_LEVEL[i] / 100 / zoom)) < Math.abs(Math.log(GRAPH_ZOOM_LEVEL[level] / 100 / zoom))) {
+                level = i;
+            }
+        }
+        return {width: w, zoom: zoom, level: level};
+    }
+
+    // The slider at zoom level `level`, the graph at the exact `zoom` (the window is 1 s / zoom)
+    function setExactZoom(level, zoom) {
+        setGraphZoomLevel(level, true);
+        if (graph) {
+            graph.setGraphZoom(zoom);
+        }
+        $(".graph-zoom-control .noUi-handle").text(+(zoom * 100).toPrecision(3) + "%");
+    }
+
+    // Show t0..t1 (us) in the graph, in a window `margin` times as wide: centred on the span, or on `at` when the span is
+    // wider than the widest window. Playback stops. Nothing goes to prefs.
+    function fitGraphToSpan(t0, t1, at, margin) {
+        var z = zoomForWidth((t1 - t0) * margin);
+
+        setExactZoom(z.level, z.zoom);
+        setCurrentBlackboxTime(clampToLog(t1 - t0 <= z.width ? (t0 + t1) / 2 : at));
+        setGraphState(GRAPH_STATE_PAUSED);
+    }
+
+    // The analyser on one field of the graphs on display
+    function showAnalyserOf(fieldName) {
+        var graphs = activeGraphConfig.getGraphs();
+        for (var g = 0; g < graphs.length; g++) {
+            for (var f = 0; f < graphs[g].fields.length; f++) {
+                if (graphs[g].fields[f].name === fieldName) {
+                    activeGraphConfig.selectedFieldName = graphs[g].fields[f].friendlyName;
+                    activeGraphConfig.selectedGraphIndex = g;
+                    activeGraphConfig.selectedFieldIndex = f;
+                    hasAnalyser = true;
+                    html.addClass("has-analyser");
+                    if (graph) {
+                        graph.setDrawAnalyser(true);
+                    }
+                    invalidateGraph();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // "Show in the log": the log viewer shows the part of a log that a claim comes from.
+    // req: { log (index in the file; absent: the open log), fromS, toS (the span in frame seconds from the log start, the
+    //        viewer clock: us = getMinTime(log) + s * 1e6), atS (optional: the moment), graphs ([[field names], ...]: one
+    //        graph per array, shown in place of the user's graphs, which are kept), analyser (a field name: its spectrum
+    //        over the span), title, text (for the bar over the graph), from ("tuning" or "analysis": the view that the
+    //        bar goes back to) }
+    // The span gets the in and out marks, so the analyser and the step response use it too.
+    function viewInLog(req) {
+        if (!flightLog || !req || typeof req.fromS !== "number" || typeof req.toS !== "number") {
+            return false;
+        }
+        var li = typeof req.log === "number" ? req.log : flightLog.getLogIndex();
+        if (li < 0 || li >= flightLog.getLogCount() || flightLog.getLogError(li)) {
+            return false;
+        }
+
+        var saved = evidence ? evidence.saved : {
+                graphConfig: graphConfig, logIndex: flightLog.getLogIndex(), time: currentBlackboxTime,
+                zoom: graphZoom, lastZoom: lastGraphZoom, width: graph ? graph.getWindowWidthTime() : null, // the log lens sets exact zooms
+                inTime: videoExportInTime, outTime: videoExportOutTime,
+                hasAnalyser: hasAnalyser, hasAnalyserFullscreen: hasAnalyserFullscreen,
+                selected: [activeGraphConfig.selectedFieldName, activeGraphConfig.selectedGraphIndex, activeGraphConfig.selectedFieldIndex],
+                legendTitle: document.getElementById("legend_title").firstChild.nodeValue,
+            },
+            keepGraphs = evidence ? evidence.keepGraphs : false;
+        if (evidence && evidence.keepGraphs) {
+            saved.graphConfig = graphConfig; // the graphs that the user set since the snapshot (Graph setup, a workspace): Back gives them
+        }
+        if (evidence && typeof evidence.legendTitle === "string") {
+            saved.legendTitle = evidence.legendTitle; // and the legend title of that workspace
+        }
+        evidence = null;
+
+        if (li !== flightLog.getLogIndex()) {
+            selectLog(li); // clears the in and out marks
+            (hasAnalyserFullscreen)?html.addClass("has-analyser-fullscreen"):html.removeClass("has-analyser-fullscreen");
+            graph.setAnalyser(hasAnalyserFullscreen);
+        }
+
+        // the fields of the request that this log has (each log of a file has its own header)
+        var
+            has = function(name) { return flightLog.getMainFieldIndexByName(name) !== undefined; },
+            missing = [].concat.apply([], req.graphs || []).filter(function(name) { return !has(name); }),
+            groups = (req.graphs || []).map(function(names) { return names.filter(has); }).filter(function(names) { return names.length; }).map(function(names) {
+                var friendly = names.map(function(name) { return FlightLogFieldPresenter.fieldNameToFriendly(name, flightLog.getSysConfig().debug_mode); });
+                return {label: friendly.join(", "), height: 1, fields: names.map(function(name) {
+                    return {name: name, smoothing: 0, curve: {power: 1.0, outputRange: 1.0}}; // as measured: no smoothing, no expo
+                })};
+            });
+        if (groups.length) {
+            graphConfig = groups; // shown through activeGraphConfig and never stored (newGraphConfig stores)
+            keepGraphs = false;
+            activeGraphConfig.adaptGraphs(flightLog, graphConfig);
+        }
+
+        var
+            min = flightLog.getMinTime(),
+            t0 = clampToLog(min + Math.min(req.fromS, req.toS) * 1e6),
+            t1 = clampToLog(min + Math.max(req.fromS, req.toS) * 1e6),
+            at = typeof req.atS === "number" ? clampToLog(min + req.atS * 1e6) : (t0 + t1) / 2;
+        setVideoInTime(t0); // in before out: GraphSpectrumCalc.setOutTime measures from the in time
+        setVideoOutTime(t1);
+        fitGraphToSpan(t0, t1, at, 1.1); // a 10 % margin
+        if (req.analyser) {
+            showAnalyserOf(req.analyser);
+        }
+
+        var
+            from = req.from === "analysis" ? "analysis" : "tuning",
+            name = from === "analysis" ? "Analysis" : "Tuning",
+            where = "The graphs show log " + (li + 1) + " from " + ((t0 - min) / 1e6).toFixed(1) + " s to " + ((t1 - min) / 1e6).toFixed(1) + " s." +
+                (missing.length ? " This log does not contain these fields: " + missing.join(", ") + "." : "");
+        setLegendTitle("Show in the log"); // short: the legend panel is as wide as its title
+        $(".log-evidence-text").empty().attr("title", [req.title, req.text, where].filter(Boolean).join("\n")).append(
+            $("<strong>").text(req.title || "Show in the log"), document.createTextNode(" "), $("<span>").text(where + (req.text ? " " + req.text : "")));
+        $(".log-evidence-back").text("Back to " + name).attr("title", "Show the " + name + " view again");
+        evidence = {saved: saved, from: from, keepGraphs: keepGraphs, req: req}; // req: for "Show the period again"
+        renderEvidenceLegend();
+        html.addClass("has-evidence");
+        showView("viewer");
+        return true;
+    }
+
+    // The legend of "Show in the log" (SPEC3 E): the curves of the graphs on display, each with its color, its field name and
+    // a short STE label ("gyroADC[2]: yaw rate"; "" for a field that has no label here). graphs: activeGraphConfig.getGraphs().
+    // [{ graph (1, 2, ...), fields: [{ name, color, label }] }]; the colors repeat in each graph, so the legend has a group
+    // for each graph
+    function evidenceBar(graphs) {
+        var
+            axis = ["roll", "pitch", "yaw"],
+            labels = [
+                [/^gyroADC\[([0-2])\]$/, function(k) { return axis[k] + " rate"; }],
+                [/^gyroRAW\[([0-2])\]$/, function(k) { return axis[k] + " rate before the filters"; }],
+                [/^setpoint\[([0-3])\]$/, function(k) { return k < 3 ? axis[k] + " setpoint" : "collective setpoint"; }],
+                [/^rcCommand\[([0-4])\]$/, function(k) { return ["roll stick", "pitch stick", "yaw stick", "collective stick", "throttle stick"][k]; }],
+                [/^axisError\[([0-2])\]$/, function(k) { return axis[k] + " PID error"; }],
+                [/^axis([PIDF])\[([0-2])\]$/, function(term, k) { return axis[k] + " " + term + "-term"; }],
+                [/^mixer\[([0-3])\]$/, function(k) { return ["roll output", "pitch output", "tail output", "collective output"][k]; }],
+                [/^servo\[([0-7])\]$/, function(k) { return "servo " + (k + 1); }],
+                [/^headspeed$/, function() { return "headspeed"; }],
+                [/^tailspeed$/, function() { return "tail rotor speed"; }],
+                [/^govTarget$/, function() { return "governor target"; }],
+                [/^motor\[0\]$/, function() { return "motor output"; }],
+                [/^throttle$/, function() { return "throttle"; }],
+                [/^vbatLatest$/, function() { return "battery voltage"; }]
+            ];
+        function label(name) {
+            for (var i = 0; i < labels.length; i++) {
+                var m = labels[i][0].exec(name);
+                if (m) {
+                    return labels[i][1].apply(null, m.slice(1).map(function(x) { return /^\d+$/.test(x) ? +x : x; }));
+                }
+            }
+            return "";
+        }
+        return (graphs || []).map(function(g, i) {
+            return {graph: i + 1, fields: (g && g.fields || []).map(function(f) {
+                return {name: String(f.name), color: f.color || "#ffffff", label: label(String(f.name))};
+            })};
+        }).filter(function(g) { return g.fields.length; });
+    }
+
+    // The legend in the bar of "Show in the log": always open while the bar shows, the field names in code font
+    function renderEvidenceLegend() {
+        var box = $(".log-evidence-legend").empty();
+        if (!evidence) {
+            return;
+        }
+        evidenceBar(activeGraphConfig.getGraphs()).forEach(function(g) {
+            var group = $("<span>").addClass("log-evidence-graph").append($("<span>").addClass("log-evidence-graph-name").text("Graph " + g.graph));
+            g.fields.forEach(function(f) {
+                var item = $("<span>").addClass("log-evidence-curve"), name = $("<span>").append($("<code>").text(f.name));
+                if (f.label) {
+                    name.append(document.createTextNode(": " + f.label));
+                }
+                item.append($("<span>").addClass("log-evidence-swatch").css("background", f.color), name);
+                group.append(item);
+            });
+            box.append(group);
+        });
+    }
+
+    // "Show the period again" (SPEC3 E): after the pilot moved or zoomed the viewer, the period of "Show in the log" with its
+    // marks and zoom again (the same request). The snapshot of the pilot's own graphs stays. False without the bar
+    function resetEvidence() {
+        return evidence && evidence.req ? viewInLog(evidence.req) : false;
+    }
+
+    // The pilot picked a log with the log picker of the legend while "Show in the log" was on display (the change handler of
+    // renderLogFileInfo has opened that log). The span of the bar is of another log, so the bar ends. The pilot's graphs,
+    // analyser, zoom and legend title come back, and the picked log stays: the snapshot never puts back its own log, marks
+    // or time over a log that the pilot chose (before, "Back to ..." and the close button opened the log of the snapshot again)
+    function evidenceLogPicked() {
+        if (!evidence || !flightLog) {
+            return false;
+        }
+        var s = evidence.saved;
+        s.logIndex = flightLog.getLogIndex();
+        s.time = currentBlackboxTime;
+        s.inTime = videoExportInTime; // selectLog cleared the marks
+        s.outTime = videoExportOutTime;
+        endEvidence("all");
+        return true;
+    }
+
+    // Leave "Show in the log". what "all": put back the user's graphs, log, marks, zoom, time, analyser and legend title;
+    // "graphs": only the graphs, analyser, zoom and legend title (a new file is opening: selectLog sets the rest)
+    function endEvidence(what) {
+        var e = evidence;
+        if (!e) {
+            return;
+        }
+        evidence = null;
+        html.removeClass("has-evidence");
+        if (!flightLog) {
+            return;
+        }
+
+        var s = e.saved;
+        if (!e.keepGraphs) {
+            graphConfig = s.graphConfig;
+        }
+        if (what === "all" && s.logIndex !== flightLog.getLogIndex() && s.logIndex < flightLog.getLogCount() && !flightLog.getLogError(s.logIndex)) {
+            selectLog(s.logIndex);
+        } else if (what === "all" && !e.keepGraphs) {
+            activeGraphConfig.adaptGraphs(flightLog, graphConfig);
+        }
+        activeGraphConfig.selectedFieldName = s.selected[0];
+        activeGraphConfig.selectedGraphIndex = s.selected[1];
+        activeGraphConfig.selectedFieldIndex = s.selected[2];
+        hasAnalyser = s.hasAnalyser;
+        hasAnalyserFullscreen = s.hasAnalyserFullscreen;
+        html.toggleClass("has-analyser", !!hasAnalyser);
+        html.toggleClass("has-analyser-fullscreen", !!hasAnalyserFullscreen);
+        if (graph) {
+            graph.setDrawAnalyser(!!hasAnalyser);
+            graph.setAnalyser(!!hasAnalyserFullscreen);
+        }
+        if (s.width) {
+            setExactZoom(s.zoom, 1e6 / s.width);
+        } else {
+            setGraphZoomLevel(s.zoom, true);
+        }
+        lastGraphZoom = s.lastZoom;
+        // the title of the snapshot, or the one that the user set while the evidence was on display (a workspace switch)
+        document.getElementById("legend_title").firstChild.nodeValue = typeof e.legendTitle === "string" ? e.legendTitle : s.legendTitle;
+        if (what === "all") {
+            setVideoInTime(s.inTime);
+            setVideoOutTime(s.outTime);
+            setCurrentBlackboxTime(s.time);
+        }
+        if (what === "all" && graph) {
+            updateValuesChart(); // not for "graphs": the new file has no open log yet
+        }
+        updateCanvasSize(); // the legend title and values set the width of the legend panel, so of the graph
     }
 
     this.getMarker = function() { // get marker field
@@ -1015,6 +1436,9 @@ function BlackboxLogViewer() {
     function newGraphConfig(newConfig) {
         lastGraphConfig = graphConfig; // Remember the last configuration.
         graphConfig = newConfig;
+        if (evidence) {
+            evidence.keepGraphs = true; // the user changed the graphs of "Show in the log": Back keeps them
+        }
 
         activeGraphConfig.adaptGraphs(flightLog, graphConfig);
 
@@ -1055,9 +1479,13 @@ function BlackboxLogViewer() {
         setLegendTitle("Legend");
     }
 
-    // Only replace the heading text so the close button inside it survives
+    // Only replace the heading text so the close button inside it survives. During "Show in the log" the title is the
+    // user's (a workspace switch): endEvidence keeps it
     function setLegendTitle(title) {
         document.getElementById("legend_title").firstChild.nodeValue = title + " ";
+        if (evidence) {
+            evidence.legendTitle = title + " ";
+        }
     }
 
     // New workspaces feature; local storage of user configurations
@@ -1091,6 +1519,9 @@ function BlackboxLogViewer() {
 
     activeGraphConfig.addListener(function() {
         invalidateGraph();
+        if (evidence) {
+            renderEvidenceLegend(); // the pilot changed the graphs while the bar shows
+        }
     });
 
     $(document).ready(function() {
@@ -1512,11 +1943,28 @@ function BlackboxLogViewer() {
                     videoConfig = newConfig;
 
                     prefs.set('videoConfig', newConfig);
-                }),
+                });
 
-                flightAnalysisDialog = new FlightAnalysisDialog($("#dlgFlightAnalysis"));
+        // The open file and its FlightLog, read at each use: main.js replaces the two on every load
+        var logHooks = {
+            getBytes: function() { return flightLogDataArray; },
+            getFlightLog: function() { return flightLog; },
+            getFileName: function() { return currentOffsetCache.log; },
+            getCurrentLogIndex: function() { return flightLog ? flightLog.getLogIndex() : null; },
+            // the filters of the result lists, shared by the two views (SPEC3 E)
+            resultFilter: function() { return {thin: resultFilter.thin, ok: resultFilter.ok}; },
+            setResultFilter: function(f) { return setResultFilter(f, true); },
+            onResultFilter: function(cb) {
+                if (typeof cb !== "function") {
+                    return function() {};
+                }
+                resultFilterListeners.push(cb);
+                return function() { resultFilterListeners = resultFilterListeners.filter(function(x) { return x !== cb; }); };
+            }
+        };
 
-        var tuningDialog = new TuningDialog($("#dlgTuning"), {
+        var tuningDialog = new TuningDialog($("#viewTuning"), $.extend({
+            viewInLog: function(req) { return viewInLog($.extend({}, req, {from: "tuning"})); },
             seek: function(us) {
                 setCurrentBlackboxTime(clampToLog(us));
                 setGraphState(GRAPH_STATE_PAUSED);
@@ -1527,11 +1975,61 @@ function BlackboxLogViewer() {
                     (hasAnalyserFullscreen)?html.addClass("has-analyser-fullscreen"):html.removeClass("has-analyser-fullscreen");
                     graph.setAnalyser(hasAnalyserFullscreen);
                 }
-            },
-            getBytes: function() { return flightLogDataArray; },
-            getFlightLog: function() { return flightLog; },
-            getFileName: function() { return currentOffsetCache.log; },
-            getCurrentLogIndex: function() { return flightLog ? flightLog.getLogIndex() : null; }
+            }
+        }, logHooks));
+
+        // The Analysis view: the verdict of the analysis (js/analysis_view.js; "Show in the log" plots the span in the view). The
+        // TuningDialog runs the analysis and the derive worker for the two views, so the Analysis view shows the result of
+        // the Tuning view; each call goes to it at the time of use. The upstream Flight analysis (FlightAnalysisDialog) is
+        // not used. Without js/analysis_view.js there is no Analysis view, and the rest of the viewer still works.
+        var analysisView = typeof AnalysisView !== "function" ? null : new AnalysisView($("#viewAnalysis"), $.extend({
+            viewInLog: function(req) { return viewInLog($.extend({}, req, {from: "analysis"})); },
+            runAnalysis: function() { return tuningDialog.runAnalysis(); }, // a cached result, else a run on the open log
+            getResult: function() { return tuningDialog.getResult(); },
+            onResult: function(cb) { return tuningDialog.onResult(cb); },
+            getSelection: function() { return tuningDialog.getSelection(); }, // "Selected flights" of the result on display (SPEC3 D)
+            // the "Logs" control of the analysis, the same settings as the Tuning view (2026-10-06: all flights of the file by default)
+            scopePanel: function() { return tuningDialog.scopePanel(); },
+            scopeAction: function(act) { return tuningDialog.scopeAction(act); },
+            onSettings: function(cb) { return tuningDialog.onSettings(cb); },
+            derive: function(kind, cols, rate, params, transfer) { return tuningDialog.derive(kind, cols, rate, params, transfer); },
+            // "Open in the Tuning view" of a result (SPEC3 I): the Tuning view with the step of the result and its recommendation
+            openTuning: function(target) {
+                showView("tuning");
+                if (target) {
+                    tuningDialog.focus(target);
+                }
+            }
+        }, logHooks));
+
+        if (analysisView) {
+            views.analysis = analysisView;
+        }
+        views.tuning = tuningDialog;
+        tuningDialog.onResult(updateLogPicker); // the flights of each log in the log picker
+
+        // The text size of the views (SPEC3 C): 100 % until the preferences answer
+        setTextSize(100, false);
+        prefs.get('viewTextSize', function(item) {
+            if (item !== null && item !== undefined) {
+                setTextSize(item, false);
+            }
+        });
+        // The filters of the result lists (SPEC3 E)
+        prefs.get('resultFilter', function(item) {
+            if (item && typeof item === "object") {
+                setResultFilter(item, false);
+            }
+        });
+
+        $(".rf-view-text-step").click(function(e) {
+            e.preventDefault();
+            setTextSize(textSizeStep(textSize, +this.getAttribute("data-text-step")), true);
+        });
+
+        $(".rf-view-text-value").click(function(e) {
+            e.preventDefault();
+            setTextSize(100, true);
         });
 
         $(".open-graph-configuration-dialog").click(function(e) {
@@ -1557,16 +2055,33 @@ function BlackboxLogViewer() {
             userSettingsDialog.show(flightLog, userSettings);
         });
 
-        $(".open-flight-analysis-dialog").click(function(e) {
+        $(".rf-view-tab").click(function(e) {
             e.preventDefault();
-
-            flightAnalysisDialog.show(flightLog);
+            if (e.originalEvent && e.originalEvent.detail) {
+                this.blur(); // a mouse click (jQuery 1.11 does not copy detail to its event): the keys go to the log viewer again
+            }
+            showView(this.getAttribute("data-view"));
         });
 
-        $(".open-tuning-dialog").click(function(e) {
+        $(".log-evidence-back").click(function(e) {
             e.preventDefault();
+            showView(evidence ? evidence.from : "tuning"); // leaving the viewer puts back the user's graphs
+        });
 
-            tuningDialog.show(flightLog);
+        $(".log-evidence-reset").click(function(e) {
+            e.preventDefault();
+            resetEvidence();
+        });
+
+        $(".log-evidence-close").click(function(e) {
+            e.preventDefault();
+            endEvidence("all");
+        });
+
+        // The log picker (renderLogFileInfo makes it again for each file). Delegated, so it runs after the picker's own
+        // handler, which opens the picked log
+        $(document).on("change", "select.log-index", function() {
+            evidenceLogPicked();
         });
 
         $(".marker-offset", statusBar).click(function(e) {
@@ -1840,10 +2355,6 @@ function BlackboxLogViewer() {
             }
         });
 
-        function clampToLog(time) {
-            return Math.min(Math.max(time, flightLog.getMinTime()), flightLog.getMaxTime());
-        }
-
         // Position of pageX across the graph canvas, from -0.5 (left edge) to 0.5 (right edge)
         function graphOffsetAtPageX(pageX) {
             return (pageX - $(canvas).offset().left) / $(canvas).width() - 0.5;
@@ -1881,7 +2392,7 @@ function BlackboxLogViewer() {
                 return;
             }
 
-            if (!graph || $(e.target).parents('.modal').length != 0) {
+            if (!graph || activeView !== "viewer" || $(e.target).parents('.modal').length != 0) {
                 return;
             }
 
@@ -2046,7 +2557,7 @@ function BlackboxLogViewer() {
                 $(e.target).blur();
             }
             // keyboard controls are disabled on modal dialog boxes and text entry fields
-            if (graph && e.target.type != 'text' && $(e.target).parents('.modal').length == 0) {
+            if (graph && activeView === "viewer" && e.target.type != 'text' && $(e.target).parents('.modal').length == 0) {
                 switch (e.which) {
                     case "I".charCodeAt(0):
                         if (!(shifted)) {

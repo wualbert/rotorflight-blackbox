@@ -302,6 +302,7 @@ function dist() {
         './css/user_settings_dialog.css',
         './css/flight_analysis_dialog.css',
         './css/tuning_dialog.css',
+        './css/log_lens.css',
 
         // JavaScript
         './index.js',
@@ -346,7 +347,10 @@ function dist() {
         './js/flight_analysis.js',
         './js/flight_analysis_dialog.js',
         './js/tuning_plot.js',
+        './js/tuning_snippet.js',
         './js/tuning_dialog.js',
+        './js/log_lens.js',
+        './js/analysis_view.js',
         './js/tuning_worker.js',
         './js/video_export_dialog.js',
         './js/csv-exporter.js',
@@ -381,7 +385,18 @@ function dist() {
         './tools/autotune/report.cjs',
         './tools/autotune/health_track.cjs',
         './tools/autotune/health_more.cjs',
+        './tools/autotune/health_phase.cjs',
+        './tools/autotune/health_rescue.cjs',
+        './tools/autotune/health_limits.cjs',
+        './tools/autotune/health_config.cjs',
+        './tools/autotune/health_power.cjs',
         './tools/autotune/advice.cjs',
+        './tools/autotune/catalog.cjs',
+        './tools/autotune/hierarchy.cjs',
+        './tools/autotune/evidence.cjs',
+        './tools/autotune/datasets.cjs',
+        './tools/autotune/filter_tune.cjs',
+        './tools/autotune/param_epochs.cjs',
 
         // everything else
         './package.json', // For NW.js

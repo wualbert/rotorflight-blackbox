@@ -20,6 +20,7 @@
     <link rel="stylesheet" href="css/user_settings_dialog.css">
     <link rel="stylesheet" href="css/flight_analysis_dialog.css">
     <link rel="stylesheet" href="css/tuning_dialog.css">
+    <link rel="stylesheet" href="css/log_lens.css">
 
     <script src="js/vendor/modernizr-2.6.2-respond-1.1.0.min.js"></script>
 </head>
@@ -119,6 +120,18 @@
         <div class="rf-navbar-inner header-pane">
             <img src="./images/rf_logo_white.svg" alt="Rotorflight" class="rf-navbar-logo" />
             <span class="rf-navbar-divider" aria-hidden="true"></span>
+            <div class="rf-view-tabs" role="tablist" aria-label="Views">
+                <button type="button" class="rf-view-tab is-active" role="tab" id="tabViewer" data-view="viewer" aria-controls="screenshot-frame" aria-selected="true">Log viewer</button>
+                <button type="button" class="rf-view-tab" role="tab" id="tabAnalysis" data-view="analysis" aria-controls="viewAnalysis" aria-selected="false">Analysis</button>
+                <button type="button" class="rf-view-tab" role="tab" id="tabTuning" data-view="tuning" aria-controls="viewTuning" aria-selected="false">Tuning</button>
+            </div>
+            <!-- The text size of the Analysis and Tuning views (setTextSize in main.js), shown with those views -->
+            <div class="rf-view-text" role="group" aria-label="Text of the Analysis and Tuning views">
+                <span class="rf-view-text-label" title="Make the text of the Analysis and Tuning views smaller or larger. The app keeps this value.">Text</span>
+                <button type="button" class="rf-view-text-step" data-text-step="-1" title="Make the text smaller" aria-label="Make the text smaller">A&minus;</button>
+                <button type="button" class="rf-view-text-value" title="Set the text to 100 %">100 %</button>
+                <button type="button" class="rf-view-text-step" data-text-step="1" title="Make the text larger" aria-label="Make the text larger">A+</button>
+            </div>
             <span class="rf-navbar-file log-filename"></span>
 
             <div class="rf-navbar-actions">
@@ -143,12 +156,6 @@
 
                 <span class="rf-navbar-divider" aria-hidden="true"></span>
 
-                <button type="button" class="btn rf-nav-icon open-flight-analysis-dialog" data-toggle="tooltip" data-placement="bottom" title="Flight analysis">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-                </button>
-                <button type="button" class="btn rf-nav-icon open-tuning-dialog" data-toggle="tooltip" data-placement="bottom" title="Tuning">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-                </button>
                 <button type="button" class="btn rf-nav-icon open-user-settings-dialog" data-toggle="tooltip" data-placement="bottom" title="Settings">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                 </button>
@@ -484,6 +491,16 @@
                 </div>
                 <canvas width="0" height="0" id="stickCanvas"></canvas>
                 <span class="log-open-legend-dialog glyphicon glyphicon-cog" data-toggle="tooltip" title="Show the legend"></span>
+                <div class="log-evidence" role="status" data-html2canvas-ignore="true">
+                    <div class="log-evidence-row">
+                        <div class="log-evidence-text"></div>
+                        <button type="button" class="btn btn-default btn-xs log-evidence-reset" title="Show the period of the result again, with its zoom and its marks">Show the period again</button>
+                        <button type="button" class="btn btn-primary btn-xs log-evidence-back" title="Show the Tuning view again">Back to Tuning</button>
+                        <button type="button" class="btn btn-default btn-xs log-evidence-close" aria-label="Close" title="Close this bar and show your graphs again">&times;</button>
+                    </div>
+                    <!-- The curves of the graphs: color, field name and label (evidenceBar in main.js) -->
+                    <div class="log-evidence-legend" aria-label="Curves of the graphs"></div>
+                </div>
             </div>
             <div class="log-graph-config">
                 <h2 id="legend_title">Legend
@@ -609,6 +626,15 @@
             <span class="viewer-version">-</span>
         </div>
     </div>
+
+    <!-- Analysis and Tuning: views at the level of the log viewer, chosen with the navbar tabs (showView in main.js).
+         Analysis (analysis_view.js): the verdict of the analysis -->
+    <section class="rf-view analysis-view" id="viewAnalysis" role="tabpanel" aria-labelledby="tabAnalysis" tabindex="-1">
+        <div id="analysisVerdictBody"></div>
+    </section>
+    <section class="rf-view tuning-view" id="viewTuning" role="tabpanel" aria-labelledby="tabTuning" tabindex="-1">
+        <div id="tuningBody"></div>
+    </section>
 
     <!-- Dialog Boxes and Popup Windows -->
     <div class="modal fade graph-configuration-dialog" id="dlgGraphConfiguration">
@@ -3521,20 +3547,6 @@
         </div>
     </div>
 
-    <div class="modal fade tuning-dialog" id="dlgTuning" tabindex="-1">
-        <div class="modal-dialog">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <button type="button" class="close" data-dismiss="modal" aria-label="Close" data-toggle="tooltip" title="Close">
-                        <span aria-hidden="true">&times;</span>
-                    </button>
-                    <h4 class="modal-title">Tuning</h4>
-                </div>
-                <div class="modal-body" id="tuningBody">
-                </div>
-            </div>
-        </div>
-    </div>
     <!-- Scripts -->
     <script src="node_modules/html2canvas/dist/html2canvas.min.js"></script>
     <script src="js/save_file.js"></script>
@@ -3587,7 +3599,10 @@
     <script src="js/flight_analysis.js"></script>
     <script src="js/flight_analysis_dialog.js"></script>
     <script src="js/tuning_plot.js"></script>
+    <script src="js/tuning_snippet.js"></script>
     <script src="js/tuning_dialog.js"></script>
+    <script src="js/log_lens.js"></script>
+    <script src="js/analysis_view.js"></script>
     <script src="js/release_checker.js"></script>
     <script src="js/seekbar.js"></script>
     <script src="js/context_menu.js"></script>

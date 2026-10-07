@@ -74,6 +74,9 @@ var FlightLogParser = function(logData) {
 
         FLIGHT_LOG_EVENT_LOG_END = 255,
 
+        // Header keys of the parameter journal (RF-PARAM-1, Blackbox_Params_Spec.md 2.2 and 4.1)
+        PARAM_HEADER_KEY = /^(?:Param log$|param_|set\.|set@p|set@r|el\.|pg\.|boot\.)/,
+
         EOF = ArrayDataStream.prototype.EOF,
         NEWLINE  = '\n'.charCodeAt(0),
 
@@ -492,6 +495,9 @@ var FlightLogParser = function(logData) {
         // How many intentionally un-logged frames did we skip over before we decoded the current frame?
         lastSkippedFrames,
 
+        // True between the "Param log" and the "param_end" header lines of the current log
+        inParamSection = false,
+
         // Details about the last main frame that was successfully parsed
         lastMainFrameIteration,
         lastMainFrameTime,
@@ -590,6 +596,17 @@ var FlightLogParser = function(logData) {
 
         fieldName = asciiArrayToString(stream.data.subarray(lineStart, separatorPos));
         fieldValue = asciiArrayToString(stream.data.subarray(separatorPos + 1, lineEnd));
+
+        // The parameter journal section: each line from "Param log" to "param_end", and each key of the section, goes in
+        // order and as written into the paramHeader of this log ([name, value]), not into unknownHeaders and with no console
+        // line. tools/autotune/param_log.cjs checks the line count and the hash of param_end over these lines.
+        if (inParamSection || PARAM_HEADER_KEY.test(fieldName)) {
+            if (!Object.prototype.hasOwnProperty.call(that.sysConfig, 'paramHeader')) that.sysConfig.paramHeader = []; // own array per log
+            that.sysConfig.paramHeader.push([fieldName, fieldValue]);
+            if (fieldName === 'Param log') inParamSection = true;
+            else if (fieldName === 'param_end') inParamSection = false;
+            return;
+        }
 
         // Translate the fieldName to the sysConfig parameter name. The fieldName has been changing between versions
         // In this way is easier to maintain the code
@@ -1647,6 +1664,7 @@ var FlightLogParser = function(logData) {
         stream.pos = stream.start;
         stream.end = endOffset === undefined ? stream.end : endOffset;
         stream.eof = false;
+        inParamSection = false;
 
         mainloop:
         while (true) {
@@ -1671,6 +1689,10 @@ var FlightLogParser = function(logData) {
                 break;
             }
         }
+
+        // The offset of the first data byte after the header: the data of the log (and its events before the first
+        // I-frame) start here (flightlog_index.js, flightlog.js)
+        this.headerEndOffset = stream.pos;
 
         adjustFieldDefsList(that.sysConfig.firmwareType, that.sysConfig.firmwareVersion);
         FlightLogFieldPresenter.adjustDebugDefsList(that.sysConfig.firmwareType, that.sysConfig.firmwareVersion);

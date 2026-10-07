@@ -6,22 +6,33 @@
  *   encode([log, ...]) -> { bytes: Uint8Array, names: [[main field names of each log]] }
  *   simulateFlight(options) -> log        one simulated 4.6 flight at 1 kHz with every field the toolkit reads
  *
- * log = { w, header, start, govState, airborne, rescueState, profile, slow, gapAt, gapFrames, rate } or { broken: true }
+ * log = { w, header, start, govState, airborne, rescueState, profile, rateProfile, adjustments, events, slow, gapAt, gapFrames, rate, clock }
+ *       or { broken: true }
  *   w          columns as tools/autotune/lib.cjs segments() returns them: sp/gyro deg/s, u/P/I/D/F/B fraction of authority
  *              (written x 1000), hs rpm, coll raw, extra { name: raw column }; integers are written rounded
  *   govState, airborne, rescueState, profile   Uint8Array per frame or null: GOVERNOR_STATE (50), AIRBORNE_STATE (52),
  *              RESCUE_STATE (51) and INFLIGHT_ADJUSTMENT func 2 (13) events where the value changes. The decoder starts
  *              governor, airborne and rescue state at 0, so a non-zero start is written at frame 1 (an event before the
  *              first frame is attached to no chunk); the profile at frame 0 is not written, as a flight controller does not log it
- *   slow       { name: column } slow fields (flightModeFlags, ...): an S-frame before frame 0 and wherever one changes
+ *   rateProfile  Uint8Array per frame or null: INFLIGHT_ADJUSTMENT func 1 (rate profile, 1-based) where it changes, as profile
+ *   adjustments  [[frame, func, value], ...]: other INFLIGHT_ADJUSTMENT events (rc_adjustments.c: func and the new value)
+ *   events     [[frame, type, data], ...]: more events before that frame (1 or more), as the firmware writes them (blackbox.c
+ *              blackboxLogEvent): DISARM (15) { reason }, FLIGHT_MODE (30) { newFlags, lastFlags } (bit 0: ARM), SYNC_BEEP (0)
+ *              (the time of the beep: the time of that frame), CUSTOM_STRING (101) { string } (length byte + ASCII, at most
+ *              252 chars; the parameter journal of blackbox_params writes its records as these)
+ *   slow       { name: column } slow fields (flightModeFlags, ...): an S-frame before frame 0 and wherever one changes.
+ *              A blackbox_params log adds pidProfile, rateProfile (0-5), armed and paramSeq after the 5 stock fields.
+ *   header     extra H lines in order, e.g. the parameter section: { 'Param log': 1, param_mode: 'FULL', 'set.x': ..., param_end: ... }
  *   gapAt      frame index (a multiple of 32: an I-frame) where gapFrames frames are lost: LOGGING_RESUME (14)
+ *   clock      the time field: { periods: [[from frame, frame interval us], ...] (else 1e6 / rate), stalls: [[frame, us], ...] }:
+ *              a loop stall makes the time of that frame jump by us with the loop iterations contiguous (no frame lost)
  *   broken     a header without field definitions: the decoder reports a parse error for this log
  *
  * Every main field uses predictor 0 and signed variable-byte encoding, so P-frames carry raw values too: an I-frame
  * every 32 frames, P interval 1/1, looptime 500 us, pid_process_denom 2 (1 kHz logging).
  */
 
-const EV = { INFLIGHT_ADJUSTMENT: 13, LOGGING_RESUME: 14, GOVERNOR_STATE: 50, RESCUE_STATE: 51, AIRBORNE_STATE: 52, LOG_END: 255 };
+const EV = { SYNC_BEEP: 0, INFLIGHT_ADJUSTMENT: 13, LOGGING_RESUME: 14, DISARM: 15, FLIGHT_MODE: 30, GOVERNOR_STATE: 50, RESCUE_STATE: 51, AIRBORNE_STATE: 52, CUSTOM_STRING: 101, LOG_END: 255 };
 const PRODUCT = 'Blackbox flight data recorder by Nicholas Sherlock';
 
 function vbU(out, v) { v = v >>> 0; while (v >= 0x80) { out.push((v & 0x7f) | 0x80); v >>>= 7; } out.push(v); }
@@ -34,8 +45,12 @@ function encodeLog(log) {
     if (log.broken) { H('Firmware type', 'Rotorflight'); H('Firmware revision', 'Rotorflight 4.6.0 (sim)'); ascii(out, 'garbage'); return { bytes: Uint8Array.from(out), names: [] }; }
     const { w } = log, n = w.n, rate = log.rate || w.rate || 1000, cols = [], names = [];
     const add = (name, col, k = 1) => { if (col) { names.push(name); cols.push(k === 1 ? col : Float64Array.from(col, v => v * k)); } };
-    const time = new Float64Array(n), iter = new Float64Array(n); let us = 1e6, it = 0;
-    for (let i = 0; i < n; i++) { if (log.gapAt !== null && log.gapAt !== undefined && i === log.gapAt) { us += log.gapFrames * 1e6 / rate; it += log.gapFrames; } time[i] = Math.round(us); iter[i] = it; us += 1e6 / rate; it++; }
+    const time = new Float64Array(n), iter = new Float64Array(n), clock = log.clock || {}, stall = new Map(clock.stalls || []), periods = (clock.periods || []).slice().sort((a, b) => a[0] - b[0]);
+    let us = 1e6, it = 0, period = 1e6 / rate;
+    for (let i = 0; i < n; i++) { while (periods.length && periods[0][0] <= i) period = periods.shift()[1];
+        if (log.gapAt !== null && log.gapAt !== undefined && i === log.gapAt) { us += log.gapFrames * period; it += log.gapFrames; }
+        if (stall.has(i)) us += stall.get(i);
+        time[i] = Math.round(us); iter[i] = it; us += period; it++; }
     add('loopIteration', iter); add('time', time);
     const zero = new Float64Array(n); // the decoder needs setpoint, gyro, mixer, P, I, D, F and headspeed: a fixture without them logs zeros
     for (const [k, base] of [['P', 'axisP'], ['I', 'axisI'], ['D', 'axisD'], ['F', 'axisF'], ['B', 'axisB']]) for (let a = 0; a < 3; a++) add(`${base}[${a}]`, w[k] ? w[k][a] : k === 'B' ? null : zero, 1000);
@@ -53,13 +68,21 @@ function encodeLog(log) {
     const fixed = { 'Firmware type': 'Rotorflight', 'Firmware revision': 'Rotorflight 4.6.0 (sim) STM32F7X2', 'Log start datetime': log.start || '2026-10-04T12:00:00.000+00:00', 'Craft name': 'sim', looptime: 500, pid_process_denom: 2 };
     for (const [k, v] of Object.entries(Object.assign(fixed, log.header || {}))) if (v !== null && v !== undefined) H(k, v);
     const E = (type, write) => { out.push('E'.charCodeAt(0), type); write(); };
-    const prev = { gov: 0, air: 0, rescue: 0, prof: log.profile ? log.profile[0] : 0 };
+    const prev = { gov: 0, air: 0, rescue: 0, prof: log.profile ? log.profile[0] : 0, rate: log.rateProfile ? log.rateProfile[0] : 0 }, adj = new Map();
+    for (const [at, func, value] of log.adjustments || []) adj.set(at, (adj.get(at) || []).concat([[func, value]]));
+    const more = new Map(); for (const [at, type, data] of log.events || []) more.set(at, (more.get(at) || []).concat([[type, data || {}]]));
+    const writeEvent = (type, d, i) => E(type, () => { if (type === EV.SYNC_BEEP) vbU(out, time[i]); else if (type === EV.DISARM) vbU(out, d.reason || 0);
+        else if (type === EV.FLIGHT_MODE) { vbU(out, d.newFlags || 0); vbU(out, d.lastFlags || 0); }
+        else if (type === EV.CUSTOM_STRING) { const t = String(d.string || ''); if (t.length > 252) throw new Error('bbl_encode: a CUSTOM_STRING has at most 252 chars'); out.push(t.length); ascii(out, t); } else throw new Error(`bbl_encode: event type ${type} is not supported`); });
     for (let i = 0; i < n; i++) {
         if (i >= 1) {
             if (log.govState && log.govState[i] !== prev.gov) { prev.gov = log.govState[i]; E(EV.GOVERNOR_STATE, () => vbU(out, prev.gov)); }
             if (log.airborne && log.airborne[i] !== prev.air) { prev.air = log.airborne[i]; E(EV.AIRBORNE_STATE, () => vbU(out, prev.air)); }
             if (log.rescueState && log.rescueState[i] !== prev.rescue) { prev.rescue = log.rescueState[i]; E(EV.RESCUE_STATE, () => vbU(out, prev.rescue)); } // unsigned VB, flightlog_parser.js:1543
             if (log.profile && log.profile[i] !== prev.prof) { prev.prof = log.profile[i]; E(EV.INFLIGHT_ADJUSTMENT, () => { out.push(2); vbS(out, prev.prof); }); }
+            if (log.rateProfile && log.rateProfile[i] !== prev.rate) { prev.rate = log.rateProfile[i]; E(EV.INFLIGHT_ADJUSTMENT, () => { out.push(1); vbS(out, prev.rate); }); }
+            for (const [func, value] of adj.get(i) || []) E(EV.INFLIGHT_ADJUSTMENT, () => { out.push(func); vbS(out, value); });
+            for (const [type, d] of more.get(i) || []) writeEvent(type, d, i);
         }
         if (log.gapAt === i) E(EV.LOGGING_RESUME, () => { vbU(out, iter[i]); vbU(out, time[i]); });
         if (slow.length && (i === 0 || slow.some(([, c]) => c[i] !== c[i - 1]))) { out.push('S'.charCodeAt(0)); for (const [, c] of slow) vbU(out, c[i]); }
@@ -116,7 +139,8 @@ function gauss(rand) { return Math.sqrt(-2 * Math.log(rand() + 1e-12)) * Math.co
  * and ANGLE over `level` [from, to] s. RESCUE_STATE as the firmware logs a rescue: PULLUP at the switch, CLIMB after 0.3 s,
  * EXIT from the switch drop for rescue_exit_time 0.5 s, then OFF, so the state outlasts the switch (Gaui #58: EXIT to OFF
  * 0.50 s each time). Truth for the tests: `truth.rescueFrames` (switch on), `truth.rescueStateFrames` (state not OFF),
- * `truth.levelFrames`, the targets per profile, the frame count.
+ * `truth.levelFrames`, the targets per profile, the frame count. Rate profiles from `rateProfiles` [{ from s, profile }]
+ * (null: no change is logged) and other in-flight adjustments from `adjustments` [[s, func, value], ...].
  */
 function simulateFlight(o = {}) {
     o = Object.assign({ seconds: 60, seed: 1, profiles: [{ from: 0, profile: 1, target: 2500 }], airborne: [6, 54], rescue: null, level: null, gapAt: null, gapFrames: 300, header: {}, start: '2026-10-04T12:00:00.000+00:00' }, o);
@@ -176,8 +200,10 @@ function simulateFlight(o = {}) {
         rescued += inRescue ? 1 : 0; rescueStates += rescueState[i] ? 1 : 0; levelled += inLevel ? 1 : 0;
         flags[i] = 1 | (inRescue ? 1 << RESCUE_BIT : 0) | (inLevel ? 1 << ANGLE_BIT : 0);
     }
-    return { w, header: hdr, start: o.start, govState, airborne: o.airborne ? airborne : null, rescueState: o.rescue ? rescueState : null, profile,
-        gapAt: o.gapAt === null ? null : Math.round(o.gapAt * RATE / 32) * 32, gapFrames: o.gapFrames,
+    const rateProfile = o.rateProfiles ? Uint8Array.from({ length: n }, (_, i) => o.rateProfiles.filter(q => q.from <= i * dt).pop().profile) : null;
+    return { w, header: hdr, start: o.start, govState, airborne: o.airborne ? airborne : null, rescueState: o.rescue ? rescueState : null, profile, rateProfile,
+        adjustments: (o.adjustments || []).map(([t, func, value]) => [Math.round(t * RATE), func, value]),
+        gapAt: o.gapAt === null ? null : Math.round(o.gapAt * RATE / 32) * 32, gapFrames: o.gapFrames, clock: o.clock || null,
         slow: { flightModeFlags: flags, stateFlags: zeros, failsafePhase: zeros, rxSignalReceived: ones, rxFlightChannelsValid: ones },
         truth: { frames: n, rescueFrames: rescued, rescueStateFrames: rescueStates, levelFrames: levelled, targets: Object.fromEntries(o.profiles.map(q => [q.profile, q.target])) } };
 }

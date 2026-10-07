@@ -181,7 +181,8 @@ function decodeNotchSource(code, gear) {
     const mainGR = gear ? ratio(gear.main) : null, tailPair = gear ? gear.tail : null;
     if (code === 10) return { code, kind: 'main motor', harmonic: 1, order: mainGR ? 1 / mainGR : null, enabled: mainGR === null ? null : mainGR !== 1 };
     if (code >= 11 && code <= 18) return { code, kind: 'main rotor', harmonic: code - 10, order: code - 10, enabled: true };
-    if (code === 20) return { code, kind: 'tail motor', harmonic: 1, order: null, enabled: gear ? !!gear.motorisedTail && ratio(tailPair) !== 1 : null };
+    // motorisedTail null (a gear from the log notch fit with no tail fit: tuning_worker gearFit): the tail type is unknown
+    if (code === 20) return { code, kind: 'tail motor', harmonic: 1, order: null, enabled: gear && gear.motorisedTail !== null ? !!gear.motorisedTail && ratio(tailPair) !== 1 : null };
     if (code >= 21 && code <= 28) {
         const k = code - 20; let order = null;
         if (gear && !gear.motorisedTail && tailPair) order = k * Math.max(tailPair[1], 1) / Math.max(tailPair[0], 1);
@@ -342,9 +343,9 @@ function analyse(w, ctx = {}) {
         need(['T6', 'G3', 'G4'], ['setpoint[3]'], 'collective');
         out.D3 = { fields, skips, govStateEvents: !!ctx.govState }; }
 
-    // D4 header against CLI
-    if (!cli) out.D4 = { skipped: 'no CLI dump given (ctx.cli undefined)' };
-    else {
+    // D4 header against CLI: only with a CLI dump, an optional input (user rule 2026-10-06: the log is the only necessary
+    // input). Without one there is no D4 metric and no D4 result, not a result that was not done
+    if (cli) {
         const profiles = Object.keys(cli.profiles).map(Number), score = profiles.map(p => ({ p, rows: compareCli(h, cli, p) })).map(s => ({ p: s.p, rows: s.rows, bad: s.rows.filter(v => !v.match && v.where !== 'global').length }));
         const guess = profile[0] > 0 ? profile[0] - 1 : null, best = score.slice().sort((a, b) => a.bad - b.bad)[0] || null;
         const chosen = guess !== null && profiles.includes(guess) ? guess : best ? best.p : null, rows = compareCli(h, cli, chosen);
@@ -474,7 +475,8 @@ function judge(flights, RULES = DEFAULT_RULES) {
             add({ id: 'D3', severity: sk.length ? 'note' : 'ok', log, value: sk.length, source: R.D3.source,
                 text: sk.length ? 'checks that cannot run: ' + sk.map(s => `${s.checks.join('/')} (${s.missing.join(', ')})`).join('; ') : 'all fields for the checks are present.' }); }
         // D4
-        if (m.D4.skipped) add({ id: 'D4', severity: 'skipped', log, source: R.D4.source, text: m.D4.skipped });
+        if (!m.D4) { /* no CLI dump: no D4 result */ }
+        else if (m.D4.skipped) add({ id: 'D4', severity: 'skipped', log, source: R.D4.source, text: m.D4.skipped });
         else { const d = m.D4, mm = d.mismatches, gm = d.cliOnly.gov_mode, gd = d.cliOnly.govModeFromData, govClash = gm && gd && ((/DIRECT|LIMIT|OFF/.test(gm) && /^PID/.test(gd)) || (/ELECTRIC|NITRO/.test(gm) && /^no PID/.test(gd)));
             add({ id: 'D4', severity: mm.length || govClash ? 'flag' : 'ok', log, profile: d.profileCompared, value: mm.length, n: d.compared, threshold: 'any disagreement', source: R.D4.source,
                 text: `header vs CLI (${d.cliKind}, CLI profile ${d.profileCompared}, chosen by ${d.profileChosenBy}): ${mm.length} of ${d.compared} values differ` + (mm.length ? ': ' + mm.slice(0, 12).map(v => `${v.header} ${v.headerValue} vs ${v.cli} ${v.cliValue}${v.from === 'default' ? ' (default)' : ''}`).join('; ') + (mm.length > 12 ? '; ...' : '') + '. Trust the log header for header keys.' : '.')

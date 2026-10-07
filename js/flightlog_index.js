@@ -61,11 +61,15 @@ function FlightLogIndex(logData) {
                 eventInThisChunk = null,
                 currentPIDProfile = 0,
                 parsedHeader,
-                sawEndMarker = false;
+                sawEndMarker = false,
+                eventBeforeFirstChunk = false;
 
             try {
                 parser.parseHeader(logBeginOffsets[i], logBeginOffsets[i + 1]);
                 parsedHeader = true;
+                // Chunk 0 starts here, at the end of the header, not at the first I-frame: the events before the first
+                // I-frame (SYNC_BEEP, GOVSTATE, the parameter journal) belong to it (flightlog.js)
+                intraIndex.dataStart = parser.headerEndOffset;
             } catch (e) {
                 console.log("Error parsing header of log #" + (i + 1) + ": " + e);
                 intraIndex.error = e;
@@ -126,6 +130,11 @@ function FlightLogIndex(logData) {
                                     intraIndex.times.push(frameTime);
                                     intraIndex.offsets.push(frameOffset);
 
+                                    // The events before the first I-frame are in chunk 0
+                                    if (intraIndex.times.length == 1 && eventBeforeFirstChunk) {
+                                        intraIndex.hasEvent[0] = true;
+                                    }
+
                                     if (motorFields.length) {
                                         throttleTotal = 0;
                                         for (var j = 0; j < motorFields.length; j++) {
@@ -158,6 +167,8 @@ function FlightLogIndex(logData) {
                             // Mark that there was an event inside the current chunk
                             if (intraIndex.times.length > 0) {
                                 intraIndex.hasEvent[intraIndex.times.length - 1] = true;
+                            } else {
+                                eventBeforeFirstChunk = true;
                             }
 
                             if (frame.event == FlightLogEvent.LOG_END) {

@@ -285,6 +285,21 @@ test('cell count: an inferred count that is ambiguous gives no per-cell verdict;
     assert.equal(clean.metrics.D5.cells, 6); assert.equal(clean.metrics.D5.cellsAmbiguous, false);
 });
 
+test('cell count: the firmware rule (battery.c, health_power autoCells) with the cell levels of the log header needs no CLI dump', () => {
+    // the same 6S pack at 21.7 V: with vbatcellvoltage 330, 350, 430 of the header, the smallest count whose range holds 21.7 V is 6
+    // (5 x 3.30-4.30 V = 16.5-21.5 V, 6 x = 19.8-25.8 V); the per-cell verdict is given as with the CLI count
+    const header = { collectiveRange: [-1250, 1250], govPID: [10, 30, 0, 23, 100], vbatmincellvoltage: 330, vbatwarningcellvoltage: 350, vbatmaxcellvoltage: 430 };
+    const r = run({ seconds: 40, vStart: 21.7, vEnd: 19 }, { header }), d5 = r.metrics.D5;
+    assert.deepEqual([d5.cells, d5.cellsAmbiguous], [6, false], d5.cellsSource);
+    assert.match(d5.cellsSource, /^firmware rule \(battery\.c\): resting 21\.\d+ V at log start, 3\.3-4\.3 V\/cell \(log header vbatcellvoltage\)$/);
+    assert.equal(r.of('G13')[0].severity, 'flag', r.of('G13')[0].text);
+    assert.ok(Math.abs(r.metrics.G13.minCell - 19 / 6) < 0.03, `min ${r.metrics.G13.minCell}`);
+    // a CLI count comes first; a voltage that no count of the rule holds (13.0 V: 3 x 4.30 = 12.9 V, 4 x 3.30 = 13.2 V) keeps the old inference
+    assert.match(run({ seconds: 40, vStart: 21.7, vEnd: 19 }, { header, cells: 6, cellsSource: 'CLI battery_cell_count' }).metrics.D5.cellsSource, /^CLI/);
+    const none = run({ seconds: 40, vStart: 13.0, vEnd: 12 }, { header }).metrics.D5;
+    assert.match(none.cellsSource, /^inferred/, none.cellsSource);
+});
+
 test('D5 low voltage needs a duration and reports how many samples are below, not one sample', () => {
     const d = run({ vEnd: 17 }).of('D5').find(f => /below 3 V\/cell/.test(f.text));
     assert.ok(d && d.severity === 'flag');

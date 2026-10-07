@@ -11,7 +11,8 @@ const vm = require('node:vm');
 const SRC = fs.readFileSync(path.join(__dirname, '../js/tuning_plot.js'), 'utf8');
 const METHODS = ['save', 'restore', 'beginPath', 'closePath', 'moveTo', 'lineTo', 'rect', 'arc', 'fill', 'stroke', 'clip',
     'fillRect', 'strokeRect', 'clearRect', 'fillText', 'strokeText', 'setLineDash', 'setTransform', 'translate', 'rotate', 'drawImage'];
-const RED = '#fb8072', CYAN = '#8dd3c7'; // PALETTE[0], PALETTE[1]: default colours of series 0 and 1
+const RED = '#fb8072', CYAN = '#8dd3c7';
+const plain = (v) => JSON.parse(JSON.stringify(v)); // objects of the vm realm have its prototypes // PALETTE[0], PALETTE[1]: default colours of series 0 and 1
 
 function rng(seed) { let s = seed >>> 0; return () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296; }
 
@@ -355,8 +356,9 @@ test('100k-point series: drawn in under 50 ms, decimated to the pixel columns, e
     assert.ok(ms < 50, `draw took ${ms.toFixed(1)} ms`);
     const path = calls(ctx, 'moveTo', 'lineTo').filter((c) => c.stroke === RED).map((c) => c.args[1]);
     assert.ok(path.length > 800 && path.length <= 4 * 800, 'path points ' + path.length);
-    // y range [-1000, 1000] padded 5 %: plot box 8..200 px (220 high, no title or x label)
-    const px = (v) => 200 + (v + 1100) * (8 - 200) / 2200;
+    // y range [-1000, 1000] padded 5 %: plot box 10..196 px (220 high, no title or x label; at 100 % text the margins are
+    // 1.2 x those of the 10 px font, SPEC3 C: top round(8 x 1.2), bottom round(20 x 1.2))
+    const px = (v) => 196 + (v + 1100) * (10 - 196) / 2200;
     assert.ok(Math.abs(Math.min(...path) - px(1000)) < 1e-9 && Math.abs(Math.max(...path) - px(-1000)) < 1e-9, 'spikes drawn');
     const t1 = performance.now();
     for (let k = 0; k < 20; k++) canvas.fire('mousemove', 100 + 30 * k, 100);
@@ -506,6 +508,81 @@ test('labels: a two-entry legend leaves a row below it; every vline label shows 
     clean(p);
 });
 
+
+// the box of a label from its fillText call (6 px a character in the fake context, 13 px a row): [x0, y0, x1, y1]
+function labelBox(ctx, text) {
+    const c = calls(ctx, 'fillText').find((q) => q.args[0] === text);
+    if (!c) return null;
+    const w = String(text).length * 6, x0 = c.align === 'right' ? c.args[1] - w : c.args[1];
+    return [x0, c.args[2], x0 + w, c.args[2] + 12];
+}
+const overlap = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+
+test('labels (V10): the line labels keep clear of the band labels, the vline labels and the legend; each label is drawn after the curves on a dark box', () => {
+    // A14.png: the T8 spans "Tail output limit" along the top, and the limit lines at 1250 and -1250 permille near the edges
+    const x = Array.from({ length: 321 }, (_, i) => i), y = x.map((t) => 1200 * Math.sin(t / 3));
+    const a = plot({ title: 'Measurement: T8, yaw, PID profile 1, log 1', x: { min: 0, max: 320 }, y: { min: -1300, max: 1300 },
+        series: [{ name: 'tail output (mixer[2])', x, y }],
+        bands: [{ x0: 100, x1: 102, label: 'Tail output limit' }, { x0: 230, x1: 232, label: 'Tail output limit' }],
+        hlines: [{ y: 1250, label: 'Tail output limit 1250 ‰' }, { y: -1250, label: 'Tail output limit -1250 ‰' }] });
+    // D07.png: "Hover tail trim" along the top and the limit at -187.5 permille at the top edge, with a legend of two entries
+    const b = plot({ x: { min: 175, max: 186 }, y: { min: -400, max: -187.5 },
+        series: [{ name: 'axisI[2]', x: [175, 186], y: [-210, -290] }, { name: 'mixer[2]', x: [175, 186], y: [-280, -330] }],
+        bands: [{ x0: 175, x1: 186, label: 'Hover tail trim' }],
+        hlines: [{ y: -187.5, label: 'Limit -187.5 ‰ (15 % of the tail output range)' }, { y: -265, label: 'Hover median -265 ‰' }] });
+    // D06.png: the yaw notch label at 76.7 Hz and the peak line at 156 Hz that crossed it
+    const c = plot({ x: { min: 0, max: 500 }, y: { min: 0.01, max: 20, log: true }, series: [{ name: 'gyroRAW[2]', x: [0, 500], y: [1, 1] }],
+        vlines: [{ x: 156, label: 'Peak 156 Hz' }, { x: 153, label: 'Roll notch filter 153 Hz' }, { x: 76.7, label: 'Yaw notch filter 76.7 Hz' }] });
+    for (const [p, labels] of [[a, ['Tail output limit', 'Tail output limit 1250 ‰', 'Tail output limit -1250 ‰']],
+        [b, ['Hover tail trim', 'Limit -187.5 ‰ (15 % of the tail output range)', 'Hover median -265 ‰']],
+        [c, ['Peak 156 Hz', 'Roll notch filter 153 Hz', 'Yaw notch filter 76.7 Hz']]]) {
+        const boxes = labels.map((t) => [t, labelBox(p.ctx, t)]).filter((q) => q[1]);
+        assert.ok(boxes.length >= 2, 'drawn: ' + boxes.map((q) => q[0]).join(', '));
+        for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
+            assert.ok(!overlap(boxes[i][1], boxes[j][1]), `"${boxes[i][0]}" ${boxes[i][1]} over "${boxes[j][0]}" ${boxes[j][1]}`);
+        }
+        // after the curves: the last stroke of a series comes before the first label; a dark box under each label
+        const log = p.ctx.log, first = log.findIndex((q) => q.m === 'fillText' && labels.includes(q.args[0]));
+        const clip = log.findIndex((q) => q.m === 'clip'), end = log.findIndex((q, i) => i > clip && q.m === 'restore'); // inside the plot box (the legend comes later)
+        const lastCurve = log.map((q, i) => (q.m === 'stroke' && q.stroke === RED && i > clip && i < end ? i : -1)).filter((i) => i >= 0).pop();
+        assert.ok(lastCurve > clip && first > lastCurve && first < end, `labels after the curves, in the plot box: ${clip} ${lastCurve} ${first} ${end}`);
+        for (const [t] of boxes) {
+            const k = log.findIndex((q) => q.m === 'fillText' && q.args[0] === t), box = log.slice(0, k).reverse().find((q) => q.m === 'fillRect');
+            assert.equal(box.fill, 'rgba(20,20,20,0.72)', t + ': on a dark box');
+        }
+        clean(p);
+    }
+    assert.ok(labelBox(a.ctx, 'Tail output limit 1250 ‰') && labelBox(a.ctx, 'Tail output limit -1250 ‰'), 'both limits have their labels');
+    // a line label that finds no room shows in the readout when the mouse is on its line
+    const full = plot({ x: { min: 0, max: 10 }, y: { min: 0, max: 10 }, legend: false, series: [{ x: [0, 10], y: [0, 10] }],
+        hlines: [5, 5.05, 5.1, 5.15].map((v, i) => ({ y: v, label: 'line label number ' + i + ' that is long, longer than half of the plot width' })) });
+    const drawn = [0, 1, 2, 3].filter((i) => labelBox(full.ctx, 'line label number ' + i + ' that is long, longer than half of the plot width'));
+    assert.ok(drawn.length < 4, 'four long labels on one line do not fit');
+    const miss = [0, 1, 2, 3].find((i) => !drawn.includes(i)), y4 = yPixel(full.ctx, '4'), y6 = yPixel(full.ctx, '6');
+    const tx = hover(full, 300, Math.round(y4 + (y6 - y4) * ([5, 5.05, 5.1, 5.15][miss] - 4) / 2) + 0.5);
+    assert.ok(tx.some((t) => t.startsWith('line label number ' + miss)), 'the readout names the line: ' + tx.join(' | '));
+});
+
+test('a title that is wider than the plot goes on two lines, the second cut with "…" (V10: the lens plot title)', () => {
+    const title = 'Tracking error, roll: setpoint and gyro after a low-pass filter at 30 Hz';
+    const p = plot({ title, x: { min: 0, max: 10 }, y: { min: 0, max: 1 }, series: [{ x: [0, 10], y: [0, 1] }] }, { width: 300 });
+    const lines = calls(p.ctx, 'fillText').filter((q) => q.align === 'left' && q.baseline === 'top' && (q.args[2] === 6 || q.args[2] === 22)).map((q) => q.args); // ROW 16 at 100 % text
+    assert.equal(lines.length, 2, JSON.stringify(lines));
+    const left = lines[0][1];
+    for (const l of lines) assert.ok(left + String(l[0]).length * 6 <= 300 - 8, 'inside the canvas: ' + l[0]);
+    assert.equal(lines[0][0] + ' ' + lines[1][0].replace(/…$/, ''), title.slice(0, lines[0][0].length + 1 + lines[1][0].replace(/…$/, '').length), 'the words in their sequence');
+    const frame = calls(p.ctx, 'strokeRect')[0].args;
+    assert.ok(frame[1] >= 35, 'the plot box starts under the two lines: ' + frame[1]);
+    const one = plot({ title: 'Short', x: { min: 0, max: 10 }, y: { min: 0, max: 1 }, series: [{ x: [0, 10], y: [0, 1] }] }, { width: 300 });
+    assert.equal(calls(one.ctx, 'strokeRect')[0].args[1], 26.5, 'one line: the plot box under the title (round(22 x 1.2) at 100 % text)');
+    const { TP } = setup(), m = { measureText: (t) => ({ width: String(t).length * 6 }) };
+    assert.deepEqual([...TP.wrapTitle(m, 'a b c', 100)], ['a b c']);
+    assert.deepEqual([...TP.wrapTitle(m, 'aaaa bbbb cccc dddd', 60)], ['aaaa bbbb', 'cccc dddd']);
+    assert.deepEqual([...TP.wrapTitle(m, 'aaaa bbbb cccc dddd eeee', 60)], ['aaaa bbbb', 'cccc dddd…']);
+    assert.equal(TP.fitText(m, 'abcdefghijkl', 30), 'abcd…');
+    clean(p);
+});
+
 test('unsorted x: every point drawn (no binary-search window), no hover readout', () => {
     const p = plot({ legend: false, x: { min: 0, max: 4 }, y: { min: 0, max: 4 }, series: [{ name: 'ev', x: [3, 1, 2], y: [3, 1, 2], points: true, width: 0 }] });
     assert.equal(calls(p.ctx, 'arc').length, 3);
@@ -547,4 +624,70 @@ test('resize, late layout, destroy and re-attach', () => {
     const a = env.TP.attach(canvas, {}), b = env.TP.attach(canvas, {}); // the second replaces the first
     assert.ok(['mousemove', 'mouseleave', 'click'].every((t) => canvas.listeners[t].length === 1));
     assert.notEqual(a, b);
+});
+
+// --- SPEC3 C: the text size of the views --------------------------------------------------------------------------------
+
+test('text size: the fonts, the line height, the margins and the tick spacing follow setTextScale; the live plots draw again', () => {
+    const env = setup(1), canvas = fakeCanvas(800), spec = { title: 'Roll', x: { label: 'Time', unit: 's', min: 0, max: 10 }, y: { min: 0, max: 1 },
+        series: [{ name: 'gyro', x: [0, 10], y: [0, 1] }] };
+    assert.deepEqual(plain(env.TP.textMetrics()), { scale: 1, k: 1.2, font: '12px Verdana, Arial, sans-serif', title: 'bold 13px Verdana, Arial, sans-serif', row: 16 }, '100 %: 12 px tick labels');
+    env.TP.attach(canvas, spec);
+    const cache = env.created[env.created.length - 1], first = calls(cache.ctx, 'strokeRect')[0].args;
+    assert.equal(env.TP.livePlots(), 1);
+    let redraws = 0;
+    const off = env.TP.onTextScale((s) => { redraws++; assert.equal(s, 1.6); });
+    cache.ctx.log.length = 0;
+    // a font that the stand-in measures: 0.6 x the px size for each character, so the margins follow the text
+    let px = 12;
+    cache.ctx.measureText = (t) => ({ width: String(t).length * 0.6 * px });
+    Object.defineProperty(cache.ctx, 'font', { set(v) { px = parseFloat(/(\d+)px/.exec(v)[1]); this._font = v; }, get() { return this._font; }, configurable: true });
+    assert.equal(env.TP.setTextScale(1.6), 1.6);
+    assert.equal(redraws, 1, 'the listeners after the plots');
+    assert.equal(cache.ctx._font, '19px Verdana, Arial, sans-serif', '10 px x 1.2 x 1.6');
+    const box = calls(cache.ctx, 'strokeRect')[0].args;
+    assert.ok(box[1] > first[1], `the plot box starts lower under the larger title: ${first[1]} -> ${box[1]}`);
+    assert.ok(box[0] + box[2] <= 800 && box[1] + box[3] < 220 - 34 * 1.2 * 1.6 + 1, 'the bottom margin holds the larger tick labels and the axis title');
+    assert.deepEqual(plain(env.TP.textMetrics()), { scale: 1.6, k: 1.92, font: '19px Verdana, Arial, sans-serif', title: 'bold 21px Verdana, Arial, sans-serif', row: 25 });
+    assert.equal(env.TP.setTextScale(1.6), 1.6, 'the same scale: no draw');
+    assert.equal(redraws, 1);
+    // out of range or not a number: held to 0.5 to 3, or 100 %
+    assert.equal(env.TP.setTextScale(9), 3);
+    assert.equal(env.TP.setTextScale('x'), 1);
+    off();
+    env.TP.setTextScale(1.2);
+    assert.equal(redraws, 3, 'no call after the listener is removed');
+    // a destroyed plot and a plot taken off the page are not drawn again
+    canvas._tuningPlot.destroy();
+    assert.equal(env.TP.livePlots(), 0);
+    const gone = fakeCanvas(800);
+    env.TP.attach(gone, spec);
+    gone.isConnected = false;
+    const n = env.created.length, c2 = env.created[n - 1];
+    c2.ctx.log.length = 0;
+    env.TP.setTextScale(1.4);
+    assert.equal(calls(c2.ctx, 'strokeRect').length, 0, 'detached: no draw');
+    assert.equal(env.TP.livePlots(), 0, 'and no longer kept');
+});
+
+test('SPEC3 G: the spectra of the filter calculation (js/tuning_dialog.js ftPlotSpecs) draw on log y axes with their legend, also with a bin at 0 Hz and a series that is null', () => {
+    const env = setup();
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../js/tuning_dialog.js'), 'utf8'), env.realm, { filename: 'js/tuning_dialog.js' });
+    const f = Float32Array.from({ length: 200 }, (_, i) => i * 2.5), c = (k) => Float32Array.from(f, (x) => k / (1 + x)); // 0 Hz first: finite, positive
+    const res = { curves: { f, windows: 46, roll: { raw: c(9), logged: c(4), predicted: c(4.1), candidate: c(1), pidOut: c(3), pidOutCandidate: c(0.5) },
+        yaw: { raw: c(9), logged: c(4), predicted: c(4.1), candidate: null, pidOut: c(3), pidOutCandidate: null } } };
+    const specs = env.realm.TuningDialog.internals.ftPlotSpecs(res, 'roll').map((it) => it.spec);
+    assert.equal(specs.length, 2);
+    for (const spec of specs) {
+        const canvas = fakeCanvas(800), h = env.TP.attach(canvas, spec), ctx = env.created[env.created.length - 1].ctx;
+        assert.deepEqual([...ctx.bad, ...canvas.ctx.bad], [], spec.title + ': non-finite canvas arguments');
+        const tx = texts(ctx);
+        assert.ok(tx.includes(spec.title), spec.title);
+        for (const s of spec.series) assert.ok(tx.includes(s.name), s.name + ' in the legend');
+        assert.ok(tx.includes('frequency (Hz)'), 'the x axis label');
+        h.destroy();
+    }
+    const yaw = env.realm.TuningDialog.internals.ftPlotSpecs(res, 'yaw').map((it) => it.spec);
+    assert.deepEqual(plain(yaw.map((s) => s.series.length)), [3, 1], 'no series for the recommended values of an axis without them');
+    assert.deepEqual(plain(env.realm.TuningDialog.internals.ftPlotSpecs({ curves: { f } }, 'pitch')), [], 'no plot for an axis without curves');
 });

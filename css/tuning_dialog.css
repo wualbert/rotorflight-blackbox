@@ -1,32 +1,11 @@
-/* Tuning dialog (js/tuning_dialog.js). Status colours as in css/flight_analysis_dialog.css; plot panels dark like the analyser. */
+/* Tuning view (js/tuning_dialog.js). Status colours as in css/flight_analysis_dialog.css; plot panels dark like the analyser.
+ * #viewTuning is the scroll container (css/main.css "Views"); .tuning-tabs sticks at its top edge, top: -10px against
+ * the 10 px padding here. */
 
-.tuning-dialog .modal-dialog {
-    width: auto;
-    margin: 10px;
-}
-
-.tuning-dialog .modal-header {
-    padding: 10px 15px;
-}
-
-.tuning-dialog .modal-body {
-    max-height: calc(100vh - 72px);
-    overflow-y: auto;
+#viewTuning {
     padding: 10px 15px 14px;
-    font-size: 13px;
+    font-size: calc(15 * var(--rf-px));
     color: #303030;
-}
-
-@media (min-width: 768px) {
-    .tuning-dialog .modal-dialog {
-        width: 90%;
-        max-width: 1200px;
-        margin: 30px auto;
-    }
-
-    .tuning-dialog .modal-body {
-        max-height: calc(100vh - 115px);
-    }
 }
 
 .tuning-hide {
@@ -45,12 +24,12 @@
     gap: 2px 14px;
     margin-bottom: 8px;
     color: #606060;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 .tuning-context strong {
     color: #303030;
-    font-size: 13px;
+    font-size: calc(15 * var(--rf-px));
 }
 
 .tuning-controls {
@@ -80,13 +59,135 @@
 }
 
 .tuning-controls .tuning-rpm {
-    width: 104px;
+    width: calc(175 * var(--rf-px)); /* "automatic: 2900" with the arrows of a number field (V10) */
+}
+
+/* The CLI dump: an optional input on its own line under the controls (the log is the only necessary input) */
+.tuning-cli-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+    margin-top: 6px;
+    color: #606060;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-cli-line .btn-xs {
+    padding: 0 6px;
+}
+
+.tuning-cli-about {
+    flex: 1 1 100%;
+    font-size: calc(13 * var(--rf-px));
+}
+
+.tuning-cli-about code {
+    color: inherit;
+    background: none;
+    padding: 0;
+}
+
+.tuning-cli-conflicts {
+    margin: 4px 0 0;
+    padding-left: 18px;
+}
+
+/* D12: the PID profile at the start of a log; its basis is in the title */
+.tuning-start {
+    border-bottom: 1px dotted #a0a0a0;
+    cursor: help;
+}
+
+/* Values that are possibly not current (result.epochs, f.stale, r.stale): the mark of a result, a period or a recommendation,
+   its text and links, and the parts of the logs in the Configurations tab. The mark is a tag, not a status: no capitals */
+.tuning-badge.st-stale {
+    border-color: #d9b36a;
+    border-style: dashed;
+    background: #fffaf0;
+    color: #7a5208;
+    letter-spacing: 0;
+    text-transform: none;
+    cursor: help;
+}
+
+.tuning-stale {
+    margin: 0 0 4px;
+}
+
+.tuning-stale > summary {
+    cursor: pointer;
+    outline: none;
+}
+
+.tuning-stale-text {
+    color: #5a4a2a;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-stale-links {
+    margin-top: 2px;
+    font-size: calc(13 * var(--rf-px));
+}
+
+.tuning-stale-links a {
+    white-space: nowrap;
+}
+
+.tuning-spans a.is-stale {
+    text-decoration: underline dashed #c28a1e;
+}
+
+.tuning-rec-list.is-stale {
+    color: #7a5208;
+}
+
+.tuning-fresh {
+    margin-top: 14px;
+}
+
+.tuning-fresh-caveat {
+    margin: 4px 0 8px;
+    padding: 4px 8px;
+    border-left: 3px solid #d9b36a;
+    background: #fffaf0;
+    color: #5a4a2a;
+}
+
+.tuning-fresh-causes {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+    margin: 4px 0 8px;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.tuning-fresh-causes dt {
+    font-weight: 600;
+}
+
+.tuning-fresh-causes dd {
+    margin: 0;
+}
+
+.tuning-fresh-cause {
+    border-bottom: 1px dotted #a0a0a0;
+    cursor: help;
+}
+
+/* The notch orders of the log (result.notchFit) over the plots of the Filters tab */
+.tuning-notch-fit {
+    margin: 4px 0 6px;
+}
+
+.tuning-cli-off {
+    color: #a3362e;
 }
 
 .tuning-cli-name a {
     margin-left: 2px;
     color: #909090;
-    font-size: 15px;
+    font-size: calc(17.5 * var(--rf-px));
     text-decoration: none;
 }
 
@@ -96,11 +197,114 @@
     margin-left: auto;
 }
 
+/* "Selected flights" (SPEC3 D): the logs of the file and their flights, under the controls */
+.tuning-fsel {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid #dde1e5;
+    border-left: 4px solid #4da8da;
+    border-radius: 4px;
+    background: #fafbfc;
+}
+
+/* The list collapses under its head (2026-10-06): a <details>, closed when a selection exists; the flights of a log with more
+   than one flight collapse under its row. The summary keeps its marker (display: list-item) and the keyboard (Enter, Space) */
+.tuning-fsel-head {
+    display: list-item;
+    cursor: pointer;
+}
+
+.tuning-fsel-head:focus-visible,
+.tuning-fsel-sub > summary:focus-visible {
+    outline: 2px solid #4da8da;
+    outline-offset: 2px;
+}
+
+.tuning-fsel-box[open] > .tuning-fsel-head {
+    margin-bottom: 6px;
+}
+
+.tuning-fsel-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.tuning-fsel-sub > summary {
+    display: list-item;
+    cursor: pointer;
+    color: #505050;
+}
+
+.tuning-fsel-flights {
+    padding: 2px 0 0 14px;
+}
+
+/* The "Logs" control: what the analysis uses, beside the control (also in the Analysis view, js/analysis_view.js) */
+.tuning-scope-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+}
+
+.tuning-scope-text {
+    white-space: normal;
+}
+
+.tuning-scope-bar .form-control {
+    display: inline-block;
+    width: auto;
+}
+
+.tuning-fsel-help {
+    margin: 4px 0 6px;
+}
+
+.tuning-fsel-wrap {
+    max-height: calc(340 * var(--rf-px));
+    overflow-y: auto;
+}
+
+.tuning-fsel-table td,
+.tuning-fsel-table th {
+    vertical-align: top;
+}
+
+.tuning-fsel-table td:first-child {
+    width: calc(28 * var(--rf-px));
+}
+
+.tuning-fsel-row.is-bench,
+.tuning-fsel-row.is-nodata {
+    color: #909090;
+}
+
+.tuning-fsel-row.is-on {
+    background: #eef5fb;
+}
+
+.tuning-fsel-flight {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0 14px 2px 0;
+    font-weight: normal;
+    white-space: nowrap;
+}
+
+.tuning-fsel input[type="checkbox"] {
+    width: calc(15 * var(--rf-px));
+    height: calc(15 * var(--rf-px));
+    margin: 0;
+    vertical-align: -2px;
+}
+
 .tuning-progress {
     display: flex;
     align-items: center;
     gap: 10px;
-    height: 24px;
+    min-height: calc(28 * var(--rf-px));
     margin: 4px 0 6px;
 }
 
@@ -145,7 +349,7 @@
     white-space: nowrap;
     text-overflow: ellipsis;
     color: #505050;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
     font-variant-numeric: tabular-nums;
 }
 
@@ -155,7 +359,7 @@
     border-left: 4px solid #3a7fc1;
     border-radius: 3px;
     background: #eef5fb;
-    font-size: 12.5px;
+    font-size: calc(14.5 * var(--rf-px));
 }
 
 .tuning-notice.is-warn {
@@ -176,7 +380,7 @@
     max-height: 160px;
     margin: 4px 0 0;
     overflow: auto;
-    font-size: 11px;
+    font-size: calc(12.5 * var(--rf-px));
 }
 
 /* Tabs; the strip stays visible while the body scrolls */
@@ -220,7 +424,7 @@
     border-radius: 8px;
     background: #ebebeb;
     color: #505050;
-    font-size: 10.5px;
+    font-size: calc(12 * var(--rf-px));
 }
 
 .tuning-tab-count:empty {
@@ -234,7 +438,7 @@
 @media (max-width: 900px) {
     .tuning-tab {
         padding: 8px 6px 6px;
-        font-size: 12px;
+        font-size: calc(14 * var(--rf-px));
     }
 
     .tuning-tab-count {
@@ -252,26 +456,26 @@
 }
 
 .tuning-intro {
-    max-width: 760px;
+    max-width: calc(880 * var(--rf-px));
     padding: 12px 2px;
     color: #404040;
 }
 
 .tuning-summary {
     margin: 0 0 10px;
-    font-size: 14px;
+    font-size: calc(16 * var(--rf-px));
 }
 
 .tuning-summary .tuning-muted {
     display: block;
     margin-top: 2px;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 .tuning-h {
     margin: 16px 0 6px;
     color: #303030;
-    font-size: 13px;
+    font-size: calc(15 * var(--rf-px));
     font-weight: 600;
 }
 
@@ -290,45 +494,53 @@
     border-radius: 4px;
 }
 
-.tuning-card.st-good { border-left-color: #3c9d40; background: #f2f9f2; }
-.tuning-card.st-watch { border-left-color: #d99a1f; background: #fdf7ea; }
-.tuning-card.st-attention { border-left-color: #c9483f; background: #fbeeed; }
-.tuning-card.st-info { border-left-color: #3a7fc1; background: #eef5fb; }
-.tuning-card.st-insufficient { border-left-color: #b0b0b0; background: #f5f5f5; }
+.tuning-card.st-satisfactory { border-left-color: #3c9d40; background: #f2f9f2; }
+.tuning-card.st-monitor { border-left-color: #d99a1f; background: #fdf7ea; }
+.tuning-card.st-problem { border-left-color: #c9483f; background: #fbeeed; }
+.tuning-card.st-information { border-left-color: #3a7fc1; background: #eef5fb; }
+.tuning-card.st-insufficient,
+.tuning-card.st-notmeasured { border-left-color: #b0b0b0; background: #f5f5f5; }
 .tuning-card.st-error { border-left-color: #8e2a23; background: #f8e4e2; }
 
-.tuning-rec.st-watch { border-left-color: #d99a1f; }
-.tuning-rec.st-attention { border-left-color: #c9483f; }
-.tuning-rec.st-info { border-left-color: #3a7fc1; }
+.tuning-rec.st-monitor { border-left-color: #d99a1f; }
+.tuning-rec.st-problem { border-left-color: #c9483f; }
+.tuning-rec.st-information { border-left-color: #3a7fc1; }
+.tuning-rec.st-blocked { border-left-color: #b9776f; border-left-style: dashed; }
+.tuning-rec.st-possible { border-left-color: #8b6bb5; }
 
 .tuning-badge {
     display: inline-block;
-    min-width: 46px;
+    min-width: calc(53 * var(--rf-px));
     padding: 0 6px;
     border: 1px solid #ddd;
     border-radius: 3px;
     background: #f5f5f5;
     color: #707070;
-    font-size: 10.5px;
+    font-size: calc(12 * var(--rf-px));
     font-weight: 600;
-    line-height: 16px;
+    line-height: calc(18.5 * var(--rf-px));
     letter-spacing: 0.3px;
     text-align: center;
     text-transform: uppercase;
     white-space: nowrap;
 }
 
-.tuning-badge.st-attention { border-color: #ecc3bf; background: #fbeeed; color: #a3362e; }
-.tuning-badge.st-watch { border-color: #efd9a8; background: #fdf7ea; color: #8a5d0b; }
-.tuning-badge.st-good { border-color: #c4e2c5; background: #f2f9f2; color: #2b7230; }
-.tuning-badge.st-info { border-color: #c3daf0; background: #eef5fb; color: #2a5f94; }
+.tuning-badge.st-problem { border-color: #ecc3bf; background: #fbeeed; color: #a3362e; }
+.tuning-badge.st-start { border-color: #c9483f; background: #c9483f; color: #fff; }
+.tuning-badge.st-monitor { border-color: #efd9a8; background: #fdf7ea; color: #8a5d0b; }
+.tuning-badge.st-satisfactory { border-color: #c4e2c5; background: #f2f9f2; color: #2b7230; }
+.tuning-badge.st-information { border-color: #c3daf0; background: #eef5fb; color: #2a5f94; }
+.tuning-badge.st-blocked { border-color: #d9b5b0; border-style: dashed; background: #f8f1f0; color: #8d4a42; }
+.tuning-badge.st-possible { border-color: #d6c8ea; background: #f4f0fa; color: #6a4c95; }
+.tuning-badge.st-notapplicable { border-style: dashed; background: #fff; color: #9a9a9a; }
+.tuning-badge.st-notaccurate { border-color: #cfcfcf; background: repeating-linear-gradient(45deg, #f7f7f7 0 3px, #e9e9e9 3px 5px); color: #606060; }
 .tuning-badge.st-error { border-color: #8e2a23; background: #8e2a23; color: #fff; }
 
 /* Overview */
 
 .tuning-cards {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(calc(196 * var(--rf-px)), 1fr));
     gap: 8px;
 }
 
@@ -354,7 +566,7 @@
 
 .tuning-card-status {
     color: #707070;
-    font-size: 10.5px;
+    font-size: calc(12 * var(--rf-px));
     letter-spacing: 0.4px;
     text-transform: uppercase;
     white-space: nowrap;
@@ -363,13 +575,13 @@
 .tuning-card-counts {
     margin-top: 3px;
     color: #505050;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 .tuning-card-ids,
 .tuning-card-recs {
     margin-top: 2px;
-    font-size: 11.5px;
+    font-size: calc(13.5 * var(--rf-px));
 }
 
 .tuning-card-recs {
@@ -391,7 +603,7 @@
 .tuning-notes {
     padding-left: 18px;
     color: #505050;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 /* Tables */
@@ -404,7 +616,7 @@
 .tuning-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 .tuning-table th {
@@ -423,8 +635,9 @@
     vertical-align: top;
 }
 
-.tuning-table .row-good td,
-.tuning-table .row-insufficient td {
+.tuning-table .row-satisfactory td,
+.tuning-table .row-insufficient td,
+.tuning-table .row-notmeasured td {
     color: #707070;
 }
 
@@ -438,7 +651,7 @@
 }
 
 .tuning-table .tuning-times {
-    min-width: 52px;
+    min-width: calc(60 * var(--rf-px));
     font-variant-numeric: tabular-nums;
 }
 
@@ -449,22 +662,22 @@
 
 .tuning-table .tuning-rule,
 .tuning-table .tuning-text-value {
-    min-width: 110px;
-    max-width: 200px;
+    min-width: calc(127 * var(--rf-px));
+    max-width: calc(230 * var(--rf-px));
 }
 
 .tuning-table .tuning-text {
-    min-width: 180px;
+    min-width: calc(208 * var(--rf-px));
 }
 
 .tuning-table .tuning-params {
-    max-width: 260px;
+    max-width: calc(300 * var(--rf-px));
     font-family: Menlo, Consolas, monospace;
-    font-size: 11px;
+    font-size: calc(12.5 * var(--rf-px));
 }
 
 .tuning-table .tuning-muted {
-    font-size: 11px;
+    font-size: calc(12.5 * var(--rf-px));
     font-weight: normal;
 }
 
@@ -479,7 +692,7 @@
 
 .tuning-sortable.is-sorted::after {
     content: " \25B2";
-    font-size: 9px;
+    font-size: calc(12 * var(--rf-px));
 }
 
 .tuning-sortable.is-desc::after {
@@ -493,7 +706,31 @@
 .tuning-evidence-text td {
     padding-top: 0;
     color: #606060;
-    font-size: 11.5px;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+/* The two filters of the result lists (SPEC3 E) */
+.tuning-rf-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 16px;
+    margin: 2px 0 6px;
+    color: #505050;
+}
+
+.tuning-rf-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0;
+    font-weight: normal;
+}
+
+.tuning-rf-item input {
+    width: calc(15 * var(--rf-px));
+    height: calc(15 * var(--rf-px));
+    margin: 0;
 }
 
 .tuning-filters {
@@ -504,27 +741,29 @@
 }
 
 .tuning-filters .tuning-f-query {
-    flex: 1 1 180px;
-    min-width: 160px;
+    flex: 1 1 calc(208 * var(--rf-px));
+    min-width: calc(185 * var(--rf-px));
 }
 
 .tuning-count {
     margin: 0 0 4px;
-    font-size: 11.5px;
+    font-size: calc(13.5 * var(--rf-px));
 }
 
-.tuning-coverage-summary .tuning-badge {
-    margin: 0 4px 4px 0;
-}
+
 
 /* Recommendations */
 
 .tuning-disclaimer {
+    margin-bottom: 10px;
     padding: 6px 10px;
-    border-left: 4px solid #3a7fc1;
-    background: #eef5fb;
-    color: #2a5f94;
-    font-weight: 600;
+    border-left: 4px solid #d99a1f;
+    background: #fdf7ea;
+    color: #5c4310;
+}
+
+.tuning-disclaimer p {
+    margin: 2px 0;
 }
 
 .tuning-rec {
@@ -542,18 +781,20 @@
 }
 
 .tuning-rec-title {
-    font-size: 13.5px;
+    font-size: calc(15.5 * var(--rf-px));
     font-weight: 600;
 }
 
 .tuning-rec-head .tuning-muted {
     margin-left: auto;
-    font-size: 11.5px;
+    font-size: calc(13.5 * var(--rf-px));
 }
 
+/* advice.cjs writes the paragraphs of a text with a line feed between them (STE: 6 sentences or less in a paragraph) */
 .tuning-rec-text {
     margin-top: 5px;
     color: #404040;
+    white-space: pre-line;
 }
 
 .tuning-rec-param {
@@ -569,7 +810,7 @@
 .tuning-rec-list {
     margin-top: 4px;
     color: #404040;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 .tuning-rec-list {
@@ -592,10 +833,10 @@
 .tuning-label {
     flex: none;
     display: inline-block;
-    min-width: 72px;
+    min-width: calc(83 * var(--rf-px));
     margin-right: 6px;
     color: #909090;
-    font-size: 10.5px;
+    font-size: calc(12 * var(--rf-px));
     letter-spacing: 0.4px;
     text-transform: uppercase;
 }
@@ -613,7 +854,7 @@
     background: #f6f8fa;
     color: #24292e;
     font-family: Menlo, Consolas, "DejaVu Sans Mono", monospace;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
     line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-all;
@@ -627,7 +868,7 @@
 
 .tuning-cli-none {
     margin-top: 6px;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
     font-style: italic;
 }
 
@@ -651,7 +892,7 @@
 
 .tuning-plots {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(calc(554 * var(--rf-px)), 1fr));
     gap: 10px;
 }
 
@@ -662,16 +903,11 @@
     background: rgb(20, 20, 20);
 }
 
+/* Two rows of plots under the controls and the tab strip (about 330 px with the navbar), 207 to 460 px each at 100 % text */
 .tuning-plot-canvas {
     display: block;
     width: 100%;
-    height: 220px;
-}
-
-@media (max-height: 600px) {
-    .tuning-plot-canvas {
-        height: 180px;
-    }
+    height: clamp(calc(207 * var(--rf-px)), calc((100vh - 330px) / 2), calc(460 * var(--rf-px)));
 }
 
 .tuning-plot.is-na {
@@ -682,10 +918,983 @@
 .tuning-plot-title {
     margin-bottom: 6px;
     color: rgba(255, 255, 255, 0.85);
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
 }
 
 .tuning-plot .tuning-na {
     color: #9da5b1;
-    font-size: 12px;
+    font-size: calc(14 * var(--rf-px));
+}
+
+/* Text that is not STE (toolkit text): collapsed under the STE summary */
+
+.tuning-summary-text {
+    color: #303030;
+    white-space: pre-line; /* catalog.cjs summaries: a line feed between two paragraphs */
+}
+
+.tuning-toolkit {
+    margin-top: 2px;
+    color: #707070;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-toolkit summary {
+    color: #909090;
+    cursor: pointer;
+}
+
+.tuning-summary .tuning-muted + .tuning-muted {
+    margin-top: 0;
+}
+
+/* Links to the log: "Show in the log", "Show the measurement", the parts of the log */
+
+.tuning-times a,
+.tuning-spans a {
+    margin-right: 6px;
+}
+
+.tuning-compare-open.active {
+    font-weight: 600;
+}
+
+.tuning-compare-row > td {
+    padding: 0 0 8px;
+    background: #fafbfc;
+}
+
+.tuning-compare {
+    margin: 4px 0;
+    padding: 8px 10px 10px;
+    border: 1px solid #dde1e5;
+    border-left: 4px solid #4da8da;
+    border-radius: 4px;
+    background: #fafbfc;
+}
+
+.tuning-compare-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+}
+
+.tuning-compare-close {
+    margin-left: auto;
+    color: #909090;
+    font-size: calc(18.5 * var(--rf-px));
+    line-height: 1;
+    text-decoration: none;
+}
+
+.tuning-compare-expected,
+.tuning-compare-measured {
+    display: flex;
+    margin: 4px 0 0;
+}
+
+.tuning-compare-body {
+    margin-top: 6px;
+}
+
+.tuning-compare-body > .tuning-muted {
+    margin: 4px 0 0;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-compare-plot .tuning-plot-canvas {
+    height: clamp(calc(230 * var(--rf-px)), calc((100vh - 330px) / 2), calc(437 * var(--rf-px)));
+}
+
+.tuning-compare-table {
+    width: auto;
+}
+
+/* The tuning sequence (SPEC3 A and B): the checklist before the first flight, the flow of the tuning steps, the legend and
+   the side panel of the selected item or step. All of it is HTML in --rf-px, so its text has the text size of the views
+   (SPEC3 C). The side panel goes under the flow when the two do not fit next to each other, and a flow that is wider than
+   the view scrolls. */
+
+.tuning-prereq {
+    margin: 4px 0 14px;
+    padding: 8px 10px 10px;
+    border: 1px solid #e3e6ea;
+    border-radius: 6px;
+    background: #fafbfc;
+}
+
+.tuning-prereq-head .tuning-h {
+    margin-top: 0;
+}
+
+.tuning-prereq-head .tuning-muted {
+    margin: 0 0 6px;
+}
+
+.tuning-prereq-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(calc(205 * var(--rf-px)), 1fr));
+    align-items: start;
+    gap: 8px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.tuning-prereq-item {
+    padding: 6px 9px 7px;
+    border: 1px solid #d5dae0;
+    border-left-width: 4px;
+    border-radius: 5px;
+    background: #fff;
+    cursor: pointer;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.tuning-prereq-item.st-ok { border-left-color: #3c9d40; }
+.tuning-prereq-item.st-problem { border-color: #e2aaa4; border-left-color: #c9483f; background: #fdf6f5; }
+.tuning-prereq-item.st-nodata { border-left-color: #b0b0b0; }
+
+.tuning-prereq-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 7px;
+}
+
+.tuning-prereq-title {
+    font-size: calc(15 * var(--rf-px));
+    font-weight: 600;
+}
+
+.tuning-prereq-problems {
+    margin: 4px 0 0;
+    padding-left: 18px;
+    color: #a3362e;
+}
+
+.tuning-prereq-checks,
+.tuning-prereq-gates {
+    margin-top: 3px;
+    font-size: calc(13 * var(--rf-px));
+}
+
+.tuning-prereq-gates {
+    color: #8d4a42;
+}
+
+.tuning-badge.st-ok { border-color: #c4e2c5; background: #f2f9f2; color: #2b7230; }
+.tuning-badge.st-nodata { border-color: #d5d5d5; background: #f7f7f7; color: #707070; }
+
+.tuning-order {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: flex-start;
+}
+
+.tuning-order-main {
+    flex: 3 1 calc(900 * var(--rf-px));
+    min-width: 0;
+    padding: 8px 10px 10px;
+    border: 1px solid #e3e6ea;
+    border-radius: 6px;
+    background: #fff;
+}
+
+.tuning-order-scroll {
+    overflow-x: auto;
+}
+
+.tuning-order-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin-bottom: 8px;
+    color: #606060;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.tuning-swatch {
+    display: inline-block;
+    width: calc(21 * var(--rf-px));
+    height: calc(14 * var(--rf-px));
+    border: 1.5px solid #b0b0b0;
+    border-radius: 3px;
+    background: #f5f5f5;
+}
+
+.tuning-legend-arrow {
+    position: relative;
+    display: inline-block;
+    width: calc(24 * var(--rf-px));
+    height: 2px;
+    margin-right: 6px;
+    background: #9aa4ae;
+}
+
+.tuning-legend-arrow::after,
+.tuning-flow-arrow::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    right: calc(-7 * var(--rf-px));
+    border-top: calc(5.5 * var(--rf-px)) solid transparent;
+    border-bottom: calc(5.5 * var(--rf-px)) solid transparent;
+    border-left: calc(8 * var(--rf-px)) solid #9aa4ae;
+    transform: translateY(-50%);
+}
+
+/* The flow: a column for each order of js/tuning_dialog.js columnsOf, an arrow column between two columns; the steps of the
+   main lane take the two rows, the cyclic lane is the first row and the tail lane the second */
+.tuning-flow {
+    display: grid;
+    grid-template-rows: auto auto;
+    gap: 10px 0;
+    min-width: min-content;
+}
+
+.tuning-flow-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+.tuning-flow-cell > .tuning-block {
+    flex: 1 1 auto;
+}
+
+.tuning-flow-arrow {
+    position: relative;
+    align-self: center;
+    height: 2px;
+    margin: 0 calc(10 * var(--rf-px)) 0 4px;
+    background: #9aa4ae;
+}
+
+.tuning-block {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 7px 10px 9px;
+    border: 1px solid #d5dae0;
+    border-top-width: 4px;
+    border-radius: 6px;
+    background: #fff;
+    color: #303030;
+    cursor: pointer;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.tuning-block:hover,
+.tuning-block:focus,
+.tuning-prereq-item:hover,
+.tuning-prereq-item:focus {
+    outline: none;
+    border-color: #8a96a3;
+}
+
+.tuning-block.is-selected,
+.tuning-prereq-item.is-selected {
+    box-shadow: 0 0 0 2px #4da8da;
+}
+
+.tuning-block.st-start,
+.tuning-block.st-problem { border-top-color: #c9483f; background: #fffafa; }
+.tuning-block.st-blocked { border-style: dashed; border-top-style: solid; border-top-color: #b9776f; }
+.tuning-block.st-possible { border-top-color: #8b6bb5; }
+.tuning-block.st-error { border-top-color: #8e2a23; }
+.tuning-block.st-monitor { border-top-color: #d99a1f; }
+.tuning-block.st-satisfactory { border-top-color: #3c9d40; }
+.tuning-block.st-information { border-top-color: #3a7fc1; }
+.tuning-block.st-insufficient,
+.tuning-block.st-notmeasured { border-top-color: #cfcfcf; }
+.tuning-block.st-notapplicable { border-style: dashed; border-top-color: #d5d5d5; color: #808080; }
+.tuning-block.st-notaccurate { border-top-color: #a0a0a0; background: repeating-linear-gradient(45deg, #fff 0 6px, #f6f6f6 6px 9px); }
+
+.tuning-block-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.tuning-block-no {
+    flex: none;
+    min-width: calc(26 * var(--rf-px));
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: #eef1f4;
+    color: #404a54;
+    font-size: calc(13 * var(--rf-px));
+    font-weight: 700;
+    text-align: center;
+}
+
+.tuning-block-title {
+    flex: 1 1 auto;
+    font-size: calc(16 * var(--rf-px));
+    font-weight: 600;
+    line-height: 1.25;
+}
+
+.tuning-start-badge {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: calc(22 * var(--rf-px));
+    height: calc(22 * var(--rf-px));
+    border-radius: 50%;
+    background: #c9483f;
+    color: #fff;
+    font-size: calc(13 * var(--rf-px));
+    font-weight: 700;
+}
+
+.tuning-start-badge.is-legend {
+    width: calc(19 * var(--rf-px));
+    height: calc(19 * var(--rf-px));
+    font-size: calc(12 * var(--rf-px));
+}
+
+.tuning-block-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px 6px;
+}
+
+.tuning-block-ids {
+    color: #a3362e;
+    font-size: calc(13 * var(--rf-px));
+}
+
+.tuning-block-wait {
+    color: #8d4a42;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-block-sect .tuning-label {
+    margin: 2px 0 1px;
+}
+
+.tuning-param {
+    font-family: inherit;
+    color: inherit;
+}
+
+.tuning-block-params .tuning-param,
+.tuning-node-params .tuning-param {
+    display: inline-block;
+    max-width: 100%;
+    margin: 0 3px 4px 0;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: #edf1f4;
+    font-size: calc(13 * var(--rf-px));
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
+.tuning-block-more {
+    white-space: nowrap;
+}
+
+.tuning-block-checks {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: calc(13.5 * var(--rf-px));
+    line-height: 1.4;
+}
+
+.tuning-block-check {
+    font-weight: 600;
+}
+
+.tuning-block-check-st {
+    color: #a3362e;
+    font-size: calc(12.5 * var(--rf-px));
+}
+
+.tuning-block-checks li.st-monitor .tuning-block-check-st { color: #8a5d0b; }
+.tuning-block-checks li.st-notmeasured,
+.tuning-block-checks li.st-insufficient { color: #707070; }
+
+.tuning-block-none {
+    margin-top: 2px;
+    font-size: calc(13 * var(--rf-px));
+}
+
+.tuning-block-group {
+    margin-top: 2px;
+    color: #505050;
+    font-size: calc(13.5 * var(--rf-px));
+    line-height: 1.4;
+}
+
+.tuning-block-group .tuning-block-check {
+    font-weight: 500;
+    cursor: help;
+}
+
+.tuning-dot {
+    display: inline-block;
+    width: calc(9 * var(--rf-px));
+    height: calc(9 * var(--rf-px));
+    margin-right: 5px;
+    border: 1px solid #b0b0b0;
+    border-radius: 50%;
+    background: #f5f5f5;
+}
+
+.tuning-block-profiles {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px;
+    margin-top: 3px;
+}
+
+.tuning-block-profiles .tuning-label {
+    margin: 0 4px 0 0;
+}
+
+.tuning-pchip {
+    display: inline-block;
+    min-width: calc(18 * var(--rf-px));
+    padding: 0 3px;
+    border: 1.5px solid #c8cdd3;
+    border-radius: 3px;
+    background: #fff;
+    color: #505050;
+    font-size: calc(12 * var(--rf-px));
+    font-weight: 700;
+    line-height: calc(16 * var(--rf-px));
+    text-align: center;
+}
+
+/* Condition colours: the swatches of the legend, the dots of the checks and the PID profile chips */
+
+.tuning-swatch.st-problem,
+.tuning-dot.st-problem,
+.tuning-pchip.st-problem { background: #fbeeed; border-color: #c9483f; }
+.tuning-swatch.st-start,
+.tuning-pchip.st-start { background: #c9483f; border-color: #c9483f; color: #fff; }
+.tuning-dot.st-error,
+.tuning-swatch.st-error,
+.tuning-pchip.st-error { background: #8e2a23; border-color: #8e2a23; color: #fff; }
+.tuning-swatch.st-blocked,
+.tuning-pchip.st-blocked { background: #f8f1f0; border: 1.5px dashed #b9776f; }
+.tuning-swatch.st-possible,
+.tuning-pchip.st-possible { background: #f4f0fa; border-color: #8b6bb5; }
+.tuning-swatch.st-monitor,
+.tuning-dot.st-monitor,
+.tuning-pchip.st-monitor { background: #fdf7ea; border-color: #d99a1f; }
+.tuning-dot.st-monitor { background: #d99a1f; }
+.tuning-dot.st-problem { background: #c9483f; }
+.tuning-swatch.st-satisfactory,
+.tuning-dot.st-satisfactory,
+.tuning-pchip.st-satisfactory,
+.tuning-pchip.st-ok { background: #f2f9f2; border-color: #3c9d40; }
+.tuning-dot.st-satisfactory { background: #3c9d40; }
+.tuning-swatch.st-information,
+.tuning-dot.st-information,
+.tuning-pchip.st-information { background: #eef5fb; border-color: #3a7fc1; }
+.tuning-dot.st-information { background: #3a7fc1; }
+.tuning-swatch.st-insufficient,
+.tuning-dot.st-insufficient,
+.tuning-swatch.st-notmeasured,
+.tuning-dot.st-notmeasured,
+.tuning-pchip.st-notmeasured,
+.tuning-pchip.st-nodata { background: #fafafa; border-color: #cfcfcf; color: #909090; }
+.tuning-swatch.st-notapplicable,
+.tuning-pchip.st-notapplicable { background: #fff; border: 1.5px dashed #d5d5d5; color: #909090; }
+.tuning-swatch.st-notaccurate,
+.tuning-pchip.st-notaccurate { border-color: #a0a0a0; background: repeating-linear-gradient(45deg, #f7f7f7 0 3px, #dcdcdc 3px 5px); }
+.tuning-pchip.st-problem { color: #a3362e; }
+
+.tuning-order-panel {
+    flex: 1 1 calc(330 * var(--rf-px));
+    min-width: 0;
+    position: sticky;
+    top: 40px; /* under the sticky tab strip */
+    max-height: calc(100vh - 110px);
+    overflow-y: auto;
+    padding: 10px 12px;
+    border: 1px solid #e3e6ea;
+    border-radius: 6px;
+    background: #fafbfc;
+}
+
+.tuning-node-head .tuning-node-title-text {
+    margin: 2px 0 4px;
+    font-size: calc(16 * var(--rf-px));
+    font-weight: 600;
+}
+
+.tuning-node-reason,
+.tuning-node-about {
+    margin: 6px 0;
+    color: #404040;
+}
+
+/* The recommendation of a result that the Analysis view opened ("Open in the Tuning view", SPEC3 I) */
+.tuning-node-recs li.is-focus {
+    margin: 4px 0 8px -16px;
+    padding: 6px 8px;
+    border: 1px solid #4da8da;
+    border-radius: 4px;
+    background: #f3f9fd;
+    list-style: none;
+}
+
+.tuning-node-recs li.is-focus .tuning-cli {
+    margin-top: 4px;
+}
+
+/* The caption of the plot of a result (evidence.cjs plot.caption, SPEC3 H) */
+.tuning-plot-caption {
+    margin: 4px 0 0;
+    color: #404040;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-panel-block {
+    margin: 6px 0;
+    color: #404040;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.tuning-panel-block ul {
+    margin: 2px 0 0;
+    padding-left: 16px;
+}
+
+.tuning-panel-block.is-blocked,
+.tuning-rec-list.is-blocked {
+    color: #8d4a42;
+}
+
+.tuning-panel-block.is-possible,
+.tuning-rec-list.is-possible {
+    color: #5b3f86;
+}
+
+.tuning-check-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.tuning-check-list > li {
+    margin-bottom: 6px;
+    padding: 5px 8px;
+    border: 1px solid #e3e6ea;
+    border-radius: 4px;
+    background: #fff;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.tuning-check-list > li.is-open {
+    border-color: #4da8da;
+}
+
+.tuning-node-recs,
+.tuning-start-list {
+    padding-left: 20px;
+}
+
+.tuning-start-list.is-prereq {
+    list-style: square;
+}
+
+.tuning-node-recs li,
+.tuning-start-list li {
+    margin-bottom: 4px;
+}
+
+.tuning-order-compare {
+    margin-top: 10px;
+}
+
+.tuning-steps {
+    margin: 2px 0 0;
+    padding-left: 20px;
+    color: #505050;
+}
+
+/* Block elements for the parts of one line: each is a text of its own for screen readers and the STE lint */
+
+.tuning-rec-badges {
+    display: inline-flex;
+    gap: 4px;
+}
+
+.tuning-rec-rule {
+    display: flex;
+}
+
+.tuning-coverage-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 0 0 10px;
+    padding: 0;
+    list-style: none;
+}
+
+.tuning-docs {
+    margin: 2px 0 0;
+    padding-left: 16px;
+}
+
+.tuning-summary > div + div {
+    margin-top: 2px;
+}
+
+/* PID profile selector of the diagram and the lists (SPEC2 D12), and the PID profile chips on each step */
+
+.tuning-profile-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+    margin: 2px 0 10px;
+}
+
+.tuning-profile-bar .tuning-label {
+    margin: 0;
+}
+
+.tuning-profile-count {
+    display: inline-block;
+    min-width: calc(18.5 * var(--rf-px));
+    margin-left: 3px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: #c9483f;
+    color: #fff;
+    font-size: calc(12 * var(--rf-px));
+    font-weight: 700;
+    line-height: calc(17.5 * var(--rf-px));
+    text-align: center;
+}
+
+.tuning-profile.active .tuning-profile-count {
+    background: #fff;
+    color: #a3362e;
+}
+
+/* The CLI file (SPEC2 D11): the selection on the left, the commands on the right */
+
+.tuning-export {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+}
+
+@media (max-width: 1100px) {
+    .tuning-export {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.tuning-pick-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.tuning-pick-row {
+    margin-bottom: 5px;
+    padding: 5px 8px;
+    border: 1px solid #e3e6ea;
+    border-radius: 4px;
+    background: #fff;
+}
+
+.tuning-pick-row.is-off {
+    background: #fafafa;
+}
+
+.tuning-pick-row.is-off .tuning-pick-label {
+    color: #808080;
+}
+
+.tuning-pick-label {
+    display: block;
+    margin: 0;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.tuning-pick-row.is-off .tuning-pick-label {
+    cursor: default;
+}
+
+.tuning-pick {
+    margin: 0 4px 0 0;
+    vertical-align: -2px;
+}
+
+.tuning-export-out {
+    position: sticky;
+    top: 40px; /* under the sticky tab strip */
+}
+
+.tuning-export-actions {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.tuning-export-text {
+    max-height: calc(100vh - 190px);
+    overflow: auto;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid #e3e6ea;
+    border-radius: 4px;
+    background: #f7f8fa;
+    font-size: calc(14 * var(--rf-px));
+    white-space: pre;
+}
+
+/* Flights and phases in the context bar (SPEC2 D13) */
+
+.tuning-context a.tuning-flight {
+    white-space: nowrap;
+}
+
+.tuning-flights summary {
+    cursor: pointer;
+}
+
+.tuning-flights ul {
+    max-height: calc(276 * var(--rf-px));
+    overflow-y: auto;
+    margin: 4px 0 0;
+    padding-left: 18px;
+}
+
+.tuning-pass ul {
+    margin: 0;
+    padding-left: 16px;
+}
+
+/* a part of one line that is a block element for the STE lint and screen readers (.tuning-top-recs, .tuning-node-recs) */
+.tuning-inline {
+    display: inline;
+}
+
+/* SPEC3 J: the configuration menu next to the PID profile menu, the tab "Configurations" and the configuration part of a
+ * recommendation (js/tuning_dialog.js configBar, renderConfigs, diffTable, recConfigHtml) */
+
+.tuning-select-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 22px;
+    margin: 2px 0 10px;
+}
+
+.tuning-select-row .tuning-profile-bar {
+    margin: 0;
+}
+
+.tuning-config-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+    min-width: 0;
+}
+
+.tuning-config-bar .tuning-label {
+    margin: 0;
+}
+
+.tuning-config-bar .tuning-config {
+    display: inline-block;
+    width: auto;
+    max-width: calc(560 * var(--rf-px));
+}
+
+.tuning-config-about {
+    flex-basis: 100%;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.tuning-config-table .is-selected td,
+.tuning-diff-table .is-selected {
+    background: #eef5fb;
+}
+
+.tuning-diff-table td,
+.tuning-diff-table th {
+    text-align: center;
+}
+
+.tuning-diff-table td:first-child,
+.tuning-diff-table th:first-child {
+    text-align: left;
+}
+
+.tuning-diff-row.is-same-profile td:first-child {
+    box-shadow: inset 3px 0 #d99a1f; /* the mark of a row with different values in two configurations of one PID profile */
+}
+
+.tuning-diff-row.is-same-profile td {
+    background: #fdf7ea;
+}
+
+.tuning-diff-row.is-same-profile td.is-selected {
+    background: #f3eedc;
+}
+
+.tuning-diff-unknown,
+.tuning-diff-absent {
+    color: #909090;
+    font-weight: bold;
+}
+
+.tuning-config-info {
+    margin: 4px 0 10px;
+    padding-left: 18px;
+}
+
+.tuning-rec-config {
+    margin: 6px 0;
+    padding: 6px 9px;
+    border-left: 3px solid #8da0cb;
+    background: #f6f7fb;
+}
+
+.tuning-rec-config > div + div {
+    margin-top: 4px;
+}
+
+.tuning-rec-config .tuning-label {
+    display: inline;
+    margin-right: 4px;
+}
+
+/* SPEC3 G: the filter calculation in the Filters tab and in the side panel of the Filters step (filterSearchHtml) */
+
+.tuning-ft {
+    margin: 10px 0 14px;
+    padding: 9px 12px;
+    border: 1px solid #dfe6ee;
+    border-radius: 4px;
+    background: #fafcfe;
+}
+
+.tuning-ft.is-compact {
+    padding: 7px 9px;
+}
+
+.tuning-ft .tuning-h:first-child {
+    margin-top: 0;
+}
+
+.tuning-ft-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    margin: 6px 0;
+}
+
+.tuning-ft-progress {
+    display: flex;
+    flex: 1 1 calc(280 * var(--rf-px));
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.tuning-ft-progress .tuning-progress-bar {
+    background: repeating-linear-gradient(45deg, #4da8da 0 6px, #80c5eb 6px 12px);
+    background-size: 17px 17px;
+    animation: tuning-busy 0.8s linear infinite;
+}
+
+.tuning-ft-progress-text {
+    color: #505050;
+    font-size: calc(14 * var(--rf-px));
+    font-variant-numeric: tabular-nums;
+}
+
+.tuning-ft-result {
+    margin: 8px 0;
+    padding: 6px 0 2px 10px;
+    box-shadow: inset 3px 0 #3c9d40;
+}
+
+.tuning-ft-result.st-problem {
+    box-shadow: inset 3px 0 #4da8da;
+}
+
+.tuning-ft-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+}
+
+.tuning-ft-text {
+    margin: 6px 0;
+}
+
+.tuning-ft-reasons {
+    margin: 4px 0 8px;
+    padding-left: 18px;
+    color: #606060;
+}
+
+.tuning-ft-total td {
+    font-weight: bold;
+}
+
+.tuning-ft-plot-links {
+    margin: 8px 0;
+}
+
+.tuning-ft-plot.active {
+    font-weight: bold;
+}
+
+/* M4: a log with no data that the app can read */
+
+.tuning-nodata {
+    color: #8a5d0b;
+}
+
+.tuning-nodata-why {
+    font-size: calc(13 * var(--rf-px));
+}
+
+.tuning-ab-pair {
+    margin: 8px 0 12px;
+    padding-left: 9px;
+    border-left: 3px solid #8da0cb;
+}
+
+.tuning-ft-plotbox {
+    min-width: 0;
+}
+
+.tuning-ab-table .tuning-ab-check {
+    min-width: calc(260 * var(--rf-px));
+    white-space: normal;
 }

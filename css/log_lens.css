@@ -1,0 +1,1144 @@
+/* The Analysis view (#viewAnalysis scrolls it): the verdict of js/analysis_view.js, at the full width of the view. The
+   rules of .log-lens are of js/log_lens.js, whose pieces the verdict shares. Light content and dark plot panels as css/tuning_dialog.css; the status
+   colours of the Tuning view. */
+
+#viewAnalysis {
+    padding: 16px 24px 24px;
+}
+
+/* --- The verdict (js/analysis_view.js) --- */
+
+.analysis-verdict-box {
+    color: #303030;
+    font-size: calc(15 * var(--rf-px));
+}
+
+.analysis-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 16px;
+    margin-bottom: 8px;
+}
+
+/* The "Logs" control of the analysis (2026-10-06): the control, what the analysis uses and the flight list of the Tuning view
+   (css/tuning_dialog.css .tuning-scope-bar, .tuning-fsel), under the title */
+.analysis-scope {
+    margin: 0 0 10px;
+    color: #505050;
+}
+
+.analysis-scope:empty {
+    display: none;
+}
+
+.analysis-scope .tuning-fsel {
+    margin-top: 6px;
+}
+
+.analysis-stale {
+    margin: 6px 0 0;
+}
+
+.analysis-title {
+    margin: 0;
+    color: #303030;
+    font-size: calc(21 * var(--rf-px));
+    font-weight: 600;
+}
+
+.analysis-meta {
+    color: #707070;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.analysis-meta code {
+    padding: 0 3px;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.analysis-summary-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(calc(323 * var(--rf-px)), 36%);
+    gap: 12px 24px;
+    align-items: start;
+    margin-bottom: 14px;
+}
+
+@media (max-width: 1100px) {
+    .analysis-summary-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.analysis-verdict {
+    margin: 0 0 6px;
+    font-size: calc(16 * var(--rf-px));
+}
+
+.analysis-verdict .btn {
+    margin-left: 8px;
+}
+
+.analysis-muted {
+    margin: 6px 0 0;
+    color: #808080;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.analysis-muted .btn {
+    margin-left: 6px;
+}
+
+.analysis-warn {
+    margin: 6px 0 0;
+    padding: 5px 9px;
+    border-left: 4px solid #d99a1f;
+    border-radius: 3px;
+    background: #fdf7ea;
+    font-size: calc(14.5 * var(--rf-px));
+}
+
+.analysis-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    margin: 4px 0;
+}
+
+.analysis-count {
+    padding: 0 7px;
+    border: 1px solid #e0e0e0;
+    border-radius: 9px;
+    background: #f6f6f6;
+    color: #606060;
+    font-size: calc(13.5 * var(--rf-px));
+    line-height: calc(21 * var(--rf-px));
+    white-space: nowrap;
+}
+
+.analysis-count b {
+    margin-left: 2px;
+    font-weight: 600;
+}
+
+.analysis-count.st-problem { border-color: #ecc3bf; background: #fbeeed; color: #a3362e; }
+.analysis-count.st-error { border-color: #8e2a23; background: #8e2a23; color: #fff; }
+.analysis-count.st-monitor { border-color: #efd9a8; background: #fdf7ea; color: #8a5d0b; }
+.analysis-count.st-satisfactory { border-color: #c4e2c5; background: #f2f9f2; color: #2b7230; }
+.analysis-count.st-information { border-color: #c3daf0; background: #eef5fb; color: #2a5f94; }
+
+.analysis-start {
+    margin-top: 8px;
+}
+
+.analysis-start-list {
+    margin: 2px 0 0;
+    padding-left: 22px;
+}
+
+.analysis-h {
+    margin: 0 0 6px;
+    color: #606060;
+    font-size: calc(12.5 * var(--rf-px));
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+}
+
+.analysis-logs {
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background: #fafafa;
+}
+
+.analysis-log-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.analysis-log-list li + li {
+    margin-top: 4px;
+}
+
+/* The overview of the parts of the helicopter (SPEC3 I): one tile for each card, with its condition and its main number */
+
+.analysis-health {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(calc(190 * var(--rf-px)), 1fr));
+    gap: 8px;
+    margin: 10px 0 4px;
+    padding: 0;
+    list-style: none;
+}
+
+.analysis-tile {
+    display: block;
+    width: 100%;
+    padding: 6px 9px 7px;
+    border: 1px solid #e3e3e3;
+    border-left: 4px solid #c8c8c8;
+    border-radius: 4px;
+    background: #fff;
+    color: #303030;
+    font-size: calc(14 * var(--rf-px));
+    text-align: left;
+}
+
+.analysis-tile:hover,
+.analysis-tile:focus {
+    border-color: #a8b0b8;
+    outline: none;
+}
+
+.analysis-tile.st-problem { border-left-color: #c9483f; background: #fdf6f5; }
+.analysis-tile.st-error { border-left-color: #8e2a23; }
+.analysis-tile.st-monitor { border-left-color: #d99a1f; }
+.analysis-tile.st-satisfactory { border-left-color: #3c9d40; }
+.analysis-tile.st-information { border-left-color: #3a7fc1; }
+
+.analysis-tile-title {
+    display: block;
+    font-size: calc(15 * var(--rf-px));
+    font-weight: 600;
+}
+
+.analysis-tile-state {
+    display: block;
+    margin-top: 2px;
+    color: #606060;
+    font-size: calc(13 * var(--rf-px));
+}
+
+/* The main numbers of a card */
+
+.analysis-keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 6px 0 2px;
+    padding: 0;
+    list-style: none;
+    font-size: calc(14.5 * var(--rf-px));
+}
+
+.analysis-key-noun {
+    color: #606060;
+}
+
+.analysis-key-value {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.analysis-keys li.st-problem .analysis-key-value { color: #a3362e; }
+.analysis-keys li.st-monitor .analysis-key-value { color: #8a5d0b; }
+
+/* What to do about a result: its recommendations and "Open in the Tuning view", or what to examine */
+
+.analysis-action {
+    margin-top: 5px;
+    padding: 5px 8px;
+    border-radius: 4px;
+    background: #f5f8fb;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.analysis-action.is-examine {
+    background: #faf6ee;
+}
+
+.analysis-action-label {
+    color: #505050;
+    font-size: calc(12.5 * var(--rf-px));
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.analysis-action-list {
+    margin: 2px 0 4px;
+    padding-left: 18px;
+}
+
+.analysis-action .analysis-tune {
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.analysis-prereq {
+    font-weight: 600;
+}
+
+/* The area cards: two columns on a wide window, one on a narrow one */
+
+.analysis-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(calc(600 * var(--rf-px)), 1fr));
+    gap: 12px;
+    align-items: start;
+}
+
+@media (max-width: 1150px) {
+    .analysis-cards {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.analysis-card {
+    min-width: 0;
+    padding: 10px 12px;
+    border: 1px solid #e3e3e3;
+    border-top: 4px solid #c8c8c8;
+    border-radius: 4px;
+    background: #fff;
+}
+
+.analysis-card.st-problem { border-top-color: #c9483f; }
+.analysis-card.st-error { border-top-color: #8e2a23; }
+.analysis-card.st-monitor { border-top-color: #d99a1f; }
+.analysis-card.st-satisfactory { border-top-color: #3c9d40; }
+.analysis-card.st-information { border-top-color: #3a7fc1; }
+
+.analysis-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.analysis-card-title {
+    margin: 0;
+    color: #303030;
+    font-size: calc(17.5 * var(--rf-px));
+    font-weight: 600;
+}
+
+.analysis-rows {
+    margin: 6px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.analysis-row {
+    padding: 6px 0 6px 9px;
+    border-top: 1px solid #f0f0f0;
+    box-shadow: inset 3px 0 #c8c8c8;
+}
+
+.analysis-row.st-problem { box-shadow: inset 3px 0 #c9483f; }
+.analysis-row.st-error { box-shadow: inset 3px 0 #8e2a23; }
+.analysis-row.st-monitor { box-shadow: inset 3px 0 #d99a1f; }
+.analysis-row.st-satisfactory { box-shadow: inset 3px 0 #3c9d40; }
+.analysis-row.st-information { box-shadow: inset 3px 0 #3a7fc1; }
+
+.analysis-row-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+}
+
+.analysis-what {
+    flex: 1 1 calc(254 * var(--rf-px));
+    min-width: 0;
+}
+
+.analysis-where {
+    color: #707070;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.analysis-nums {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    font-size: calc(14 * var(--rf-px));
+    font-variant-numeric: tabular-nums;
+}
+
+.analysis-value {
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.analysis-limit {
+    color: #707070;
+}
+
+.analysis-limit code,
+.log-lens-facts code {
+    padding: 0 3px;
+    background: #f2f2f2;
+    color: #505050;
+    font-size: calc(12.5 * var(--rf-px));
+    white-space: normal;
+}
+
+.analysis-summary {
+    margin-top: 3px;
+    color: #404040;
+    white-space: pre-line; /* catalog.cjs summaries: a line feed between two paragraphs (STE: 6 sentences or less in each) */
+}
+
+.analysis-links {
+    margin-top: 3px;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.analysis-links a + a {
+    margin-left: 12px;
+}
+
+.analysis-links a.active {
+    font-weight: 600;
+}
+
+.analysis-raw {
+    margin-top: 3px;
+    color: #707070;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.analysis-raw summary,
+.analysis-more summary {
+    cursor: pointer;
+}
+
+.analysis-more {
+    margin-top: 4px;
+    color: #505050;
+    font-size: calc(14.5 * var(--rf-px));
+}
+
+.analysis-compare {
+    margin-top: 6px;
+    padding: 8px;
+    border: 1px solid #dde1e5;
+    border-radius: 4px;
+    background: #fbfbfb;
+}
+
+.analysis-compare-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+
+.analysis-compare-canvas {
+    display: block;
+    width: 100%;
+    height: calc(276 * var(--rf-px));
+}
+
+.analysis-compare-canvas.is-log {
+    height: calc(190 * var(--rf-px));
+}
+
+/* --- The log lens (js/log_lens.js) --- */
+
+.log-lens {
+    color: #303030;
+    font-size: calc(15 * var(--rf-px));
+    outline: 0;
+}
+
+.log-lens:focus-visible .log-lens-timeline {
+    box-shadow: 0 0 0 2px #4da8da;
+}
+
+/* Head, hint, notices */
+
+.log-lens-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 14px;
+    padding-top: 14px;
+    border-top: 1px solid #ddd;
+}
+
+.log-lens-title {
+    margin: 0;
+    color: #303030;
+    font-size: calc(18.5 * var(--rf-px));
+    font-weight: 600;
+}
+
+.log-lens-window {
+    color: #404040;
+    font-variant-numeric: tabular-nums;
+}
+
+.log-lens-where {
+    color: #707070;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-busy {
+    margin-left: auto;
+    color: #808080;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-hint {
+    margin: 4px 0 8px;
+    color: #808080;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-notice {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border-left: 4px solid #3a7fc1;
+    border-radius: 3px;
+    background: #eef5fb;
+    font-size: calc(14.5 * var(--rf-px));
+}
+
+.log-lens-notice.is-warn {
+    border-left-color: #d99a1f;
+    background: #fdf7ea;
+}
+
+.log-lens-notice.is-error {
+    border-left-color: #c9483f;
+    background: #fbeeed;
+}
+
+.log-lens-notice .btn {
+    margin-left: 8px;
+}
+
+/* The timeline of the whole log */
+
+.log-lens-timeline {
+    padding: 4px;
+    border-radius: 4px;
+    background: rgb(20, 20, 20);
+}
+
+.log-lens-timeline-canvas {
+    display: block;
+    width: 100%;
+    height: calc(125 * var(--rf-px)); /* the strips and the tick labels of js/log_lens.js drawTimeline scale with the text (timelineRows) */
+    cursor: grab;
+}
+
+.log-lens-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 6px 0 12px;
+    color: #606060;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.log-lens-swatch {
+    display: inline-block;
+    width: calc(11.5 * var(--rf-px));
+    height: calc(11.5 * var(--rf-px));
+    margin-right: 5px;
+    border-radius: 2px;
+    vertical-align: -1px;
+}
+
+.log-lens-swatch.is-phase {
+    height: 6px;
+    vertical-align: 1px;
+}
+
+.log-lens-legend-gap {
+    margin-left: 10px;
+}
+
+/* The PID profile at the start of the log, and how the analysis found it (js/log_lens.js startHtml) */
+.log-lens-start {
+    margin: -6px 0 12px;
+    color: #606060;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.log-lens-start:empty {
+    display: none;
+}
+
+/* The parts of the time window whose values are possibly not those of the log header (js/log_lens.js epochRowsHtml, CLAUDE.md
+   "Values that are possibly not current"); the Analysis view shows the same rows over its "Show in the log" panel. On the
+   timeline these parts are lighter on the PID profile strip (EPOCH_ALPHA) */
+.log-lens-epochs {
+    margin: -4px 0 12px;
+    padding: 5px 10px 6px;
+    border-left: 4px solid #d99a1f;
+    border-radius: 3px;
+    background: #fdf7ea;
+    color: #404040;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.log-lens-epochs:empty {
+    display: none;
+}
+
+.log-lens-epochs .log-lens-sub,
+.analysis-compare-epochs .log-lens-sub {
+    margin: 0 0 3px;
+}
+
+.log-lens-epoch-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.log-lens-epoch + .log-lens-epoch {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid #efd9a8;
+}
+
+.log-lens-epoch-meta {
+    color: #8a5d0b;
+    white-space: nowrap;
+}
+
+.log-lens-epoch-text {
+    color: #606060;
+}
+
+.log-lens-swatch.is-epoch {
+    background: #80b1d3;
+    opacity: 0.4;
+}
+
+.log-lens-flight {
+    padding: 0 7px;
+    border: 1px solid #c9dfb0;
+    border-radius: 9px;
+    background: #f3f9ec;
+    color: #3f6a1c;
+    font-size: calc(13.5 * var(--rf-px));
+    line-height: calc(21 * var(--rf-px));
+    white-space: nowrap;
+}
+
+button.log-lens-flight:hover,
+button.log-lens-flight:focus-visible {
+    border-color: #8fbf5a;
+    background: #e6f2d8;
+}
+
+.log-lens-flight.is-static {
+    display: inline-block;
+}
+
+.log-lens-swatch.is-window {
+    border: 1.5px solid #4da8da;
+    background: rgba(77, 168, 218, 0.15);
+}
+
+/* Strip charts (left) and the panel (right); one column on narrow windows */
+
+.log-lens-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(calc(415 * var(--rf-px)), 34%);
+    gap: 14px;
+    align-items: start;
+}
+
+@media (max-width: 1100px) {
+    .log-lens-main {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.log-lens-charts {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+}
+
+.log-lens-chart,
+.log-lens-plot {
+    min-width: 0;
+    padding: 4px;
+    border-radius: 4px;
+    background: rgb(20, 20, 20);
+}
+
+.log-lens-chart.is-na {
+    padding: 8px 12px;
+    color: #9da5b1;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-chart.is-na strong {
+    color: rgba(255, 255, 255, 0.85);
+    font-weight: 600;
+}
+
+.log-lens-chart.is-na code {
+    background: transparent;
+    color: #c8ccd2;
+}
+
+.log-lens-chart-canvas {
+    display: block;
+    width: 100%;
+    height: calc(152 * var(--rf-px));
+}
+
+.log-lens-panel {
+    position: sticky;
+    top: 0;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+    padding: 10px 12px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background: #fafafa;
+}
+
+.log-lens-h {
+    margin: 0 0 8px;
+    color: #303030;
+    font-size: calc(16 * var(--rf-px));
+    font-weight: 600;
+}
+
+.log-lens-sub {
+    margin: 12px 0 6px;
+    color: #606060;
+    font-size: calc(12.5 * var(--rf-px));
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+}
+
+.log-lens-count {
+    margin-left: 4px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: #e8e8e8;
+    color: #505050;
+    letter-spacing: 0;
+}
+
+.log-lens-muted {
+    color: #808080;
+}
+
+/* Results in the window */
+
+/* The two filters of the result list (SPEC3 E, as .tuning-rf-bar) */
+.log-lens-rf {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 14px;
+    margin: 0 0 6px;
+    color: #505050;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.log-lens-rf-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0;
+    font-weight: normal;
+}
+
+.log-lens-rf-item input {
+    width: calc(15 * var(--rf-px));
+    height: calc(15 * var(--rf-px));
+    margin: 0;
+}
+
+.log-lens-findings {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.log-lens-finding {
+    margin-bottom: 6px;
+    padding: 6px 8px;
+    border: 1px solid #e3e3e3;
+    border-left: 4px solid #b0b0b0;
+    border-radius: 3px;
+    background: #fff;
+}
+
+.log-lens-finding.st-problem { border-left-color: #c9483f; }
+.log-lens-finding.st-monitor { border-left-color: #d99a1f; }
+.log-lens-finding.st-satisfactory { border-left-color: #3c9d40; }
+.log-lens-finding.st-information { border-left-color: #3a7fc1; }
+.log-lens-finding.st-error { border-left-color: #8e2a23; }
+.log-lens-finding.st-insufficient,
+.log-lens-finding.st-notMeasured { border-left-color: #c8c8c8; }
+
+.log-lens-finding-head .log-lens-badge {
+    margin-right: 4px;
+}
+
+.log-lens-finding.is-compact {
+    padding: 3px 8px;
+    border-left-width: 3px;
+}
+
+.log-lens-finding.is-compact > details > summary {
+    color: #505050;
+    cursor: pointer;
+}
+
+.log-lens-finding.is-compact > details[open] > summary {
+    margin-bottom: 2px;
+}
+
+.log-lens-badge {
+    display: inline-block;
+    padding: 0 6px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    background: #f5f5f5;
+    color: #707070;
+    font-size: calc(12 * var(--rf-px));
+    font-weight: 600;
+    line-height: calc(18.5 * var(--rf-px));
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.log-lens-badge.st-problem { border-color: #ecc3bf; background: #fbeeed; color: #a3362e; }
+.log-lens-badge.st-monitor { border-color: #efd9a8; background: #fdf7ea; color: #8a5d0b; }
+.log-lens-badge.st-satisfactory { border-color: #c4e2c5; background: #f2f9f2; color: #2b7230; }
+.log-lens-badge.st-information { border-color: #c3daf0; background: #eef5fb; color: #2a5f94; }
+.log-lens-badge.st-error { border-color: #8e2a23; background: #8e2a23; color: #fff; }
+
+.log-lens-id {
+    font-weight: 600;
+}
+
+.log-lens-summary {
+    margin-top: 4px;
+    color: #404040;
+    white-space: pre-line; /* catalog.cjs summaries: a line feed between two paragraphs */
+}
+
+.log-lens-facts {
+    margin-top: 3px;
+    color: #606060;
+    font-size: calc(14 * var(--rf-px));
+    font-variant-numeric: tabular-nums;
+}
+
+
+
+.log-lens-links {
+    margin-top: 4px;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-links a + a {
+    margin-left: 12px;
+}
+
+.log-lens-finding details {
+    margin-top: 4px;
+    color: #707070;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.log-lens-finding summary {
+    cursor: pointer;
+}
+
+/* Values in the window */
+
+.log-lens-values {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-values th {
+    padding: 3px 5px;
+    border-bottom: 1px solid #ddd;
+    color: #707070;
+    font-weight: 600;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.log-lens-values td {
+    padding: 4px 5px;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+}
+
+.log-lens-values .lv-monitor td:first-child { box-shadow: inset 3px 0 #d99a1f; }
+.log-lens-values .lv-satisfactory td:first-child { box-shadow: inset 3px 0 #3c9d40; }
+.log-lens-values .lv-information td:first-child { box-shadow: inset 3px 0 #3a7fc1; }
+.log-lens-values .lv-insufficient td,
+.log-lens-values .lv-notMeasured td { color: #909090; }
+
+.log-lens-what {
+    width: 46%; /* the quantity and its note: the widest column, also with large text (SPEC3 C) */
+    min-width: calc(140 * var(--rf-px));
+    padding-left: 9px !important;
+}
+
+.log-lens-num {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.log-lens-check {
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.log-lens-level {
+    font-size: calc(12.5 * var(--rf-px));
+    white-space: normal;
+}
+
+.lv-monitor .log-lens-level { color: #8a5d0b; }
+.lv-satisfactory .log-lens-level { color: #2b7230; }
+.lv-information .log-lens-level { color: #2a5f94; }
+
+.log-lens-note {
+    color: #909090;
+    font-size: calc(12.5 * var(--rf-px));
+}
+
+.log-lens-notes {
+    margin: 6px 0 0;
+    padding-left: 16px;
+    color: #808080;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+/* "Show": the plot of one value */
+
+.log-lens-detail {
+    margin-bottom: 10px;
+    padding: 8px;
+    border: 1px solid #dde1e5;
+    border-radius: 4px;
+    background: #fff;
+}
+
+.log-lens-detail-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.log-lens-detail-title {
+    font-weight: 600;
+}
+
+.log-lens-plot + .log-lens-plot {
+    margin-top: 6px;
+}
+
+.log-lens-detail-canvas {
+    display: block;
+    width: 100%;
+    height: calc(242 * var(--rf-px));
+}
+
+.log-lens-line {
+    margin-bottom: 4px;
+    color: #404040;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-table {
+    margin: 4px 0;
+    border-collapse: collapse;
+    font-size: calc(14 * var(--rf-px));
+}
+
+.log-lens-table th,
+.log-lens-table td {
+    padding: 2px 8px 2px 0;
+    border-bottom: 1px solid #eee;
+    text-align: left;
+}
+
+.log-lens-caption {
+    margin: 6px 0 0;
+    color: #505050;
+    font-size: calc(14 * var(--rf-px));
+}
+
+/* the caption of the plot of a result (evidence.cjs plot.caption, SPEC3 H) */
+.log-lens-caption.is-plot {
+    color: #303030;
+}
+
+/* M3: the 3 most important items of the analysis, and one row for each item (check and axis) in the cards; the results of each
+ * log open under it (js/analysis_view.js topHtml, issueHtml) */
+
+.analysis-top {
+    margin: 0 0 12px;
+    padding: 9px 12px 6px;
+    border: 1px solid #ecc3bf;
+    border-radius: 4px;
+    background: #fffaf9;
+}
+
+.analysis-top.is-empty {
+    border-color: #c4e2c5;
+    background: #f7fbf7;
+}
+
+.analysis-top .analysis-h {
+    margin-top: 0;
+}
+
+.analysis-top-list {
+    margin: 0;
+    padding-left: calc(22 * var(--rf-px));
+}
+
+.analysis-top-item {
+    padding: 4px 0 6px;
+}
+
+.analysis-top-item + .analysis-top-item {
+    border-top: 1px solid #f3e1de;
+}
+
+.analysis-top-item .analysis-what strong {
+    font-size: calc(15.5 * var(--rf-px));
+}
+
+.analysis-issue {
+    padding: 6px 0 6px 9px;
+    border-top: 1px solid #f0f0f0;
+    box-shadow: inset 3px 0 #c8c8c8;
+}
+
+.analysis-issue.st-problem { box-shadow: inset 3px 0 #c9483f; }
+.analysis-issue.st-error { box-shadow: inset 3px 0 #8e2a23; }
+.analysis-issue.st-monitor { box-shadow: inset 3px 0 #d99a1f; }
+.analysis-issue.st-satisfactory { box-shadow: inset 3px 0 #3c9d40; }
+.analysis-issue.st-information { box-shadow: inset 3px 0 #3a7fc1; }
+
+.analysis-issue-where {
+    margin-top: 2px;
+    color: #707070;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+/* The mark of an item, a result or a recommendation whose values are possibly not those of the log header (js/analysis_view.js
+   epochHtml, CLAUDE.md "Values that are possibly not current"), and the summary with the caveat of the worker */
+.analysis-epoch {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+    margin-top: 4px;
+    color: #5a4a2a;
+    font-size: calc(13.5 * var(--rf-px));
+}
+
+.analysis-epoch-tag,
+.analysis-epoch-mini {
+    padding: 0 7px;
+    border: 1px solid #efd9a8;
+    border-radius: 9px;
+    background: #fdf7ea;
+    color: #8a5d0b;
+    font-size: calc(12.5 * var(--rf-px));
+    line-height: calc(19 * var(--rf-px));
+    white-space: nowrap;
+}
+
+.analysis-epoch-body {
+    flex: 1 1 calc(300 * var(--rf-px));
+    min-width: 0;
+}
+
+.analysis-epoch-why,
+.analysis-epoch-src {
+    display: inline;
+}
+
+.analysis-epoch-why::after {
+    content: " ";
+}
+
+.analysis-epoch-mini {
+    display: inline-block;
+    margin-left: 6px;
+    cursor: help;
+}
+
+.analysis-epochs .analysis-warn {
+    margin-top: 8px;
+}
+
+.analysis-compare-epochs {
+    margin: 0 0 6px;
+}
+
+.analysis-issue-rows {
+    margin-top: 4px;
+}
+
+.analysis-issue-rows > summary {
+    color: #4a6f96;
+    font-size: calc(13.5 * var(--rf-px));
+    cursor: pointer;
+}
+
+.analysis-issue-rows .analysis-rows {
+    margin: 2px 0 0 6px;
+}
+
+/* SPEC3 J: the configuration menu of the lens head and the strip of the configurations on the timeline */
+
+.log-lens-config select {
+    display: inline-block;
+    width: auto;
+    margin-left: 4px;
+}
+
+.log-lens-config-label {
+    margin: 0;
+    font-weight: normal;
+}
+
+.log-lens-timeline-canvas.has-config {
+    height: calc(140 * var(--rf-px)); /* timelineRows(H, k, true): the configuration strip under the PID profile strip */
+}
+
+.log-lens-swatch.is-config {
+    border-radius: 2px;
+}
+
+.log-lens-config-note {
+    margin: 2px 0 6px;
+}
+
+/* the numbers of an item are a range or a list: they wrap, and they do not make the page wider */
+.analysis-issue .analysis-nums,
+.analysis-top .analysis-nums {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.analysis-issue .analysis-value,
+.analysis-top .analysis-value {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}

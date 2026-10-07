@@ -1,5 +1,140 @@
 "use strict";
 
+/*
+ * Parameter journal records in event 101 (RF-PARAM-1, Blackbox_Params_Spec.md 2.4):
+ *   "P" TYPE SEQ " " AT *(" " FIELD) "*" CRC, TYPE one of C A R M L Q +, AT one of p, N.c, N.c~N.c, CRC-8 poly 0xD5 of the
+ *   chars before "*".
+ * The graph draws one marker for each C record (change), or one for a group of C records at the same point. It does not
+ * draw the A, R, M, L, Q and + records. tools/autotune/param_log.cjs reads the records for the analysis: a record is
+ * good here only when it is good there (the same grammar, a valid AT and CRC). No DOM: test/param_log.test.cjs loads
+ * this file in a vm and compares parse() with param_log.cjs parseRecord.
+ */
+var ParamJournalMarks = (function() {
+    var RECORD = /^P([CARMLQ+])([0-9a-f]{1,8}) /,
+        POINT = /^(?:p|\d+\.\d+|\d+\.\d+~\d+\.\d+)$/;
+
+    function crc8(text) {
+        var crc = 0;
+
+        for (var i = 0; i < text.length; i++) {
+            crc ^= text.charCodeAt(i) & 0xFF;
+            for (var k = 0; k < 8; k++) {
+                crc = (crc & 0x80) ? ((crc << 1) ^ 0xD5) & 0xFF : (crc << 1) & 0xFF;
+            }
+        }
+
+        return crc;
+    }
+
+    // One event-101 string -> null (not a journal record) | { type, seq, at, items: [[key, new, old]], n, count, crcOk }
+    function parse(text) {
+        var m = typeof text === 'string' ? RECORD.exec(text) : null;
+
+        if (!m) {
+            return null;
+        }
+
+        var star = text.lastIndexOf('*'), body = star < 0 ? text : text.slice(0, star),
+            tokens = body.slice(m[0].length).split(' ').filter(function(t) { return t.length > 0; }),
+            record = { type: m[1], seq: parseInt(m[2], 16), at: tokens.length ? tokens[0] : '', items: [], n: null, count: 0, crcOk: false };
+
+        record.crcOk = star >= m[0].length && /^[0-9A-F]{2}$/.test(text.slice(star + 1)) && POINT.test(record.at)
+            && crc8(body) === parseInt(text.slice(star + 1), 16);
+        for (var i = 1; i < tokens.length; i++) {
+            var eq = tokens[i].indexOf('='), lt = eq > 0 ? tokens[i].indexOf('<', eq) : -1;
+
+            if (lt > 0 && (record.type === 'C' || record.type === '+')) {
+                record.items.push([tokens[i].slice(0, eq), tokens[i].slice(eq + 1, lt), tokens[i].slice(lt + 1)]);
+            } else if (eq > 0 && tokens[i].slice(0, eq) === 'n' && /^\d+$/.test(tokens[i].slice(eq + 1))) {
+                record.n = parseInt(tokens[i].slice(eq + 1), 10);
+            }
+        }
+        record.count = record.n !== null && record.n >= record.items.length ? record.n : record.items.length;
+
+        return record;
+    }
+
+    // The journal record of an event, or null. Kept on the event.
+    function recordOf(event) {
+        if (event.event !== FlightLogEvent.CUSTOM_STRING || !event.data || typeof event.data.string !== 'string') {
+            return null;
+        }
+        if (event.paramRecord === undefined) {
+            event.paramRecord = parse(event.data.string);
+        }
+
+        return event.paramRecord;
+    }
+
+    // C records that follow a C record at the same point go into its marker (only journal records between them)
+    function group(events) {
+        if (events.paramGrouped) {
+            return;
+        }
+        events.paramGrouped = true;
+
+        for (var j = 0; j < events.length; j++) {
+            var first = recordOf(events[j]);
+
+            if (!first || first.type !== 'C' || first.grouped) {
+                continue;
+            }
+            first.groupCount = first.count;
+            for (var k = j + 1; k < events.length; k++) {
+                var next = recordOf(events[k]);
+
+                if (!next || (next.type === 'C' && next.at !== first.at)) {
+                    break;
+                }
+                if (next.type === 'C') {
+                    next.grouped = true;
+                    first.groupCount += next.count;
+                }
+            }
+        }
+    }
+
+    function valueLabel(value) {
+        return /^-?\d+$/.test(value) ? value : '"' + value + '"';
+    }
+
+    // The label of one change. Names and values from the log are in quotation marks. PID and rate profiles are 1-6.
+    function itemLabel(item) {
+        var key = item[0], m;
+
+        if (key === 'pid_profile' || key === 'rate_profile') {
+            var name = key === 'pid_profile' ? 'PID profile ' : 'rate profile ';
+
+            return (key === 'pid_profile' ? 'PID profile ' : 'Rate profile ') + (parseInt(item[2], 10) + 1) + ' to ' + name + (parseInt(item[1], 10) + 1);
+        }
+        if ((m = /^([pr])([0-5])\.(.+)$/.exec(key))) {
+            return (m[1] === 'p' ? 'PID profile ' : 'Rate profile ') + (parseInt(m[2], 10) + 1) + ': "' + m[3] + '" ' + valueLabel(item[2]) + ' to ' + valueLabel(item[1]);
+        }
+
+        return '"' + key + '" ' + valueLabel(item[2]) + ' to ' + valueLabel(item[1]);
+    }
+
+    function label(record) {
+        if (!record.crcOk) {
+            return 'Parameter record with a CRC error';
+        }
+
+        var count = record.groupCount || record.count,
+            text = record.items.length ? itemLabel(record.items[0]) : 'Parameter change';
+
+        if (count > 1) {
+            text += ' (and ' + (count - 1) + ' more)';
+        }
+        if (record.at.indexOf('~') >= 0) {
+            text += ' (time in an interval)';
+        }
+
+        return text;
+    }
+
+    return { crc8: crc8, parse: parse, recordOf: recordOf, group: group, label: label };
+})();
+
 function FlightLogGrapher(flightLog, graphConfig, canvas, stickCanvas, craftWrapper, analyserCanvas, stepResponseCanvas, options) {
     var
         PID_P = 0,
@@ -576,7 +711,9 @@ function FlightLogGrapher(flightLog, graphConfig, canvas, stickCanvas, craftWrap
                 drawEventLine(x, labelY, 'DATA: ' + event.data.buffer.join(), "rgba(0,133,255,0.5)", 3);
             break;
             case FlightLogEvent.CUSTOM_STRING:
-                drawEventLine(x, labelY, event.data.string, "rgba(0,133,255,0.5)", 3);
+                var paramRecord = ParamJournalMarks.recordOf(event);
+
+                drawEventLine(x, labelY, paramRecord ? ParamJournalMarks.label(paramRecord) : event.data.string, "rgba(0,133,255,0.5)", 3);
             break;
             case FlightLogEvent.CUSTOM: // Virtual Events shown in RED
                 drawEventLine(x, labelY, (event.label)?event.label:'EVENT', "rgba(255,0,0,0.75)", 3, null, event.align);
@@ -603,9 +740,17 @@ function FlightLogGrapher(flightLog, graphConfig, canvas, stickCanvas, craftWrap
         for (var i = 0; i < chunks.length; i++) {
             var events = chunks[i].events;
 
+            ParamJournalMarks.group(events);
+
             for (var j = 0; j < events.length; j++) {
                 if (events[j].time > windowEndTime) {
                     return;
+                }
+
+                // Parameter journal: only the first C record of a group has a marker
+                var paramRecord = ParamJournalMarks.recordOf(events[j]);
+                if (paramRecord && (paramRecord.type !== 'C' || paramRecord.grouped)) {
+                    continue;
                 }
 
                 if (events[j].time >= windowStartTime - BEGIN_MARGIN_MICROSECONDS) {
@@ -987,6 +1132,13 @@ function FlightLogGrapher(flightLog, graphConfig, canvas, stickCanvas, craftWrap
     this.destroy = function() {
         $(canvas).off("mousedown", onMouseDown);
         $(canvas).off("touchstart", onTouchStart);
+        // the analyser and the step response of this grapher leave the shared controls (graph_spectrum.js destroy)
+        if (analyser && analyser.destroy) {
+            analyser.destroy();
+        }
+        if (stepResponse && stepResponse.destroy) {
+            stepResponse.destroy();
+        }
     };
 
     this.setGraphZoom = function(zoom) {
