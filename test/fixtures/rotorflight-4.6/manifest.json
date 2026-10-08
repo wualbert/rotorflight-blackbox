@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/rotorflight/rotorflight-firmware",
+  "commit": "118e912",
+  "files": {
+    "common/filter.c": "b38f94879fe69bd58c7b37a95300c901aa785ffc06ca9ee47125a1d502efe374",
+    "common/filter.h": "9269b369159fa0f32431140e4c9a56f994456a526457b15beea673d4c2d61767",
+    "common/maths.c": "72c65185c125aecd70ce9c7e53dafa26b93a437a1a2ca9c141e0d59e89ebf15d",
+    "common/sdft.c": "7bc7c7feaa30388cbb6706d72e935f846e9639c6d457bb48e8a657ff196c1312",
+    "common/sdft.h": "c3015a21405d14dc265b59a2277408676296feb4dfb903417c3d199b7637c071",
+    "flight/dyn_notch_filter.c": "97d0811f2c7d35ad193647cf03e09bd4db191f7481e5aa4f2519d5e63daf76c1",
+    "flight/rpm_filter.c": "6d7ccb1588e5e59ef85d6643d6a5dfdb232730d52e1957d5f6be5a286a13e906",
+    "sensors/gyro_filter_impl.c": "8b3e6ae69e25a0050cde26511e370ff44de9a74a1ea694d9e171d2347a9535ce",
+    "sensors/gyro_init.c": "9fbcb45d4a4d6394bc7520179d930df916ef702444b5b6fc5c8adc6ff920d78b",
+    "sensors/gyro.c": "2f91bc6e2c810ba7b39e8e635e50558bd564b49c5f8326893fefdab70ba1c59c",
+    "fc/core.c": "8aecefa65fe2684947cf0ff917630163030e59be97b67acbacb584cc0967dcb8",
+    "blackbox/blackbox.c": "1714b9e3a83fb2a951cc647e2ccb0eb40fb548586badb139a1a9e17b2db55827",
+    "flight/governor.c": "2834ebbce1a95fed538e6105624e64b7972d1bf4f10d1ae13a782aeed949df5e",
+    "flight/motors.c": "3b7d62920f61c6a9c072056c24876bdf7b1c8fe62c7524099374430ffef53eb0",
+    "scheduler/scheduler.c": "ca0e238de452cd966729fb18f214c53d25433bd1190bf594c025fc16842c326f",
+    "scheduler/scheduler.h": "616f1e7cd793613660a7ddff3b73708a11ce8baa3b605c22607b48409b63b18a"
+  }
+}

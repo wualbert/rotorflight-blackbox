@@ -1,7 +1,10 @@
 'use strict';
 
 /**
- * Automatic tuning of the gyro filters (SPEC3 G). A replica of the Rotorflight 4.6.0 gyro filter chain predicts gyroADC
+ * Filter analysis and firmware coefficient helpers (SPEC3 G). Public tune() now
+ * delegates to filter_autotune.cjs and filter_replay.cjs: time-domain-only evaluation.
+ * The spectral helpers below remain for log analysis and regression comparisons.
+ * Legacy analysis: a replica of the Rotorflight 4.6.0 gyro filter chain predicts gyroADC
  * from the logged gyroRAW; the replica is validated on each log (parity); then filter settings are searched on the logged
  * gyroRAW of the flight phase, scored by the noise that reaches the PID output under a time-delay limit at 10-30 Hz, and the
  * chosen set is validated leave-one-flight-out. Pure computation, no DOM; it runs in Node and in the worker's CommonJS shim.
@@ -73,7 +76,7 @@ const lib = require('./lib.cjs');
 const setup = require('./health_setup.cjs');
 
 const AXES = ['roll', 'pitch', 'yaw'];
-const EXTRA = ['gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'tailspeed'];
+const EXTRA = ['gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'tailspeed', 'time', 'govRequest', 'govTarget', 'govP'];
 
 // ---------------------------------------------------------------------------------------------
 // Firmware constants (sources in the header comment)
@@ -107,6 +110,7 @@ const PRESETS = (() => {
 // Firmware ranges of the settings this module may write (cli/settings.c, release/4.6.0). advice.cjs RANGE has some of them;
 // test/filter_tune.test.cjs checks that the two agree where both have a name.
 const FW_RANGE = {
+    gyro_decimation_hz: [0, 1000],
     gyro_lpf1_static_hz: [0, 1000], gyro_lpf2_static_hz: [0, 1000],                         // settings.c:663, 670 (LPF_MAX_HZ, gyro.h:40)
     gyro_notch1_hz: [0, 1000], gyro_notch1_cutoff: [0, 1000], gyro_notch2_hz: [0, 1000], gyro_notch2_cutoff: [0, 1000], // 672-675
     dyn_notch_count: [0, 8], dyn_notch_q: [10, 100], dyn_notch_min_hz: [10, 200], dyn_notch_max_hz: [100, 500], // 678-681
@@ -322,8 +326,10 @@ function config(header, opts = {}) {
     if (filtDenom < pidDenom) while (pidDenom % filtDenom) filtDenom++; else filtDenom = pidDenom;
     const gyroHz = looptime ? 1e6 / looptime : null, pNum = hk(h, 'frameIntervalPNum') || 1, pDen = hk(h, 'frameIntervalPDenom') || 1;
     const dec = (hk(h, 'unknownHeaders') || []).find(u => u.name === 'gyro_decimation_hz');
+    take('gyro_decimation_hz', dec ? +dec.value : hk(h, 'gyro_decimation_hz'), g.gyro_decimation_hz, null);
+    take('motor_rpm_lpf', arr(hk(h, 'motor_rpm_lpf')), arr(g.motor_rpm_lpf), null);
     const rates = { gyroHz, pidDenom, filtDenom, pidHz: gyroHz && gyroHz / pidDenom, filterHz: gyroHz && gyroHz / filtDenom, logHz: gyroHz && gyroHz / pidDenom * pNum / pDen,
-        loopsPerFrame: pDen / pNum, decimationHz: dec ? +dec.value : hk(h, 'gyro_decimation_hz') };
+        loopsPerFrame: pDen / pNum, decimationHz: s.gyro_decimation_hz };
     rates.offsetTicks = FW.bbCounter[Math.min(8, pidDenom)] - Math.floor(FW.bbCounter[Math.min(8, pidDenom)] / filtDenom) * filtDenom;
     rates.scale = opts.actualRate && rates.logHz ? opts.actualRate / rates.logHz : 1;
     if (!gyroHz) notes.push('The log header has no looptime. The filter rates are unknown.');
@@ -337,11 +343,18 @@ function config(header, opts = {}) {
     if (!gear && opts.logGear) gear = Object.assign({}, opts.logGear);
     // PID path per profile: the header holds the profile at arming; the CLI sections the others
     const bw = (ax) => arr(hk(h, `${ax}BW`)), pid = (ax) => arr(hk(h, `${ax}PID`));
-    const pidHeader = Object.fromEntries(AXES.map(ax => [ax, { gyro_cutoff: bw(ax) ? +bw(ax)[0] : null, d_cutoff: bw(ax) ? +bw(ax)[1] : null, P: pid(ax) ? +pid(ax)[0] : null, D: pid(ax) ? +pid(ax)[2] : null, from: 'header' }]));
+    const entry = (a,i) => a && a[i] !== null && a[i] !== undefined && Number.isFinite(+a[i]) ? +a[i] : null;
+    const pidHeader = Object.fromEntries(AXES.map(ax => [ax, { gyro_cutoff: entry(bw(ax),0), d_cutoff: entry(bw(ax),1), P: entry(pid(ax),0), D: entry(pid(ax),2), from: 'header' }]));
+    const stop = arr(hk(h, 'yaw_stop_gain'));
+    if (stop && stop.length >= 2) pidHeader.yaw.stopGain = [stop[1] / 100, stop[0] / 100];
     const pidCli = {};
     if (cli) for (const [k, sec] of Object.entries(cli.profiles)) pidCli[+k + 1] = Object.fromEntries(AXES.map(ax => [ax, {
         gyro_cutoff: sec[`${ax}_gyro_cutoff`] !== undefined ? +sec[`${ax}_gyro_cutoff`] : null, d_cutoff: sec[`${ax}_d_cutoff`] !== undefined ? +sec[`${ax}_d_cutoff`] : null,
         P: sec[`${ax}_p_gain`] !== undefined ? +sec[`${ax}_p_gain`] : null, D: sec[`${ax}_d_gain`] !== undefined ? +sec[`${ax}_d_gain`] : null, from: 'cli' }]));
+    if (cli) for (const [k, sec] of Object.entries(cli.profiles)) {
+        if (Number.isFinite(sec.yaw_ccw_stop_gain) && Number.isFinite(sec.yaw_cw_stop_gain))
+            pidCli[+k + 1].yaw.stopGain = [sec.yaw_ccw_stop_gain / 100, sec.yaw_cw_stop_gain / 100];
+    }
     return { s, from, rates, gear, pid: { header: pidHeader, cli: pidCli }, notes, cliKind: cli ? cli.kind : null };
 }
 
@@ -375,7 +388,7 @@ function compile(cfg) {
     const lpf = (t, hz) => { let c = hz > limit ? limit : hz; return c > 0 && t > 0 ? { type: t, hz: c } : null; };
     const L2 = lpf(s.gyro_lpf2_type, s.gyro_lpf2_static_hz), L1 = lpf(s.gyro_lpf1_type, s.gyro_lpf1_static_hz);
     const dynLpf = L1 && s.gyro_lpf1_dyn_min_hz > 0 && s.gyro_lpf1_dyn_min_hz <= s.gyro_lpf1_dyn_max_hz && s.gyro_lpf1_dyn_min_hz <= L1.hz && s.gyro_lpf1_dyn_max_hz >= L1.hz;
-    if (dynLpf) notes.push('The dynamic LPF1 is on. Its cutoff follows the governor headspeed ratio; the replica uses the static cutoff (not exact).');
+    if (dynLpf) notes.push('The dynamic LPF1 cutoff follows the governor headspeed ratio.');
     const notch = (hz, co) => {
         if (hz > limit) hz = limit; if (co > limit) co = 0; if (co >= hz) return null;
         const nyq = fsF / 2; if (hz > nyq) hz = co < nyq ? nyq : 0;
@@ -1945,54 +1958,6 @@ function summarizeNode(prep, n, base, units, ref) {
  * result = { version, ms, model: { parity: [...], passed, rules, notes }, bench, units, lines, current: { settings, from, noise, delay },
  *   candidates: [...], path: [...], recommended: { status, reasons, params, cli, rows, predicted, delay, validation }, curves, notes }
  */
-function tune(logs, opts = {}) {
-    const t0 = Date.now(), notes = [];
-    const prep = prepare(logs, opts);
-    const tailFit = summarizeFit(prep.tailFit, prep.logs[prep.logs.length - 1]);
-    if (!prep.logs.length) return { version: 1, ms: Date.now() - t0, model: { parity: [], passed: false, leftOut: [] }, bench: prep.bench, tailFit, recommended: { status: 'no flight log', reasons: prep.notes }, notes: prep.notes };
-    const par = parity(prep); prep.usable = usableMasks(prep, par);
-    prep.cache.clear();
-    const units = unitsOf(prep), base = evaluate(prep, {}), ref = prep.logs[prep.logs.length - 1].cfg;
-    if (prep.unitKind === 'block') notes.push(`The file has ${prep.logs.length} flight log${prep.logs.length === 1 ? '' : 's'}. The uncertainty and the leave-one-out use ${units.length} blocks of ${RULE.blockS} s of flight, not flights.`);
-    const differs = prep.logs.filter(L => changeKey(L.cfg.s) !== changeKey(ref.s)).map(L => L.log);
-    if (differs.length) notes.push(`The filter settings of logs ${differs.join(', ')} differ from the last flight log. Each log is evaluated with its own settings; the changes are to the settings of the last flight log.`);
-    const tSearch = Date.now(), path = greedy(prep, units, prep.lines, opts), pick = choose(path), tLoo = Date.now();
-    const pool = [...prep.cache.values()].map(ev => { const d = delayChange(base.delay, ev.delay); return { changes: ev.changes, ev, label: (path.tried.find(t => changeKey(t.changes) === ev.key) || {}).label || (ev.key === base.key ? 'the settings of the logs' : 'candidate'), size: changeSize(ref, ev.changes), why: guards(ref, ev.changes, d) }; });
-    const folds = opts.loo === false || units.length < 3 ? [] : looValidate(prep, units, pool);
-    const tEnd = Date.now();
-    const node = pick.chosen, R0 = RULES.reduction, reasons = [];
-    const usedAxes = par.map(p => AXES.filter(ax => p.axes[ax] && p.axes[ax].linesPassed && p.axes[ax].delayPassed).length);
-    if (!usedAxes.some(n => n > 0)) reasons.push('The replica did not pass parity on any axis of any log.');
-    if (node === path[0]) reasons.push('No change passed the guards with a gain of at least the search step.');
-    else {
-        if (!(node.score.db <= -R0.minDb)) reasons.push(`The predicted change is ${r(node.score.db, 2)} dB. A reduction of ${R0.minDb} dB or more is necessary.`);
-        if (node.score.se === null) reasons.push(`There are ${units.length} units: no standard error (3 or more are necessary).`);
-        else if (!(node.score.db + RULES.sig * node.score.se < 0)) reasons.push(`The reduction is less than ${RULES.sig} standard errors (${r(node.score.db, 2)} ± ${r(node.score.se, 2)} dB).`);
-        if (folds.length) { const okShare = folds.filter(fd => fd.heldOutDb !== null && fd.heldOutDb < 0).length / folds.length; if (okShare < R0.looMinShare) reasons.push(`In leave-one-out, ${r(100 * okShare, 0)} % of the held-out units had less noise; ${100 * R0.looMinShare} % is necessary.`); }
-    }
-    const held = folds.map(fd => fd.heldOutDb).filter(v => v !== null), hms = meanSe(held);
-    const sum0 = summarizeNode(prep, node, base, units, ref), cl = cliLines(ref, node.changes, prep, opts);
-    const singles = path.tried ? Object.values(path.tried.filter(t => t.round === 0 && !t.screened && !(t.why && t.why.length)).reduce((m, t) => { if (!m[t.family] || t.db < m[t.family].db) m[t.family] = t; return m; }, {})) : [];
-    const result = {
-        version: 1,
-        ms: { total: Date.now() - t0, prepare: prep.ms, search: tLoo - tSearch, loo: tEnd - tLoo, simulations: prep.simRuns || 0, subsetSimulations: prep.subRuns || 0, exactEvaluations: prep.cache.size, screened: path.tried ? path.tried.filter(t => t.screened).length : 0, timedOut: !!path.timedOut },
-        model: { passed: par.every(p => p.passed), parity: par, rules: RULES.parity, notes: [].concat(...prep.logs.map(L => L.notes.map(t => `log ${L.log}: ${t}`))),
-            gear: ref.gear ? { source: ref.gear.source || null, tailOrder: tailOrderOf(ref.gear), motorOrder: motorOrderOf(ref.gear) } : null,
-            leftOut: [].concat(...prep.logs.map(L => L.model.leftOut.map(x => Object.assign({ log: L.log }, x)))) },
-        tailFit,
-        bench: prep.bench, units: { kind: prep.unitKind, n: units.length, ids: units.map(u => u.id) },
-        lines: prep.lines,
-        current: { settings: ref.s, from: ref.from, noise: summarizeNoise(prep, base, units), delay: base.delay },
-        path: path.map(n => summarizeNode(prep, n, base, units, ref)),
-        candidates: singles.map(t => ({ family: t.family, label: t.label, db: r(t.db, 2), se: r(t.se, 2), delay: t.delay, changes: t.changes })).sort((p, q) => p.db - q.db),
-        recommended: { status: reasons.length ? 'not recommended' : 'recommended', reasons, targetDb: pick.targetDb, bestDb: r(pick.best.score.db, 2), params: node.changes, cli: cl.lines, rows: cl.rows, unknownProfiles: cl.unknownProfiles,
-            predicted: sum0.predicted, delay: node.delay, size: node.size,
-            validation: { leaveOneOut: { unit: prep.unitKind, folds, heldOutMeanDb: r(hms.mean, 2), heldOutSe: r(hms.se, 2), sameAsFull: folds.filter(fd => changeKey(fd.chosen) === changeKey(node.changes)).length } } },
-        notes: notes.concat(prep.notes),
-    };
-    if (opts.curves !== false) result.curves = curves(prep, base, node === path[0] ? null : node.ev);
-    return result;
-}
 // the notch orders of a gear context: tail rotor speed / rotor speed, motor rpm / rotor speed (motors.c:251-258)
 const tailOrderOf = (g) => !g ? null : g.tailOrder > 0 ? g.tailOrder : g.tail && !g.motorisedTail ? Math.max(+g.tail[1], 1) / Math.max(+g.tail[0], 1) : null;
 const motorOrderOf = (g) => !g ? null : g.motorOrder > 0 ? g.motorOrder : g.main ? Math.max(+g.main[1], 1) / Math.max(+g.main[0], 1) : null;
@@ -2080,6 +2045,7 @@ function fitCauseText(G, name) {
  * a gear ratio: the orders that the log gave (res.tailFit) or the filters that the model does not have (res.model.leftOut)
  */
 function texts(res, opts = {}) {
+    if (res && res.version === 2) return require('./filter_autotune.cjs').texts(res);
     const lb = opts.logBase === undefined ? 1 : opts.logBase, R = (res && res.recommended) || {}, M = (res && res.model) || {}, par = Array.isArray(M.parity) ? M.parity : [];
     const unit = res && res.units && res.units.kind === 'block' ? 'periods of 30 s of flight' : 'flight logs', unit1 = unit === 'flight logs' ? 'flight log' : 'period of 30 s of flight';
     const L = (l) => typeof l === 'number' ? l + lb : l, logs = par.map(p => L(p.log)), seconds = par.reduce((a, p) => a + (+p.seconds || 0), 0);
@@ -2138,36 +2104,40 @@ function texts(res, opts = {}) {
     return out;
 }
 
+function tune(logs, opts = {}) { return require('./filter_autotune.cjs').tune(logs, opts); }
+
 module.exports = { FW, FW_RANGE, RULES, RULE, EXTRA, PRESETS, config, withSettings, compile, effectiveBanks, chainResponse, pidResponse, pidPath, runChain, centresAt,
     prepare, findLines, decompose, parity, usableMasks, evaluate, delayOf, delayChange, score, movesOf, guards, greedy, choose, looValidate, cliLines, curves, tune,
-    lowpassSections, biquad, firstOrderLpf, difSection, pt1Gain, notchQ, notchCutoffFor, notchAt, mulSection, fftPlan, twoSpectra, tvKey, texts,
+    lowpassSections, biquad, firstOrderLpf, difSection, pt1Gain, notchQ, notchCutoffFor, notchAt, mulSection, fftPlan, fft, twoSpectra, tvKey, texts,
     tailOrder, tailOrderStart, tailOrderAdd, tailOrderFit, fitCauseText, orderSpectra, fitOrderAt, tailOrderOf, motorOrderOf,
-    _t: { sumUnits, dipCandidates, cleanBanks, inViewBanks, banksAt, fitQAt, bankDip, revHeadspeed } /* the parts of tailOrder, for the tests */ };
+    _t: { sumUnits, dipCandidates, cleanBanks, inViewBanks, banksAt, fitQAt, bankDip, revHeadspeed, dynStep } /* stateful SDFT processing shared with native-rate replay */ };
 if (require.main !== module) return;
 
 // ---------------------------------------------------------------------------------------------
-// CLI: node tools/autotune/filter_tune.cjs <out dir> <log file> [--cli <dump>] [--logs 1,2,...] [--no-loo]
+// CLI: node tools/autotune/filter_tune.cjs <out dir> <log file> [--cli <dump>] [--logs 0,1,...] [--flight-rpm 2000] [--budget-ms 120000]
 // ---------------------------------------------------------------------------------------------
 {
     const fsN = require('node:fs'), pathN = require('node:path'), args = process.argv.slice(2), outDir = args[0], file = args[1];
     const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
-    if (!outDir || !file) { console.error('usage: node tools/autotune/filter_tune.cjs <out dir> <log file> [--cli <dump>] [--logs 1,2] [--no-loo]'); process.exit(1); }
+    if (!outDir || !file) { console.error('usage: node tools/autotune/filter_tune.cjs <out dir> <log file> [--cli <dump>] [--logs 0,1] [--flight-rpm 2000] [--budget-ms 120000]'); process.exit(1); }
     const phase = require('./health_phase.cjs'), more = require('./health_more.cjs'), only = opt('--logs') ? opt('--logs').split(',').map(Number) : null;
     const app = lib.loadApp(), extra = [...new Set([...EXTRA, ...phase.EXTRA, ...more.EXTRA])], items = [], t0 = Date.now();
     for (const w of lib.segments(app, file, { whole: true, extra })) {
         if (only && !only.includes(w.flight.log)) continue;
-        const ctx = { rate: w.rate, flightRule: { headspeed: lib.FLIGHT_RPM } }, ph = phase.phases(w, ctx), fm = phase.flightMask(w, ctx, ph);
+        const ctx = { rate: w.rate, flightRule: { headspeed: +opt('--flight-rpm') || lib.FLIGHT_RPM } }, ph = phase.phases(w, ctx), fm = phase.flightMask(w, ctx, ph);
         let mask = fm; try { mask = more.normalMask(w, Object.assign({ flying: fm, phases: ph, header: w.flight.header, profile: w.profileAt, govState: w.govStateAt }, ctx)).mask; } catch (e) { /* the flight phase only */ }
         items.push({ w, mask, flight: ph.class === 'flight' });
     }
     const tDecode = Date.now() - t0, cli = opt('--cli') ? fsN.readFileSync(opt('--cli'), 'utf8') : null;
-    const res = tune(items, { cli, loo: !args.includes('--no-loo') });
+    const res = tune(items, { cli, flightRpm: +opt('--flight-rpm') || undefined, budgetMs: +opt('--budget-ms') || undefined, progress: text => console.error(text) });
     res.ms.decode = tDecode;
     fsN.mkdirSync(outDir, { recursive: true });
     const plain = JSON.parse(JSON.stringify(res, (k, v) => ArrayBuffer.isView(v) ? Array.from(v, x => +(+x).toPrecision(5)) : v));
     fsN.writeFileSync(pathN.join(outDir, 'filter_tune.json'), JSON.stringify(plain, null, 1));
+    if (res.cliFile) fsN.writeFileSync(pathN.join(outDir, 'filter-autotune.txt'), res.cliFile);
+    else fsN.rmSync(pathN.join(outDir, 'filter-autotune.txt'), { force: true });
     const TF = res.tailFit;
     if (TF) console.log(JSON.stringify({ tailFit: { passed: TF.passed, used: TF.used, order: TF.order, se: TF.se, n: TF.n, unit: TF.unit, axis: TF.axis, depthDb: TF.depthDb, maxDevOrder: TF.maxDevOrder, limitDevOrder: TF.limitDevOrder, reasons: TF.reasons, cli: TF.cli, units: (TF.units || []).map(u => `${u.id}: ${u.order} (${u.depthDb} dB, ${u.windows} windows)`), motor: TF.motor && { passed: TF.motor.passed, order: TF.motor.order, reasons: TF.motor.reasons }, ms: TF.ms } }, null, 1));
     console.log(JSON.stringify({ parity: res.model.parity.map(p => ({ log: p.log, passed: p.passed, axes: Object.fromEntries(Object.entries(p.axes).map(([ax, A]) => [ax, { passed: A.passed, band: A.maxBandErrorDb, line: A.medianLineErrorDb, delay: A.delayErrorMs }])) })) }));
-    console.log(JSON.stringify({ ms: res.ms, status: res.recommended.status, reasons: res.recommended.reasons, cli: res.recommended.cli, predicted: res.recommended.predicted && { totalDb: res.recommended.predicted.totalDb, se: res.recommended.predicted.se, axes: res.recommended.predicted.axes }, delay: res.recommended.delay, loo: res.recommended.validation.leaveOneOut }, null, 1));
+    console.log(JSON.stringify({ ms: res.ms, status: res.recommended.status, reasons: res.recommended.reasons, cli: res.recommended.cli, predicted: res.recommended.predicted, delay: res.recommended.delay, holdout: res.recommended.validation.holdout }, null, 1));
 }

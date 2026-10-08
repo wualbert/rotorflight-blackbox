@@ -206,7 +206,7 @@ const RULES = {
 // and DYN_LPF_MAX_HZ 1000, sensors/gyro.h:40-41), dyn_notch_q 679, stop gains 1136-1137, collective FFs 1142, 1147,
 // governor gains 1209-1212, gyro_rpm_notch_preset 1699, yaw_inertia_precomp_gain 1144 (a T14 target, never CLI); axis
 // gains PID_GAIN_MAX (flight/pid.h:35). The notch arrays (MODE_ARRAY) have no range there.
-const RANGE = { blackbox_rate_denom: [1, 8000], gyro_lpf1_static_hz: [0, 1000], gyro_lpf2_static_hz: [0, 1000], gyro_lpf1_dyn_min_hz: [0, 1000], dyn_notch_q: [10, 100],
+const RANGE = { gyro_decimation_hz:[0,1000], motor_rpm_lpf:[0,255], blackbox_rate_denom: [1, 8000], gyro_lpf1_static_hz: [0, 1000], gyro_lpf2_static_hz: [0, 1000], gyro_lpf1_dyn_min_hz: [0, 1000], gyro_lpf1_dyn_max_hz: [0, 1000], dyn_notch_q: [10, 100],
     yaw_cw_stop_gain: [25, 250], yaw_ccw_stop_gain: [25, 250], yaw_collective_ff_gain: [0, 250], pitch_collective_ff_gain: [0, 250],
     gov_p_gain: [0, 250], gov_i_gain: [0, 250], gov_f_gain: [0, 250], gyro_rpm_notch_preset: [0, 3], yaw_inertia_precomp_gain: [0, 250], gov_spoolup_time: [0, 600],  // settings.c:959
     // round 3 M2, the filter search (filter_tune.cjs FW_RANGE): settings.c:672-681 (LPF_MAX_HZ 1000, DYN_NOTCH_COUNT_MAX 8), 1124-1134
@@ -272,7 +272,7 @@ const REFUTED = {
 // CLI names this module may write (guard 12): [scope, header key, element (null scalar, 'all' whole array), 4.6 default].
 // Names and defaults are health_setup.cjs PAIRS_PROFILE / PAIRS_GLOBAL and TUNING_KNOWLEDGE.md 2.5, 2.10, 3.2, 7.1;
 // test/advice.test.cjs checks each against those files. Anything else gets advice text only.
-const PARAMS = { blackbox_rate_denom: ['global', null, null, 8] };
+const PARAMS = { blackbox_rate_denom: ['global', null, null, 8], gyro_decimation_hz:['global','gyro_decimation_hz',null,250], motor_rpm_lpf:['global',null,'all',null] };
 for (const [ax, def] of [['roll', [50, 100, 0, 100, 0]], ['pitch', [50, 100, 40, 100, 0]], ['yaw', [80, 120, 10, 0, 0]]])
     ['p', 'i', 'd', 'f', 'b'].forEach((k, i) => { PARAMS[`${ax}_${k}_gain`] = ['profile', `${ax}PID`, i, def[i]]; });
 Object.assign(PARAMS, {
@@ -281,7 +281,7 @@ Object.assign(PARAMS, {
     yaw_collective_ff_gain: ['profile', 'yaw_precomp', 2, 60], pitch_collective_ff_gain: ['profile', 'pitch_compensation', null, 0],
     yaw_inertia_precomp_gain: ['profile', 'yaw_inertia_precomp', 0, 0],   // the T14 target: its value of each PID profile; T14 is a check, never CLI
     gyro_lpf1_type: ['global', 'gyro_soft_type', null, 'FIRST_ORDER'], gyro_lpf1_static_hz: ['global', 'gyro_lowpass_hz', null, 100],
-    gyro_lpf2_static_hz: ['global', 'gyro_lowpass2_hz', null, 50], gyro_lpf1_dyn_min_hz: ['global', 'gyro_lowpass_dyn_hz', 0, 0],
+    gyro_lpf2_static_hz: ['global', 'gyro_lowpass2_hz', null, 50], gyro_lpf1_dyn_min_hz: ['global', 'gyro_lowpass_dyn_hz', 0, 0], gyro_lpf1_dyn_max_hz: ['global', 'gyro_lowpass_dyn_hz', 1, 0],
     dyn_notch_q: ['global', 'dyn_notch_q', null, 25], gyro_rpm_notch_preset: ['global', 'gyro_rpm_notch_preset', null, 2],
     gov_spoolup_time: ['global', null, null, 100],   // not in the log header: the CLI dump only (TUNING_KNOWLEDGE 3.2, settings.c:959)
     // round 3 M2: the names that the filter search writes (filter_tune.cjs movesOf), with the defaults of health_setup PAIRS_GLOBAL
@@ -2253,7 +2253,7 @@ const DS_RULES = {
 };
 function dsContext(inp) {
     const ds = inp && inp.datasets && Array.isArray(inp.datasets.datasets) ? inp.datasets : null;
-    return ds ? { ds, byId: new Map(ds.datasets.map(d => [d.id, d])) } : null;
+    return ds ? { ds, selected: inp.configurationId || null, byId: new Map(ds.datasets.map(d => [d.id, d])) } : null;
 }
 const dsList = (ids) => ids.length > 1 ? `configurations ${and(ids)}` : `configuration ${ids[0]}`;
 // The present value of a parameter from the newest configuration of PID profile p (the newest of the file for a global value):
@@ -2267,9 +2267,12 @@ function dsValue(c, param, p) {
     const v = d.values[param], s = d.sources ? d.sources[param] : null, lb = c.logBase;
     if (v === null || s === 'none' || s === undefined || s === null) return { value: null, unknown: 'dsNone', dataset: id };
     if (typeof v !== 'number') return null;
-    const logs = (d.logs || []).map(l => l + lb), where = `configuration ${id}, the newest of ${P[0] === 'global' ? 'the file' : prof(p)}`;
+    const logs = (d.logs || []).map(l => l + lb), selected=c.dsc.selected===id;
+    const where = selected ? `recorded configuration ${id}` : `configuration ${id}, the newest of ${P[0] === 'global' ? 'the file' : prof(p)}`;
     if (s === 'estimate') return { value: v, source: `${where}, log header`, approx: true, why: 'dsEstimate', dataset: id };
-    if (s === 'adjustment') return { value: v, source: `${where}, in-flight adjustment`, approx: true, why: 'dsAdjustment', dataset: id };
+    // rc_adjustments.c records the absolute newValue. Within that exact
+    // configuration interval it is an observed setting, not an estimate of now.
+    if (s === 'adjustment') return Object.assign({ value: v, source: `${where}, in-flight adjustment`, dataset: id },selected ? {} : { approx:true, why:'dsAdjustment' });
     if (s === 'cli') return c.staleCli.has(param) ? { value: null, unknown: 'staleCli', dataset: id } : { value: v, source: `${where}, ${cliWords(c)}${P[0] === 'global' ? '' : `, section \`profile ${p - 1}\``}`, dataset: id };
     const m = /^log (\d+)/.exec(String(s));
     if (m) { const from = +m[1], ok = (d.assumedFrom || []).filter(a => a.from === from).every(a => a.bracketed === true);
@@ -2418,6 +2421,15 @@ const FILTER_RULE = 'The app recommends a set of filter values only if the filte
     + 'The set must also be correct in 80 % of the tests without one flight log.';
 // short sources: the "Sources:" sentence must stay on one comment line of the CLI file (240 characters), so that its quoted text stays quoted
 const FILTER_SOURCES = ['toolkit rule, no flight test: a model of the Rotorflight 4.6 gyro filters (firmware 4.6.0, sensors/gyro_filter_impl.c)', 'Rotorflight documentation, "First flight and filter tuning"'];
+function filterReplayRule(res) {
+    const limit=res.limits && num(res.limits.maxAddMs)!==null ? res.limits.maxAddMs : 0.5;
+    return 'The replay must agree with the recorded gyro on all axes. '
+        + `The maximum added time delay is ${limit} ms.\nThe control-band gain must not decrease by more than 0.5 dB. `
+        + 'The gyro vibration on each axis must not increase by more than 0.25 dB.\n'
+        + (res.mode==='simulation' ? 'The replay checks the changed values on the recorded flight periods.'
+            : 'The vibration must decrease by 3 dB or more, and by more than 2 SE. '
+            + 'The analysis keeps some flight periods for a different test. The selected values must decrease vibration in 80 % of those periods.');
+}
 // the Q of a static notch from its center and its cutoff (firmware filter.c notchFilterGetQ)
 const notchQOf = (hz, cutoff) => hz > 0 && cutoff > 0 && hz > cutoff ? hz * cutoff / (hz * hz - cutoff * cutoff) : null;
 /**
@@ -2431,9 +2443,10 @@ const notchQOf = (hz, cutoff) => hz > 0 && cutoff > 0 && hz > cutoff ? hz * cuto
  * filters block in the diagram), dataset (the newest configuration) }
  */
 function filterRecommendations(res, meta = {}) {
-    const R = (res && res.recommended) || {}, M = (res && res.model) || {}, T = meta.texts || {}, rows = Array.isArray(R.rows) ? R.rows : [];
-    const action = R.status === 'recommended' && M.passed === true && rows.length > 0, why = (T.why || []).slice(), blocked = Array.isArray(meta.blockedBy) ? meta.blockedBy.filter(Boolean) : [];
-    const base = { node: 'filters', area: 'filters', rule: FILTER_RULE, sources: FILTER_SOURCES.slice(), confidence: 'predicted', dataset: meta.dataset || null };
+    const R = (res && res.recommended) || {}, M = (res && res.model) || {}, T = meta.texts || {}, rows = res && res.version===2 && Array.isArray(R.fullRows) ? R.fullRows : Array.isArray(R.rows) ? R.rows : [];
+    const action = R.status === 'recommended' && M.passed === true && rows.length > 0 && (!res || res.mode!=='simulation' || (R.rows||[]).length>0), why = (T.why || []).slice(), blocked = Array.isArray(meta.blockedBy) ? meta.blockedBy.filter(Boolean) : [];
+    const replayValidated = res && res.version === 2 && M.passed && R.status === 'recommended';
+    const base = { node: 'filters', area: 'filters', rule: res && res.version === 2 ? filterReplayRule(res) : FILTER_RULE, sources: FILTER_SOURCES.slice(), confidence: 'predicted', dataset: meta.dataset || null, replayValidated: !!replayValidated };
     const paras = [T.summary, T.recommendation, T.delay, T.validation, T.parity].filter(Boolean);
     const check = (caveats) => [finishFilter(rec(Object.assign({}, base, { id: 'F:filters', severity: 'check', scope: 'global', title: 'Filter values from the flight logs: no change (to examine)',
         text: paras.join('\n'), caveats })))];
@@ -2449,7 +2462,7 @@ function filterRecommendations(res, meta = {}) {
         // a value at this time from the log header or the CLI dump only (CLAUDE.md "PID profiles"): a default of the model is not one
         if (!SRC[row.source] || row.from === null || row.from === undefined) { bad.push(`The value of \`${nm}\` at this time is unknown, because ${meta.cli ? 'the log header and the CLI dump do not give it' : 'the log header does not record it'}.`); continue; }
         if (P[0] !== (row.scope === 'profile' ? 'profile' : 'global')) { bad.push(`\`${nm}\` is not a ${row.scope === 'profile' ? 'PID profile' : 'global'} value.`); continue; }
-        if (!cliValueOk(nm, v)) { bad.push(`The value ${v} of \`${nm}\` is not in its firmware range, or it is less than a filter limit.`); continue; }
+        if (!cliValueOk(nm, v, replayValidated)) { bad.push(`The value ${v} of \`${nm}\` is not in its firmware range, or it is less than a filter limit.`); continue; }
         if (row.scope === 'profile') { const p = num(row.profile); if (!(p > 0)) { bad.push(`The PID profile of \`${nm}\` is unknown (PID profile unknown).`); continue; }
             if (!byProf.has(p)) byProf.set(p, []); byProf.get(p).push([nm, v]); }
         else glob.sets.push([nm, v]);
@@ -2458,15 +2471,15 @@ function filterRecommendations(res, meta = {}) {
     // the set keeps a gyro low-pass filter, and every static notch has a Q of 2.0 or more
     const s = Object.assign({}, (res.current && res.current.settings) || {}); for (const [k, v] of glob.sets) s[k] = /_type$/.test(k) ? setup.LPF_TYPES.indexOf(v) : +v;
     const lpfOn = (t, hz) => num(t) !== null && t > 0 && num(hz) > 0;
-    if ((glob.sets.some(([k]) => /^gyro_lpf\d_/.test(k))) && !lpfOn(s.gyro_lpf1_type, s.gyro_lpf1_static_hz) && !lpfOn(s.gyro_lpf2_type, s.gyro_lpf2_static_hz))
+    if (!replayValidated && (glob.sets.some(([k]) => /^gyro_lpf\d_/.test(k))) && !lpfOn(s.gyro_lpf1_type, s.gyro_lpf1_static_hz) && !lpfOn(s.gyro_lpf2_type, s.gyro_lpf2_static_hz))
         bad.push('The set has no gyro low-pass filter. With the RPM filters, one low-pass filter of about 100 Hz is necessary (Configurator help text).');
     for (const k of [1, 2]) { const hz = s[`gyro_notch${k}_hz`], co = s[`gyro_notch${k}_cutoff`], q = notchQOf(hz, co);
-        if (glob.sets.some(([n]) => n === `gyro_notch${k}_hz` || n === `gyro_notch${k}_cutoff`) && hz > 0 && (q === null || q < RULES.minNotchQ)) bad.push(`The static notch filter ${k} has a Q of ${q === null ? 'unknown' : fmt(q, 2)}, less than ${RULES.minNotchQ}.`); }
+        if (!replayValidated && glob.sets.some(([n]) => n === `gyro_notch${k}_hz` || n === `gyro_notch${k}_cutoff`) && hz > 0 && (q === null || q < RULES.minNotchQ)) bad.push(`The static notch filter ${k} has a Q of ${q === null ? 'unknown' : fmt(q, 2)}, less than ${RULES.minNotchQ}.`); }
     if (bad.length) return check(bad.concat(['Thus, there is no CLI text.']));
     const n = (glob.features.length || glob.sets.length ? 1 : 0) + byProf.size, group = n > 1 ? 'F:filters' : null, out = [];
     const pick = (keep, strip) => Object.fromEntries(Object.entries(keep).filter(([k]) => strip(k) !== null).map(([k, v]) => [strip(k), v]));
     const rowText = (sel) => sel.map(x => x.text).filter(Boolean), chunks = (list) => { const o = []; for (let i = 0; i < list.length; i += 5) o.push(list.slice(i, i + 5).join(' ')); return o; };
-    const effect = 'Then less vibration gets to the PID controller and the servos.';
+    const effect = res.mode === 'simulation' ? 'The replay shows the change of vibration with these values.' : 'Then less vibration gets to the PID controller and the servos.';
     if (glob.features.length || glob.sets.length) {
         const gr = (T.rows || []).filter(x => x.scope !== 'profile');
         out.push(rec(Object.assign({}, base, { id: 'F:filters', severity: 'action', scope: 'global', title: 'Set the gyro filter values that the app found', group, groupSize: group ? n : null,
@@ -2489,6 +2502,7 @@ function finishFilter(r) {
     const kinds = [...new Set(Object.values(r.fromSources || {}))];
     r.fromSource = kinds.length === 1 ? kinds[0] : null; if (kinds.length < 2) r.fromSources = null;
     const o = {}; for (const k of OUT_KEYS) o[k] = r[k] === undefined ? null : r[k];
+    if (r.replayValidated === true) o.replayValidated = true;
     o.order = 0; return o;
 }
 
@@ -2508,12 +2522,13 @@ function defaultPicks(recommendations) { return (Array.isArray(recommendations) 
 
 // one value that the CLI accepts for name k (guards 5, 6 and 12): a number in RANGE, a filter type name, or a list of
 // exactly 16 integers for the RPM notch arrays (SPEC2 C10); the filter floors and the RPM notch sources that the firmware knows
-function cliValueOk(k, v) {
+function cliValueOk(k, v, replayValidated = false) {
+    if(k==='motor_rpm_lpf') {const values=String(v).split(',').map(Number);return replayValidated&&values.length===4&&values.every(x=>Number.isInteger(x)&&x>=0&&x<=255);}
     const P = PARAMS[k]; if (!P || typeof v !== 'string' || !v.length) return false;
-    if (P[2] === 'all') return /^-?\d+(,-?\d+)*$/.test(v) && v.split(',').length === BANKS && floorsOk(k, v) && legal(k, v);
+    if (P[2] === 'all') return /^-?\d+(,-?\d+)*$/.test(v) && v.split(',').length === BANKS && (replayValidated || floorsOk(k, v)) && legal(k, v);
     if (/_type$/.test(k)) return setup.LPF_TYPES.includes(v);
     if (!/^-?\d+$/.test(v)) return false;
-    return floorsOk(k, +v) && legal(k, +v);
+    return (replayValidated || floorsOk(k, +v)) && legal(k, +v);
 }
 // why a picked recommendation does not go into the file, or null; and its commands: { scope, index, sets: [[k, v]] }
 function exportPlan(r) {
@@ -2542,10 +2557,15 @@ function exportPlan(r) {
             features.push([fm[2], fm[1] !== '-']); continue; }
         const m = /^set ([a-z0-9_]+) = (\S+)$/.exec(l);
         if (!m) return { why: `The CLI text has a line that is not a \`set\` command: \`${l.replace(/[`\r\n]/g, ' ').slice(0, 60)}\`.` };
+        if (r.configurationBase === true && scope === 'profile') {
+            if (profileConfigValue(m[1],{[m[1]]:m[2]})!==m[2]) return {why:`The recorded value of \`${m[1]}\` is unknown or outside its firmware range.`};
+            sets.push([m[1],m[2]]); continue;
+        }
         if (!PARAMS[m[1]]) return { why: `\`${m[1]}\` is not a name that the app writes.` };
         if (PARAMS[m[1]][0] !== scope) return { why: `\`${m[1]}\` is not a ${scope === 'profile' ? 'PID profile' : scope === 'rateprofile' ? 'rate profile' : 'global'} value.` };
-        if (PARAMS[m[1]][2] === 'all' && m[2].split(',').length !== BANKS) return { why: `The value of \`${m[1]}\` must have ${BANKS} numbers, one for each bank.` };
-        if (!cliValueOk(m[1], m[2])) return { why: `The value of \`${m[1]}\` is not in its firmware range, or it is less than a filter limit.` };
+        const arrayCount = m[1] === 'motor_rpm_lpf' ? 4 : BANKS;
+        if (PARAMS[m[1]][2] === 'all' && m[2].split(',').length !== arrayCount) return { why: `The value of \`${m[1]}\` must have ${arrayCount} numbers, one for each ${m[1] === 'motor_rpm_lpf' ? 'motor' : 'bank'}.` };
+        if (!cliValueOk(m[1], m[2], r.replayValidated === true)) return { why: `The value of \`${m[1]}\` is not in its firmware range, or it is less than a filter limit.` };
         sets.push([m[1], m[2]]);
     }
     return sets.length || features.length ? { scope, index, sets, features } : { why: 'It has no `set` command.' };
@@ -2611,10 +2631,97 @@ const staleOf = (r) => r && r.stale && typeof r.stale === 'object' && typeof r.s
  * selection, `save`. In a command batch, `save` does not save after a command error (RULES.source.batch).
  * Pure: the caller gives the date.
  */
-function exportScript(recommendations, picks, meta) {
+// Recorded PID configuration restore schema: Rotorflight 4.6.0 / 118e912,
+// src/main/cli/settings.c PROFILE_VALUE entries. This is separate from the
+// narrower set of parameters that the advice generators can recommend.
+const PROFILE_CONFIG = {};
+for (const name of "pid_mode".split(' ')) PROFILE_CONFIG[name]={range:[0,9]};
+for (const name of "pitch_p_gain pitch_i_gain pitch_d_gain pitch_f_gain pitch_b_gain pitch_o_gain roll_p_gain roll_i_gain roll_d_gain roll_f_gain roll_b_gain roll_o_gain yaw_p_gain yaw_i_gain yaw_d_gain yaw_b_gain yaw_f_gain rescue_pull_up_collective rescue_climb_collective rescue_hover_collective".split(' ')) PROFILE_CONFIG[name]={range:[0,1000]};
+for (const name of "pitch_d_cutoff pitch_b_cutoff pitch_gyro_cutoff roll_d_cutoff roll_b_cutoff roll_gyro_cutoff yaw_d_cutoff yaw_b_cutoff yaw_gyro_cutoff yaw_precomp_cutoff yaw_cyclic_ff_gain yaw_collective_ff_gain yaw_inertia_precomp_gain yaw_inertia_precomp_cutoff pitch_collective_ff_gain cyclic_cross_coupling_gain error_decay_time_ground error_decay_time_cyclic error_decay_time_yaw error_decay_limit_cyclic error_decay_limit_yaw horizon_tilt_effect rescue_pull_up_time rescue_climb_time rescue_flip_time rescue_exit_time gov_gain gov_p_gain gov_i_gain gov_d_gain gov_f_gain gov_tta_gain gov_tta_limit gov_yaw_ff_weight gov_cyclic_ff_weight gov_collective_ff_weight".split(' ')) PROFILE_CONFIG[name]={range:[0,250]};
+for (const name of "yaw_cw_stop_gain yaw_ccw_stop_gain".split(' ')) PROFILE_CONFIG[name]={range:[25,250]};
+for (const name of "cyclic_cross_coupling_ratio angle_level_strength horizon_level_strength horizon_transition".split(' ')) PROFILE_CONFIG[name]={range:[0,200]};
+for (const name of "cyclic_cross_coupling_cutoff".split(' ')) PROFILE_CONFIG[name]={range:[1,250]};
+for (const name of "offset_flood_relax_level".split(' ')) PROFILE_CONFIG[name]={range:[10,250]};
+for (const name of "offset_flood_relax_cutoff".split(' ')) PROFILE_CONFIG[name]={range:[1,100]};
+for (const name of "angle_level_limit".split(' ')) PROFILE_CONFIG[name]={range:[10,90]};
+for (const name of "acro_trainer_angle_limit".split(' ')) PROFILE_CONFIG[name]={range:[10,80]};
+for (const name of "acro_trainer_lookahead_ms".split(' ')) PROFILE_CONFIG[name]={range:[10,200]};
+for (const name of "acro_trainer_gain".split(' ')) PROFILE_CONFIG[name]={range:[25,255]};
+for (const name of "rescue_flip_gain rescue_level_gain".split(' ')) PROFILE_CONFIG[name]={range:[5,250]};
+for (const name of "rescue_hover_altitude rescue_alt_p_gain rescue_alt_i_gain rescue_alt_d_gain".split(' ')) PROFILE_CONFIG[name]={range:[0,10000]};
+for (const name of "rescue_max_sp_rate rescue_max_collective".split(' ')) PROFILE_CONFIG[name]={range:[1,1000]};
+for (const name of "rescue_max_sp_accel".split(' ')) PROFILE_CONFIG[name]={range:[1,10000]};
+for (const name of "gov_headspeed".split(' ')) PROFILE_CONFIG[name]={range:[0,50000]};
+for (const name of "gov_p_limit gov_i_limit gov_d_limit gov_f_limit gov_dyn_min_throttle".split(' ')) PROFILE_CONFIG[name]={range:[0,100]};
+for (const name of "gov_max_throttle gov_min_throttle".split(' ')) PROFILE_CONFIG[name]={range:[10,100]};
+for (const name of "gov_fallback_drop".split(' ')) PROFILE_CONFIG[name]={range:[0,50]};
+for (const name of "gov_collective_curve".split(' ')) PROFILE_CONFIG[name]={range:[5,40]};
+PROFILE_CONFIG.error_limit={range:[0,255],count:3};
+PROFILE_CONFIG.offset_limit={range:[0,255],count:2};
+PROFILE_CONFIG.iterm_relax_level={range:[0,255],count:3};
+PROFILE_CONFIG.iterm_relax_cutoff={range:[0,255],count:3};
+PROFILE_CONFIG.iterm_relax_type={choices:["OFF", "RP", "RPY"]};
+PROFILE_CONFIG.horizon_tilt_expert_mode={choices:["OFF", "ON"]};
+PROFILE_CONFIG.rescue_mode={choices:["OFF", "CLIMB", "ALT_HOLD"]};
+PROFILE_CONFIG.rescue_flip={choices:["OFF", "ON"]};
+PROFILE_CONFIG.gov_use_fallback_precomp={choices:["OFF", "ON"]};
+PROFILE_CONFIG.gov_use_pid_spoolup={choices:["OFF", "ON"]};
+PROFILE_CONFIG.gov_use_voltage_comp={choices:["OFF", "ON"]};
+PROFILE_CONFIG.gov_use_dyn_min_throttle={choices:["OFF", "ON"]};
+
+// Differences needed to restore an older recorded PID configuration before its
+// pending tuning changes. Every command passes the regular firmware validator.
+function profileConfigValue(name,values) {
+    const schema=PROFILE_CONFIG[name]; if (!schema || !values) return null;
+    let value=values[name];
+    if (schema.count && value===undefined) value=Array.from({length:schema.count},(_,i)=>values[name+'['+i+']']);
+    if (value===null || value===undefined) return null;
+    if (schema.choices) {
+        if (typeof value==='number' || /^\d+$/.test(value)) value=schema.choices[+value];
+        return schema.choices.includes(value) ? value : null;
+    }
+    const list=schema.count ? Array.isArray(value) ? value : String(value).split(',') : [value];
+    if (list.length!==(schema.count||1) || list.some(v=>v===null || v===undefined || !/^-?\d+$/.test(String(v)) || +v<schema.range[0] || +v>schema.range[1])) return null;
+    return list.map(Number).join(',');
+}
+function configurationBases(ds) {
+    if (!ds || !Array.isArray(ds.datasets)) return ds;
+    for (const d of ds.datasets) {
+        const newest=ds.datasets.find(x=>x.id===(ds.newestByProfile||{})[d.pidProfile]), records=[], unsupported=[];
+        if (d.pidProfile>0 && newest && newest.id!==d.id) {
+            for (const name of new Set((ds.diff||[]).map(row=>row.name.replace(/\[\d+\]$/,'')))) {
+                if (!PROFILE_CONFIG[name] && DSM.scopeOf(name)!=='profile') continue;
+                const schema=PROFILE_CONFIG[name], numeric=schema && schema.range && !schema.count;
+                const value=profileConfigValue(name,d.values),previous=profileConfigValue(name,newest.values);
+                const v=value!==null&&numeric ? +value : value, old=previous!==null&&numeric ? +previous : previous;
+                if (v===old && v!==null) continue;
+                const different=(ds.diff||[]).some(row=>(row.name===name || row.name.startsWith(name+'[')) && String((d.values||{})[row.name])!==String((newest.values||{})[row.name]));
+                if (!different) continue;
+                const rec={id:'base:'+d.id+':'+name, dataset:d.id, scope:'profile', profile:d.pidProfile, cliProfile:d.pidProfile-1,
+                    severity:'action', node:'configuration', area:'configuration', title:`Use the recorded value of \`${name}\` from configuration ${d.id}`,
+                    parameter:name, from:old, to:v, fromSets:{[name]:old}, fromSource:`Configuration ${newest.id}`, configurationBase:true,
+                    text:`This value restores configuration ${d.id} before its selected tuning changes.`, rule:'Use one recorded configuration for each PID profile.',
+                    cli:[`profile ${d.pidProfile-1}`,`set ${name} = ${v}`], evidence:[], blockedBy:[], causes:[], caveats:[]};
+                const plan=exportPlan(rec);
+                if (v===null || v===undefined || plan.why) unsupported.push({name,reason:plan.why||'The recorded value is unknown.'});
+                else records.push(rec);
+            }
+        }
+        d.exportBase={records,unsupported,relativeTo:newest ? newest.id : d.id};
+    }
+    return ds;
+}
+
+function exportScript(recommendations, picks, meta, withPlan = false) {
     const m = meta || {}, list = (Array.isArray(recommendations) ? recommendations : []).filter(r => r && typeof r === 'object' && typeof r.id === 'string');
     const ids = new Set(picks === undefined || picks === null ? defaultPicks(list) : picks instanceof Set ? [...picks] : [].concat(picks));
     const base = num(m.logBase) || 0, chosen = list.filter(r => ids.has(r.id)), plans = chosen.map(r => ({ r, plan: exportPlan(r) }));
+    const profileConfigurations=new Map();
+    for (const {r} of plans) if (r.dataset && r.profile>0) {
+        if (profileConfigurations.has(r.profile) && profileConfigurations.get(r.profile)!==r.dataset)
+            throw new Error(`Select one final configuration for PID profile ${r.profile}.`);
+        profileConfigurations.set(r.profile,r.dataset);
+    }
     // two picks that set one name on one profile to different values: neither goes into the file
     const value = new Map();
     for (const { plan } of plans) if (plan.sets) for (const [k, v] of plan.sets.concat((plan.features || []).map(([n, on]) => [`feature ${n}`, on]))) { const key = `${plan.scope}|${plan.index}|${k}`; if (!value.has(key)) value.set(key, new Set()); value.get(key).add(v); }
@@ -2626,6 +2733,8 @@ function exportScript(recommendations, picks, meta) {
         if (xs.length < size) for (const x of xs) x.plan = { why: `It is 1 of ${size} changes that the model makes together (\`${clean(g).replace(/`/g, "'")}\`). Select all ${size} changes, or none of them.` };
     }
     const ok = plans.filter(x => x.plan.sets), bad = plans.filter(x => !x.plan.sets);
+    const flightPlan = require('./control_tune.cjs').flightPlan(ok.map(x => x.r));
+    const finish = out => withPlan ? { text: out.join('\n'), flightPlan } : out.join('\n');
     const profiles = Array.isArray(m.profiles) && m.profiles.length ? m.profiles : [...new Set(list.map(r => num(r.profile)).filter(p => p > 0))].sort((a, b) => a - b);
     const out = ['# Rotorflight CLI file from Rotorflight Blackbox (Tuning view, Export).',
         '# WARNING: Examine each change before you use it. After each change, do a hover test in a safe area. Incorrect gains or filters can cause oscillations that you cannot control.',
@@ -2636,7 +2745,7 @@ function exportScript(recommendations, picks, meta) {
         '# 3. In the CLI tab, click "Load from file" and select this file. Examine the commands, then click "Execute". You can also paste the commands.',
         '# 4. If the CLI shows an error, `save` does not save the changes (`batch start`). Correct the error, then do step 3 again.',
         '# 5. After `save`, the flight controller starts again. If possible, fly the changes one at a time.', '#'];
-    const meta1 = [['Craft name', m.craft], ['Log file', m.file], ['Logs', Array.isArray(m.logs) ? and(m.logs.map(String)) : m.logs], ['Flights', m.flights], ['Firmware', m.firmware],
+    const meta1 = [['Craft name', m.craft], ['Log file', m.file], ['Logs', Array.isArray(m.logs) ? and(m.logs.map(String)) : m.logs], ['Flights', m.flights], ['Configurations', m.configurations], ['Firmware', m.firmware],
         ['PID profiles in the analysis', profiles.length ? and(profiles.map(p => num(p) > 0 ? `PID profile ${p}` : 'PID profile unknown')) : null], ['Date', m.date]];
     // log-derived names (craft, file, firmware) are quoted text: the pilot or the log wrote them
     const quoted = new Set(['Craft name', 'Log file', 'Firmware']);
@@ -2667,7 +2776,17 @@ function exportScript(recommendations, picks, meta) {
         out.push('#');
     });
     for (const { r, plan } of bad) out.push(...commentLines(`Not in the file: ${r.title} (\`${clean(r.id).replace(/`/g, "'")}\`). ${plan.why}`));
-    if (!ok.length) { out.push('# This file has no commands. No change that you selected has CLI text that the app can write.'); return out.join('\n'); }
+    if (!ok.length) { out.push('# This file has no commands. No change that you selected has CLI text that the app can write.'); return finish(out); }
+    if (flightPlan.maneuvers.length) {
+        out.push('# Next flight: flight test necessary.', ...commentLines(flightPlan.limitation, true));
+        for (const line of flightPlan.preparation) out.push(...commentLines(line, true));
+        for (const item of flightPlan.maneuvers) {
+            out.push(...commentLines(`${prof(item.profile)}: ${item.title}.`, true), ...commentLines(item.purpose, true));
+            for (const line of item.instructions) out.push(...commentLines(line, true));
+        }
+        for (const line of flightPlan.followup) out.push(...commentLines(line, true));
+        out.push('#');
+    }
     if (bad.length) out.push('#');
     out.push('batch start');
     const numberOf = new Map(ok.map((x, i) => [x, i + 1]));
@@ -2696,9 +2815,9 @@ function exportScript(recommendations, picks, meta) {
         else out.push(...commentLines(`After \`save\`, the flight controller uses ${prof(ok.filter(x => x.plan.scope === 'profile').map(x => x.plan.index).sort((a, b) => a - b).pop() + 1)}. If you use a different PID profile, select it again.`)); }
     if (usedR) { if (ar !== null && Number.isInteger(ar) && ar >= 0 && ar < RULES.rateProfiles) out.push(`# Select rate profile ${ar + 1} again, as before the changes.`, `rateprofile ${ar}`);
         else out.push('# After `save`, the flight controller uses the last rate profile of this file. If you use a different rate profile, select it again.'); }
-    return out.concat('save').join('\n');
+    return finish(out.concat('save'));
 }
 // the CLI file with the default picks and no meta, or '' when no recommendation has CLI text (TuningResult advice.script)
 function script(recommendations) { return defaultPicks(recommendations).length ? exportScript(recommendations, null, {}) : ''; }
 
-module.exports = { RULES, PARAMS, RANGE, COVERAGE, CHECKS: Object.keys(GEN), DS_RULES, FEATURE_NAMES, advise, comparisons, filterRecommendations, script, exportScript, defaultPicks, floorsOk };
+module.exports = { RULES, PARAMS, RANGE, COVERAGE, CHECKS: Object.keys(GEN), DS_RULES, FEATURE_NAMES, advise, comparisons, filterRecommendations, script, exportScript, defaultPicks, floorsOk, configurationBases };

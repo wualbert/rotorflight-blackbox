@@ -1,3 +1,32 @@
+# Unreleased
+
+- Simplify the Tuning Overview to its prerequisite checklist and tuning sequence. Keep priorities on the steps and show recommendations, parameter changes and blockers in the selected step's details.
+
+- Refocus control autotune on recorded problems and the reasons for each recommended change. Show the evidence and parameter values together. Remove unmeasurable new-response columns and keep recorded comparisons and model estimates in supporting details.
+
+- Color-code tuning tabs by outstanding problems, monitor items and satisfactory results, with text labels and counts. Keep missing data neutral, use current filter replay results, and flag export conflicts.
+
+- Reduce tuning-tab stalls by loading closed checks, secondary plots and configuration tables only when opened. Release collapsed content and reuse unchanged configuration panels.
+
+- Consolidate Filters into one editable parameter table and one checklist. Keep previous issues highlighted with their replay outcomes, add Show changed values only, and make Autotune a secondary action after calculation. Show roll, pitch and yaw together, with time and frequency plots paired to the same selected flight interval.
+
+- Organize filter autotune by log or flight. Show the recorded configurations, time ranges and differing Before values used by replay; label spectra that include multiple configurations. Keep each flight's filter draft separate from control configuration choices and identify its source in Export.
+
+- Rename the filter tuning step to Filters. Coalesce plot updates, resizing and hover drawing into animation frames. Defer hidden plot data scans and release observers and queued draws when plots are removed.
+
+- Add control autotune for governor, cyclic, tail and compensation steps, with tracking problems, recorded comparisons and parameter differences. Keep all new responses marked as needing a flight test.
+- Add parameter-specific stick maneuvers to Export and the saved CLI comments, using ASD-STE100 instructions. The list follows the selected, valid changes and includes collective steps, axis inputs and stops, and constant-rate maneuvers.
+- Fix filter autotune using an unavailable configuration after changing the selected flights. Keep the selector, recorded values and filter inputs together, and explain when a configuration has no flight data.
+- Keep the flight selection table's scroll position after each selection in Analysis and Tuning.
+- Add Raw data, Previous filter (recorded) and New filter (calculated) curve controls to the filter comparison. Keep old-filter replay plots in diagnostics and remove the P+D preview plots. Curve selections persist across plot and result changes without rerunning analysis.
+- Simplify Filters and vibration to Before and After, with detailed controls collapsed and change selection in Export. Remove the Flight RPM input and derive the threshold from recorded governor data. Fix autotune failing with `Invalid typed array length: -Infinity` on flight intervals with no complete analysis windows.
+
+- Reorganize Tuning into Overview, one tab per tuning step, and a final Export tab. Place recorded configurations below flight selection, with independent tuning drafts and one final configuration per PID profile.
+- Add a before/after filter workspace with an adjustable delay limit, complete parameter table, manual replay, signal plots and the original filter checklist. Compile changes from all steps into one parameter diff and CLI file.
+- Add filter autotuning under Tuning → Filters and vibration. Candidates use firmware-rate replay of recorded gyro input, with baseline agreement and reserved-period validation.
+- Add complete filter CLI export and previews of recorded, replayed and proposed filtered signals. Show unavailable filter inputs and reject unvalidated exports.
+- Reconstruct native gyro input from the firmware's gyro and PID observations, including asymmetric yaw P, and validate excluded samples. Identify the adaptive filter's pre-log update phase, refine its motion, and preserve complete filter/SDFT state across blocks and final replay. Score native-rate outputs and include gyro decimation and known motor-RPM filtering in the search.
+
 # 2.3.0-20260208
 
 This is a *development snapshot* of the Rotorflight 2.3 Blackbox.

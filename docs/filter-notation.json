@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "documents": ["FILTER_AUTOTUNE.md", "DEVELOPMENT.md"],
+  "scopes": [
+    {
+      "name": "Filter autotune replay score",
+      "files": ["FILTER_AUTOTUNE.md"],
+      "strict_components": true,
+      "component_carriers": [],
+      "symbols": [
+        {"tex": ["\\rho"], "role": "quantity", "meaning": "mean candidate to baseline output energy ratio within one flight block", "space": "positive real, dimensionless"},
+        {"tex": ["d"], "role": "quantity", "meaning": "noise change for one flight block", "space": "real, decibels"}
+      ]
+    },
+    {
+      "name": "Application development documentation",
+      "files": ["DEVELOPMENT.md"],
+      "strict_components": true,
+      "component_carriers": [],
+      "symbols": []
+    }
+  ]
+}

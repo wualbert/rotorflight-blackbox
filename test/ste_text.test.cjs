@@ -543,7 +543,24 @@ function resultTexts(r, add) { // a TuningResult of js/tuning_worker.js
 }
 // The exports of our toolkit modules whose outputs are texts, and how to read them. add(text, kind, where, source): source
 // is the group of the table (the module when it is not given)
+function controlPlanTexts(plan, add) {
+    if (!plan) return;
+    add(plan.limitation, 'message', 'control limitation');
+    for (const line of (plan.preparation || []).concat(plan.followup || [])) add(line,'instruction','flight test procedure');
+    for (const item of plan.maneuvers || []) {
+        add(item.title,'label','flight maneuver'); add(item.purpose,'message','flight maneuver purpose');
+        for (const line of item.instructions || []) add(line,'instruction','flight maneuver instruction');
+    }
+}
 const READERS = {
+    'tools/autotune/control_tune.cjs': {
+        flightPlan: controlPlanTexts,
+        tune: (out,add) => {
+            add(out.reason,'message','control result'); add(out.limitation,'message','control limitation');
+            for (const item of out.deferred || []) add(item.reason,'message','control change that must wait');
+            recommendationTexts(out.recommendations,add); controlPlanTexts(out.flightPlan,add);
+        }
+    },
     'tools/autotune/catalog.cjs': { summary: (out, add, args) => add(out, 'message', `summary ${args[0] && args[0].id}`), issues: (out, add) => issueTexts(out, add) },
     'tools/autotune/datasets.cjs': { datasets: (out, add) => datasetTexts(out, add) },
     'tools/autotune/filter_tune.cjs': { texts: (out, add) => filterTexts(out, add) },
@@ -561,7 +578,7 @@ const READERS = {
         comparisons: (out, add) => comparisonTexts(out, add),
         filterRecommendations: (out, add) => recommendationTexts(out, add),
         script: (out, add) => scriptTexts(out, (t, k, w) => add(t, k, w, SCRIPT_SOURCE), 'advice script'),
-        exportScript: (out, add) => scriptTexts(out, (t, k, w) => add(t, k, w, SCRIPT_SOURCE), 'exportScript'),
+        exportScript: (out, add) => { scriptTexts(typeof out === 'string' ? out : out.text, (t, k, w) => add(t, k, w, SCRIPT_SOURCE), 'exportScript'); },
     },
 };
 const SCRIPT_SOURCE = 'tools/autotune/advice.cjs (comment lines of the CLI scripts)';
@@ -1055,6 +1072,7 @@ function countsOf(hits) { const c = {}; for (const h of hits) c[h.check] = (c[h.
 // The tests that run again, and the sources that each one must give. The list follows the tree: a test that is not in the
 // tree is reported as not found, and every js/*_view.js with its test is read as a DOM script
 const HARVEST = [
+    { file: 'test/control_tune.test.cjs', expect: ['tools/autotune/control_tune.cjs'] },
     { file: 'test/tuning_dialog.test.cjs', expect: ['js/tuning_dialog.js', 'plots of js/tuning_dialog.js'] },
     { file: 'test/log_lens.test.cjs', expect: ['js/log_lens.js'] },
     ...[...DOM_SCRIPTS].filter((f) => /_view\.js$/.test(f)).map((f) => ({ file: `test/${path.basename(f, '.js')}.test.cjs`, expect: [f] })),

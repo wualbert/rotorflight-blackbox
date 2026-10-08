@@ -58,9 +58,6 @@
     width: auto;
 }
 
-.tuning-controls .tuning-rpm {
-    width: calc(175 * var(--rf-px)); /* "automatic: 2900" with the arrows of a number field (V10) */
-}
 
 /* The CLI dump: an optional input on its own line under the controls (the log is the only necessary input) */
 .tuning-cli-line {
@@ -402,21 +399,55 @@
     margin-bottom: -1px;
     padding: 8px 10px 6px;
     border-bottom: 2px solid transparent;
-    color: #606060;
+    color: var(--tab-status-color, #606060);
+    background: var(--tab-status-background, #f5f6f7);
+    border-radius: 4px 4px 0 0;
     white-space: nowrap;
 }
 
 .tuning-tab:hover,
-.tuning-tab:focus {
-    color: #303030;
-    background: #f5f7f9;
+.tuning-tab:focus,
+.tuning-tab.active {
+    color: var(--tab-status-color, #404b53);
+    background: var(--tab-status-background, #f5f6f7);
     text-decoration: none;
 }
 
 .tuning-tab.active {
-    color: #1d5f86;
-    border-bottom-color: #4da8da;
+    border-bottom: 3px solid #245577;
+    font-weight: 700;
 }
+
+/* Status stays visible on inactive tabs. Selection and keyboard focus have
+   separate marks so the problem color does not disappear on navigation. */
+.tuning-tab.st-problem,
+.tuning-tab.st-error {
+    --tab-status-color: #a3362e;
+    --tab-status-background: #fbeeed;
+}
+
+.tuning-tab.st-monitor {
+    --tab-status-color: #8a5d0b;
+    --tab-status-background: #fdf7ea;
+}
+
+.tuning-tab.st-satisfactory {
+    --tab-status-color: #2b7230;
+    --tab-status-background: #f2f9f2;
+}
+
+.tuning-tab:hover { box-shadow: inset 0 0 0 1px currentColor; }
+.tuning-tab:focus-visible { outline: 2px solid #245577; outline-offset: -2px; }
+
+.tuning-tab-status {
+    display: block;
+    margin-top: 3px;
+    font-size: calc(12 * var(--rf-px));
+    line-height: 1.3;
+    font-weight: 600;
+}
+
+.tuning-tab-status:empty { display: none; }
 
 .tuning-tab-count {
     margin-left: 5px;
@@ -487,20 +518,11 @@
 
 /* Status colours */
 
-.tuning-card,
 .tuning-rec {
     border: 1px solid #ddd;
     border-left: 4px solid #b0b0b0;
     border-radius: 4px;
 }
-
-.tuning-card.st-satisfactory { border-left-color: #3c9d40; background: #f2f9f2; }
-.tuning-card.st-monitor { border-left-color: #d99a1f; background: #fdf7ea; }
-.tuning-card.st-problem { border-left-color: #c9483f; background: #fbeeed; }
-.tuning-card.st-information { border-left-color: #3a7fc1; background: #eef5fb; }
-.tuning-card.st-insufficient,
-.tuning-card.st-notmeasured { border-left-color: #b0b0b0; background: #f5f5f5; }
-.tuning-card.st-error { border-left-color: #8e2a23; background: #f8e4e2; }
 
 .tuning-rec.st-monitor { border-left-color: #d99a1f; }
 .tuning-rec.st-problem { border-left-color: #c9483f; }
@@ -537,68 +559,6 @@
 .tuning-badge.st-error { border-color: #8e2a23; background: #8e2a23; color: #fff; }
 
 /* Overview */
-
-.tuning-cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(calc(196 * var(--rf-px)), 1fr));
-    gap: 8px;
-}
-
-.tuning-card {
-    padding: 8px 10px;
-    cursor: pointer;
-}
-
-.tuning-card:hover {
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
-}
-
-.tuning-card-top {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 6px;
-}
-
-.tuning-card-title {
-    font-weight: 600;
-}
-
-.tuning-card-status {
-    color: #707070;
-    font-size: calc(12 * var(--rf-px));
-    letter-spacing: 0.4px;
-    text-transform: uppercase;
-    white-space: nowrap;
-}
-
-.tuning-card-counts {
-    margin-top: 3px;
-    color: #505050;
-    font-size: calc(14 * var(--rf-px));
-}
-
-.tuning-card-ids,
-.tuning-card-recs {
-    margin-top: 2px;
-    font-size: calc(13.5 * var(--rf-px));
-}
-
-.tuning-card-recs {
-    color: #1d5f86;
-}
-
-.tuning-top-recs {
-    padding-left: 22px;
-}
-
-.tuning-top-recs li {
-    margin-bottom: 4px;
-}
-
-.tuning-top-blocked {
-    color: #a3362e;
-}
 
 .tuning-notes {
     padding-left: 18px;
@@ -1508,18 +1468,16 @@
     border-color: #4da8da;
 }
 
-.tuning-node-recs,
-.tuning-start-list {
+.tuning-node-recs {
     padding-left: 20px;
 }
 
-.tuning-start-list.is-prereq {
-    list-style: square;
+.tuning-node-recs li {
+    margin-bottom: 4px;
 }
 
-.tuning-node-recs li,
-.tuning-start-list li {
-    margin-bottom: 4px;
+.tuning-node-rec-blocked {
+    color: #a3362e;
 }
 
 .tuning-order-compare {
@@ -1692,7 +1650,7 @@
     padding-left: 16px;
 }
 
-/* a part of one line that is a block element for the STE lint and screen readers (.tuning-top-recs, .tuning-node-recs) */
+/* A part of one line that is a block element for the STE lint and screen readers. */
 .tuning-inline {
     display: inline;
 }
@@ -1845,6 +1803,10 @@
     box-shadow: inset 3px 0 #4da8da;
 }
 
+.tuning-ft-result.st-monitor {
+    box-shadow: inset 3px 0 #d99a1f;
+}
+
 .tuning-ft-head {
     display: flex;
     flex-wrap: wrap;
@@ -1898,3 +1860,160 @@
     min-width: calc(260 * var(--rf-px));
     white-space: normal;
 }
+
+/* Configuration reference precedes the ordered tuning workflow. */
+.tuning-configuration {
+    margin: 12px 0 18px;
+    padding: 14px 18px;
+    border: 1px solid #d4dce1;
+    border-left: 4px solid #4da8da;
+    border-radius: 5px;
+    background: #f6f9fb;
+}
+.tuning-configuration .tuning-config-bar { display: block; }
+.tuning-configuration .tuning-config { width: 100%; max-width: 1050px; margin: 6px 0 8px; }
+.tuning-config-reference { margin-top: 8px; }
+.tuning-config-reference > summary { cursor: pointer; color: #245577; }
+.tuning-config-reference > .tuning-table-wrap { max-height: 340px; margin-top: 8px; }
+.tuning-config-comparison { margin-bottom: 0; }
+.tuning-tabs { display: flex; gap: 2px; overflow-x: auto; align-items: stretch; }
+.tuning-tabs .tuning-tab { flex: 1 0 auto; padding: 10px 12px; text-align: center; }
+.tuning-step-nav { display: flex; justify-content: space-between; gap: 20px; border-top: 1px solid #d4dce1; padding: 16px 0; margin-top: 24px; }
+.tuning-review-links { margin-bottom: 14px; }
+.tuning-step-picks { border-top: 1px solid #d4dce1; padding-top: 14px; margin-top: 20px; }
+.tuning-step-pick { display: block; margin: 8px 0; font-weight: normal; }
+.tuning-final-profiles { margin: 16px 0; padding: 16px; border: 1px solid #cfd9e2; background: #f6f9fb; border-radius: 5px; }
+.tuning-final-profiles > label { display: inline-block; min-width: 240px; margin: 4px 20px 6px 0; }
+.tuning-final-config { margin-top: 6px; }
+.tuning-pending-diff { margin: 16px 0 24px; }
+
+/* Before/after comparison, with optional controls and diagnostics below. */
+.tuning-ft-workspace { padding: 16px; border: 1px solid #cfd9e2; border-radius: 6px; background: #fff; }
+.tuning-ft-workspace > .tuning-ft-heading .tuning-h { font-size: calc(23 * var(--rf-px)); margin-bottom: 6px; }
+.tuning-ft-source { margin: 20px 0 12px; padding: 16px; background: #f2f7fb; border: 1px solid #cddde9; border-radius: 5px; }
+.tuning-ft-source label { display: block; margin-bottom: 8px; }
+.tuning-ft-source-select { margin-top: 8px; width: 100%; max-width: 850px; }
+.tuning-ft-source p { margin: 0; }
+.tuning-ft-source-title { margin: 10px 0; font-weight: 600; }
+.tuning-ft-run { display: flex; align-items: center; gap: 18px; margin: 12px 0 18px; }
+.tuning-ft-run .tuning-ft-actions { flex: 0 0 auto; }
+.tuning-ft-run p { margin: 0; max-width: 760px; }
+.tuning-ft-baseline { margin: 16px 0; padding: 12px 14px; background: #f6f8fa; border-left: 3px solid #8aa3b6; }
+.tuning-ft-baseline.is-mixed { background: #fff9ec; border-color: #bd8636; }
+.tuning-ft-baseline p { margin: 0 0 7px; }
+.tuning-ft-baseline summary { cursor: pointer; color: #245577; }
+.tuning-ft-baseline .tuning-table-wrap { max-height: 180px; margin-top: 9px; }
+.tuning-ft-baseline table { width: 100%; }
+.tuning-ft-baseline td small, .tuning-ft-recorded-value { display: block; }
+.tuning-ft-axis { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 18px; }
+.tuning-final-filter { margin: 16px 0; padding: 16px; border: 1px solid #cddde9; border-radius: 5px; background: #f2f7fb; }
+.tuning-ct { margin-top: 12px; }
+.tuning-ct-eyebrow { display: block; color: #52718b; font-size: calc(12 * var(--rf-px)); letter-spacing: .1em; margin-bottom: 6px; }
+.tuning-ct .tuning-ft-heading .tuning-h { font-size: calc(23 * var(--rf-px)); margin-bottom: 6px; }
+.tuning-ct-limit { margin: 18px 0; padding: 12px 16px; border-left: 3px solid #bd8636; background: #fff8e9; color: #77521f; border-radius: 3px; }
+.tuning-ct-limit p { margin: 5px 0 0; }
+.tuning-ct-section { padding: 18px 0; border-top: 1px solid #e1e7ec; }
+.tuning-ct-section-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.tuning-ct-section-head .tuning-h { margin: 0; }
+.tuning-ct-section-head label { display: flex; gap: 10px; align-items: center; margin: 0; font-weight: normal; }
+.tuning-ct-reference { width: auto; max-width: 100%; }
+.tuning-ct-problems { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
+.tuning-ct-problems article { padding: 14px; border: 1px solid #e5d5bf; border-radius: 5px; background: #fffdf9; }
+.tuning-ct-problems article.st-problem { border-top: 3px solid #c5654e; }
+.tuning-ct-problems h6 { font-size: calc(15 * var(--rf-px)); margin: 12px 0 5px; }
+.tuning-ct-links { margin-bottom: 0; display: flex; flex-wrap: wrap; gap: 8px; font-size: calc(12 * var(--rf-px)); }
+.tuning-ct-parameters { width: 100%; margin-bottom: 16px; }
+.tuning-ct-parameters small { display: block; color: #607589; }
+.tuning-ct-reason { margin: 14px 0; padding: 14px 18px; border-left: 3px solid #6e879f; background: #f5f8fa; }
+.tuning-ct-reason > h6 { margin-top: 0; font-size: calc(15 * var(--rf-px)); }
+.tuning-ct-evidence { border-top: 1px solid #e1e7ec; padding-top: 10px; margin-top: 10px; }
+.tuning-ct-evidence p { margin-bottom: 6px; }
+.tuning-ct-delta { color: #886128; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tuning-ct-model { padding: 12px 16px; background: #f0f4f8; margin: 14px 0; border-radius: 4px; }
+.tuning-ct-details { padding: 12px 0; border-top: 1px solid #e1e7ec; }
+.tuning-ct-details summary { cursor: pointer; color: #466277; font-weight: 600; }
+.tuning-ct-details[open] summary { margin-bottom: 14px; }
+.tuning-flight-plan { padding: 16px; border: 1px solid #dfca9f; border-radius: 5px; background: #fffdf7; margin-bottom: 18px; }
+.tuning-flight-plan h6 { font-size: calc(15 * var(--rf-px)); font-weight: 600; margin: 16px 0 8px; }
+.tuning-flight-plan article { border-top: 1px solid #e8dec9; margin-top: 16px; }
+.tuning-flight-plan li { margin: 5px 0; }
+.tuning-flight-plan ol { padding-left: 22px; }
+.tuning-ft-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap; }
+.tuning-ft-heading .tuning-h { margin-top: 0; }
+.tuning-ft-heading p { margin-bottom: 0; }
+.tuning-ft-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+.tuning-ft-delay { width: 80px; margin-left: 8px; padding: 5px 7px; border: 1px solid #b7c4ce; border-radius: 4px; }
+.tuning-ft-summary-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; margin: 18px 0; }
+.tuning-ft-summary-grid > div { background: #f3f6f9; padding: 16px; border-radius: 5px; }
+.tuning-ft-summary-grid span { display: block; color: #5b6771; margin-bottom: 5px; }
+.tuning-ft-summary-grid strong { display: block; font-size: calc(16 * var(--rf-px)); }
+.tuning-ft-summary-grid p { margin: 8px 0 0; }
+.tuning-ft-summary-grid p strong { display: inline; font-size: inherit; }
+.tuning-ft-comparison { width: 100%; margin-bottom: 16px; table-layout: fixed; }
+.tuning-ft-comparison th:first-child { width: 44%; }
+.tuning-ft-comparison td { overflow-wrap: anywhere; }
+.tuning-ft-comparison td small { display: block; color: #65737e; }
+.tuning-ft-options, .tuning-ft-details, .tuning-ft-diagnostics { border-top: 1px solid #e0e6eb; margin-top: 16px; }
+.tuning-ft-options > summary, .tuning-ft-details > summary, .tuning-ft-diagnostics > summary { cursor: pointer; padding: 12px 0; color: #245577; }
+.tuning-ft-editor, .tuning-ft-signals { min-width: 0; }
+.tuning-ft-parameter-scroll { max-height: 400px; overflow: auto; margin: 12px 0; border: 1px solid #dde3e7; border-radius: 4px; }
+.tuning-ft-rows { width: 100%; }
+.tuning-ft-rows th { position: sticky; top: 0; background: #edf2f6; z-index: 1; }
+.tuning-ft-rows td { vertical-align: top; }
+.tuning-ft-rows td > small { display: block; color: #65737e; margin-top: 4px; font-size: calc(12 * var(--rf-px)); }
+.tuning-ft-rows code { word-break: break-word; white-space: normal; }
+.tuning-ft-param { width: 100%; min-width: 95px; max-width: 270px; border: 1px solid #b7c4ce; border-radius: 4px; padding: 5px 7px; background: #fff; }
+.tuning-ft-param[type=text] { min-width: 160px; }
+.tuning-ft-changed td { background: #edf7fd; }
+.tuning-ft-draft-note { background: #fff4d9; border-left: 3px solid #d99a1f; padding: 10px 12px; }
+.tuning-ft-signals .tuning-plot { height: 270px; margin-top: 12px; }
+.tuning-ft-signals .tuning-plot-canvas { height: 270px; }
+.tuning-ft-curves { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 18px; }
+.tuning-ft-curves legend { width: 100%; margin: 0 0 8px; border: 0; font-size: inherit; font-weight: 600; }
+.tuning-ft-curves label { display: inline-flex; align-items: center; gap: 7px; margin: 0; font-weight: normal; cursor: pointer; }
+.tuning-ft-curves input { margin: 0; }
+.tuning-ft-curve-swatch { width: 22px; border-top: 3px solid; }
+.tuning-ft-trace { max-width: 100%; padding: 5px; border: 1px solid #b7c4ce; border-radius: 4px; }
+.tuning-ft-checklist { padding-top: 16px; margin-top: 20px; border-top: 1px solid #d4dce1; }
+.tuning-ft-checks td { vertical-align: top; }
+.tuning-ft-checks details { max-width: 410px; }
+.tuning-ft-cleared { background: #f0faf2; }
+.tuning-ft-regression { background: #fff1ed; }
+.tuning-ft-recorded, .tuning-ft-diagnostics { margin-top: 18px; }
+.tuning-ft-recorded > summary, .tuning-ft-diagnostics > summary { cursor: pointer; padding: 9px 0; }
+.tuning-ft-empty { margin: 18px 0 4px; padding: 18px; background: #f3f6f9; border-radius: 4px; }
+.tuning-ft-empty > strong { display: block; font-size: calc(22 * var(--rf-px)); margin-bottom: 10px; }
+@media (max-width: 650px) {
+    .tuning-ft-workspace, .tuning-configuration { padding: 10px; }
+    .tuning-ft-summary-grid { grid-template-columns: minmax(0,1fr); }
+    .tuning-ft-run { align-items: flex-start; flex-direction: column; gap: 8px; }
+}
+
+/* One parameter editor and checklist; each axis pairs one interval in both domains. */
+.tuning-ft-section-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 18px; margin: 14px 0; }
+.tuning-ft-section-head .tuning-h, .tuning-ft-section-head .tuning-ft-actions { margin: 0; }
+.tuning-ft-hide-label { display: inline-flex; align-items: center; gap: 7px; font-weight: normal; cursor: pointer; margin: 0; }
+.tuning-ft-hide-label input { margin: 0; }
+.tuning-ft-rows { table-layout: fixed; }
+.tuning-ft-rows th:first-child { width: 42%; }
+.tuning-ft-rows td { overflow-wrap: anywhere; }
+.tuning-ft-rows td:nth-child(2) { color: #536370; }
+.tuning-ft-checklist > .tuning-h { margin-top: 0; }
+.tuning-ft-checks { width: 100%; }
+.tuning-ft-checks td > small { display: block; margin-top: 5px; }
+.tuning-ft-prior-issue { background: #fff8e9; }
+.tuning-ft-prior-issue > td:first-child { border-left: 3px solid #cb922b; }
+.tuning-ft-cleared { background: #f0faf2; }
+.tuning-ft-signals { margin-top: 24px; padding-top: 16px; border-top: 1px solid #d4dce1; }
+.tuning-ft-axis-pair { margin: 20px 0 0; }
+.tuning-ft-axis-pair > h6 { margin: 0; font-size: calc(15 * var(--rf-px)); font-weight: 600; }
+.tuning-ft-plot-pair { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; }
+.tuning-ft-plotbox { min-width: 0; }
+.tuning-ft-signals .tuning-plot, .tuning-ft-signals .tuning-plot-canvas { height: 220px; }
+.tuning-ft-signals .tuning-ft-curves { margin: 14px 0; }
+@media (max-width: 850px) {
+    .tuning-ft-plot-pair { grid-template-columns: minmax(0,1fr); gap: 0; }
+}
+
+.tuning-ft-checklist > .tuning-table-wrap { max-height: 520px; overflow: auto; }
+.tuning-ft-checks th { position: sticky; top: 0; background: #edf2f6; z-index: 1; }

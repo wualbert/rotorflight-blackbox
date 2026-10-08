@@ -29,8 +29,11 @@ function showAllResults(app) {
 // --- stand-ins -------------------------------------------------------------------------------------------------
 
 function fakeElement(tag = 'div') {
+    const events = {};
     return {
         tagName: tag.toUpperCase(), children: [], parentNode: null, style: {}, scrolled: 0,
+        addEventListener(type, fn) { (events[type] = events[type] || []).push(fn); },
+        dispatchEvent(e) { (events[e.type] || []).forEach(fn => fn(e)); },
         appendChild(child) { child.remove(); this.children.push(child); child.parentNode = this; },
         insertAdjacentElement(where, child) {
             assert.equal(where, 'afterend');
@@ -58,7 +61,7 @@ function fakeJquery() {
         const w = {
             0: Object.assign(n.element, { click() { n.clicks++; } }), length: n.sel.startsWith('$') ? 0 : 1,
             find: (sel) => wrap(node(sel)),
-            html(v) { if (v === undefined) return n.html; n.html = String(v); return w; },
+            html(v) { if (v === undefined) return n.html; n.html = String(v); n.htmlWrites = (n.htmlWrites || 0) + 1; return w; },
             text(v) { if (v === undefined) return n.text; n.text = String(v); return w; },
             val(v) { if (v === undefined) return n.val; n.val = v; return w; },
             prop(k, v) { if (v === undefined) return n.props[k]; n.props[k] = v; return w; },
@@ -74,7 +77,7 @@ function fakeJquery() {
     // An event on an element matching a delegated selector: the handler gets the element as `this`
     function fire(type, sel, attrs = {}, props = {}) {
         const el = props.element || Object.assign({ getAttribute: (k) => (k in attrs ? String(attrs[k]) : null), textContent: 'Copy' }, props);
-        const hit = handlers.filter((h) => h.type === type && h.sel === sel);
+        const hit = handlers.filter((h) => h.type.split(' ').includes(type) && h.sel === sel);
         hit.forEach((h) => h.fn.call(el, { preventDefault() {}, which: props.which }));
         return { count: hit.length, el };
     }
@@ -145,7 +148,10 @@ function setup({ result, logCount = 3, current = 1, sysConfig = {}, liveHook = t
         },
         FileReader: function () { this.readAsText = (file) => { this.result = file.text; this.onload(); }; },
         TuningPlot: {
-            attach(canvas, spec) { plots.push({ canvas, spec }); return { update() {}, destroy() { destroyed.push(spec.title); } }; },
+            attach(canvas, spec) {
+                const plot = { canvas, spec }; plots.push(plot);
+                return { update(next) { plot.spec = next; }, destroy() { destroyed.push(spec.title); } };
+            },
         },
         TuningSnippet,
         pickSaveFile: (options) => Promise.resolve({ write: async (blob) => saved.push({ options, text: await blob.text() }) }),
@@ -167,8 +173,35 @@ function setup({ result, logCount = 3, current = 1, sysConfig = {}, liveHook = t
     const html = (sel) => jq.node(sel).html;
     const pane = (key) => html(`.tuning-pane[data-pane="${key}"]`);
     const allHtml = () => [...jq.nodes.values()].map((n) => n.html).join('\n') + Object.values(elements).map((e) => e.parentNode.innerHTML).join('\n');
+    // Native details toggle events do not bubble. Model the body insertion without replacing the parent pane,
+    // including nested disclosures, so deferred tables are tested only after the user opens them.
+    function detail(key, open = true) {
+        const n = [...jq.nodes.values()].find(n => n.html.includes('data-tuning-detail-key="' + key + '"'));
+        assert.ok(n, 'disclosure exists: ' + key);
+        const keyAt = n.html.indexOf('data-tuning-detail-key="' + key + '"');
+        const start = n.html.lastIndexOf('<details', keyAt), headEnd = n.html.indexOf('>', keyAt);
+        const head = n.html.slice(start, headEnd + 1), id = /data-tuning-detail="([^"]+)"/.exec(head)[1];
+        n.html = n.html.slice(0, start) + head.replace(/ open(?=>)/, '').replace(/>$/, open ? ' open>' : '>') + n.html.slice(headEnd + 1);
+        const content = {};
+        Object.defineProperty(content, 'innerHTML', { set(value) {
+            const at = n.html.indexOf('data-tuning-detail="' + id + '"');
+            if (at < 0) return;
+            const body = n.html.indexOf('<div class="tuning-detail-body">', at) + '<div class="tuning-detail-body">'.length;
+            const tags = /<details\b|<\/details>/g; tags.lastIndex = body;
+            let depth = 1, match;
+            while ((match = tags.exec(n.html))) {
+                depth += match[0] === '</details>' ? -1 : 1;
+                if (!depth) break;
+            }
+            assert.ok(match, 'matching disclosure end');
+            n.html = n.html.slice(0, body) + value + n.html.slice(match.index - '</div>'.length);
+        } });
+        const el = { open, getAttribute: name => name === 'data-tuning-detail' ? id : null, querySelector: () => content };
+        jq.node('#viewTuning').element.dispatchEvent({ type: 'toggle', target: el });
+        return el;
+    }
     return {
-        context, jq, dialog, hooks, calls, workers, plots, destroyed, errors, saved, copied, offsets, elements, html, pane, allHtml, reads, snippet, later,
+        context, jq, dialog, hooks, calls, workers, plots, destroyed, errors, saved, copied, offsets, elements, html, pane, allHtml, reads, snippet, later, detail,
         internals: context.TuningDialog.internals,
         get flightLog() { return flightLog; }, get bytes() { return bytes; }, setFile(b, name) { bytes = b; fileName = name; },
         // js/main.js loadLogFile, as for a file dropped on the window while the view is open: new bytes, name and
@@ -425,7 +458,7 @@ test('opening on a log slices that log on the main thread and posts analyseLog w
 test('a result renders every tab, plots and tables, with log-derived text escaped', () => {
     const app = analysed();
     assert.equal(app.workers[0].terminated, true, 'the worker is released after the result');
-    const expect = { overview: 0, recs: 0, export: 0, curves: 5, governor: 3, filters: 4, tail: 2, checks: 0, configs: 0, coverage: 0 };
+    const expect = { overview: 0, cyclic: 1, cycomp: 1, tailcomp: 1, recs: 0, export: 0, curves: 5, governor: 1, filters: 0, tail: 1, checks: 0, configs: 0, coverage: 0 };
     for (const t of app.internals.TABS) {
         const before = app.plots.length;
         assert.equal(app.tab(t.key).count, 1);
@@ -456,14 +489,13 @@ test('a result renders every tab, plots and tables, with log-derived text escape
     const o = app.pane('overview');
     assert.match(o, /Log 2 of 3: 16 results, 9 recommendations\. 2 changes to do, 1 change that must wait\./, 'a blocked change is not one to do now');
     assert.match(o, /Analysis error 1 · Problem 6 · Monitor 2 · Satisfactory 2 · Information 3 · Not sufficient data 1 · Not measured 1/);
-    assert.match(o, /<span class="tuning-badge st-monitor">Change<\/span> <span class="tuning-badge st-blocked">Blocked<\/span><\/div> <a [^>]*>Increase the roll P gain<\/a>[\s\S]*?<div class="tuning-inline tuning-top-blocked">Blocked: <a href="#" class="tuning-node-link" data-node="filters">Filters<\/a>, Correct the filters first \(check F5\)\.<\/div><\/li>/,
-        'the first list marks a blocked change and links the gate step');
-    assert.match(o, /st-problem">Change<\/span><\/div> <a [^>]*>Decrease the pitch F gain<\/a>/, 'an unblocked change keeps its badge');
+    assert.doesNotMatch(o, /<h5[^>]*>(Areas|Before you tune|Start here|First recommendations)<\/h5>/, 'the overview has no duplicate summaries');
+    assert.doesNotMatch(o, /class="tuning-(cards|start-list|top-recs)"/);
+    assert.match(o, /class="tuning-tab-link" data-tab="checks"/, 'all checks remain accessible');
+    assert.match(o, /class="tuning-tab-link" data-tab="recs"/, 'all recommendations remain accessible');
     assert.match(o, /<div class="tuning-muted">Flight rpm 2000 \(85 % of the lowest governor target: 2353 rpm\) · Analysis time 3\.4 s<\/div>/, 'no CLI dump: no word about it');
     assert.ok(!/CLI dump/.test(o), 'the overview names the CLI dump only when the pilot loaded one');
     assert.match(o, /Analysis error in 1 check\./);
-    assert.match(o, /tuning-card st-error" data-area="data"[\s\S]*?Analysis error[\s\S]*?Analysis error 1 · Problem 2 · Information 1 · Not measured 1[\s\S]*?D1, D2, MORE/, 'data card: the worst status, counts, problem ids');
-    assert.match(o, /tuning-card st-information" data-area="rates"[\s\S]*?Information/);
     const recs = app.pane('recs');
     assert.match(recs, /<strong>WARNING:<\/strong> Examine each change before you set it in the flight controller\. After each change, do a hover test in a safe area\./);
     assert.match(recs, /<strong>NOTE:<\/strong> This app does not send data to the flight controller\./);
@@ -479,6 +511,7 @@ test('a result renders every tab, plots and tables, with log-derived text escape
     assert.match(app.pane('checks'), /Show results with not sufficient data \(1\)<\/label>.*Show satisfactory results \(2\)<\/label><span class="tuning-muted tuning-rf-hidden">The list does not show 3 results\.<\/span>/);
     assert.match(app.pane('checks'), /-0\.00074&nbsp;±&nbsp;0\.00046/);
     assert.doesNotMatch(app.pane('governor'), /0\.998680&nbsp;±&nbsp;0\.000030/, 'SPEC3 E: a satisfactory result only with "Show satisfactory results"');
+    app.detail('governor:checks');
     assert.match(app.pane('governor'), /Show satisfactory results \(\d+\)<\/label><span class="tuning-muted tuning-rf-hidden">The list does not show \d+ results?\.<\/span>/);
     showAllResults(app);
     app.tab('governor');
@@ -519,7 +552,7 @@ test('SPEC3 A: the checklist before the first flight is a band above the steps: 
     const app = analysed();
     const o = app.pane('overview');
     assert.ok(o.indexOf('<section class="tuning-prereq"') < o.indexOf('<div class="tuning-flow"'), 'the band is above the flow');
-    assert.match(o, /<h5 class="tuning-h">Before the first flight<\/h5><p class="tuning-muted">The analysis accepts these items as correct\. An item shows a problem only when the log shows a clear problem that the analysis can measure\.<\/p>/);
+    assert.match(o, /<h5 class="tuning-h">Before the first flight<\/h5><p class="tuning-muted">The log shows only problems that the analysis can measure\. Before the first flight, correct all items with a problem\.<\/p>/);
     assert.deepEqual(prereqsOf(o), [['logging', 'problem', false], ['rpm', 'ok', false], ['power', 'nodata', false], ['mechanics', 'ok', false], ['rescue', 'nodata', false], ['controller', 'ok', false]]);
     assert.match(o, /data-node="logging" tabindex="0" role="button" aria-label="Blackbox log: Problem"><div class="tuning-prereq-top"><span class="tuning-badge st-problem">Problem<\/span> <span class="tuning-prereq-title">Blackbox log<\/span><\/div><ul class="tuning-prereq-problems"><li><span class="tuning-block-check">D1<\/span><\/li><li><span class="tuning-block-check">D2<\/span><\/li><\/ul>/,
         'a problem: its checks with the problem');
@@ -528,8 +561,6 @@ test('SPEC3 A: the checklist before the first flight is a band above the steps: 
     assert.match(o, /aria-label="Power: No data"><div class="tuning-prereq-top"><span class="tuning-badge st-nodata">No data<\/span> <span class="tuning-prereq-title">Power<\/span><\/div><div class="tuning-muted tuning-prereq-checks">The log does not contain the battery voltage\.<\/div><\/li>/, 'No data: the reason');
     assert.match(o, /aria-label="Rescue: No data">[^]*?The log cannot show this item\.<\/div><\/li>/, 'No data without a reason');
     assert.ok(!/tuning-prereq-item[^>]*>[^]*?Start here[^]*?<\/li>/.test(o.slice(o.indexOf('tuning-prereq-list'), o.indexOf('</ul></section>'))), 'never "Start here" for an item');
-    assert.match(o, /<h5 class="tuning-h">Before you tune<\/h5><p class="tuning-muted">Correct these items before the first flight\.<\/p><ul class="tuning-start-list is-prereq"><li><a href="#" class="tuning-node-link" data-node="logging">Blackbox log<\/a> <span class="tuning-muted">D1, D2<\/span><\/li><\/ul>/,
-        'the items with a problem are listed apart from "Start here"');
     // the side panel of an item: its condition, the steps that wait, its checks, its parameters and pages
     app.jq.fire('click', '.tuning-node', { 'data-node': 'logging' });
     const panel = panelOf(app.pane('overview'));
@@ -575,7 +606,7 @@ test('SPEC3 B: the tuning steps are parameters only: Filters, Governor, then the
     const legend = /<div class="tuning-order-legend">([\s\S]*?)<\/div><div class="tuning-order-scroll">/.exec(o)[1];
     assert.deepEqual([...legend.matchAll(/<\/span>([^<]+)<\/div>/g)].map((m) => m[1]), ['Start here', 'Blocked', 'Possible result', 'Not measured', 'Not applicable',
         'The sequence of the steps to correct', 'Tune the step on the left first']);
-    assert.match(o, /<h5 class="tuning-h">Start here<\/h5><ol class="tuning-start-list"><li><a href="#" class="tuning-node-link" data-node="filters">Step 1: Filters<\/a> <span class="tuning-muted">F5, F1<\/span><div><a href="#" class="tuning-goto-rec" data-rec="\d+">Examine the notch filter for the line at 4\.06×<\/a><\/div><\/li><li><a href="#" class="tuning-node-link" data-node="tailcomp">Step 4b: Tail compensation and output range<\/a> <span class="tuning-muted">T8<\/span>/);
+    assert.match(panelOf(o), /class="tuning-goto-rec" data-rec="\d+">Examine the notch filter for the line at 4\.06×<\/a>/, 'the first step has its recommendation in the details panel');
     noRawMarkup(app);
     assert.deepEqual(app.errors, []);
 });
@@ -593,7 +624,10 @@ test('a click on a step opens its side panel: what it waits for, possible result
     assert.match(panel, /<ul class="tuning-check-list"><li class="row-problem"><span class="tuning-badge st-problem">Problem<\/span> <strong>C5 · PID profile 1 · roll · log 2<\/strong><div class="tuning-summary-text">At 45\.0 s a roll oscillation/);
     assert.match(panel, /class="tuning-show" data-key="track\|C5\|1\|0\|1\|roll\|0"[^>]*>Show in the log<\/a> <a href="#" class="tuning-compare-open" data-key="track\|C5\|1\|0\|1\|roll\|0" data-where="overview"[^>]*>Show the measurement<\/a>/);
     assert.match(panel, /These checks have no result: C1, C7\./, 'the checks of the step without a result');
-    assert.match(panel, /<h5 class="tuning-h">Recommendations<\/h5><ul class="tuning-node-recs"><li class="tuning-node-rec" id="[^"]+-rec-\d+-panel"><div class="tuning-rec-badges"><span class="tuning-badge st-problem">Change<\/span><\/div> <a href="#" class="tuning-goto-rec" data-rec="\d+">Decrease the pitch F gain<\/a> <div class="tuning-inline tuning-muted">PID profile 1<\/div><\/li>/);
+    assert.match(panel, /<h5 class="tuning-h">Recommendations<\/h5><ul class="tuning-node-recs"><li class="tuning-node-rec" id="[^"]+-rec-\d+-panel"><div class="tuning-rec-badges"><span class="tuning-badge st-problem">Change<\/span><\/div> <a href="#" class="tuning-goto-rec" data-rec="\d+">Decrease the pitch F gain<\/a> <div class="tuning-inline tuning-muted"><span class="tuning-param" title="pitch_f_gain">Pitch F<\/span> \(PID profile 1\): 100 to 80 \(decrease\)<\/div><\/li>/);
+    assert.ok(panel.indexOf('>Recommendations</h5>') < panel.indexOf('>Checks</h5>'), 'recommendations precede detailed checks');
+    assert.match(panel, /<span class="tuning-badge st-monitor">Change<\/span> <span class="tuning-badge st-blocked">Blocked<\/span><\/div> <a [^>]*>Increase the roll P gain<\/a>[\s\S]*?<div class="tuning-node-rec-blocked">Blocked: <a href="#" class="tuning-node-link" data-node="filters">Filters<\/a>, Correct the filters first \(check F5\)\.<\/div><\/li>/,
+        'the step keeps the blocked change and links its gate');
     assert.match(panel, /<div class="tuning-label">Rotorflight page<\/div><ul class="tuning-docs"><li><a href="https:\/\/rotorflight\.org\/docs\/Tuning\/Tuning-description" target="_blank" rel="noopener noreferrer" data-ste="quoted">Tuning your helicopter &lt;b&gt;<\/a><\/li><\/ul>/);
     assert.match(panel, /<div class="tuning-label">Parameters<\/div><span class="tuning-param" title="\{pitch,roll\}_\{d,p,i,f,o,b\}_gain">Pitch and roll D, P, I, F, O, B<\/span><\/div>$/);
     // the keyboard selects a step; a possible result shows its K rule and the step of its cause
@@ -637,7 +671,7 @@ test('SPEC3 I: focus() (the Analysis view: "Open in the Tuning view") opens the 
     assert.match(o, /class="btn btn-default tuning-profile active" data-profile="all"/, 'All PID profiles: the result is of PID profile 1');
     assert.deepEqual(blocksOf(o).filter((b) => b[2]).map((b) => b[0]), ['tailcomp']);
     const panel = panelOf(o);
-    assert.match(panel, /<h5 class="tuning-h">Recommendations<\/h5><ul class="tuning-node-recs"><li class="tuning-node-rec is-focus" id="([^"]+)-rec-(\d+)-panel"><div class="tuning-rec-badges"><span class="tuning-badge st-problem">Change<\/span><\/div> <a href="#" class="tuning-goto-rec" data-rec="\d+">Increase the yaw collective precompensation &lt;b&gt;!&lt;\/b&gt;<\/a> <div class="tuning-inline tuning-muted">PID profile 1<\/div><div class="tuning-rec-param"><span class="tuning-param" title="yaw_collective_ff_gain">Yaw collective feedforward gain<\/span> \(PID profile 1\): 60 to 72 \(increase\)<\/div><div class="tuning-rec-rule"><div class="tuning-label">Rule<\/div><div>Check T7: r is 0\.5 or more, with a 2 SE test\. The step is 20 % or less\.<\/div><\/div><div class="tuning-cli"><button [^>]*>Copy<\/button><pre>profile 0\nset yaw_collective_ff_gain = 72<\/pre><\/div><\/li>/);
+    assert.match(panel, /<h5 class="tuning-h">Recommendations<\/h5><ul class="tuning-node-recs"><li class="tuning-node-rec is-focus" id="([^"]+)-rec-(\d+)-panel"><div class="tuning-rec-badges"><span class="tuning-badge st-problem">Change<\/span><\/div> <a href="#" class="tuning-goto-rec" data-rec="\d+">Increase the yaw collective precompensation &lt;b&gt;!&lt;\/b&gt;<\/a> <div class="tuning-inline tuning-muted"><span class="tuning-param" title="yaw_collective_ff_gain">Yaw collective feedforward gain<\/span> \(PID profile 1\): 60 to 72 \(increase\)<\/div><div class="tuning-rec-rule"><div class="tuning-label">Rule<\/div><div>Check T7: r is 0\.5 or more, with a 2 SE test\. The step is 20 % or less\.<\/div><\/div><div class="tuning-cli"><button [^>]*>Copy<\/button><pre>profile 0\nset yaw_collective_ff_gain = 72<\/pre><\/div><\/li>/);
     const id = /<li class="tuning-node-rec is-focus" id="([^"]+)"/.exec(panel)[1];
     assert.ok(app.elements[id] && app.elements[id].scrolled === 1, 'the recommendation scrolls into view');
     // another step: the focus goes; an unknown step or no result: false
@@ -1032,13 +1066,9 @@ test('runAnalysis of the Analysis view: a run for another file or log stops firs
     await assert.rejects(pc, reason('canceled', { message: 'You canceled the analysis.' }));
     // the Tuning view starts a run with other settings: the run of the Analysis view stops
     const pr = d.dialog.runAnalysis();
-    d.jq.node('.tuning-rpm').val = '1800';
+    d.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
     d.jq.fire('click', '.tuning-analyse');
     await assert.rejects(pr, reason('replaced'));
-    // an input that is not correct: no run
-    d.jq.node('.tuning-rpm').val = '12';
-    const pi = d.dialog.runAnalysis();
-    await assert.rejects(pi, reason('start', { message: 'The flight rpm must be a number from 300 to 50000. For an automatic value, do not type a value.' }));
     // "All logs in the file": a run for another selected log gives the findings of this log too, so it goes on
     const f = setup();
     f.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
@@ -1519,6 +1549,7 @@ test('plot specs follow the TuningPlot contract and time plots seek the viewer',
     assert.deepEqual(Array.from(byErr.series, (q) => q.name), ['mean error, less than 30 Hz', 'without the time delay, less than 30 Hz']);
 
     app.tab('governor');
+    app.detail('governor:signals');
     const hs = app.plots.map((p) => p.spec).find((s) => /^Headspeed, governor target and governor condition/.test(s.title));
     assert.equal(hs.bands.map((b) => b.label).filter(Boolean).join(), 'SPOOLUP', 'non-ACTIVE states shaded, long runs labelled');
     assert.equal(hs.bands.length, 2, 'SPOOLUP and AUTOROTATION');
@@ -1526,25 +1557,26 @@ test('plot specs follow the TuningPlot contract and time plots seek the viewer',
     let at = app.plots.length;
     app.tab('filters');
     // the spectra of the profile flown longest (P1, 200 s), with its rotor harmonics and its notches; filter lines first
-    const raw = app.plots.map((p) => p.spec).find((s) => /^Gyro spectrum before and after the filters, roll, PID profile 1 \(30 windows\)\. Rotor harmonics at 38\.3 Hz$/.test(s.title));
+    const recorded = (axis, profile) => app.internals.vibPlots(app.result.curves[0],axis,app.result,{}, {vibProfile:profile}).map(p=>p.spec);
+    const raw = recorded('roll').find((s) => /^Gyro spectrum before and after the filters, roll, PID profile 1 \(30 windows\)\. Rotor harmonics at 38\.3 Hz$/.test(s.title));
     assert.ok(raw, 'the profile flown longest');
     assert.equal(raw.vlines.map((v) => v.label).join(', '), 'main rotor 2× <b> Q8, LPF1 150 Hz, 1×, 2×, 3×, 4×, 5×, 6×, 7×, 8×', 'notches of unknown frequency left out; filter lines take the label rows first');
     assert.ok(Math.abs(raw.vlines.find((v) => v.label === '3×').x - 3 * 38.3) < 1e-9 && raw.vlines[0].x === 76.6);
     assert.ok(raw.series[0].y === app.result.curves[0].more.vib.byProfile[1].roll.raw, 'P1\'s own spectrum');
-    assert.match(app.pane('filters'), /<select class="form-control input-sm tuning-vib-profile"[^>]*><option value="all">All PID profiles \(weight: time in each\)<\/option><option value="1" selected>PID profile 1, 2298 rpm, 30 windows \(75 %\), longest flight time<\/option><option value="2">PID profile 2, 2502 rpm, 8 windows \(20 %\)<\/option><\/select>/);
-    assert.equal(app.plots[at + 1].spec.title, 'Filter transmission (gyroADC / gyroRAW), roll, PID profile 1 (30 windows)');
+    assert.match(app.internals.vibToolbar(app.result.curves[0],app.result,{}), /<select class="form-control input-sm tuning-vib-profile"[^>]*><option value="all">All PID profiles \(weight: time in each\)<\/option><option value="1" selected>PID profile 1, 2298 rpm, 30 windows \(75 %\), longest flight time<\/option><option value="2">PID profile 2, 2502 rpm, 8 windows \(20 %\)<\/option><\/select>/);
+    assert.equal(recorded('roll')[1].title, 'Filter transmission (gyroADC / gyroRAW), roll, PID profile 1 (30 windows)');
     at = app.plots.length;
     app.jq.fire('change', '.tuning-vib-profile', {}, { value: 'all' });
-    const pooled = app.plots.slice(at).map((p) => p.spec)[0];
+    const pooled = recorded('roll','all')[0];
     assert.equal(pooled.title, 'Gyro spectrum before and after the filters, roll, all PID profiles (weight: time in each). Rotor harmonics of PID profile 1 at 38.3 Hz', 'pooled: harmonics of the profile flown longest');
     assert.ok(pooled.series[0].y === app.result.curves[0].more.vib.roll.raw && pooled.vlines[0].x === 76.6, 'the pooled spectrum, notches at the median headspeed');
     at = app.plots.length;
     app.jq.fire('change', '.tuning-vib-profile', {}, { value: '2' });
-    const p2 = app.plots.slice(at).map((p) => p.spec)[0];
+    const p2 = recorded('roll','2')[0];
     assert.equal(p2.title, 'Gyro spectrum before and after the filters, roll, PID profile 2 (8 windows). Rotor harmonics at 41.7 Hz');
     assert.ok(Math.abs(p2.vlines[0].x - 83.4) < 1e-9 && Math.abs(p2.vlines.find((v) => v.label === '2×').x - 83.4) < 1e-9, 'P2\'s notch and harmonics at its own headspeed');
     app.jq.fire('click', '.tuning-axis', { 'data-axis': 'yaw' });
-    assert.match(app.plots.at(-4).spec.title, /^Gyro spectrum before and after the filters, yaw, PID profile 2 \(8 windows\)/, 'the choice holds across axes');
+    assert.match(recorded('yaw','2')[0].title, /^Gyro spectrum before and after the filters, yaw, PID profile 2 \(8 windows\)/, 'the choice holds across axes');
     app.jq.fire('change', '.tuning-vib-profile', {}, { value: '1' });
     app.jq.fire('click', '.tuning-axis', { 'data-axis': 'roll' });
     const err = app.plots.map((p) => p.spec).find((s) => /^Headspeed error from govTarget$/.test(s.title));
@@ -1552,6 +1584,7 @@ test('plot specs follow the TuningPlot contract and time plots seek the viewer',
     assert.equal(raw.y.log, true);
     assert.equal(JSON.stringify(raw.bands.map((b) => [b.x0, b.x1])), '[[80,400]]');
     app.tab('tail');
+    app.detail('tail:signals');
     const tail = app.plots.map((p) => p.spec).find((s) => /^Tail output and the tail output limits/.test(s.title));
     assert.equal(tail.hlines.map((h) => h.y).join(), '-400,400');
     assert.equal(tail.series[0].lo.length, 3000);
@@ -1596,6 +1629,7 @@ test('a tail check without an axis marks and lists the yaw curves only', () => {
     assert.deepEqual(seen.pitch, { markers: [], listed: false });
     assert.deepEqual(seen.yaw, { markers: ['T14 Problem 150', 'T14 Problem 50'], listed: true }, 'the markers on the yaw plot and their check below it');
     app.tab('tail');
+    app.detail('tail:signals');
     const tail = app.plots.map((p) => p.spec).find((s) => /^Tail output and the tail output limits/.test(s.title));
     assert.deepEqual(Array.from(tail.markers, (m) => m.x), [50, 150], 'the tail tab marks every tail check');
     const I = app.internals;
@@ -1610,11 +1644,11 @@ test('a flag the advice explains (all its recommendations information) is report
     assert.match(app.pane('checks'), /<span class="tuning-badge st-information" title="Information only: The filters remove this vibration line\.">Information<\/span>/);
     assert.match(app.pane('checks'), /<div class="tuning-muted">Information only: <span data-ste="quoted">The filters remove this vibration line\.<\/span><\/div>/);
     app.tab('overview');
-    const card = /<div class="tuning-card st-(\w+)" data-area="filters"[\s\S]*?<div class="tuning-card-counts">([^<]*)<\/div>/.exec(app.pane('overview'));
-    assert.equal(card[2], 'Problem 1 · Satisfactory 1 · Information 1', 'the explained flag counts as information');
+    const block = app.pane('overview').split('data-node="filters"')[1].split('</li>')[0];
+    assert.doesNotMatch(block, /tuning-block-ids">F5/, 'the explained flag is not listed as a problem');
+    assert.match(app.pane('overview'), /Information: <span class="tuning-block-check">F5<\/span>/, 'the step keeps the explained flag as information');
     const alone = synthResult({ findings: [Object.assign({}, f5)] }), one = analysed({ result: alone });
-    const card1 = /<div class="tuning-card st-(\w+)" data-area="filters"/.exec(one.pane('overview'));
-    assert.equal(card1[1], 'information', 'an explained flag alone does not mark its area');
+    assert.match(one.pane('overview'), /<div class="tuning-muted">Information 1<\/div>/, 'an explained flag alone contributes no problem to the summary');
 });
 
 test('missing curves say why, the toolkit report and the 250 Hz warning are shown', () => {
@@ -1626,14 +1660,14 @@ test('missing curves say why, the toolkit report and the 250 Hz warning are show
     app.tab('governor');
     assert.match(app.pane('governor'), /Not available: all values of headspeed in the log are 0/);
     app.tab('filters');
-    assert.match(app.pane('filters'), /Not available: gyroRAW\[0\] is not in the log/);
+    assert.match(app.internals.vibPlots(curves[0],'roll',app.result,{},{} )[0].na, /gyroRAW\[0\] is not in the log/);
     app.tab('curves');
     app.jq.fire('click', '.tuning-axis', { 'data-axis': 'yaw' });
     assert.match(app.pane('curves'), /Not available: the result has no yaw curves/);
     assert.match(app.html('.tuning-notices'), /The log rate is 250 Hz\. The Nyquist frequency is 125 Hz\. If the log rate is less than 1 kHz, the log does not show the rotor and tail harmonics correctly\./);
 
     const none = analysed({ result: synthResult({ curves: null, advice: null, hierarchy: null, notes: ['The app cannot load "health_more.cjs".'] }) });
-    for (const key of ['curves', 'governor', 'filters', 'tail']) {
+    for (const key of ['curves', 'governor', 'tail']) {
         none.tab(key);
         assert.match(none.pane(key), /Not available: /, key);
     }
@@ -1645,6 +1679,7 @@ test('missing curves say why, the toolkit report and the 250 Hz warning are show
     assert.match(none.pane('coverage'), /The parameter groups are not available/);
     none.tab('overview');
     assert.match(none.pane('overview'), /This result has no data for the tuning sequence\./, 'a result without result.hierarchy');
+    assert.match(none.pane('overview'), /The recommendations are not available/, 'missing advice remains explicit in the summary');
     assert.deepEqual(none.errors, []);
 
     // gyroRAW not logged: health_more gives the filtered spectrum only
@@ -1653,9 +1688,10 @@ test('missing curves say why, the toolkit report and the 250 Hz warning are show
     for (const a of ['roll', 'pitch', 'yaw']) for (const q of [vib, ...Object.values(vib.byProfile)]) q[a] = Object.assign({}, q[a], { raw: null, pass: null }); // per profile too, as health_more gives it
     const filt = analysed({ result: synthResult({ curves: only, fields: { 'gyroRAW[0]': 'absent' } }) });
     filt.tab('filters');
-    const spec = filt.plots.map((p) => p.spec).find((x) => /^Gyro spectrum after the filters only \(gyroRAW is not in the log\), roll/.test(x.title));
+    const recorded = filt.internals.vibPlots(only[0],'roll',filt.result,{},{});
+    const spec = recorded.map((p) => p.spec).filter(Boolean).find((x) => /^Gyro spectrum after the filters only \(gyroRAW is not in the log\), roll/.test(x.title));
     assert.equal(spec.series.length, 1);
-    assert.match(filt.pane('filters'), /Filter transmission \(gyroADC \/ gyroRAW\), roll, PID profile 1 \(30 windows\)<\/div><div class="tuning-na">Not available: gyroRAW\[0\] is not in the log/);
+    assert.match(recorded[1].na,/gyroRAW\[0\] is not in the log/);
 
     const before = setup({ sysConfig: { looptime: 500, frameIntervalPDenom: 4, pid_process_denom: 2 } });
     before.show();
@@ -1681,11 +1717,6 @@ test('worker errors, cancel, bad input and no log are reported, escaped', () => 
     assert.equal(app.pane('overview'), '', 'a canceled run is ignored');
     app.show();
     assert.equal(app.workers.length, 2, 'a canceled run is not started again on reopening');
-
-    app.jq.node('.tuning-rpm').val = 'fast';
-    app.jq.fire('click', '.tuning-analyse');
-    assert.equal(app.workers.length, 2);
-    assert.match(app.html('.tuning-notices'), /The flight rpm must be a number from 300 to 50000\./);
 
     // no log open: main.js has no FlightLog yet, or a host without getFlightLog passes none to show()
     const none = setup();
@@ -1736,26 +1767,25 @@ test('a file dropped while the view is open: log count, labels and seeks follow 
     assert.deepEqual(app.calls.selectLog, []);
 });
 
-test('results are cached per file, scope, log, flight rpm and CLI dump', async () => {
+test('results are cached per file, scope, log and CLI dump', async () => {
     const app = analysed();
     app.show();
     assert.equal(app.workers.length, 1, 'reopening shows the cached result');
 
-    // all logs in the file, with a CLI dump and a flight rpm
+    // all logs in the file, with a CLI dump and automatic RPM
     app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'notes.txt', text: 'hello' }] });
     assert.match(app.html('.tuning-notices'), /The file is not a Rotorflight CLI dump \(&quot;diff all&quot; or &quot;dump&quot;\)\. <span data-ste="quoted">notes\.txt<\/span>/);
     const dump = '# diff all\nprofile 0\nset gov_mode = 1\n';
     app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: '<b>dump</b>.txt', text: dump }] });
     assert.match(app.html('.tuning-cli-name'), /&lt;b&gt;dump&lt;\/b&gt;\.txt/);
-    app.jq.node('.tuning-rpm').val = '2200';
     app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
-    assert.match(app.html('.tuning-notices'), /The logs, the flights, the flight rpm or the CLI dump are different from this result\. To use them, click "Start analysis"\./);
+    assert.match(app.html('.tuning-notices'), /The logs, the flights or the CLI dump are different from this result\. To use them, click "Start analysis"\./);
     app.jq.fire('click', '.tuning-analyse');
     const { msg } = app.workers[1].sent[0];
     assert.equal(msg.cmd, 'analyseFile');
     assert.equal(msg.bytes.byteLength, 400);
     assert.equal(msg.selectedLog, 1);
-    assert.deepEqual(plain(msg.options), { flightRpm: 2200, cliText: dump, cliName: '<b>dump</b>.txt', excludeAbnormal: true, gains: true });
+    assert.deepEqual(plain(msg.options), { flightRpm: null, cliText: dump, cliName: '<b>dump</b>.txt', excludeAbnormal: true, gains: true });
     app.workers[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
     assert.match(app.pane('overview'), /All flights in the file \(3 logs\): /);
     app.tab('checks');
@@ -1763,7 +1793,6 @@ test('results are cached per file, scope, log, flight rpm and CLI dump', async (
 
     // back to this log with the old settings: the first result again, no new run
     app.jq.fire('change', '.tuning-scope', {}, { value: 'log' });
-    app.jq.node('.tuning-rpm').val = '';
     app.jq.fire('click', '.tuning-cli-clear');
     app.tab('overview');
     assert.match(app.pane('overview'), /<div class="tuning-summary"><div>Log 2 of 3: /);
@@ -1836,8 +1865,8 @@ test('filters, sorting, copy and save', async () => {
     app.jq.fire('click', 'th[data-sort]', { 'data-sort': 'id' });
     assert.equal([...app.html('.tuning-checks-table').matchAll(/<td class="tuning-id">([^<]+)/g)][0][1], 'T8', 'reversed');
 
-    app.jq.fire('click', '.tuning-card', { 'data-area': 'tail' });
-    assert.match(app.pane('checks'), /1 of 16 results\./);
+    app.jq.fire('change', '.tuning-f-area', {}, { value: 'tail' });
+    assert.match(app.html('.tuning-checks-table'), /1 of 16 results\./);
 
     app.tab('recs');
     const block = /data-copy="(\d+)">Copy<\/button><pre>profile 0\nset yaw_collective_ff_gain = 72<\/pre>/.exec(app.pane('recs'));
@@ -1961,7 +1990,7 @@ test('V1: a CLI dump goes with its file: a different file removes it with a noti
     // the pilot loads a dump again: no notice
     app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'gaui.txt', text: DUMP(null) }] });
     assert.ok(!/removed the CLI dump/.test(app.html('.tuning-notices')));
-    assert.match(app.html('.tuning-notices'), /The logs, the flights, the flight rpm or the CLI dump are different from this result/);
+    assert.match(app.html('.tuning-notices'), /The logs, the flights or the CLI dump are different from this result/);
     // the Analysis view asks for a run with the dump of an old file: runAnalysis goes without it
     app.load(Uint8Array.from({ length: 400 }, (_, i) => (i * 5) & 0xff), 'third.bbl', fakeLog({ sysConfig: { 'Craft name': '' } }));
     const n = app.workers.length;
@@ -2023,20 +2052,14 @@ test('V9: "Start analysis" stops the automatic run and starts the run that the p
     // "All logs in the file" while it operates: a notice, then the first click stops it and starts the file run
     app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
     // no CLI dump: the notice does not name it (the log is the only necessary input)
-    assert.match(app.html('.tuning-notices'), /The analysis that operates at this time uses different logs or a different flight rpm\. To use the values that you selected, click "Start analysis"\./);
+    assert.match(app.html('.tuning-notices'), /The analysis that operates at this time uses different logs\. To use the values that you selected, click "Start analysis"\./);
     app.jq.fire('click', '.tuning-analyse');
     assert.equal(auto.terminated, true, 'the automatic run stops');
     assert.equal(app.workers.length, 2);
     assert.equal(app.workers[1].sent[0].msg.cmd, 'analyseFile');
     await assert.rejects(waiting, (e) => e.reason === 'replaced', 'the waiter of the old run hears that it stopped');
     assert.ok(!/operates at this time/.test(app.html('.tuning-notices')), 'the run is for the values on display');
-    // Enter in the flight rpm field does the same while a run operates
-    app.jq.node('.tuning-rpm').val = '2100';
-    app.jq.fire('keydown', '.tuning-rpm', {}, { which: 13 });
-    assert.equal(app.workers[1].terminated, true);
-    assert.equal(app.workers.length, 3);
-    assert.equal(app.workers[2].sent[0].msg.options.flightRpm, 2100);
-    app.workers[2].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
+    app.workers[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
     assert.equal(app.jq.node('.tuning-analyse').props.disabled, false);
     assert.deepEqual(app.errors, []);
 });
@@ -2119,14 +2142,18 @@ test('V10: "Show the measurement" from the curves of the whole log, for a result
 });
 
 
-test('V10: the flight rpm field is wide enough for its placeholder "automatic: 2900"', () => {
-    const css = read('css/tuning_dialog.css'), m = /\.tuning-controls \.tuning-rpm \{\s*width: calc\((\d+) \* var\(--rf-px\)\)/.exec(css);
-    assert.ok(m, 'the width of the field, in the units of the text size (SPEC3 C)');
-    // 14 px text at 100 % (css/main.css .input-sm in a view): 8 px or less for each character, the padding (2 x 0.55 em), the
-    // border (2 px) and the arrows of a number field (20 px). The width scales with the text, so this holds at each text size
-    assert.ok('automatic: 2900'.length * 8 + 2 * 0.55 * 14 + 2 + 20 <= +m[1], m[1] + ' px');
+test('flight RPM comes from the recorded data and has no user input', () => {
     const app = analysed();
-    assert.equal(app.jq.node('.tuning-rpm').attrs.placeholder, 'automatic: 2000');
+    assert.doesNotMatch(app.allHtml(), /<input[^>]*tuning-rpm/);
+    assert.equal(app.workers[0].sent[0].msg.options.flightRpm, null, 'analysis derives the threshold');
+    app.tab('filters');
+    assert.doesNotMatch(app.pane('filters'), /Selected changes from this step|tuning-step-picks/);
+    app.jq.fire('click', '.tuning-ft-start');
+    assert.equal(ftWorker(app).sent[0].msg.options.flightRpm, 2000, 'autotune reuses the recorded analysis threshold');
+    // Changed configuration inputs must derive RPM again, not reuse a stale result.
+    app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'configuration.txt', text: '# diff all\nprofile 0\nset gov_headspeed = 2300\n' }] });
+    app.jq.fire('click', '.tuning-ft-start');
+    assert.equal(ftWorker(app).sent[0].msg.options.flightRpm, null);
 });
 
 // --- the worker's display of a finding (catalog.cjs display: review V5, V6) and the sources of a recommendation ------------
@@ -2413,7 +2440,7 @@ test('SPEC3 D: "Selected flights" lists the logs and the known flights, sends op
     // the selection is part of the key: another selection is another run, the same selection again is the cached result
     app.jq.fire('change', '.tuning-fsel-one', { 'data-log': 1, 'data-flight': 0, 'data-count': 2 }, { checked: true });
     assert.match(app.html('.tuning-fsel'), /tuning-fsel-count">2 of 2 flights, all flights of 1 of 1 other log \(1 log with no data\)</);
-    assert.match(app.html('.tuning-notices'), /The logs, the flights or the flight rpm are different from this result\./);
+    assert.match(app.html('.tuning-notices'), /The logs or the flights are different from this result\./);
     app.jq.fire('change', '.tuning-fsel-one', { 'data-log': 1, 'data-flight': 0, 'data-count': 2 }, { checked: false });
     assert.doesNotMatch(app.html('.tuning-notices'), /are different from this result/, 'the cached result of this selection');
     assert.equal(analyseWorkers(app, 'analyseFile').length, 1, 'no run for a cached selection');
@@ -2499,6 +2526,7 @@ test('SPEC3 E: "Show results with not sufficient data" and "Show satisfactory re
     state = { thin: false, ok: false };
     listeners[0](state);
     app.tab('governor');
+    app.detail('governor:checks');
     assert.match(app.pane('governor'), /Show satisfactory results \(\d+\)<\/label><span class="tuning-muted tuning-rf-hidden">The list does not show \d+ results?\./);
     const I = app.internals, fs = [{ id: 'A', severity: 'ok' }, { id: 'B', severity: 'note', thin: true }, { id: 'C', severity: 'flag' }];
     const got = I.filterResults(fs, { thin: false, ok: false });
@@ -2588,6 +2616,43 @@ test('the flight list collapses: its head gives the counts, it is closed when a 
     app.internals.fselRefocus(null, null);
 });
 
+test('selecting logs and flights keeps the table scroll position and keyboard focus after each redraw', () => {
+    const app = setup({ scope: 'file' });
+    app.setFile(datedFile(), 'gaui.bbl');
+    app.show();
+    app.workers[0].reply({ type: 'result', result: fileResult() });
+    app.dialog.scopeAction({ kind: 'scope', value: 'flights' });
+    app.dialog.scopeAction({ kind: 'open', on: true });
+    const node = app.jq.node('.tuning-fsel'), root = node.element;
+    let html = node.html, wrap = { scrollTop: 0, scrollLeft: 0 }, active, selector, focused;
+    // Replacing the HTML creates a new table at (0, 0) and removes the focused checkbox, as in Chromium.
+    Object.defineProperty(node, 'html', { get: () => html, set(value) {
+        html = value;
+        wrap = { scrollTop: 0, scrollLeft: 0 };
+        app.context.document.activeElement = null;
+        active = Object.assign({}, active, { focus(options) { focused = options; app.context.document.activeElement = this; } });
+    } });
+    root.contains = (el) => el === active;
+    root.querySelector = (sel) => sel === '.tuning-fsel-wrap' ? wrap : sel === selector ? active : null;
+    for (const [className, checked] of [['tuning-fsel-log', false], ['tuning-fsel-log', true], ['tuning-fsel-one', false], ['tuning-fsel-one', true]]) {
+        const attrs = { 'data-log': 2, 'data-flight': 0, 'data-count': 1 };
+        selector = '.' + className + '[data-log="2"]' + (className === 'tuning-fsel-one' ? '[data-flight="0"]' : '');
+        active = { className, checked, getAttribute: (key) => String(attrs[key]) };
+        app.context.document.activeElement = active;
+        wrap.scrollTop = 287.5;
+        wrap.scrollLeft = 31;
+        const before = wrap;
+        app.jq.fire('change', '.' + className, attrs, { element: active });
+        assert.notEqual(wrap, before, 'the selection redraws the table');
+        assert.equal(wrap.scrollTop, 287.5, className + ': vertical scroll');
+        assert.equal(wrap.scrollLeft, 31, className + ': horizontal scroll');
+        assert.equal(app.context.document.activeElement, active, 'the replacement checkbox keeps the focus');
+        assert.equal(focused.preventScroll, true);
+        assert.match(html, checked ? /tuning-fsel-count">2 of 2 flights/ : /tuning-fsel-count">1 of 2 flights/);
+    }
+    assert.deepEqual(app.errors, []);
+});
+
 test('the "Logs" control of the Analysis view: scopePanel, scopeAction and onSettings share the settings and the flight list of the Tuning view', () => {
     const app = setup({ scope: null });
     app.setFile(datedFile(), 'gaui.bbl');
@@ -2616,7 +2681,7 @@ test('the "Logs" control of the Analysis view: scopePanel, scopeAction and onSet
     app.dialog.scopeAction({ kind: 'flight', log: 2, flight: 0, count: 1, on: false });
     assert.match(app.dialog.scopePanel().html, /tuning-fsel-count">1 of 2 flights \(1 bench run\)</);
     assert.equal(app.dialog.scopePanel().stale, true, 'another selection: the result on display is of other flights');
-    assert.match(app.html('.tuning-notices'), /The logs, the flights or the flight rpm are different from this result\./);
+    assert.match(app.html('.tuning-notices'), /The logs or the flights are different from this result\./);
     assert.match(app.html('.tuning-fsel'), /tuning-fsel-count">1 of 2 flights \(1 bench run\)</, 'the list of the Tuning view too');
     app.dialog.scopeAction({ kind: 'none' });
     assert.match(app.dialog.scopePanel().html, /tuning-fsel-count">no flight \(1 bench run\)</);
@@ -2716,54 +2781,82 @@ function withDatasets(r) {
     return r;
 }
 
-test('SPEC3 J: the configuration menu next to the PID profile menu: each configuration with its PID profile, logs, flight time and marks; it filters the diagram and the lists, and tells the lens', () => {
-    const app = analysed({ result: withDatasets(synthResult()) }), I = app.internals, got = [];
-    app.dialog.onConfiguration((id) => got.push(id));
-    let o = app.pane('overview');
-    assert.match(o, /<div class="tuning-select-row"><div class="tuning-profile-bar"[\s\S]*?<\/div><div class="tuning-config-bar" role="group" aria-label="Configuration"><label class="tuning-label" for="tuning\d+-config">Configuration<\/label>/, 'next to the PID profile menu');
-    for (const s of ['<option value="all" selected>All configurations (3)</option>', '<option value="A">Configuration A: PID profile 1, log 2, 73.0 s of flight</option>',
-        '<option value="B">Configuration B: PID profile 2, log 2, 0.0 s of flight, PID profile values from log 1, 1 value unknown, the newest of PID profile 2</option>',
-        '<option value="C">Configuration C: PID profile 1, logs 2 and 3, 2.5 min of flight, the newest</option>', 'Parameters that are not the same</a>']) {
-        assert.ok(o.includes(s), s);
-    }
-    // a configuration: its PID profile on display, the lists of that configuration and of no single configuration, the note of the diagram
-    app.jq.fire('change', '.tuning-config', {}, { value: 'C' });
-    eq(got, ['C']);
-    assert.equal(app.dialog.getConfiguration(), 'C');
-    o = app.pane('overview');
-    assert.match(o, /class="btn btn-default tuning-profile active" data-profile="1">PID profile 1/, 'the PID profile of configuration C');
-    assert.ok(o.includes('<option value="C" selected>'));
-    assert.ok(o.includes('Configuration C has PID profile 1. It has 2.5 min of flight in logs 2 and 3.'), 'its summary under the menu');
-    assert.ok(o.includes('The diagram shows the results of all configurations together. The lists show Configuration C and the items for all configurations.'));
-    assert.match(o, /Log 2 of 3, PID profile 1, Configuration C: /);
-    app.tab('checks');
-    const checks = app.pane('checks');
-    assert.ok(checks.includes(FID.C5) && !checks.includes(FID.C12), 'C5 of C in the list, C12 of A not');
-    assert.ok(checks.includes('PID profile 1 · Configuration C · roll'), 'the configuration of a result');
-    app.tab('recs');
-    assert.ok(app.pane('recs').includes('Decrease the pitch F gain') && app.pane('recs').includes('for Configuration C'));
-    // another PID profile: all configurations again
-    app.jq.fire('click', '.tuning-profile', { 'data-profile': '2' });
-    eq(got, ['C', 'all']);
-    assert.equal(app.dialog.getConfiguration(), 'all');
-    // the API of the lens: a configuration of the result, else false
-    assert.equal(app.dialog.setConfiguration('B'), true);
-    assert.equal(app.dialog.getConfiguration(), 'B');
-    assert.equal(app.dialog.setConfiguration('Z'), false);
-    assert.equal(app.dialog.setConfiguration('all'), true);
-    eq(got, ['C', 'all', 'B', 'all']);
-    // with the status of a configuration (hierarchy.byDataset) the diagram shows it
-    const r2 = withDatasets(synthResult());
-    r2.hierarchy.byDataset = { A: Object.assign({}, r2.hierarchy, { nodes: Object.assign({}, r2.hierarchy.nodes, { filters: { status: 'satisfactory', fids: [] } }) }) };
-    assert.equal(I.hierFor(r2, 'all', 'A'), r2.hierarchy.byDataset.A);
-    assert.equal(I.hierFor(r2, 'all', 'all'), r2.hierarchy);
-    // the pure filter: an item of no single configuration shows in each; a recommendation with data from it
-    assert.ok(I.inDataset({ dataset: null }, 'A') && I.inDataset({ dataset: 'A' }, 'A') && !I.inDataset({ dataset: 'B' }, 'A'));
-    assert.ok(I.inDataset({ dataset: 'C', supportedBy: ['A', 'C'] }, 'A') && I.inDataset({ datasets: ['A'] }, 'A') && !I.inDataset({ datasets: ['B'] }, 'A'));
-    // one configuration: no menu
-    const one = withDatasets(synthResult());
-    one.datasets.datasets = one.datasets.datasets.slice(0, 1);
-    assert.equal(I.configBar({ result: one }, { dataset: 'all' }, {}), '');
+test('recorded configurations sit before the tuning tabs and select one configuration for the entire workflow', () => {
+    const app=analysed({result:withDatasets(synthResult())}), got=[];
+    app.dialog.onConfiguration(id=>got.push(id));
+    const root=app.html('#tuningBody');
+    assert.ok(root.indexOf('class="tuning-fsel ')<root.indexOf('class="tuning-configuration '));
+    assert.ok(root.indexOf('class="tuning-configuration ')<root.indexOf('class="tuning-tabs '));
+    assert.equal(app.dialog.getConfiguration(),'C');
+    let bar=app.html('.tuning-configuration');
+    assert.match(bar,/<option value="C" selected>/);
+    assert.doesNotMatch(bar,/<option value="all"/);
+    for(const title of ['Recorded values of Configuration C','Compare recorded configurations','PID profile 1','PID profile 2'])assert.ok(bar.includes(title),title);
+    assert.doesNotMatch(app.pane('overview'),/<select[^>]*tuning-config/);
+    app.dialog.setConfiguration('A');
+    eq(got,['A']);
+    app.tab('checks');assert.ok(app.pane('checks').includes(FID.C12));assert.ok(!app.pane('checks').includes(FID.C5));
+    app.tab('recs');assert.ok(!app.pane('recs').includes('data-rec="C7:pitch_f_gain:p1"'),'evidence from A does not apply a recommendation for C');
+    app.dialog.setConfiguration('C');app.tab('checks');assert.ok(app.pane('checks').includes(FID.C5));assert.ok(!app.pane('checks').includes(FID.C12));
+    assert.equal(app.dialog.setConfiguration('Z'),false);
+    assert.equal(app.dialog.setConfiguration('B'),true);
+    assert.match(app.html('.tuning-configuration'),/<option value="B" selected>/);
+    const one=withDatasets(synthResult());one.datasets.datasets=one.datasets.datasets.slice(0,1);
+    assert.match(app.internals.configBar({result:one},{dataset:'A'},{}),/Recorded values of Configuration A/,'one configuration still has its reference');
+    assert.deepEqual(app.errors,[]);
+});
+
+test('a new analysis replaces an unavailable control configuration without imposing it on the filter flight source', async () => {
+    const app=analysed({result:withDatasets(synthResult())}), changed=[];
+    assert.equal(app.dialog.getConfiguration(),'C');
+    app.dialog.onConfiguration(id=>changed.push(id));
+    const next=withDatasets(synthResult());
+    next.datasets.datasets.forEach(d=>{
+        d.analysed=d.id!=='C';
+        d.analysedFlightSeconds=d.id==='A'?40:0;
+    });
+    next.datasets.labels=next.datasets.labels.filter(q=>q.dataset==='A');
+    app.flightLog.openLog(2);
+    next.logIndex=2;
+    const pending=app.dialog.runAnalysis();
+    app.workers.at(-1).reply({type:'result',result:next});
+    await pending;
+    assert.equal(app.dialog.getConfiguration(),'A');
+    eq(changed,['A']);
+    assert.match(app.html('.tuning-configuration'),/<option value="A" selected>/);
+    assert.match(app.html('.tuning-configuration'),/Recorded values of Configuration A/);
+    assert.doesNotMatch(app.html('.tuning-configuration'),/Recorded values of Configuration C/);
+    app.tab('filters');app.jq.fire('click','.tuning-ft-start');
+    const request=ftWorker(app).sent[0].msg;
+    assert.equal(request.options.configuration,undefined);
+    eq(request.options.logs,[2]);
+    eq(request.options.flights,[{log:2,flight:null}]);
+    eq(request.options.recordedConfigurations.labels,[],'another log cannot supply the recorded intervals');
+    assert.equal(app.dialog.setConfiguration('C'),false,'a configuration outside this analysis cannot become the active draft');
+});
+
+test('the initial tuning configuration has flight data when the last configuration is only on the ground', () => {
+    const r=withDatasets(synthResult());
+    r.datasets.datasets.find(d=>d.id==='C').flightSeconds=0;
+    const app=analysed({result:r});
+    assert.equal(app.dialog.getConfiguration(),'A');
+    assert.match(app.html('.tuning-configuration'),/<option value="A" selected>/);
+});
+
+test('a ground-only control configuration does not prevent tuning the selected flight log', () => {
+    const app=analysed({result:withDatasets(synthResult())});
+    assert.equal(app.dialog.setConfiguration('B'),true);
+    app.tab('filters');
+    assert.doesNotMatch(app.pane('filters'),/tuning-ft-start" disabled/);
+    assert.ok(app.jq.node('.tuning-configuration').classes.has('tuning-hide'));
+    app.jq.fire('click','.tuning-ft-start');
+    const q=ftWorker(app).sent[0].msg;
+    eq(q.options.logs,[1]);assert.equal(q.options.configuration,undefined);
+    eq(q.options.recordedConfigurations.labels.map(q=>q.dataset),['A','B','C']);
+    const bench=analysed({result:synthResult({flights:[],benchRuns:[1]})});bench.tab('filters');
+    assert.match(bench.pane('filters'),/The analysis has no flight data for filter tuning/);
+    assert.match(bench.pane('filters'),/tuning-ft-start" disabled/);
+    const count=bench.workers.length;bench.jq.fire('click','.tuning-ft-start');assert.equal(bench.workers.length,count);
 });
 
 test('SPEC3 J: the tab "Configurations": the configurations, the table "Parameters that are not the same" with "?" and "-", and the values that do not change the flight', () => {
@@ -2774,7 +2867,7 @@ test('SPEC3 J: the tab "Configurations": the configurations, the table "Paramete
     for (const s of ['A configuration is one PID profile and one set of the parameter values that change the flight.',
         '<tr class="tuning-config-row"><td><strong>B</strong></td><td>PID profile 2</td><td>Log 2</td><td class="tuning-num">0</td><td class="tuning-num">0.0 s</td><td>PID profile values from log 1, 1 value unknown, the newest of PID profile 2</td>',
         '<td>Values from the log header and the CLI dump</td>', '<h5 class="tuning-h">Parameters that are not the same</h5>',
-        '<tr class="tuning-diff-row is-same-profile"><td><span class="tuning-param" title="roll_p_gain">Roll P</span><div class="tuning-muted">PID gains</div></td><td><code>50</code></td><td><span class="tuning-diff-unknown" title="The value is unknown">?</span></td><td><code>55</code></td></tr>',
+        '<tr class="tuning-diff-row is-same-profile"><td><span class="tuning-param" title="roll_p_gain">Roll P</span><div class="tuning-muted">PID gains</div></td><td><code>50</code></td><td><span class="tuning-diff-unknown" title="The value is unknown">?</span></td><td class="is-selected"><code>55</code></td></tr>',
         '<td><span class="tuning-diff-absent" title="The configuration does not have this parameter">-</span></td>', '<tr class="tuning-diff-row"><td><span class="tuning-param" title="yaw_expo">Yaw expo</span><div class="tuning-muted">Rates &lt;b&gt;</div>',
         'A row with a mark has different values in two configurations of the same PID profile.', '<li><span class="tuning-param" title="rescue_mode">Rescue mode</span>: <code>1</code> (log 2), <code>0</code> (log 3)</li>',
         'Thus, the app uses them as parameters that change the flight: <span data-ste="quoted"><span class="tuning-param" title="foo_&lt;b&gt;">Foo &lt;b&gt;</span></span>.', '<li>The log header records the values of PID profile 2 only when the pilot arms the helicopter in PID profile 2.</li>',
@@ -2802,8 +2895,8 @@ test('SPEC3 J: the tab "Configurations": the configurations, the table "Paramete
     app2.tab('configs');
     assert.ok(app2.pane('configs').includes('PID profile values from log 1, 1 value unknown, not in the analysis, the newest of PID profile 2'));
     assert.ok(!app2.pane('configs').includes('data-config="B"'), 'no "Show" for it');
-    assert.ok(app2.pane('configs').includes('<option value="A">Configuration A: PID profile 1, log 2, 40.0 s of flight</option>'), 'the flight time in the analysis');
-    assert.ok(!app2.pane('configs').includes('<option value="B">'));
+    assert.ok(app2.html('.tuning-configuration').includes('<option value="A">Configuration A: PID profile 1, log 2, 40.0 s of flight</option>'), 'the flight time in the analysis');
+    assert.ok(!app2.html('.tuning-configuration').includes('<option value="B">'));
     // "Show the configurations" of the Analysis view: the tab
     app2.tab('overview');
     assert.equal(app2.dialog.focus({ tab: 'configs' }), true);
@@ -2870,12 +2963,12 @@ test('SPEC3 G: "Find the best filter values" in the Filters step and its tab: fi
     // the side panel of the Filters step (the first "Start here") and the Filters tab have the button
     assert.ok(app.pane('overview').includes('<section class="tuning-ft is-compact" aria-label="Filter values from the flight logs">'), 'in the side panel of the Filters step');
     app.tab('filters');
-    assert.ok(app.pane('filters').includes('<button type="button" class="btn btn-primary btn-sm tuning-ft-start">Find the best filter values</button>'));
-    assert.ok(app.pane('filters').includes('The app uses a model of the gyro filters of the firmware.'));
+    assert.ok(app.pane('filters').includes('<button type="button" class="btn btn-primary btn-sm tuning-ft-start">Autotune</button>'));
+    assert.ok(app.pane('filters').includes('Autotune calculates the filter parameters.'));
     app.jq.fire('click', '.tuning-ft-start', {});
     const w = ftWorker(app), { msg, transfer } = w.sent[0];
     eq([msg.cmd, msg.fileName, msg.selectedLog, msg.logCount, msg.bytes.byteLength, transfer[0] === msg.bytes], ['filterTune', '<i>flight</i>.bbl', 1, 3, 400, true], 'the whole file, transferred (a copy)');
-    eq(plain(msg.options), { flightRpm: 2000, cliText: null, cliName: null, flights: null, blockedBy: [] }, 'the flight rpm of the analysis on display');
+    eq(plain(msg.options), { flightRpm: 2000, cliText: null, cliName: null, flights: [{log:1,flight:null}], logs:[1], blockedBy: [], maxAddMs: .5 }, 'one source log and the flight rpm of the analysis on display');
     assert.equal(app.bytes.length, 400, 'the buffer of the viewer stays');
     assert.ok(app.pane('filters').includes('The app calculates the filter values. Wait for the result.') && app.pane('filters').includes('tuning-ft-cancel'), 'the progress and Cancel');
     w.reply({ type: 'progress', fraction: 0.4, text: 'The app tries 12 sets of values.' });
@@ -2887,7 +2980,7 @@ test('SPEC3 G: "Find the best filter values" in the Filters step and its tab: fi
     for (const s of ['<span class="tuning-badge st-problem">Recommendation</span>', 'Set the filter values of the table. The model calculates a decrease of 7.06 ± 0.51 dB of the vibration in the PID output.',
         '<tr><td>roll</td><td class="tuning-num">Decrease of 4.90 ± 0.51 dB</td></tr>', '<tr class="tuning-ft-total"><td>All axes</td><td class="tuning-num">Decrease of 7.06 ± 0.51 dB</td></tr>',
         'The largest increase of the time delay is 0.362 ms (pitch, PID profile 1, at 30 Hz). The time delay of the gyro filters (check F11) changes from 1.386 ms to 1.733 ms.',
-        '<tr><td><span class="tuning-param" title="feature DYN_NOTCH">Dynamic notch filter</span></td><td>All PID profiles</td><td><code>no</code></td><td><code>yes</code></td><td>Log header</td></tr>',
+        '<tr><td><span class="tuning-param" title="feature DYN_NOTCH">Dynamic notch filter</span></td><td>All PID profiles</td><td><code>false</code></td><td><code>true</code></td><td>Log header</td></tr>',
         '<tr><td><span class="tuning-param" title="roll_d_cutoff">Roll D cutoff</span></td><td>PID profile 1</td><td><code>30</code></td><td><code>25</code></td><td>CLI dump</td></tr>',
         '<pre>feature DYN_NOTCH\nset dyn_notch_count = 2\nset dyn_notch_min_hz = 170\nprofile 0\nset roll_d_cutoff = 25</pre>',
         'The &quot;Export&quot; tab has these commands. The app selects them first.', 'The PID profile of some logs is unknown. Thus, the app gives no CLI text for the cutoffs of that PID profile.',
@@ -2897,7 +2990,7 @@ test('SPEC3 G: "Find the best filter values" in the Filters step and its tab: fi
         '<h6 class="tuning-h">Test on each flight</h6>', 'The vibration decreased in 2 of 3 logs. The mean change is a decrease of 4.2 ± 2.5 dB. In 2 of 3 tests, the app found the same values.',
         '<tr><td>Log 6</td><td class="tuning-num">-5.12 dB</td><td>Yes</td></tr>', '<tr><td>Log 11</td><td class="tuning-num">-7.9 dB</td><td>No</td></tr>',
         '<details class="tuning-toolkit" data-ste="quoted"><summary>Toolkit text (not STE)</summary><ul><li>The file has 3 flight logs &lt;i&gt;.</li><li>log 10: a toolkit note &lt;b&gt;</li></ul></details>',
-        'class="tuning-ft-plot"', 'Calculate again']) {
+        'class="tuning-ft-plot"', 'Autotune again']) {
         assert.ok(p.includes(s), s);
     }
     // the side panel: the short form, with a link to the tab
@@ -2957,14 +3050,13 @@ test('SPEC3 G: the CLI lines of the calculation go into the Export tab, the feat
     // one change of the group off: neither goes into the CLI file
     app.jq.fire('change', '.tuning-pick', { 'data-pick': '10' }, { checked: false });
     eq(app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg.picks, ['T7:yaw_collective_ff_gain:p1', 'C7:pitch_f_gain:p1']);
-    // another flight rpm: the result is for other settings, not in the CLI file, and the panel says so
-    app.jq.node('.tuning-rpm').val = '2400';
+    // Different configuration input invalidates the replay and its export.
     app.tab('filters');
-    app.jq.fire('change', '.tuning-rpm', {});
+    app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'configuration.txt', text: '# diff all\nprofile 0\nset gov_headspeed = 2400\n' }] });
     app.tab('export');
     assert.ok(!app.pane('export').includes('that the app found'));
     app.tab('filters');
-    assert.ok(app.pane('filters').includes('This result is for different flights or a different flight rpm.'), 'no CLI dump: the notice does not name it');
+    assert.ok(app.pane('filters').includes('This result is for different flights or a different CLI dump.'), 'the notice names the changed input');
 });
 
 test('SPEC3 G: the result of the worker: its STE texts in paragraphs, its recommendations (advice.cjs filterRecommendations) for the CLI file, and the gates of the Filters step', () => {
@@ -3172,7 +3264,7 @@ test('notchFit: the tail rotor notch filters from the log in the vibration plots
     app.jq.fire('click', '.tuning-axis', { 'data-axis': 'yaw' });
     let before = app.plots.length;
     app.tab('filters');
-    let p = app.pane('filters'), specs = app.plots.slice(before).map((x) => x.spec);
+    let p = app.internals.vibCaption(app.result.curves[0],app.result,{axis:'yaw'}), specs = app.internals.vibPlots(app.result.curves[0],'yaw',app.result,{},{}).map(x=>x.spec);
     assert.ok(p.includes('<p class="tuning-muted tuning-notch-fit">Tail rotor notch filters: 4.002 ± 0.002 × the rotor frequency, from the log (yaw axis, 6 flight logs). ' +
         'The plots show these notch filters at this frequency.</p>'), p);
     const spectrum = specs.find((s) => /^Gyro spectrum before and after the filters, yaw/.test(s.title));
@@ -3191,8 +3283,8 @@ test('notchFit: the tail rotor notch filters from the log in the vibration plots
     const app2 = analysed({ result: withTailNotch(synthResult({ notchFit: failed }), null) });
     before = app2.plots.length;
     app2.tab('filters');
-    p = app2.pane('filters');
-    specs = app2.plots.slice(before).map((x) => x.spec);
+    p = app2.internals.vibCaption(app2.result.curves[0],app2.result,{axis:'roll'});
+    specs = app2.internals.vibPlots(app2.result.curves[0],'roll',app2.result,{},{}).map(x=>x.spec);
     assert.ok(p.includes('<p class="tuning-muted tuning-notch-fit">The log does not show the frequency of the tail rotor notch filters. Thus, the plots do not show these notch filters.</p>'), p);
     assert.ok(!specs.some((s) => (s.vlines || []).some((v) => /tail rotor/.test(v.label || ''))), 'no tail rotor marker');
     eq(app2.internals.notchFitRows(app2.result), [['Tail rotor notch filters', 'The log does not show the frequency.']]);
@@ -3202,7 +3294,7 @@ test('notchFit: the tail rotor notch filters from the log in the vibration plots
     // no fit (a CLI dump gave the orders, or the fit did not operate): a notch filter with no frequency is not hidden without a word
     const app3 = analysed();
     app3.tab('filters');
-    assert.ok(app3.pane('filters').includes('<p class="tuning-muted tuning-notch-fit">The plots do not show 1 notch filter, because its frequency is unknown.</p>'));
+    assert.ok(app3.internals.vibCaption(app3.result.curves[0],app3.result,{axis:'roll'}).includes('<p class="tuning-muted tuning-notch-fit">The plots do not show 1 notch filter, because its frequency is unknown.</p>'));
     eq(app3.internals.notchFitTexts({ notchFit: null }, [{ code: 21, hz: 150 }]), [], 'all notch filters on display: nothing to say');
     eq(app3.internals.notchFitTexts({ notchFit: { used: true, tail: null, motor: null } }, []), [], 'no tail rotor notch filter in the log header');
 });
@@ -3374,7 +3466,7 @@ test('values possibly different: a recommendation with r.stale has the caveat wi
     // the CLI file: the mark next to the change in the list of the Export tab
     app.tab('export');
     assert.ok(app.pane('export').includes('<span class="tuning-badge st-problem">Change</span> ' + badgeOf(STALE_REC) + ' Increase the yaw collective precompensation &lt;b&gt;!&lt;/b&gt;</label>'));
-    // the side panel of the step and the first recommendations of the overview
+    // the recommendations in the side panel of the step
     app.tab('overview');
     app.jq.fire('click', '.tuning-node', { 'data-node': 'tailcomp' });
     assert.ok(panelOf(app.pane('overview')).includes(badgeOf(STALE_REC)), 'the side panel');
@@ -3478,4 +3570,609 @@ test('values possibly different: a result without epochs and stale shows no mark
     assert.ok(html.includes('<p class="tuning-fresh-caveat">' + FRESH_TEXT.caveat + ' Thus, a result without this mark') && html.includes('<p class="tuning-muted">The app found no cause in the parts of the logs.</p>'));
     assert.ok(html.includes('<tr><td>2</td><td colspan="6" class="tuning-muted">No known cause</td></tr>'));
     assert.ok(!html.includes('In this analysis,'), 'no count without a mark');
+});
+
+test('filter autotune v2: complete setup, replay signals, trace selector, stale export and unvalidated labels', async () => {
+    const app=analysed(), res=synthFilterTune();
+    res.version=2; res.model.passed=true; res.model.reconstructed=true;
+    res.model.coverage=[{log:5,gyroHz:4000,filterHz:2000,logHz:1000}];
+    res.model.parity[0].axes.roll.reconstruction={samples:1000,interpolationRmsDegS:1.2,withheldRmsDegS:.4,passed:true};
+    res.recommended.fullRows=res.recommended.rows.concat([{name:'gyro_lpf1_type',from:'NONE',to:'BESSEL',source:'header',scope:'global'},
+        {name:'gyro_rpm_notch_source_roll',from:'0,0',to:Array(16).fill(11).join(','),source:'header',scope:'global'}]);
+    res.recommended.validation={holdout:{blocks:3,meanDb:-5}};
+    res.search={tested:360}; res.text=require('../tools/autotune/filter_autotune.cjs').texts(res);
+    res.cliFile='# complete setup\nset gyro_lpf1_type = BESSEL\nsave\n';
+    const data=[0,1,2].map(()=>Float32Array.of(1,2,1)), trace={log:5,profile:1,t:Float64Array.of(10,10.001,10.002),raw:data,logged:data,baseline:data,candidate:data,pidBaseline:data,pidCandidate:data,pidKnown:false};
+    res.traces=[trace,{...trace,log:10,t:Float64Array.of(20,20.001,20.002)}];
+    trace.native={...trace,t:Float64Array.of(10,10.0005,10.001,10.0015,10.002,10.0025),baseline:[0,1,2].map(()=>new Float32Array(6)),candidate:[0,1,2].map(()=>new Float32Array(6)),pidBaseline:[0,1,2].map(()=>new Float32Array(6)),pidCandidate:[0,1,2].map(()=>new Float32Array(6))};
+    res.capabilities=require('../tools/autotune/filter_autotune.cjs').capabilities({segments:[]});
+    res.checklist={confirmed:true,rows:['Cleared in replay','Remains','New issue','Unchanged','Not evaluated'].map((outcome,i)=>({id:'F'+(i+1),title:'Filter check',log:5,profile:1,axis:'roll',
+        before:{status:i<2?'Issue':'Pass',issues:i<2?1:0,findings:[]},after:{status:i===4?'Not evaluated':i===1||i===2?'Issue':'Pass',issues:i===1||i===2?1:0,findings:[]},outcome}))};
+
+    app.tab('filters'); app.jq.fire('click','.tuning-ft-start',{}); ftWorker(app).reply({type:'filterTuned',result:res});
+    const html=app.pane('filters');
+    for(const text of ['Filter parameters','BESSEL','Save filter CLI file','Flight interval','Filter analysis coverage','Show changed values only']) assert.ok(html.includes(text),text);
+    const primary=app.plots.find(p=>p.spec.title==='Flight spectrum, roll');
+    eq(primary.spec.series.map(s=>s.name),['Raw data','Previous filter (recorded)','New filter (calculated)']);
+    assert.doesNotMatch(html,/tuning-ft-comparison|All filter parameters|Filter checks before and after|Replay checks and filter coverage/);
+    assert.equal((html.match(/tuning-ft-checklist/g)||[]).length,1);
+    assert.match(html,/<section class="tuning-ft-editor">/);
+    assert.match(html,/<section class="tuning-ft-signals">/);
+    assert.doesNotMatch(html,/class="[^"]*tuning-axis[ "]|Recorded flight checks and spectra/);
+    assert.equal(app.plots.filter(p=>/^Gyro signals,/.test(p.spec.title)).length,3);
+    assert.doesNotMatch(html,/tuning-step-picks/);
+    assert.equal(app.plots.filter(p=>/Previous filter replay/.test(p.spec.title)).length,6);
+    assert.ok(!app.plots.some(p=>/Vibration in the PID output|Replayed P and D/.test(p.spec.title)));
+    assert.doesNotMatch(html,/The PID values are unknown/);
+    const diagnostics=html.indexOf('<summary data-ft-detail="replay">');
+    for (const p of app.plots.filter(p=>/Previous filter replay/.test(p.spec.title))) {
+        assert.ok(html.indexOf('id="'+p.canvas.id+'"')>diagnostics, 'replay curves are in the collapsed diagnostics only');
+        eq(p.spec.series.map(s=>s.ftCurve),['old','replay']);
+    }
+    assert.match(html,/tuning-ft-reconstruction/);assert.match(html,/gyro 4000 Hz/);
+    assert.equal(app.plots.find(p=>/^Gyro signals,/.test(p.spec.title)).spec.series[2].y.length,6);
+    app.jq.fire('click','.tuning-ft-workspace summary[data-ft-detail]', {'data-ft-detail':'replay'}, {parentNode:{open:false}});
+    app.jq.fire('change','.tuning-ft-trace',{}, {value:'1'});
+    assert.match(app.pane('filters'),/<details class="tuning-ft-details" open><summary data-ft-detail="replay">/);
+    assert.ok(app.plots.some(p=>/^Gyro signals,/.test(p.spec.title)&&p.spec.series[0].x[0]===20));
+    app.jq.fire('click','.tuning-ft-save',{}); await tick(); await tick();
+    assert.equal(app.saved.at(-1).text,res.cliFile);
+    const env={copy:()=>0,plotId:()=> 'filterplot'};
+    const replaced=app.internals.filterSearchHtml({state:'done',result:res},env,{plot:true,trace:99});
+    assert.ok(replaced.plots.some(p=>/^Gyro signals,/.test(p.spec.title)&&p.spec.series[0].x[0]===10));
+    assert.match(replaced.html,/<option value="0" selected>/);
+    const stale=app.internals.filterSearchHtml({state:'done',result:res,stale:true},env,{}).html;
+    assert.match(stale,/tuning-ft-save" disabled/);
+    res.recommended.status='not recommended';res.recommended.cli=[];res.recommended.reasons=['The recorded filter configuration does not agree with the replay on all axes.'];res.cliFile='';res.text=require('../tools/autotune/filter_autotune.cjs').texts(res);
+    const bad=app.internals.filterSearchHtml({state:'done',result:res},env,{plot:true});
+    assert.match(bad.html,/No recommendation/);assert.match(bad.html,/tuning-ft-save" disabled/);
+    assert.ok(bad.plots.every(p=>p.spec.series.every(s=>!/recommended/i.test(s.name))));
+});
+
+test('filter curve controls select raw, recorded old and calculated new data without losing the draft or running analysis', () => {
+    const app=analysed(), res=synthFilterTune({version:2});
+    const axes=v=>[0,1,2].map(()=>Float32Array.of(v,v+1,v));
+    res.traces=[{log:5,profile:1,t:Float64Array.of(10,10.001,10.002),raw:axes(9),logged:axes(4),baseline:axes(5),candidate:axes(1),pidBaseline:axes(3),pidCandidate:axes(2)}];
+    res.parameters=[{key:'gyro_lpf1_static_hz',name:'gyro_lpf1_static_hz',from:100,to:130,source:'header',scope:'global',editable:true,range:[0,1000]}];
+    app.tab('filters');app.jq.fire('click','.tuning-ft-start');const w=ftWorker(app);w.reply({type:'filterTuned',result:res});
+    const primary=(axis='roll')=>app.plots.filter(p=>p.spec.title==='Flight spectrum, '+axis).at(-1).spec;
+    const signal=(axis='roll')=>app.plots.filter(p=>p.spec.title==='Gyro signals, '+axis).at(-1).spec;
+    const keys=spec=>spec.series.map(s=>s.ftCurve);
+    const toggle=(key,checked)=>app.jq.fire('change','.tuning-ft-curve',{'data-ft-curve':key},{checked});
+    for (const key of ['raw','old','new']) assert.match(app.pane('filters'),new RegExp('data-ft-curve="'+key+'" checked'));
+    assert.equal(primary().series[0].y,res.curves.roll.raw);
+    assert.equal(primary().series[1].y,res.curves.roll.logged, 'old is the recorded output, not the baseline replay');
+    assert.equal(primary().series[2].y,res.curves.roll.candidate);
+    assert.equal(primary().legend,false, 'the checkboxes are the only visibility controls');
+    const messages=w.sent.length, plots=app.plots.length, destroyed=app.destroyed.length, html=app.pane('filters');
+    app.jq.fire('input','.tuning-ft-param',{'data-param':'gyro_lpf1_static_hz'},{value:'175'});
+    toggle('raw',false);eq(keys(primary()),['old','new']);eq(keys(signal()),['old','new']);
+    toggle('old',false);eq(keys(primary()),['new']);assert.equal(signal().series[0].y,res.traces[0].candidate[0]);
+    toggle('new',false);eq(keys(primary()),[]);eq(keys(signal()),[]);
+    assert.equal(primary().emptyText,'Select a curve to show.');
+    toggle('raw',true);eq(keys(primary()),['raw']);
+    assert.equal(app.pane('filters'),html,'the pane and focused controls are not replaced');
+    assert.equal(app.plots.length,plots);assert.equal(app.destroyed.length,destroyed);assert.equal(w.sent.length,messages);
+    app.jq.fire('click','.tuning-axis',{'data-axis':'pitch'});
+    eq(keys(primary('pitch')),['raw']);assert.equal(primary('pitch').series[0].y,res.curves.pitch.raw);
+    assert.match(app.pane('filters'),/data-param="gyro_lpf1_static_hz"[^>]*value="175"/,'a curve selection does not discard the edit');
+    app.tab('overview');app.tab('filters');eq(keys(primary()),['raw']);
+    app.jq.fire('click','.tuning-ft-simulate');const request=w.sent.at(-1).msg;
+    assert.equal(request.options.simulate.gyro_lpf1_static_hz,'175');
+    w.reply({type:'filterTuned',result:{...res,mode:'simulation'}},request.id);
+    eq(keys(primary()),['raw'],'visibility survives a new replay result');
+    toggle('new',true);app.jq.fire('click','.tuning-axis',{'data-axis':'yaw'});
+    // This fixture has new time signals but no new yaw spectrum. The curve keeps its proper identity.
+    eq(keys(primary('yaw')),['raw']);eq(keys(signal('yaw')),['raw','new']);
+    app.jq.fire('click','.tuning-axis',{'data-axis':'roll'});eq(keys(primary()),['raw','new']);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('filter comparison handles missing curves without relabeling replay as recorded data', () => {
+    const app=setup(),res=synthFilterTune({version:2});
+    res.curves.roll.raw=null;res.curves.roll.logged=null;res.curves.roll.pidOut=null;res.curves.roll.pidOutCandidate=null;
+    res.recommended.status='not recommended';
+    const out=app.internals.filterSearchHtml({state:'done',result:res},{plotId:()=> 'filterplot'},{});
+    const primary=out.plots.find(p=>p.spec.title==='Flight spectrum, roll').spec;
+    eq(primary.series.map(s=>s.name),['New filter (calculated, not confirmed)']);
+    assert.equal(primary.series[0].y,res.curves.roll.candidate);
+    for (const key of ['raw','old']) assert.match(out.html,new RegExp('data-ft-curve="'+key+'" checked'),'other axes retain available data');
+    assert.match(out.html,/The new filter result is not confirmed/);
+    assert.ok(!out.plots.some(p=>/PID output|P and D/.test(p.spec.title)));
+});
+
+test('one draft per recorded configuration, one final candidate per PID profile, and a shared compiled CLI diff', async () => {
+    const r=withDatasets(synthResult());
+    for(const d of r.datasets.datasets)d.values={roll_p_gain:d.id==='A'?50:d.id==='C'?55:70};
+    const make=(id,p,node,name,to)=>({id:'change:'+name,dataset:id,profile:p,cliProfile:p-1,scope:'profile',severity:'action',node,area:node,
+        title:'Set '+name,parameter:name,from:20,to,cli:['profile '+(p-1),'set '+name+' = '+to],evidence:[],blockedBy:[],causes:[]});
+    r.advice.byDataset={A:[make('A',1,'cyclic','roll_d_gain',21)],C:[make('C',1,'cyclic','roll_d_gain',24),make('C',1,'tail','yaw_p_gain',81)],B:[make('B',2,'cyclic','roll_d_gain',30)]};
+    r.advice.recommendations=[make('C',1,'cyclic','roll_d_gain',99)]; // Analysis keeps its file-wide advice.
+    advice.configurationBases(r.datasets);
+    const app=analysed({result:r});
+    app.tab('cyclic'); app.detail('cyclic:checks'); assert.match(app.pane('cyclic'),/data-pick="0" checked/);
+    assert.doesNotMatch(app.pane('cyclic'),/set roll_d_gain = 99/,'the tuning step uses only its configuration advice');
+    app.jq.fire('change','.tuning-pick',{'data-pick':0},{checked:false});
+    app.dialog.setConfiguration('A');app.tab('cyclic');assert.match(app.pane('cyclic'),/data-pick="0" checked/,'A has an independent default selection');
+    app.dialog.setConfiguration('C');app.tab('cyclic');assert.doesNotMatch(app.pane('cyclic'),/data-pick="0" checked/,'C keeps its unchecked value');
+    app.tab('export');await tick();
+    assert.equal((app.pane('export').match(/class="form-control input-sm tuning-final-config"/g)||[]).length,2);
+    let q=app.deriveWorker().sent.filter(x=>x.msg.cmd==='export').at(-1).msg;
+    eq(q.recs.filter(x=>q.picks.includes(x.id)).map(x=>[x.dataset,x.parameter]),[['C','yaw_p_gain'],['B','roll_d_gain']]);
+    app.jq.fire('change','.tuning-final-config',{'data-profile':1},{value:'A'});await tick();
+    q=app.deriveWorker().sent.filter(x=>x.msg.cmd==='export').at(-1).msg;
+    const chosen=q.recs.filter(x=>q.picks.includes(x.id));
+    assert.ok(chosen.every(x=>x.dataset!=='C'));assert.ok(chosen.some(x=>x.dataset==='B'));
+    assert.ok(chosen.some(x=>x.configurationBase && x.parameter==='roll_p_gain' && x.to===50),'the CLI restores A before applying its D change');
+    const script=advice.exportScript(plain(q.recs),plain(q.picks),plain(q.meta));
+    assert.match(script,/set roll_d_gain = 21/);assert.match(script,/set roll_d_gain = 30/);assert.match(script,/set roll_p_gain = 50/);
+    assert.doesNotMatch(script,/set roll_d_gain = 24|set yaw_p_gain = 81/);
+    assert.match(app.pane('export'),/Selected parameter changes/);assert.match(app.pane('export'),/<code>50<\/code>/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('opening an Analysis result selects its recorded configuration and its own recommendation', () => {
+    const r=withDatasets(synthResult()), id='T7:yaw_collective_ff_gain:p1';
+    r.findings.find(f=>f.fid===FID.T8).dataset='A';
+    const own={...r.advice.recommendations.find(q=>q.id===id),id:'configuration:A:'+id,dataset:'A'};
+    r.advice.byDataset={A:[own],B:[],C:[]};
+    const app=analysed({result:r});
+    assert.equal(app.dialog.getConfiguration(),'C');
+    assert.equal(app.dialog.focus({node:'tailcomp',fid:FID.T8,recs:[id]}),true);
+    assert.equal(app.dialog.getConfiguration(),'A');
+    assert.match(panelOf(app.pane('overview')),/tuning-node-rec is-focus/);
+    assert.match(panelOf(app.pane('overview')),/set yaw_collective_ff_gain = 72/);
+    app.jq.fire('click','.tuning-goto-rec',{'data-rec':0});
+    assert.match(app.pane('recs'),/set yaw_collective_ff_gain = 72/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('configuration tuning plots use the selected configuration across logs outside the viewer selection', () => {
+    const r=withDatasets(synthResult()), curve=r.curves[0];
+    r.datasets.curves=[{...curve,dataset:'A',log:0},{...curve,dataset:'B',log:2}];
+    const app=analysed({result:r});
+    app.dialog.setConfiguration('A');app.tab('governor');
+    assert.match(app.pane('governor'),/Log 1\. Click a time plot/);
+    app.dialog.setConfiguration('B');app.tab('governor');
+    assert.match(app.pane('governor'),/Log 3\. Click a time plot/);
+    assert.doesNotMatch(app.pane('governor'),/Log 2\. Click a time plot/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('filter workspace keeps delay and edits per flight source, independent of the control configuration', async () => {
+    const r=withDatasets(synthResult());for(const d of r.datasets.datasets)d.values={roll_p_gain:50};
+    r.flights=[{log:1,t0:14,t1:87,seconds:73},{log:1,t0:140,t1:230,seconds:90}];
+    r.advice.recommendations=[{id:'old-filter-advice',dataset:'C',scope:'profile',profile:1,cliProfile:0,node:'filters',area:'filters',severity:'action',title:'Set the filter cutoff',
+        parameter:'roll_d_cutoff',from:10,to:20,cli:['profile 0','set roll_d_cutoff = 20'],evidence:[],causes:[],blockedBy:[]}];
+    const app=analysed({result:r}), res=synthFilterTune({version:2,mode:'autotune'});
+    res.parameters=[{key:'gyro_lpf1_type',name:'gyro_lpf1_type',from:'FIRST_ORDER',to:'BESSEL',source:'header',scope:'global',editable:true,choices:['FIRST_ORDER','BESSEL']},
+        {key:'gyro_lpf1_static_hz',name:'gyro_lpf1_static_hz',from:100,to:130,source:'header',scope:'global',editable:true,range:[0,1000]}];
+    res.recommended.fullRows=res.parameters;res.cliFile='set gyro_lpf1_type = BESSEL\nsave\n';
+    app.tab('filters');app.jq.fire('input','.tuning-ft-delay',{}, {value:'1.25'});app.jq.fire('click','.tuning-ft-start');
+    const w=ftWorker(app), initial=w.sent[0].msg;
+    assert.equal(initial.options.maxAddMs,1.25);assert.equal(initial.options.configuration,undefined);
+    eq(initial.options.flights,[{log:1,flight:null}]);
+    eq(initial.options.recordedConfigurations.labels,r.datasets.labels);
+    w.reply({type:'filterTuned',result:res});assert.equal(w.terminated,false,'keep reconstruction for interactive replay');
+    app.jq.fire('input','.tuning-ft-param',{'data-param':'gyro_lpf1_static_hz'},{value:'170'});
+    app.tab('export');await tick();assert.ok(!app.deriveWorker() || !app.deriveWorker().sent.some(q=>q.msg.cmd==='export'),'an unplayed edit has no pending filter commands');
+    app.tab('filters');app.jq.fire('click','.tuning-ft-simulate');
+    const msg=w.sent.at(-1).msg;
+    assert.equal(msg.cmd,'filterReplay');assert.equal(msg.bytes,undefined);assert.equal(msg.workspaceKey,initial.workspaceKey);
+    assert.equal(msg.options.simulate.gyro_lpf1_static_hz,'170');
+    w.reply({type:'filterTuned',result:{...res,mode:'simulation'}},msg.id);
+    app.dialog.setConfiguration('A');assert.equal(w.terminated,false,'a control configuration does not change the replay input');
+    app.tab('filters');assert.match(app.pane('filters'),/value="1.25"/);assert.match(app.pane('filters'),/data-param="gyro_lpf1_static_hz"/);
+    app.jq.fire('change','.tuning-ft-source-select',{}, {value:'1:0'});assert.equal(w.terminated,true);
+    assert.match(app.pane('filters'),/value="0.5"/);assert.doesNotMatch(app.pane('filters'),/data-param="gyro_lpf1_static_hz"/,'a different flight starts with its own draft');
+    app.jq.fire('change','.tuning-ft-source-select',{}, {value:'1:all'});
+    assert.match(app.pane('filters'),/value="1.25"/);assert.match(app.pane('filters'),/data-param="gyro_lpf1_static_hz"/);
+    app.jq.fire('change','.tuning-ft-delay',{}, {value:'0'});app.jq.fire('click','.tuning-ft-start');
+    assert.equal(ftWorker(app).sent[0].msg.options.maxAddMs,0,'zero additional delay is allowed');
+    assert.deepEqual(app.errors,[]);
+});
+
+test('compiled parameter record detects global conflicts but allows different values in distinct PID profiles', () => {
+    const I=setup().internals;
+    const rec=(id,scope,p,value)=>({id,scope,profile:p,severity:'action',cli:(scope==='profile'?['profile '+(p-1)]:[]).concat(['set '+(scope==='profile'?'roll_d_gain':'gyro_lpf1_static_hz')+' = '+value]),node:'filters',dataset:id});
+    const recs=[rec('A','global',null,90),rec('B','global',null,110),rec('C','profile',1,20),rec('D','profile',2,40)];
+    const plan=I.pendingPlan(recs,{0:true,1:true,2:true,3:true});
+    assert.equal(plan.rows.length,3);assert.equal(plan.conflicts.length,1);assert.equal(plan.conflicts[0].name,'gyro_lpf1_static_hz');
+    eq(plan.rows.filter(r=>r.scope==='profile').map(r=>r.index),[0,1]);
+    const same=I.pendingPlan([{...rec('E','global',null,100),fromSets:{gyro_lpf1_static_hz:100}}],{0:true});
+    assert.match(I.pendingDiffHtml(same),/<details><summary>Values that do not change in the CLI file \(1\)/);
+    assert.doesNotMatch(I.pendingDiffHtml(same).split('<details>')[0],/<code>gyro_lpf1_static_hz/);
+});
+
+test('filter sources preserve original flight numbers and identify every recorded configuration in the comparison', async () => {
+    const r=withDatasets(synthResult({scope:'file',logs:[0,1,2],benchRuns:[0],flights:[
+        {log:1,t0:14,t1:200,seconds:186},{log:2,t0:20,t1:60,seconds:40}
+    ]}));
+    r.datasets.labels=r.datasets.labels.filter(q=>q.dataset!=='B');
+    r.datasets.labels[0].t1=130;
+    r.datasets.datasets.forEach(d=>{d.values={gyro_lpf1_static_hz:d.id==='A'?100:140,gyro_lpf1_type:1};
+        for(let i=0;i<4;i++)d.values['motor_rpm_lpf['+i+']']=d.id==='A'?10+i:20+i;
+    });
+    const app=analysed({result:r,scope:'file'}), I=app.internals;
+    eq(I.filterSources(r).map(s=>[s.key,s.log]),[['1:all',1],['2:all',2]],'bench data is not a tune source');
+    const partial={...r,selection:{flights:[{log:1,flight:3,t0:140,t1:200}],all:[]},flights:[{log:1,t0:140,t1:200,seconds:60}]};
+    const sources=I.filterSources(partial);eq(sources.map(s=>s.key),['1:3']);assert.match(sources[0].title,/Flight 4/);
+    eq(I.filterBaseline(partial,sources[0]).map(q=>[q.id,q.t0,q.t1]),[['C',140,200]],'the selected flight clips baseline intervals');
+    app.tab('filters');
+    let html=app.pane('filters');
+    assert.ok(html.indexOf('Flight data for this tune')<html.indexOf('Autotune</button>'));
+    assert.match(html,/Recorded output includes 2 configurations/);
+    assert.match(html,/14 s to 130 s/);assert.match(html,/130 s to 200 s/);
+    const res=synthFilterTune({version:2,mode:'autotune'});
+    res.parameters=[{key:'gyro_lpf1_static_hz',name:'gyro_lpf1_static_hz',scope:'global',from:140,to:140,editable:true,source:'header'},
+        {key:'gyro_lpf1_type',name:'gyro_lpf1_type',scope:'global',from:'FIRST_ORDER',to:'FIRST_ORDER',choices:['NONE','FIRST_ORDER','SECOND_ORDER'],editable:true,source:'header'},
+        {key:'motor_rpm_lpf',name:'motor_rpm_lpf',scope:'global',from:'20,21,22,23',to:'20,21,22,23',count:4,editable:true,source:'header'}];
+    res.recommended.rows=[];res.recommended.fullRows=res.parameters.map(({choices,count,...q})=>q);
+    res.recommendations=[{id:'F:filters',node:'filters',area:'filters',severity:'action',scope:'global',filterSearch:true,
+        title:'Set the gyro filter values',cli:['set gyro_lpf1_static_hz = 140'],fromSets:{gyro_lpf1_static_hz:140},evidence:[],blockedBy:[]}];
+    app.jq.fire('click','.tuning-ft-start');ftWorker(app).reply({type:'filterTuned',result:res});
+    html=app.pane('filters');
+    assert.match(html,/A: 100/);assert.match(html,/C: 140/,'even an unchanged last value is compared against earlier configurations');
+    assert.match(html,/A: 10,11,12,13/);assert.match(html,/C: 20,21,22,23/,'indexed dataset arrays retain each configuration value');
+    app.jq.fire('change','.tuning-ft-hide-unchanged',{}, {checked:true});
+    assert.doesNotMatch(app.pane('filters'),/data-param="gyro_lpf1_type"/,'equivalent enum numbers and labels are not changes');
+    assert.match(app.pane('filters'),/data-param="gyro_lpf1_static_hz"/,'an earlier configuration differs from the new value');
+    assert.match(html,/The spectra average all flight windows used by the replay/);
+    app.tab('export');await tick();
+    const q=app.deriveWorker().sent.filter(q=>q.msg.cmd==='export').at(-1).msg;
+    const filters=q.recs.filter(q=>q.id==='F:filters');assert.equal(filters.length,1,'one filter tune across all control drafts');
+    assert.equal(filters[0].dataset,null);assert.equal(filters[0].filterSource,'Log 2 · Flight 1');
+    assert.ok(q.picks.includes('F:filters'));
+    app.tab('filters');app.jq.fire('click','.tuning-ft-start');
+    res.recommended.params={};res.recommended.status='not recommended';res.recommendations=[];
+    ftWorker(app).reply({type:'filterTuned',result:res},ftWorker(app).sent.at(-1).msg.id);
+    html=app.pane('filters');
+    assert.match(html,/Recorded filter replay/);assert.match(html,/No filter values changed/);
+    assert.doesNotMatch(html,/One new filter configuration across/,'a baseline replay preserves the multiple recorded configurations');
+    assert.doesNotMatch(html,/class="tuning-table tuning-ft-comparison"/,'reference values are not presented as an untested candidate');
+    assert.match(html,/data-ft-curve="new" disabled/);
+    app.jq.fire('change','.tuning-ft-source-select',{}, {value:'2:all'});
+    assert.doesNotMatch(app.pane('filters'),/data-param="gyro_lpf1_static_hz"/);
+    app.jq.fire('click','.tuning-ft-start');
+    eq(ftWorker(app).sent[0].msg.options.flights,[{log:2,flight:null}]);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('unlabelled recorded intervals remain visible and cannot be attributed to a known configuration', () => {
+    const r=withDatasets(synthResult({flights:[{log:1,t0:14,t1:200}]}));
+    r.datasets.labels=r.datasets.labels.filter(q=>q.dataset!=='B');
+    const app=analysed({result:r});app.tab('filters');
+    assert.match(app.pane('filters'),/Some recorded configuration intervals are unknown/);
+    assert.match(app.pane('filters'),/100 s to 130 s<\/td><td>Unknown<\/td><td>PID profile unknown/);
+});
+
+function controlResult() {
+    const r=withDatasets(synthResult());
+    r.datasets.datasets.forEach(d=>{d.analysed=true;d.analysedFlightSeconds=100;d.values={roll_p_gain:50,roll_d_gain:20};});
+    const rec=(id,name,from,to)=>({id:name,dataset:id,node:'cyclic',area:'cyclic',profile:id==='B'?2:1,cliProfile:id==='B'?1:0,scope:'profile',
+        severity:'action',axis:'roll',title:'Increase the roll gain',parameter:name,from,to,fromSource:'log header',confidence:'measured',
+        text:'The roll response has slow oscillation after a stop. This change can decrease the slow oscillation.',
+        cli:['profile '+(id==='B'?1:0),'set '+name+' = '+to],rule:'The change is less than the step limit.',blockedBy:[],causes:[],
+        evidence:[{id:'C6',fid:FID.C12,profile:1,value:30,se:2,unit:'deg/s'}]});
+    r.advice.byDataset={A:[rec('A','roll_p_gain',50,55)],B:[],C:[rec('C','roll_p_gain',50,55),rec('C','roll_d_gain',20,22)]};
+    return r;
+}
+const controlRequest=app=>app.deriveWorker().sent.filter(q=>q.msg.cmd==='controlTune').at(-1).msg;
+function answerControl(app,q=controlRequest(app)) {
+    const out=require('../tools/autotune/control_tune.cjs').tune(plain(q));
+    app.deriveWorker().reply({type:'controlTuned',result:out},q.id);return out;
+}
+test('control autotune connects recorded problems to the reason for each change, then exports a selected flight plan',async()=>{
+    const app=analysed({result:controlResult()});app.tab('cyclic');
+    for(const text of ['Recorded problems','Recommended changes','Recorded response','Flight test necessary'])assert.ok(app.pane('cyclic').includes(text),text);
+    assert.doesNotMatch(app.pane('cyclic'),/tuning-ct-metrics|tuning-ct-pending|New values|<th>New<\/th>|>Compare<\/h5>/);
+    app.jq.fire('click','.tuning-ct-start');const q=controlRequest(app);
+    assert.equal(q.configuration,'C');assert.equal(q.step,'cyclic');assert.equal(q.analysis.curves,undefined);
+    assert.match(app.pane('cyclic'),/The app selects a control change/);
+    answerControl(app);await tick();
+    const htmlAfter=app.pane('cyclic');
+    for(const text of ['Effect of this change','slow oscillation after a stop','can decrease the slow oscillation','Results for this change','Recommended</th>','log header'])assert.ok(htmlAfter.includes(text),text);
+    assert.ok(htmlAfter.indexOf('Effect of this change')<htmlAfter.indexOf('Recorded response'),'the explanation precedes the signal plots');
+    assert.match(htmlAfter,/\+5/);app.detail('cyclic:flight');assert.match(app.pane('cyclic'),/roll stick/);
+    assert.doesNotMatch(app.pane('cyclic'),/Replay checks satisfactory|cleared issue/);
+    app.tab('export');await tick();
+    const e=app.deriveWorker().sent.filter(q=>q.msg.cmd==='export').at(-1).msg;
+    assert.equal(e.withPlan,true);
+    const selected=e.recs.filter(r=>e.picks.includes(r.id) && r.dataset==='C');
+    assert.equal(selected.length,1);assert.equal(selected[0].controlTune,true);assert.equal(selected[0].parameter,'roll_p_gain');
+    const bundle=advice.exportScript(plain(e.recs),plain(e.picks),plain(e.meta),true);
+    app.deriveWorker().reply({type:'exported',result:bundle},e.id);await tick();
+    const html=app.html('.tuning-export-preview');
+    for(const text of ['Next flight maneuvers','PID profile 1','Roll steps and stops','each direction','Blackbox log rate'])assert.ok(html.includes(text),text);
+    assert.match(html,/set roll_p_gain = 55/);assert.doesNotMatch(html,/set roll_d_gain = 22/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('tab colors follow configuration results and do not clear when a control proposal is selected', async () => {
+    const r = controlResult();
+    r.findings = [
+        {fid:'tab-a', id:'C12', node:'cyclic', dataset:'A', pidProfile:1, status:'satisfactory'},
+        {fid:'tab-b', id:'C12', node:'cyclic', dataset:'B', pidProfile:2, status:'monitor'},
+        {fid:'tab-c', id:'C12', node:'cyclic', dataset:'C', pidProfile:1, status:'problem'},
+        {fid:'tab-info', id:'G20', node:'rpm', status:'information', severity:'flag'},
+    ];
+    const app = analysed({result:r}), tab = key => app.jq.node('.tuning-tab[data-tab="' + key + '"]');
+    const label = key => app.jq.node('.tuning-tab[data-tab="' + key + '"] .tuning-tab-status').text;
+    assert.ok(tab('cyclic').classes.has('st-problem'));
+    assert.equal(label('cyclic'), 'Problem (1)');
+    assert.ok(tab('overview').classes.has('st-problem'));
+    assert.equal(label('tail'), 'Not measured');
+    app.dialog.setConfiguration('A');
+    assert.ok(tab('cyclic').classes.has('st-satisfactory'));
+    assert.ok(!tab('cyclic').classes.has('st-problem'));
+    app.dialog.setConfiguration('B');
+    assert.ok(tab('cyclic').classes.has('st-monitor'));
+    app.dialog.setConfiguration('C');
+    app.tab('cyclic');
+    assert.ok(tab('cyclic').classes.has('active'));
+    assert.ok(tab('cyclic').classes.has('st-problem'));
+    assert.match(tab('cyclic').attrs['aria-label'], /Cyclic gains: Problem \(1\).*Configuration C/);
+    assert.equal(tab('cyclic').attrs['aria-current'], 'page');
+    app.jq.fire('click', '.tuning-ct-start'); answerControl(app); await tick();
+    assert.equal(label('cyclic'), 'Problem (1)', 'a flight-test proposal is not a measured correction');
+    assert.ok(tab('export').classes.has('st-monitor'));
+    app.tab('export');
+    assert.ok(!tab('cyclic').classes.has('active'));
+    assert.ok(tab('cyclic').classes.has('st-problem'), 'inactive tabs retain their issue colors');
+    app.jq.fire('change', '.tuning-pick', {'data-pick':0}, {checked:false});
+    assert.equal(label('cyclic'), 'Problem (1)', 'export selection does not hide an issue');
+    assert.deepEqual(app.errors, []);
+});
+
+test('filter tab clearance requires a current confirmed replay and retains physical or unavailable problems', () => {
+    const r = synthResult({findings:[{fid:'tab-f1',id:'F1',node:'filters',log:1,status:'problem'}]});
+    const app = analysed({result:r}), I = app.internals;
+    const side = (status, issues = 0) => ({status, issues, findings:[]});
+    const cleared = {id:'F1',before:side('Issue',1),after:side('Pass'),outcome:'Cleared in replay'};
+    const res = synthFilterTune({version:2, checklist:{confirmed:true,rows:[cleared]}});
+    const tab = () => app.jq.node('.tuning-tab[data-tab="filters"]');
+    app.tab('filters');
+    assert.ok(tab().classes.has('st-problem'));
+    app.jq.fire('click', '.tuning-ft-start');
+    const w = ftWorker(app); w.reply({type:'filterTuned',result:res});
+    assert.ok(tab().classes.has('st-satisfactory'));
+    assert.match(tab().attrs['aria-label'], /Satisfactory in replay/);
+    app.jq.fire('input', '.tuning-ft-param', {'data-param':'gyro_lpf1_static_hz'}, {value:'150'});
+    assert.ok(tab().classes.has('st-problem'), 'unreplayed edits restore outstanding recorded problems immediately');
+    assert.ok(!tab().classes.has('st-satisfactory'));
+    const model = {state:'done',result:res,recordedChecks:r.findings};
+    const status = m => I.tabStatus(I.filterTabStates(m)).key;
+    assert.equal(status({...model,stale:true}), 'problem');
+    assert.equal(status({...model,result:{checklist:{confirmed:false,rows:[cleared]}}}), 'problem');
+    assert.equal(status({...model,recordedChecks:[{id:'F7',status:'problem'}]}), 'problem');
+    assert.equal(status({...model,result:{checklist:{rows:[{...cleared,after:side('Not evaluated'),outcome:'Not evaluated'}]}}}), 'problem');
+    assert.equal(status({...model,result:{checklist:{rows:[{...cleared,before:side('Pass'),after:side('Issue',1),outcome:'New issue'}]}}}), 'problem');
+    assert.equal(I.tabStatus(['satisfactory','notMeasured']).key, 'notMeasured');
+    assert.equal(I.tabStatus(['satisfactory','insufficient']).key, 'insufficient');
+    assert.deepEqual(app.errors, []);
+});
+
+test('export tab flags conflicting selected changes before opening Export', () => {
+    const r = controlResult(), own = r.advice.byDataset.C;
+    own.push({...own[0],id:'conflicting-gain',to:60,cli:['profile 0','set roll_p_gain = 60']});
+    const app = analysed({result:r}), tab = app.jq.node('.tuning-tab[data-tab="export"]');
+    assert.ok(tab.classes.has('st-problem'));
+    assert.match(tab.attrs['aria-label'], /Cannot export/);
+    assert.equal(app.pane('export'), '', 'status checks do not render or enter the Export tab');
+    app.tab('export');
+    app.jq.fire('change', '.tuning-pick', {'data-pick':2}, {checked:false});
+    assert.ok(!tab.classes.has('st-problem'));
+    assert.ok(tab.classes.has('st-monitor'));
+    assert.deepEqual(app.errors, []);
+});
+test('control drafts survive navigation and cancellation, reset and input changes cannot export an old proposal',async()=>{
+    const app=analysed({result:controlResult()});app.tab('cyclic');app.jq.fire('click','.tuning-ct-start');
+    const q=controlRequest(app);app.jq.fire('click','.tuning-ct-cancel');answerControl(app,q);await tick();
+    assert.match(app.pane('cyclic'),/was canceled/);assert.doesNotMatch(app.pane('cyclic'),/tuning-ct-reset/);
+    app.jq.fire('click','.tuning-ct-start');answerControl(app);await tick();
+    app.dialog.setConfiguration('A');assert.doesNotMatch(app.pane('cyclic'),/tuning-ct-reset/,'C does not become A');
+    app.dialog.setConfiguration('C');assert.match(app.pane('cyclic'),/tuning-ct-reset/,'C keeps the proposal');
+    app.jq.fire('click','.tuning-ct-reset');assert.doesNotMatch(app.pane('cyclic'),/tuning-ct-reset/);
+    app.jq.fire('click','.tuning-ct-start');answerControl(app);await tick();
+    app.jq.fire('change','.tuning-scope',{}, {value:'file'});
+    assert.match(app.pane('cyclic'),/analysis uses different inputs/);
+    assert.match(app.pane('cyclic'),/tuning-ct-start" disabled/);
+    app.tab('export');await tick();
+    assert.doesNotMatch(app.pane('export'),/<code>55<\/code>/,'the old control proposal leaves the shared diff');
+    assert.deepEqual(app.errors,[]);
+});
+test('recorded control comparisons retain uncertainty and parameter differences without claiming an after-flight result',()=>{
+    const app=analysed({result:controlResult()});app.tab('cyclic');
+    assert.doesNotMatch(app.pane('cyclic'),/The two configurations were flown|tuning-ct-reference/,'history is supporting detail');
+    app.detail('cyclic:history');
+    app.jq.fire('change','.tuning-ct-reference',{}, {value:'A'});
+    assert.match(app.pane('cyclic'),/The two configurations were flown/);
+    assert.match(app.pane('cyclic'),/4\.1/);assert.match(app.pane('cyclic'),/Other recorded configuration/);
+    assert.match(app.pane('cyclic'),/Recorded configurations/);
+    app.detail('cyclic:checks');
+    app.jq.fire('click','.tuning-axis',{'data-axis':'pitch'});
+    assert.match(app.pane('cyclic'),/<details class="tuning-ct-details"[^>]* open><summary data-ct-detail="cyclic:checks"/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('each control step retains recorded problem context without proposed measurements',()=>{
+    for(const [step,id,axis] of [['governor','G3',null],['cyclic','C6','roll'],['tail','T2','yaw'],['cycomp','C14','pitch'],['tailcomp','T14','yaw']]) {
+        const r=controlResult(), f={...r.findings.find(f=>f.id==='C12'),fid:'control-problem',id,node:step,axis,
+            dataset:'C',profile:1,pidProfile:1,log:1,severity:'flag',status:'problem',value:30,se:2,threshold:20,unit:'deg/s',
+            noun:'Recorded error',summary:'The recorded error is more than its limit.',display:null,
+            stale:{text:'The values come from the log header.',source:'Log header'},
+            evidence:{spans:[{t0:10,t1:12}],view:{log:1,t0:10,t1:12},plot:{kind:'time',curve:'track.roll'}}};
+        r.findings.push(f);
+        const app=analysed({result:r});app.tab(step);
+        const html=app.pane(step);
+        for(const text of ['The recorded error is more than its limit.','10.0 s to 12.0 s','30.0&nbsp;±&nbsp;2.0 deg/s','Log 2','PID profile 1','Configuration C','Show in the log','Show the measurement','The values come from the log header.'])assert.ok(html.includes(text),step+': '+text);
+        assert.doesNotMatch(html,/tuning-ct-metrics|tuning-ct-pending|<th>New<\/th>|New values/);
+        assert.deepEqual(app.errors,[]);
+    }
+});
+
+test('an unavailable control change keeps the recorded problem and never implies a clearance',async()=>{
+    const r=controlResult();r.advice.byDataset.C=[];
+    const app=analysed({result:r});app.tab('cyclic');
+    app.jq.fire('click','.tuning-ct-start');answerControl(app);await tick();
+    const html=app.pane('cyclic');
+    assert.match(html,/The data gives no control change/);
+    assert.match(html,/Recorded problems/);
+    assert.doesNotMatch(html,/Effect of this change|tuning-ct-reset|cleared|<th>New<\/th>/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('a control model estimate stays in supporting detail and never supplies measured new results',async()=>{
+    const app=analysed({result:controlResult()});app.tab('cyclic');app.jq.fire('click','.tuning-ct-start');
+    const q=controlRequest(app), out=require('../tools/autotune/control_tune.cjs').tune(plain(q));
+    out.prediction={axis:'roll',tracking:[20,15],delta:-5,se:1,band:[1,15]};
+    app.deriveWorker().reply({type:'controlTuned',result:out},q.id);await tick();
+    assert.match(app.pane('cyclic'),/Model estimate \(not measured\)/);
+    assert.doesNotMatch(app.pane('cyclic'),/20 to 15 deg\/s|tuning-ct-metrics/);
+    app.detail('cyclic:model');
+    assert.match(app.pane('cyclic'),/model tracking error: 20 to 15 deg\/s/);
+    assert.match(app.pane('cyclic'),/It has no flight test/);
+    app.jq.fire('change','.tuning-scope',{}, {value:'file'});
+    assert.doesNotMatch(app.pane('cyclic'),/Model estimate \(not measured\)|Effect of this change/,'stale proposals do not describe the new selection');
+    assert.deepEqual(app.errors,[]);
+});
+
+test('large control results keep closed checks and secondary plots out of the tab', () => {
+    const result = synthResult(), finding = result.findings.find(f => f.id === 'C12');
+    result.findings.push(...Array.from({ length: 1200 }, (_, i) => ({ ...finding, fid: 'many-' + i, node: 'cyclic', severity: 'flag' })));
+    const app = analysed({ result });
+    app.tab('cyclic');
+    assert.equal(app.plots.length, 1, 'only the visible primary plot attaches');
+    assert.doesNotMatch(app.pane('cyclic'), /tuning-step-picks|<td class="tuning-id">|many-1199/);
+    assert.ok(app.pane('cyclic').length < 20000, 'tab content stays small with 1200 additional findings');
+    app.detail('cyclic:checks');
+    assert.match(app.pane('cyclic'), /many-1199/, 'all evidence remains reachable');
+    app.detail('cyclic:checks', false);
+    assert.doesNotMatch(app.pane('cyclic'), /many-1199/, 'closing releases the table DOM');
+    assert.equal(app.plots.length, 1, 'opening checks does not replace the primary plot');
+    assert.deepEqual(app.errors, []);
+});
+
+test('native disclosure toggles load plots once, release them on close and ignore obsolete elements', () => {
+    const app = analysed();
+    app.tab('cyclic');
+    const primary = app.plots[0], owner = app.jq.node('#viewTuning').element;
+    const signals = app.detail('cyclic:signals');
+    assert.equal(app.plots.length, 5);
+    owner.dispatchEvent({ type: 'toggle', target: signals });
+    assert.equal(app.plots.length, 5, 'duplicate toggle notification does not duplicate plots');
+    app.detail('cyclic:signals', false);
+    assert.equal(app.destroyed.length, 4, 'only the secondary plots are destroyed');
+    assert.ok(!app.destroyed.includes(primary.spec.title), 'primary plot and summary retain their DOM');
+    app.detail('cyclic:signals');
+    assert.equal(app.plots.length, 9);
+    app.jq.fire('click', '.tuning-axis', { 'data-axis': 'pitch' });
+    const count = app.plots.length;
+    owner.dispatchEvent({ type: 'toggle', target: signals });
+    assert.equal(app.plots.length, count, 'an old element cannot attach old data after a render');
+    assert.match(app.pane('cyclic'), /data-tuning-detail-key="cyclic:signals" open/);
+    assert.deepEqual(app.errors, []);
+});
+
+test('configuration tables load on demand and survive routine chrome refreshes', () => {
+    const app = analysed({ result: controlResult() }), configuration = app.jq.node('.tuning-configuration');
+    assert.doesNotMatch(configuration.html, /<table/);
+    app.detail('configuration:values');
+    assert.match(configuration.html, /<table/);
+    const written = configuration.htmlWrites, html = configuration.html;
+    app.show();
+    assert.equal(configuration.htmlWrites, written, 'reopening Tuning does not rebuild the same configuration panel');
+    assert.equal(configuration.html, html, 'the expanded reference stays open');
+    app.detail('configuration:comparison');
+    assert.match(configuration.html, /tuning-config-table/);
+    app.detail('configuration:comparison', false);
+    assert.doesNotMatch(configuration.html, /tuning-config-table/);
+    app.dialog.setConfiguration('A');
+    assert.match(configuration.html, /Recorded values of Configuration A/);
+    assert.deepEqual(app.errors, []);
+});
+
+test('control problem cards open one measurement in the active control tab',()=>{
+    const app=analysed({result:controlResult()});app.tab('cyclic');
+    const key=/class="tuning-compare-open[^>]*data-key="([^"]+)" data-where="cyclic"/.exec(app.pane('cyclic'))[1];
+    app.jq.fire('click','.tuning-compare-open',{'data-key':key,'data-where':'cyclic'});
+    assert.equal((app.pane('cyclic').match(/class="tuning-compare"/g)||[]).length,1);
+    assert.match(app.pane('cyclic'),/tuning-order-compare/);
+    app.jq.fire('click','.tuning-compare-close');
+    assert.doesNotMatch(app.pane('cyclic'),/class="tuning-compare"/);
+    assert.deepEqual(app.errors,[]);
+});
+
+
+test('one filter checklist retains prior violations, physical input issues and unconfirmed outcomes', () => {
+    const I=setup().internals, side=(issues,status)=>({issues,status,findings:[]});
+    const row=(id,before,after,outcome)=>({id,title:'Filter check',log:1,configuration:'A',profile:2,axis:'pitch',fromS:10,toS:20,before:side(before,before?'Issue':'Pass'),after:side(after,after?'Issue':'Pass'),outcome});
+    const checklist={confirmed:true,rows:[row('F3',0,0,'Unchanged'),row('F1',1,0,'Cleared in replay'),row('F2',1,1,'Remains'),row('F4',0,1,'New issue'),{id:'F7',title:'Vibration source'}]};
+    const physical=[{id:'F7',log:1,severity:'flag',axis:'yaw',pidProfile:2,noun:'Vibration source',text:'A vibration source is present.'}];
+    let html=I.filterChecklistHtml({checklist},physical);
+    assert.equal((html.match(/Previous problem<\/span>/g)||[]).length,3);
+    assert.ok(html.indexOf('F1:')<html.indexOf('F3:'));
+    assert.match(html,/<tr class="tuning-ft-prior-issue tuning-ft-cleared">/);
+    assert.match(html,/Configuration A, PID profile 2, pitch/);
+    assert.match(html,/Same input/);
+    assert.equal((html.match(/F7:/g)||[]).length,1,'the raw-input result replaces the unavailable placeholder');
+    checklist.confirmed=false;html=I.filterChecklistHtml({checklist},physical);
+    assert.doesNotMatch(html,/tuning-ft-cleared|Not found in replay|1 previous problem not found/);
+    assert.match(html,/Not confirmed/);
+    assert.match(html,/Previous problem/);
+    html=I.filterChecklistHtml(null,physical);
+    assert.match(html,/Not replayed/);assert.match(html,/Previous problem/);
+});
+
+test('hide unchanged values compares every recorded configuration and preserves manual drafts across replay', () => {
+    const app=analysed(),res=synthFilterTune({version:2,mode:'autotune'});
+    res.parameters=[{key:'gyro_lpf1_static_hz',name:'gyro_lpf1_static_hz',scope:'global',from:100,to:130,editable:true},
+        {key:'dyn_notch_q',name:'dyn_notch_q',scope:'global',from:50,to:50,editable:true},
+        {key:'gyro_lpf1_type',name:'gyro_lpf1_type',scope:'global',from:'FIRST_ORDER',to:'FIRST_ORDER',choices:['NONE','FIRST_ORDER'],editable:true}];
+    app.tab('filters');app.jq.fire('click','.tuning-ft-start');const w=ftWorker(app);w.reply({type:'filterTuned',result:res});
+    app.jq.fire('input','.tuning-ft-param',{'data-param':'dyn_notch_q'},{value:'60'});
+    app.jq.fire('change','.tuning-ft-hide-unchanged',{}, {checked:true});
+    let html=app.pane('filters');
+    assert.match(html,/data-param="dyn_notch_q"[^>]*value="60"/);
+    assert.doesNotMatch(html,/data-param="gyro_lpf1_type"/);
+    assert.match(html,/data-param="gyro_lpf1_static_hz"/);
+    assert.match(html,/btn-default btn-sm tuning-ft-start">Autotune again/);
+    assert.match(html,/tuning-ft-save" disabled/);
+    assert.equal(w.sent.length,1,'a display filter does not run analysis');
+    app.jq.fire('click','.tuning-ft-simulate');const request=w.sent.at(-1).msg;
+    assert.equal(request.options.simulate.dyn_notch_q,'60');
+    w.reply({type:'filterTuned',result:{...res,mode:'simulation',parameters:res.parameters.map(q=>({...q,to:q.key==='dyn_notch_q'?60:q.to}))}},request.id);
+    assert.match(app.pane('filters'),/tuning-ft-hide-unchanged" checked/);
+    app.jq.fire('change','.tuning-ft-hide-unchanged',{}, {checked:false});
+    assert.match(app.pane('filters'),/data-param="gyro_lpf1_type"/);
+    const I=app.internals,baseline=[{id:'A',profile:1,t0:0,t1:10,values:{motor_rpm_lpf:'10,20'}},{id:'B',profile:1,t0:10,t1:20,values:{motor_rpm_lpf:'10,20'}}];
+    const array={key:'motor_rpm_lpf',name:'motor_rpm_lpf',scope:'global',count:2,from:'10,20',to:'10, 20',editable:true};
+    html=I.filterSearchHtml({result:{...res,parameters:[array]},baseline},{plotId:()=> 'p'},{hideUnchanged:true}).html;
+    assert.doesNotMatch(html,/data-param="motor_rpm_lpf"/,'array spaces do not make a change');
+    baseline[0].values={};
+    html=I.filterSearchHtml({result:{...res,parameters:[array]},baseline},{plotId:()=> 'p'},{hideUnchanged:true}).html;
+    assert.match(html,/data-param="motor_rpm_lpf"/,'unknown baselines must remain visible');
+});
+
+test('all axis pairs use the selected interval spectrum and identify its complete source', () => {
+    const app=analysed(),res=synthFilterTune({version:2}), data=[0,1,2].map(()=>Float32Array.of(1,2,1));
+    res.traces=[10,20].map((start,i)=>({log:5,configuration:i?'B':'A',profile:i+1,t:Float64Array.of(start,start+.001,start+.002),
+        raw:data,logged:data,baseline:data,candidate:data,pidBaseline:data,pidCandidate:data,
+        spectrum:{f:Float64Array.of(0,100,200),windows:1,...Object.fromEntries(['roll','pitch','yaw'].map(ax=>[ax,{raw:Float64Array.of(i+2,i+3,i+4),logged:data[0],predicted:data[1],candidate:data[2]}]))}}));
+    app.tab('filters');app.jq.fire('click','.tuning-ft-start');const w=ftWorker(app);w.reply({type:'filterTuned',result:res});
+    const assertWindow=i=>{
+        for(const ax of ['roll','pitch','yaw']) {
+            const spectrum=app.plots.filter(p=>p.spec.title==='Spectrum of selected interval, '+ax).at(-1).spec;
+            const time=app.plots.filter(p=>p.spec.title==='Gyro signals, '+ax).at(-1).spec;
+            assert.equal(spectrum.series[0].y,res.traces[i].spectrum[ax].raw);
+            assert.equal(time.series[0].x,res.traces[i].t);
+        }
+    };
+    assertWindow(0);app.jq.fire('change','.tuning-ft-trace',{}, {value:'1'});assertWindow(1);
+    const html=app.pane('filters');
+    assert.match(html,/<option value="1" selected>Log 6, Configuration B, PID profile 2, 20.000 to 20.002 s/);
+    assert.match(html,/Each spectrum uses the selected time interval at the recorded sample rate/);
+    assert.doesNotMatch(html,/The spectra average/);
+    assert.equal((html.match(/class="tuning-ft-axis-pair"/g)||[]).length,3);
+    assert.equal(w.sent.length,1);
 });

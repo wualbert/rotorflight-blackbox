@@ -266,8 +266,8 @@ test('T0: the worker is Chromium 99 syntax as written (esbuild chrome99 output e
 
 test('T0: the toolkit files the worker runs in Chromium 99 are Chromium 99 syntax and use no newer API', (t) => {
     const { dir, names, optional } = fetchedToolkit();
-    assert.equal(names.length, 22);
-    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_tune']);
+    assert.equal(names.length, 27);
+    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_autotune', 'filter_checklist', 'control_tune']);
     let esbuild = null; try { esbuild = require(path.join(REPO, 'node_modules/esbuild')); } catch (e) { /* the API check still runs */ }
     for (const n of names) {
         const file = path.join(JS, `${dir}${n}.cjs`);
@@ -286,7 +286,7 @@ test('T0: every file the worker loads is a relative URL to a file that exists an
     const list = /(?:var distSources|APP_ASSET_SOURCES) = \[([\s\S]*?)\];/.exec(gulp)[1], quoted = (s) => [...s.matchAll(/'([^']+)'/g)].map(m => m[1]);
     const scripts = quoted(/importScripts\(([^)]*)\)/.exec(src)[1]).map(u => path.posix.join('js', u));
     const toolkit = names.map(n => path.posix.normalize(path.posix.join('js', `${dir}${n}.cjs`)));
-    assert.equal(scripts.length, 12); assert.equal(names.length, 22);
+    assert.equal(scripts.length, 12); assert.equal(names.length, 27);
     toolkit.forEach((f, i) => { if (optional.includes(names[i]) && !fs.existsSync(path.join(REPO, f))) { t.diagnostic(`${f} is not in the repo yet: an optional module`); toolkit[i] = null; } });
     for (const f of scripts.concat(toolkit.filter(Boolean))) {
         assert.ok(!/^\/|^[a-z]+:/i.test(f) && !f.startsWith('..'), `${f} relative to the app root`);
@@ -466,7 +466,8 @@ test('T2: TuningResult schema, both scopes', async () => {
         assert.deepEqual(R.advice.recommendations, []); assert.deepEqual(R.advice.coverage, []); assert.match(R.advice.notes[0], /^The toolkit file "advice\.cjs" is not available\. Thus, the results do not include recommendations\.$/);
         for (const [file, lost] of [['advice', 'recommendations'], ['catalog', 'the STE summaries'], ['hierarchy', 'the tuning sequence'], ['evidence', 'the part of the log that gave each result'], ['health_phase', 'the flight phases and the ground checks']])
             assert.ok(R.notes.includes(`The toolkit file "${file}.cjs" is not available (HTTP 404). Thus, the results do not include ${lost}.`), R.notes.join('\n'));
-        assert.ok(R.curves.length && R.curves.every(c => c.log === li && J(Object.keys(c)) === J(['log', 'segment', 'fromS', 'seconds', 'track', 'more', 'phase']) && c.phase === null), `${scope}: curves of the selected log only`);
+        assert.ok(R.curves.length && R.curves.every(c => c.log === li && J(Object.keys(c)) === J(['log', 'segment', 'fromS', 'seconds', 'track', 'more', 'phase', 'configurations']) && c.phase === null), `${scope}: curves of the selected log only`);
+        for (const c of R.curves) assert.ok(Array.isArray(c.configurations) && c.configurations.every(part=>part.log===li && R.datasets.datasets.some(d=>d.id===part.dataset)), 'configuration curves retain their log and dataset');
         assert.deepEqual([R.flights, R.benchRuns], [[], []], 'no flight phases without health_phase.cjs');
         assert.ok(R.records.filter(l => !l.skipped).every(l => l.logClass === null && !('phases' in l) && l.profiles && Array.isArray(l.profiles.pid)), 'a record without phases has its profiles');
         assert.ok(R.findings.every(f => f.phase === null && (f.pidProfile === null || (Number.isInteger(f.pidProfile) && f.pidProfile >= 1 && f.pidProfile <= 6))), 'phase and pidProfile on every finding');
@@ -843,6 +844,32 @@ test('finding texts count logs from 1 as the viewer does; a logging rate is not 
         assert.equal(TW.viewerText(text), want === null ? text : want);
 });
 
+test('control autotune runs in the browser worker and exports only the selected maneuver plan', async () => {
+    const W = worker(), advice = require('../tools/autotune/advice.cjs');
+    const findings = [{ id:'G3',fid:'droop',module:'gov',severity:'flag',log:0,profile:1,
+        value:.07,se:.005,n:10,text:'droop 7 %: F too low (GOVT)',source:'test' }];
+    const recs = advice.advise({findings,header:{govPID:[40,50,0,10,40]},headerLog:0,headerProfile:1,
+        logs:[{log:0,flown:true,profileSeconds:{1:100},targetOf:{1:2300}}]}).recommendations
+        .filter(r=>r.parameter === 'gov_f_gain').map(r=>Object.assign({},r,{dataset:'A'}));
+    assert.equal(recs.length,1);
+    const analysis = {datasets:{datasets:[{id:'A',pidProfile:1,analysed:true,analysedFlightSeconds:100,values:{gov_f_gain:10}}]},
+        advice:{byDataset:{A:recs}}};
+    const reply = await W.post({cmd:'controlTune',analysis,configuration:'A',step:'governor'});
+    assert.equal(reply.type,'controlTuned',reply.message);
+    assert.equal(reply.result.rows.length,1,JSON.stringify(reply.result.deferred));
+    assert.equal(reply.result.rows[0].to,20);
+    assert.equal(reply.result.verifiedInFlight,false);
+    const exp = await W.post({cmd:'export',recs:reply.result.recommendations,withPlan:true});
+    assert.equal(exp.type,'exported',exp.message);
+    assert.match(exp.result.text,/set gov_f_gain = 20/);
+    assert.match(exp.result.flightPlan.maneuvers[0].instructions.join(' '),/full positive collective/);
+    const none = await W.post({cmd:'export',recs:reply.result.recommendations,picks:[],withPlan:true});
+    assert.deepEqual(none.result.flightPlan.maneuvers,[]);
+    const absent = await worker({'control_tune.cjs':null}).post({cmd:'controlTune',analysis,configuration:'A',step:'governor'});
+    assert.equal(absent.type,'error');
+    assert.match(absent.message,/control_tune/);
+});
+
 test('advice gets the selected log, its arming profile, viewer log numbering and the log dates; its CLI script comes back', async () => {
     const S = sim(), echo = `'use strict';
 module.exports = { advise: (i) => ({ recommendations: [{ id: 'X', severity: 'action', cli: ['set x = 1'] }], coverage: [{ area: 'logging' }],
@@ -984,7 +1011,7 @@ test('hierarchy.cjs (when present): result.hierarchy is hierarchy.status of the 
     // round 3: the diagram of each analysed configuration, hierarchy.status in its PID profile
     assert.deepEqual(Object.keys(byDataset), R.datasets.analysed);
     for (const [id, x] of Object.entries(byDataset)) { const d = R.datasets.datasets.find(q => q.id === id), F = plain.findings.filter(f => !f.dataset || f.dataset === id);
-        const recs = plain.recs.filter(r => r.dataset === id || (r.supportedBy || []).includes(id) || (!r.dataset && !(r.supportedBy || []).length)), st = H.status(F, recs, { logs: plain.logs, coverage: plain.coverage, profile: d.pidProfile > 0 ? d.pidProfile : 0 });
+        const recs = JSON.parse(J(R.advice.byDataset[id])), st = H.status(F, recs, { logs: plain.logs, coverage: plain.coverage, profile: d.pidProfile > 0 ? d.pidProfile : 0 });
         sameJson(x, { pidProfile: d.pidProfile, nodes: st.nodes, startHere: st.startHere, prereqProblems: st.prereqProblems }, `the diagram of configuration ${id}`); }
     sameJson(graph, H.graph(), 'the graph of the diagram (K1: prereq, blocks, edges, rules)');
     assert.deepEqual([graph.prereq.map(n => n.id), graph.blocks.map(n => n.id)], [H.PREREQ.map(n => n.id), H.BLOCKS.map(n => n.id)]);
@@ -1030,11 +1057,11 @@ test('derive: init loads the toolkit once; derive never decodes, makes no fs cal
     assert.deepEqual(Object.keys(ready.result.modules), ['track', 'more', 'gov', 'catalog']);
     assert.ok(ready.result.modules.track && ready.result.modules.more && ready.result.modules.gov, J(ready.result));
     assert.equal(ready.result.modules.catalog, has('catalog.cjs'));
-    assert.equal(W.fetches.length, 22, 'each toolkit file fetched once');
+    assert.equal(W.fetches.length, 27, 'each toolkit file fetched once');
     const x = Float32Array.from(noise(4000, 1, 10));
     await W.derive('bandpass', { x }, 1000, { lo: 5, hi: 50 });
     await W.derive('window', { 'setpoint[0]': x, 'gyroADC[0]': x }, 1000, {});
-    assert.equal(W.fetches.length, 22, 'no fetch after init');
+    assert.equal(W.fetches.length, 27, 'no fetch after init');
     assert.equal((await TW.deriveKit()).calls.n, 0, 'no fs call');
     const bad = async (msg, text) => { const m = await W.post(Object.assign({ cmd: 'derive' }, msg)); assert.deepEqual([m.type, m.message], ['error', text]); };
     await bad({ kind: 'nope', rate: 1000, cols: { x } }, 'The function "nope" is unknown.');
@@ -1886,22 +1913,30 @@ test('round 2: Fireball 2026-10-05 in file scope: P1 at the load steps of each f
     assert.deepEqual(R.noData.map(x => x.log), [7, 12]);
 });
 
-// round 3 M2: the filter search on the real flight logs, with no CLI dump. The tail rotor notch filter comes from the log. On the Gaui X4
-// dump the model does not agree with the recorded gyroADC, and the result is a check with that reason
-test('round 3 M2: filterTune on the Gaui X4 flight logs and on the Fireball 2026-10-05 flight logs, with no CLI dump: a check that says why (AUTOTUNE_REAL_LOG, AUTOTUNE_RESCUE_LOG)', { skip: REAL.skip && (!FB || !fs.existsSync(FB)) }, async () => {
+// round 3 M2: real recordings must expose their measured replay agreement.
+// Do not encode a historical reconstruction failure as the desired result.
+test('round 3 M2: filterTune on Gaui and Fireball recordings reports replay agreement consistently (AUTOTUNE_REAL_LOG, AUTOTUNE_RESCUE_LOG)', { skip: REAL.skip && (!FB || !fs.existsSync(FB)) }, async () => {
     const W = worker(), run = async (file, options) => { const m = await W.send({ cmd: 'filterTune', fileName: path.basename(file), options }, new Uint8Array(fs.readFileSync(file)));
         assert.equal(m.type, 'filterTuned', `${m.message}\n${m.stack}`); return m.result; };
     for (const [file, logs, rpm] of [[GAUI, GAUI_FLIGHTS, 1900], [FB, [5, 10, 11, 13, 14, 15], null]]) {
         if (!file || !fs.existsSync(file)) continue;
         const R = await run(file, { logs, flightRpm: rpm });
         assert.deepEqual(R.logs, logs);
-        if (file === GAUI) { assert.equal(R.model.passed, false, J(R.model.parity.map(p => [p.log, p.passed])));
-            assert.deepEqual(R.recommendations.map(r => [r.id, r.severity, r.cli]), [['F:filters', 'check', []]]);
-            assert.ok(/does not agree with the recorded gyroADC/.test(R.text.why[0]), J(R.text.why)); }
+        assert.equal(R.model.parity.every(p=>p.passed),R.model.passed,J(R.model.parity.map(p=>[p.log,p.passed])));
+        if (!R.model.passed) {
+            assert.ok(R.recommendations.every(r=>r.severity==='check'&&!r.cli.length));
+            assert.ok(R.text.why.some(t=>/does not agree with the replay/.test(t)),J(R.text.why));
+            assert.equal(R.cliFile,null);
+        }
         // the user rule of 2026-10-06: the log is the only input that the analysis needs, and no text asks for a CLI dump. The tail rotor notch
         // filter comes from the log (the dips of |gyroADC / gyroRAW| at its rotor order)
         assert.ok(!(R.text.why || []).some(t => /CLI dump/.test(t)), J(R.text.why));
-        assert.ok(/tail rotor notch filter/.test(R.text.parity) && !/CLI dump/.test(R.text.parity), R.text.parity);
+        assert.ok(R.tailFit && R.tailFit.passed && R.tailFit.used, J(R.tailFit));
+        assert.equal(R.model.gear.source, 'log notch');
+        assert.ok(!/CLI dump/.test(R.text.parity), R.text.parity);
+        assert.equal(R.version, 2);
+        assert.ok(R.search.replayedSamples > 0);
+        assert.equal(R.recommended.validation.holdout.selectedBeforeHoldout, true);
         process.stderr.write(`# filterTune ${path.basename(file)}: ${R.recommended.status}, ${R.recommended.predicted ? `${R.recommended.predicted.totalDb} ± ${R.recommended.predicted.se} dB` : ''}, ${R.timing.totalS} s\n`);
     }
 });
@@ -1966,7 +2001,11 @@ test('round 3 M1: every sample has the label of its configuration, the modules p
 });
 
 test('round 3 M2: filterTune runs the filter search of filter_tune.cjs on the flight logs of the file, with STE texts and the recommendations of advice.cjs', async () => {
-    const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE }), go = async (o) => { const m = await W.send({ cmd: 'filterTune', fileName: 'sim.bbl', options: Object.assign({ flightRpm: TRUTH.rpm, cliText: CLI, loo: false, budgetMs: 2000 }, o) }, S.bytes);
+    // This fixture tests worker integration, selection and provenance. Its gyro
+    // attenuation is synthetic, not generated by an adaptive-notch tracker.
+    // Disable that tracker in this fixture; native-C tests cover its inverse.
+    const S = sim(), bytes=bbl.encode(S.logs.map(l=>l.broken ? l : Object.assign({},l,{header:Object.assign({},l.header,{features:l.header.features&~(1<<29)})}))).bytes;
+    const W = worker({ 'health_phase.cjs': STUB_PHASE }), go = async (o) => { const m = await W.send({ cmd: 'filterTune', fileName: 'sim.bbl', options: Object.assign({ flightRpm: TRUTH.rpm, cliText: CLI, loo: false, budgetMs: 2000 }, o) }, bytes);
         assert.equal(m.type, 'filterTuned', `${m.message}\n${m.stack}`); return m.result; };
     const R = await go({ blockedBy: ['rpm', 'filters', 'The step "Governor" has a problem.', 'x'] });
     // options.blockedBy: the ids of the diagram (the titles of hierarchy.cjs graph) or STE texts
@@ -1974,8 +2013,8 @@ test('round 3 M2: filterTune runs the filter search of filter_tune.cjs on the fl
     // the flight logs with the raw gyro (log 5 has no extra field), not the bench run (log 0) or the logs with no data (2, 6)
     assert.deepEqual(R.logs, [1, 3, 4, 5]);
     assert.ok(R.model && Array.isArray(R.model.parity) && R.recommended && typeof R.recommended.status === 'string' && R.current && R.units, Object.keys(R).join());
-    assert.deepEqual(Object.keys(R.text), ['status', 'summary', 'parity', 'recommendation', 'delay', 'validation', 'why', 'rows']);
-    assert.ok(R.text.summary.startsWith('The app calculated the vibration for '), R.text.summary);
+    assert.deepEqual(Object.keys(R.text), ['status', 'summary', 'recommendation', 'parity', 'delay', 'validation', 'why', 'rows']);
+    assert.ok(R.text.summary.startsWith('The app replayed '), R.text.summary);
     assert.deepEqual([R.fileName, R.flightRpm.value, R.flightRpm.source], ['sim.bbl', TRUTH.rpm, 'user']);
     const act = R.recommended.status === 'recommended' && R.model.passed === true;
     assert.ok(R.recommendations.length >= 1 && R.recommendations.every(r => r.node === 'filters' && r.severity === (act ? 'action' : 'check') && (act || !r.cli.length)), J(R.recommendations.map(r => [r.id, r.severity, r.cli])));
@@ -2330,4 +2369,76 @@ test('values that are possibly not current (review): the time that a result meas
     assert.deepEqual(plain(T.reasonsFor(meta(['switched', 'unlogged']), R('C12', 'roll'))), ['switched', 'unlogged']);
     const adj = meta(['adjusted'], { pidSw: false, adj: [{ param: 'roll_p_gain', scope: 'profile' }] });
     assert.deepEqual([R('C12', 'roll'), R('C12', 'yaw'), R('G12', null)].map(x => plain(T.reasonsFor(adj, x))), [['adjusted'], [], []]);
+});
+
+test('filter configuration selection clips to its recorded periods, uses LUA values, and reuses the prepared input', async () => {
+    const capture=`module.exports={EXTRA:['gyroRAW[0]','gyroRAW[1]','gyroRAW[2]'],tune(items,opts){
+        const reused=!!opts.prepared;if(opts.onPrepared)opts.onPrepared({ready:true});
+        return {version:1,model:{passed:false},recommended:{status:'not recommended',rows:[],validation:{}},
+          capture:{reused,simulate:opts.simulate===undefined?null:opts.simulate,maxAddMs:opts.maxAddMs,items:items.map(x=>({log:x.w.flight.log,from:x.w.fromS,n:x.w.n,rate:x.w.rate,profile:x.armingProfile,profiles:[...new Set(x.w.profileAt)],gain:x.w.flight.header.rollPID[0],cutoff:x.w.flight.header.rollBW[0]}))}};
+    }};`;
+    const W=worker({'filter_tune.cjs':capture,'health_phase.cjs':STUB_PHASE}), S=sim();
+    const config={id:'LUA-B',pidProfile:2,values:{roll_p_gain:97,roll_gyro_cutoff:123},labels:[{dataset:'LUA-B',log:3,t0:15,t1:35}]};
+    const first=await W.send({cmd:'filterTune',workspaceKey:'B',fileName:'sim.bbl',options:{logs:[3],flightRpm:TRUTH.rpm,configuration:config,maxAddMs:.5}},S.bytes);
+    assert.equal(first.type,'filterTuned',first.stack);
+    const c=first.result.capture;
+    assert.equal(c.reused,false);assert.equal(c.items.length,1);assert.equal(c.items[0].gain,97);assert.equal(c.items[0].cutoff,123);
+    assert.deepEqual(c.items[0].profiles,[2]);assert.equal(c.items[0].profile,2);assert.ok(Math.abs(c.items[0].from-15)<.01);assert.ok(Math.abs(c.items[0].n/c.items[0].rate-20)<.02);
+    const next=await W.post({cmd:'filterReplay',workspaceKey:'B',options:{simulate:{gyro_lpf1_static_hz:120},maxAddMs:1.5}});
+    assert.equal(next.type,'filterTuned',next.stack);assert.equal(next.result.capture.reused,true);assert.equal(next.result.capture.maxAddMs,1.5);
+    assert.deepEqual(next.result.capture.items,c.items);assert.deepEqual(next.result.capture.simulate,{gyro_lpf1_static_hz:120});
+    const auto=await W.post({cmd:'filterReplay',workspaceKey:'B',options:{maxAddMs:.5}});assert.equal(auto.result.capture.simulate,null,'autotune does not retain the last manual mode');
+    const bad=await W.post({cmd:'filterReplay',workspaceKey:'A',options:{}});assert.equal(bad.type,'error');assert.match(bad.message,/filter inputs changed/);
+});
+
+test('filter flight replay uses all recorded configuration intervals and preserves unknown intervals', async () => {
+    const capture=`module.exports={EXTRA:['gyroRAW[0]','gyroRAW[1]','gyroRAW[2]'],tune(items,opts){
+        const reused=!!opts.prepared;if(opts.onPrepared)opts.onPrepared({ready:true});
+        return {version:1,model:{passed:false},recommended:{status:'not recommended',rows:[],validation:{}},
+          capture:{reused,items:items.map(x=>({log:x.w.flight.log,from:x.w.fromS,n:x.w.n,rate:x.w.rate,id:x.w.recordedConfiguration.id,
+            profile:x.armingProfile,gain:x.w.flight.header.rollPID[0],cutoff:x.w.flight.header.rollBW[0]}))}};
+    }};`;
+    const W=worker({'filter_tune.cjs':capture,'health_phase.cjs':STUB_PHASE}), S=sim();
+    const timeline={datasets:[{id:'A',pidProfile:2,values:{roll_p_gain:50,roll_gyro_cutoff:80}},
+        {id:'B',pidProfile:2,values:{roll_p_gain:97,roll_gyro_cutoff:123}}],
+        labels:[{dataset:'A',log:3,t0:0,t1:15},{dataset:'B',log:3,t0:20,t1:1000}]};
+    const first=await W.send({cmd:'filterTune',workspaceKey:'flight3',fileName:'sim.bbl',options:{logs:[3],flightRpm:TRUTH.rpm,recordedConfigurations:timeline}},S.bytes);
+    assert.equal(first.type,'filterTuned',first.stack);
+    const items=first.result.capture.items;
+    assert.deepEqual(items.map(x=>x.id),['A',null,'B']);
+    assert.ok(items.every(x=>x.log===3));
+    assert.deepEqual(items.filter(x=>x.id).map(x=>[x.profile,x.gain,x.cutoff]),[[2,50,80],[2,97,123]]);
+    assert.ok(Math.abs(items[1].from-15)<.01);assert.ok(Math.abs(items[1].n/items[1].rate-5)<.02,'unknown samples are retained');
+    assert.equal(first.result.configuration,null,'a flight is not relabeled as one recorded configuration');
+    assert.deepEqual([...new Set(first.result.recordedConfigurations.map(q=>q.id))],['A',null,'B']);
+    const next=await W.post({cmd:'filterReplay',workspaceKey:'flight3',options:{simulate:{gyro_lpf1_static_hz:120}}});
+    assert.equal(next.type,'filterTuned',next.stack);assert.equal(next.result.capture.reused,true);
+    assert.deepEqual(next.result.capture.items,items,'manual playback retains each original baseline');
+});
+
+test('configuration-specific curves and advice use each LUA interval and its recorded values', async () => {
+    const probe=`module.exports={advise(i){return {recommendations:[{id:'probe',severity:'info',profile:i.headerProfile,scope:'profile',node:'cyclic',title:'Recorded values',text:'Recorded values.',cli:[],evidence:[],causes:[],blockedBy:[],caveats:[],
+        probe:{gain:i.header.rollPID[0],datasets:(i.datasets&&i.datasets.datasets||[]).map(d=>d.id),findings:i.findings.map(f=>f.dataset).filter(Boolean)}}],coverage:[],notes:[]};}};`;
+    const curveProbe=`module.exports={analyse(w,c){return {module:'health_track',n:w.n};},judge(){return [];},curves(w,c){return {probe:{from:w.fromS,seconds:w.seconds,n:w.n,gain:c.header.rollPID[0],profiles:[...new Set(c.profile)]}};}};`;
+    const flight=bbl.simulateFlight({seconds:42,seed:17,airborne:[6,38],start:'2026-10-04T15:00:00.000+00:00',
+        profiles:[{from:0,profile:1,target:2300},{from:20,profile:2,target:2500},{from:32,profile:1,target:2300}],adjustments:[[12,18,55]]});
+    const W=worker({'advice.cjs':probe,'health_track.cjs':curveProbe});
+    const R=await W.result({cmd:'analyseFile',fileName:'configuration-curves.bbl',selectedLog:0,options:{flightRpm:1900,curves:true,logGear:false}},bbl.encode([flight,flight]).bytes);
+    const D=R.datasets, parts=D.curves;
+    assert.equal(parts.length,8,'the LUA adjustment and two PID changes split both logs');
+    assert.deepEqual(parts.map(q=>Math.round(q.fromS)),[0,12,20,32,0,12,20,32]);
+    assert.deepEqual([...new Set(parts.map(q=>q.log))],[0,1],'configuration plots include logs outside the open viewer log');
+    assert.ok(R.curves.every(c=>c.log===0),'Analysis keeps its original selected-log curves');
+    for (const q of parts) {
+        const d=D.datasets.find(d=>d.id===q.dataset), p=q.track.probe;
+        assert.ok(d);assert.equal(p.gain,d.values.roll_p_gain);assert.equal(Math.round(p.seconds*1000),p.n);
+        assert.equal(p.profiles.length,1);assert.equal(p.profiles[0],d.pidProfile||0);
+        const intervals=D.labels.filter(x=>x.dataset===d.id);
+        assert.ok(intervals.some(x=>q.fromS>=x.t0-.002&&q.fromS+q.seconds<=x.t1+.002));
+    }
+    for (const d of D.datasets.filter(x=>x.analysed)) {
+        const list=R.advice.byDataset[d.id];assert.equal(list.length,1);
+        assert.equal(list[0].probe.gain,d.values.roll_p_gain);assert.deepEqual(list[0].probe.datasets,[d.id]);
+        assert.ok(list[0].probe.findings.every(id=>id===d.id));assert.equal(list[0].dataset,d.id);
+    }
 });

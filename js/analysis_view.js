@@ -788,6 +788,7 @@ var AnalysisView = (function () {
         }
 
         function render() {
+            var scopeState = getScopeState();
             destroyPlots();
             if (!I()) {
                 root.innerHTML = '<div class="analysis-verdict-box"><p class="analysis-warn">' + esc(TEXT.noLens) + "</p></div>";
@@ -798,23 +799,30 @@ var AnalysisView = (function () {
             if (open && !rows.some(function (o) { return o.id === open.id && o.f === open.f; })) open = null;
             root.innerHTML = result ? verdictHtml(result, { li: li, open: open && open.id, at: open && open.at, kind: open && open.kind, moreOpen: moreOpen, issuesOpen: issuesOpen, issues: issues }) :
                 emptyHtml({ running: running, error: startError });
-            renderScope();
+            renderScope(scopeState);
             if (open) (open.kind === "log" ? drawLog : drawCompare)(open);
         }
 
         // The "Logs" control of the analysis (2026-10-06): the settings of the Tuning view (hooks.scopePanel, js/tuning_dialog.js):
         // by default all flights of the file, else the flights that the pilot selects (a list that collapses) or the log on
-        // display. With a result for other settings, a note and the start button. The control that had the focus keeps it
-        function renderScope() {
+        // display. With a result for other settings, a note and the start button. Keep the table's scroll position and focus,
+        // including when a cached result replaces the whole verdict.
+        function getScopeState() {
+            var el = root.querySelector ? root.querySelector("[data-analysis-scope]") : null;
+            var TD = typeof TuningDialog !== "undefined" && TuningDialog.internals ? TuningDialog.internals : null;
+            return TD && TD.fselState ? TD.fselState(el) : null;
+        }
+
+        function renderScope(state) {
             var el = root.querySelector ? root.querySelector("[data-analysis-scope]") : null;
             if (!el) return;
             var p = null;
             try { p = typeof hooks.scopePanel === "function" ? hooks.scopePanel() : null; } catch (e) { console.warn(e); }
-            var TD = typeof TuningDialog !== "undefined" && TuningDialog.internals ? TuningDialog.internals : null, again = TD && TD.fselFocus ? TD.fselFocus(el) : null;
+            var TD = typeof TuningDialog !== "undefined" && TuningDialog.internals ? TuningDialog.internals : null, again = state || getScopeState();
             el.innerHTML = !p || typeof p.html !== "string" ? "" : p.html + (p.stale && result && !p.running ? '<p class="analysis-muted analysis-stale">' + esc(TEXT.stale) +
                 ' <button type="button" class="btn btn-primary btn-xs" data-analysis-act="start">' + esc(TEXT.start) + "</button></p>" : "");
             if (el.querySelectorAll) Array.prototype.forEach.call(el.querySelectorAll('[data-partly="1"]'), function (x) { x.indeterminate = true; });
-            if (TD && TD.fselRefocus) TD.fselRefocus(el, again);
+            if (TD && TD.fselRestore) TD.fselRestore(el, again);
         }
 
         function scopeAct(act) {

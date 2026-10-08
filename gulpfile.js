@@ -396,6 +396,11 @@ function dist() {
         './tools/autotune/evidence.cjs',
         './tools/autotune/datasets.cjs',
         './tools/autotune/filter_tune.cjs',
+        './tools/autotune/filter_replay.cjs',
+        './tools/autotune/filter_reconstruct.cjs',
+        './tools/autotune/filter_autotune.cjs',
+        './tools/autotune/filter_checklist.cjs',
+        './tools/autotune/control_tune.cjs',
         './tools/autotune/param_epochs.cjs',
 
         // everything else

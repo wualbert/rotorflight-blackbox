@@ -661,6 +661,57 @@ test('the "Logs" control in the verdict: hooks.scopePanel in both states, the ac
     assert.equal(plainApp.dom.part('[data-analysis-scope]').innerHTML, '');
 });
 
+test('flight selection keeps its scroll position and focus through settings updates and a cached-result redraw', async () => {
+    const settings = [], acts = [];
+    const app = await shown({ result: synthResult(), hooks: {
+        scopePanel: () => ({ scope: 'flights', html: '<div class="tuning-fsel-wrap">flights</div>' }),
+        onSettings: (cb) => settings.push(cb),
+        scopeAction: (act) => { acts.push(act); settings.forEach((cb) => cb()); },
+    } });
+    const root = app.dom.part('#analysisVerdictBody');
+    let scope, wrap, active, selector, focused;
+    function replaceTable() {
+        wrap = { scrollTop: 0, scrollLeft: 0 };
+        app.dom.document.activeElement = null;
+        active = Object.assign({}, active, { focus(options) { focused = options; app.dom.document.activeElement = this; } });
+    }
+    function replaceScope() {
+        let html = '';
+        scope = { contains: (el) => el === active,
+            querySelector: (sel) => sel === '.tuning-fsel-wrap' ? wrap : sel === selector ? active : null };
+        Object.defineProperty(scope, 'innerHTML', { get: () => html, set(value) { html = value; replaceTable(); } });
+        app.dom.parts.set('[data-analysis-scope]', scope);
+        replaceTable();
+    }
+    replaceScope();
+    let verdictHtml = root.innerHTML;
+    Object.defineProperty(root, 'innerHTML', { get: () => verdictHtml, set(value) { verdictHtml = value; replaceScope(); } });
+    for (const className of ['tuning-fsel-log', 'tuning-fsel-one']) {
+        const attrs = { 'data-log': 2, 'data-flight': 1, 'data-count': 3 };
+        selector = '.' + className + '[data-log="2"]' + (className === 'tuning-fsel-one' ? '[data-flight="1"]' : '');
+        active = { className, checked: false, classList: { contains: (name) => name === className },
+            getAttribute: (key) => String(attrs[key]), closest: (sel) => sel === '[data-analysis-scope]' ? scope : null };
+        app.dom.document.activeElement = active;
+        wrap.scrollTop = 319.5;
+        wrap.scrollLeft = 42;
+        const before = wrap;
+        for (const listener of root.listeners.change) listener.fn({ target: active });
+        assert.notEqual(wrap, before, 'the settings listener replaces the table');
+        assert.equal(wrap.scrollTop, 319.5, className + ': vertical scroll');
+        assert.equal(wrap.scrollLeft, 42, className + ': horizontal scroll');
+        assert.equal(app.dom.document.activeElement, active);
+        assert.equal(focused.preventScroll, true);
+    }
+    eq(acts, [{ kind: 'log', log: 2, on: false }, { kind: 'flight', log: 2, flight: 1, count: 3, on: false }]);
+    const before = scope;
+    app.give(synthResult()); // selecting flights can display a cached result and replace the whole verdict
+    assert.notEqual(scope, before);
+    assert.equal(wrap.scrollTop, 319.5);
+    assert.equal(wrap.scrollLeft, 42);
+    assert.equal(app.dom.document.activeElement, active);
+    assert.equal(focused.preventScroll, true);
+});
+
 test('no result: "Start the analysis", then the result; a run that does not start; results of another file or log', async () => {
     const app = await shown({ result: null });
     assert.match(app.verdict(), /No analysis result is available\. <button type="button" class="btn btn-primary btn-sm" data-analysis-act="start">Start the analysis<\/button>/);

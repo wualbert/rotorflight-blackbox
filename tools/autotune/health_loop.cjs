@@ -132,6 +132,25 @@ const atLimit = (L, v, tol) => L && ((L.lo !== null && v <= L.lo + tol) || (L.hi
 // analyse
 // ---------------------------------------------------------------------------------------------
 
+function dNoise(w, rate, prof, ok) {
+    const n = w.n;
+    const R = RULE.dNoise, N = Math.max(1, Math.round(R.windowS * rate)), res = {};
+    for (const a of [0, 1, 2]) {
+        const D = w.D && w.D[a]; if (!D || !D.some(v => v !== 0)) { res[AXES[a]] = { skipped: 'axisD is zero (D gain 0) or not logged' }; continue; }
+        if (R.hz >= 0.45 * rate) { res[AXES[a]] = { skipped: `logging rate ${r(rate, 0)} Hz too low for ${R.hz} Hz` }; continue; }
+        const hp = lib.bandpass(D, R.hz, 0.45 * rate, rate), acc = {};
+        for (let s = 0; s + N <= n; s += N) {
+            if (!all(ok, s, s + N) || !same(prof, s, s + N)) continue;
+            const m = mean(D, s, s + N); let tot = 0, hi = 0; for (let i = s; i < s + N; i++) { tot += (D[i] - m) ** 2; hi += hp[i] ** 2; }
+            if (!tot) continue;
+            const A = acc[prof[s]] = acc[prof[s]] || { tot: 0, hi: 0, shares: [] }; A.tot += tot; A.hi += hi; A.shares.push(hi / tot);
+        }
+        const byProfile = {}; for (const p in acc) byProfile[p] = { share: r(acc[p].hi / acc[p].tot, 3), perWindow: stat(acc[p].shares), windows: acc[p].shares.length, dRms: r(Math.sqrt(acc[p].tot / acc[p].shares.length / N), 5) };
+        res[AXES[a]] = { byProfile };
+    }
+    return res;
+}
+
 function analyse(w, ctx) {
     const rate = ctx.rate || w.rate, n = w.n, H = ctx.header || (w.flight && w.flight.header) || {}, X = w.extra || {};
     const prof = ctx.profile, gov = ctx.govState, notes = [];
@@ -146,6 +165,8 @@ function analyse(w, ctx) {
 
     const out = { module: 'health_loop', rule: RULE, rate: r(rate, 2), fromS: r(w.fromS, 3), seconds: { total: r(n / rate, 1), usable: r(usable / rate, 1) }, notes };
     if (usable < S(5)) { out.skipped = `only ${r(usable / rate, 1)} s in flight with the governor active`; return out; }
+
+    if (ctx.onlyFilters) { out.C11 = dNoise(w, rate, prof, ok); return out; }
 
     const collDeg = w.coll ? Float64Array.from(w.coll, v => Math.abs(v) * RULE.degPerUnit) : null;
     const startProfile = prof[0];
@@ -449,24 +470,7 @@ function analyse(w, ctx) {
             airborneStateLogged: hasAirborne, landedWhileMoving: hasAirborne ? { seconds: r(ev.length * R.windowS, 1), events: cap(ev) } : { skipped: 'no AIRBORNE_STATE events in the log' } });
     }
 
-    // --- C11: share of axisD power above 30 Hz
-    {
-        const R = RULE.dNoise, N = S(R.windowS), res = {};
-        for (const a of [0, 1, 2]) {
-            const D = w.D[a]; if (!D || !D.some(v => v !== 0)) { res[AXES[a]] = { skipped: 'axisD is zero (D gain 0) or not logged' }; continue; }
-            if (R.hz >= 0.45 * rate) { res[AXES[a]] = { skipped: `logging rate ${r(rate, 0)} Hz too low for ${R.hz} Hz` }; continue; }
-            const hp = lib.bandpass(D, R.hz, 0.45 * rate, rate), acc = {};
-            for (let s = 0; s + N <= n; s += N) {
-                if (!all(ok, s, s + N) || !same(prof, s, s + N)) continue;
-                const m = mean(D, s, s + N); let tot = 0, hi = 0; for (let i = s; i < s + N; i++) { tot += (D[i] - m) ** 2; hi += hp[i] ** 2; }
-                if (!tot) continue;
-                const A = acc[prof[s]] = acc[prof[s]] || { tot: 0, hi: 0, shares: [] }; A.tot += tot; A.hi += hi; A.shares.push(hi / tot);
-            }
-            const byProfile = {}; for (const p in acc) byProfile[p] = { share: r(acc[p].hi / acc[p].tot, 3), perWindow: stat(acc[p].shares), windows: acc[p].shares.length, dRms: r(Math.sqrt(acc[p].tot / acc[p].shares.length / N), 5) };
-            res[AXES[a]] = { byProfile };
-        }
-        out.C11 = res;
-    }
+    out.C11 = dNoise(w, rate, prof, ok);
 
     // --- T6: yaw kick after collective steps; T7: precomp against I in collective pumps
     if (!w.coll) { out.T6 = { skipped: 'collective setpoint not logged' }; out.T7 = { skipped: 'collective setpoint not logged' }; }

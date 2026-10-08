@@ -80,6 +80,87 @@ function clean(p, what) { assert.deepEqual([...p.ctx.bad, ...p.main.bad], [], (w
 const xTicks = (ctx) => calls(ctx, 'fillText').filter((c) => c.align === 'center' && c.baseline === 'top').map((c) => c.args);
 const yTicks = (ctx) => calls(ctx, 'fillText').filter((c) => c.align === 'right' && c.baseline === 'middle').map((c) => c.args);
 const yPixel = (ctx, text) => yTicks(ctx).find((a) => a[0] === text)[2];
+
+function animationFrames(env) {
+    let next = 0;
+    const pending = new Map();
+    env.realm.requestAnimationFrame = cb => { const id = ++next; pending.set(id, cb); return id; };
+    env.realm.cancelAnimationFrame = id => pending.delete(id);
+    return { pending, flush() { const callbacks = [...pending.values()]; pending.clear(); callbacks.forEach(cb => cb(0)); } };
+}
+
+test('rapid plot changes and resize notifications draw only the latest state in one animation frame', () => {
+    const env = setup(), frames = animationFrames(env), canvas = fakeCanvas(800);
+    const spec = title => ({ title, series: [{ x: [0, 1], y: [0, 1] }] });
+    const h = env.TP.attach(canvas, spec('Initial'));
+    for (let i = 0; i < 50; i++) {
+        h.update(spec('Change ' + i));
+        env.observers[0].cb([]);
+    }
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 0, 'input handlers do not draw synchronously');
+    assert.equal(frames.pending.size, 1, 'a burst cannot queue repeated redraws');
+    frames.flush();
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 1);
+    assert.ok(texts(env.created[0].ctx).includes('Change 49'));
+    assert.ok(!texts(env.created[0].ctx).includes('Initial'));
+    h.destroy();
+});
+
+test('collapsed plots defer scanning their series until visible and discard obsolete frames', () => {
+    const env = setup(), frames = animationFrames(env), canvas = fakeCanvas(0);
+    let reads = 0;
+    const series = { get x() { reads++; return [0, 1, 2]; }, y: [1, 3, 2] };
+    const h = env.TP.attach(canvas, { series: [series] });
+    frames.flush();
+    assert.equal(reads, 0, 'closed details do not inspect plot data');
+    canvas.cssWidth = 800;
+    env.observers[0].cb([]);
+    assert.equal(reads, 0, 'the resize observer does not block on a data scan');
+    frames.flush();
+    assert.ok(reads > 0);
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 1);
+    h.update({ series: [series] });
+    const late = [...frames.pending.values()][0];
+    h.destroy();
+    assert.equal(frames.pending.size, 0, 'changing tabs removes queued work for old plots');
+    late(0);
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 1, 'an obsolete callback cannot draw');
+});
+
+test('hover bursts paint once per frame and use the latest pointer position', () => {
+    const env = setup(), frames = animationFrames(env), canvas = fakeCanvas(800), hovered = [];
+    const h = env.TP.attach(canvas, { series: [{ x: [0, 1], y: [0, 1] }], onHover: x => hovered.push(x) });
+    frames.flush();
+    canvas.ctx.log.length = 0;
+    for (let i = 0; i < 100; i++) canvas.fire('mousemove', 150 + i, 100);
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 0);
+    assert.equal(frames.pending.size, 1);
+    frames.flush();
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 1);
+    assert.equal(hovered.length, 1);
+    const ctx = env.created[0].ctx, start = xPixel(ctx, 0, 0, 1), end = xPixel(ctx, 1, 0, 1);
+    assert.ok(Math.abs(hovered[0] - (249 - start) / (end - start)) < 1e-12, 'the readout uses the last of the 100 positions');
+    canvas.fire('mousemove', 300, 100);
+    canvas.fire('mouseleave', 300, 100);
+    frames.flush();
+    assert.equal(hovered.at(-1), null, 'leaving before a queued hover removes the readout');
+    h.destroy();
+});
+
+test('replacing a detached plot releases its observer and queued frame', () => {
+    const env = setup(), frames = animationFrames(env), canvas = fakeCanvas(800);
+    canvas.isConnected = true;
+    const old = env.TP.attach(canvas, { series: [{ x: [0, 1], y: [0, 1] }] });
+    canvas.isConnected = false;
+    const current = env.TP.attach(fakeCanvas(800), { series: [] });
+    assert.equal(frames.pending.size, 1);
+    assert.deepEqual(env.observers[0].targets, []);
+    assert.equal(env.TP.livePlots(), 1);
+    old.redraw();
+    frames.flush();
+    assert.equal(calls(canvas.ctx, 'drawImage').length, 0);
+    current.destroy();
+});
 // readout texts after moving the mouse to (x, y) (canvas css px)
 function hover(p, x, y) { p.main.log.length = 0; p.canvas.fire('mousemove', x, y); return texts(p.main); }
 // x pixel of a value, interpolated between the x tick labels a and b (linear axes)
@@ -87,6 +168,17 @@ function xPixel(ctx, v, a, b) {
     const at = (t) => xTicks(ctx).find((c) => c[0] === String(t))[1], pa = at(a), pb = at(b);
     return pa + (pb - pa) * (v - a) / (b - a);
 }
+
+test('an empty comparison explains that no curves are selected and redraws when a curve is selected', () => {
+    const p=plot({title:'Compare filters',legend:false,emptyText:'Select a curve to show.',series:[]});
+    assert.ok(texts(p.ctx).includes('Select a curve to show.'));
+    assert.ok(!texts(p.ctx).includes('no data'));
+    p.ctx.log.length=0;
+    p.h.update({title:'Compare filters',legend:false,series:[{name:'Raw data',x:[0,1,2],y:[3,4,3]}]});
+    assert.ok(!texts(p.ctx).includes('Select a curve to show.'));
+    clean(p);
+    p.h.destroy();
+});
 
 test('niceTicks: round steps of 1, 2 or 5 x 10^k inside the range, exact decimals', () => {
     const { TP } = setup();

@@ -57,13 +57,20 @@ that ships.**
 | `make dev-server` (`make web`) | `vite` | none, serves the working tree |
 | `make dev-client` | `gulp dev-client` | `dev-client/` (generated manifest) |
 | `make debug` | `gulp debug` | `debug/` SDK build, then launches it |
-| `make apps` | `gulp apps` | `apps/` production build |
+| `make apps` | `gulp apps`, then the macOS installer on macOS | `apps/` production build; replaces `/Applications/Rotorflight Blackbox.app` on macOS |
 | `make release` | `gulp release` | `release/` installers (dmg, zip, deb, rpm, exe) |
 | `make version SEMVER=x.y.z` | `sed` on `package.json` | version bump |
 | `make clean` / `realclean` / `distclean` | `rm -fr` | progressively removes build output, `dist/`, then `cache/` and `node_modules/` |
 
 Details worth knowing:
 
+- After each implementation change, run `make apps` before reporting completion.
+  On macOS this also replaces `/Applications/Rotorflight Blackbox.app` through
+  `tools/install_macos_app.py`. The installer verifies a staged copy before replacing
+  the existing bundle and restores the previous bundle if the replacement fails.
+  Verify and launch the installed copy. Close an older running instance normally
+  before relaunching, preserving any unsaved work. Direct Gulp commands still only
+  produce build artifacts, so a local rebuild using Gulp must also run the installer.
 - **NW.js 0.62.2** is pinned in `gulpfile.js:31`. It is an x86_64 binary, so on Apple Silicon
   it runs under Rosetta.
 - **Platform flags**: `yarn gulp <task> --osx64 | --linux64 | --win64` (also `--linux32`,
@@ -720,7 +727,7 @@ markup, PR #84) stays byte-identical to upstream and is not used. Only its toolb
 |---|---|
 | `index.html`, `js/main.js`, `css/main.css`, `css/branding.css` | The tab strip `.rf-view-tabs`, the view sections `#viewAnalysis` (`#analysisVerdictBody`) and `#viewTuning` (`#tuningBody`), `showView`, `viewInLog`, `endEvidence`, the evidence bar, the keyboard and wheel guards |
 | `js/tuning_worker.js` | Web Worker. Loads the decoder scripts (`importScripts`) and the toolkit `.cjs` files (`fetch`, then a CommonJS shim), analyses, posts progress and one result. A second, persistent instance is the "derive" worker (`init`, `derive`) |
-| `js/tuning_dialog.js`, `css/tuning_dialog.css` | The Tuning view: context bar (logs, flights, bench runs, phases), scope, flight rpm, CLI dump, PID profile menu, tabs "Tuning steps", "Recommendations", "CLI file", "Error curves", "Governor", "Filters and vibration", "Tail", "All checks", "Parameter groups" |
+| `js/tuning_dialog.js`, `css/tuning_dialog.css` | The Tuning view: flight selection, recorded-configuration reference, then Overview, Filters, Governor, Cyclic gains, Tail gains, Cyclic compensation, Tail compensation, Export. Each configuration keeps its own draft; auxiliary checks and evidence remain accessible from their links. |
 | `js/tuning_snippet.js` | `TuningSnippet.Reader`: the raw columns of one span of a log on the main thread, in frame seconds |
 | `js/analysis_view.js` | `AnalysisView`: the Analysis view. The verdict from the TuningResult, with the "Show in the log" and "Show the measurement" panels |
 | `js/log_lens.js`, `css/log_lens.css` | The pieces that the verdict shares (`LogLens.internals`), and the `LogLens` class, which the app no longer builds |
@@ -737,7 +744,8 @@ markup, PR #84) stays byte-identical to upstream and is not used. Only its toolb
 | `tools/autotune/health_limits.cjs` | Control outputs at their limits (CLAUDE.md "Control limits"): L1 throttle, L2 collective, L3 cyclic, L4 tail, L5 servos, L6 I-term, L7 collective stick at its end, in all phases with no guard time |
 | `tools/autotune/advice.cjs` | Findings and `report.cjs` decisions to recommendations: tuning sequence, guards, causes, CLI text, `exportScript`; the coverage matrix; the configurations of a recommendation (`dataset`, `supportedBy`, `ab`, `slope`), `comparisons`, `filterRecommendations` |
 | `tools/autotune/datasets.cjs` | The configurations (SPEC3 J): one PID profile with one exact set of the values that change the flight. `datasets(logs, cli)`, the classification table of every 4.6 name, `labelArray`, `profileMap`, `compare` (A/B, slopes, 2 SE), `predict` |
-| `tools/autotune/filter_tune.cjs` | The filter search (SPEC3 G): a model of the 4.6 gyro filters, its parity with the recorded gyroADC, the search, leave-one-out, `texts` (STE). The worker command `filterTune` runs it on demand |
+| `tools/autotune/filter_tune.cjs` | Filter configuration, legacy analysis helpers and the v2 entry point. `filter_autotune.cjs` performs constrained search; `filter_reconstruct.cjs` recovers native inputs from firmware observations; `filter_replay.cjs` runs the native-rate compute path |
+| `tools/autotune/control_tune.cjs` | Offline control proposals from configuration-specific advice, atomic gain groups, exact model estimates and parameter-specific flight maneuvers for Export |
 | `docs/STE_GLOSSARY.md`, `test/ste/vocabulary.json`, `test/ste_text.test.cjs` | The STE rules, words and lint |
 
 Tests: one file for each part (`test/catalog.test.cjs`, `hierarchy`, `evidence`, `health_track`, `health_more`,
@@ -751,6 +759,18 @@ Every new file needs its `index.html` tag (app scripts and CSS) and its `distSou
 `test/tuning_worker.test.cjs` (T0) fail when one is missing. Script order in `index.html`: `js/tuning_plot.js`,
 `js/tuning_snippet.js`, `js/tuning_dialog.js`, `js/log_lens.js`, `js/analysis_view.js`; `css/log_lens.css` after
 `css/tuning_dialog.css`.
+
+`TuningPlot` coalesces updates, resize notifications and hover drawing into one animation frame per plot. Only the latest
+specification and pointer position are rendered. Hidden plots defer their data scan until they have a visible size.
+Destroying a plot cancels its pending frame and disconnects its resize observer; attaching a replacement also cleans up
+detached plots. The canvas regression tests cover update bursts, collapsed sections, hover bursts and removed plots.
+
+Control-tab details and recorded-configuration references render their bodies only when opened. A captured native
+`toggle` event inserts the body without replacing the summary or the primary plot; closing removes the body and destroys
+its plots. This bounds the initial DOM even for large finding lists and avoids unnecessary native accessibility updates
+in NW.js on macOS. Deferred callbacks are discarded when their pane or result is replaced. Routine chrome refreshes
+reuse the configuration panel when its result and selected configuration have not changed. The dialog regressions cover
+large finding lists, disclosure toggles, plot cleanup, stale callbacks, configuration changes and retained selections.
 
 ### Views and "Show in the log"
 
@@ -797,8 +817,10 @@ with a `sourceURL` so that stack traces name the file:
 - `require.main` is undefined for library use. `health_report.cjs`, `extract.cjs` and `report.cjs` run as "virtual CLIs" over
   the in-memory fs.
 - Optional modules (`health_track`, `health_more`, `health_phase`, `health_rescue`, `health_limits`, `health_config`, `health_power`, `advice`, `catalog`, `hierarchy`,
-  `evidence`, `datasets`): a module that is missing or that throws gives a note, and the rest of the result stays. `filter_tune` (`ON_DEMAND`) is fetched with
-  the others and loaded only by the command `filterTune` (`K.require`).
+  `evidence`, `datasets`): a module that is missing or that throws gives a note, and the rest of the result stays. The filter
+  modules (`filter_tune`, `filter_replay`, `filter_reconstruct`, `filter_autotune`, `filter_checklist`) are fetched with the
+  others and loaded on demand by `filterTune` and `filterReplay` (`K.require`). `control_tune` is fetched with them
+  and loaded on demand by `controlTune` or by `advice.exportScript` when it builds the flight maneuver list.
 - Rules for anyone editing `tools/autotune`:
   - no Node API calls when a module loads (the `require('node:*')` lines are fine);
   - keep `module.exports` followed by `if (require.main !== module) return`;
@@ -812,7 +834,7 @@ with a `sourceURL` so that stack traces name the file:
 2. The worker decodes it with unmodified `lib.segments`, and finds the flights and the flight phases (`health_phase.cjs`).
    A bench run stops here.
 3. It derives the flight rpm: 85 % of the lowest per-profile governor target in flight, in 100 rpm steps (1900 on the Gaui X4,
-   2900 on the Fireball). The user can override it.
+   2900 on the Fireball). This threshold is automatic and has no user input.
 4. It runs `health_setup`, `health_gov`, `health_loop`, `health_track`, `health_more` and `health_phase`. The flying mask of
    the attitude-loop checks is the flight phase (`flightMask`) without rescue, level modes and failsafe (`normalMask`).
 5. It judges with the virtual `health_report.cjs`. Then each finding gets `fid`, `summary`, `node`, `evidence`, `phase` and
@@ -1076,9 +1098,27 @@ the reasons `grace`, `rearm`, `switched`, `unlogged` (a `govRequest` step with n
 
 ### Export
 
-The "CLI file" tab is the export panel. `advice.exportScript(recommendations, picks, meta)` writes the script;
-`advice.defaultPicks` gives the first selection: actions with CLI text. Checks and items to monitor are never selected by
-default.
+The final **Export** tab compiles the selected changes from every tuning step. Control drafts in `entry.tuning.drafts`
+store selections by recorded configuration and recommendation signature; `finalByProfile` selects at most one control
+configuration for each PID profile. LUA variants of a profile are alternative control drafts. They are never combined
+into the same profile. The initial choice is the newest analysed configuration of each profile, and each profile can
+instead select "No changes". The filter draft belongs to the log or flight selected in Filters. Export shows that source
+separately and includes its validated filter recommendations once, independently of the control configurations.
+
+`compiledPlan` builds one pending parameter record, keyed by global/profile/rate scope, profile index and parameter name.
+The diff shows recorded and candidate values with their configuration or flight source. Identical commands are deduplicated;
+conflicting global or same-profile commands prevent export. An edited filter draft contributes no commands until replay
+passes. The worker independently rejects a request containing two recorded configurations of the same PID profile.
+
+When the chosen configuration predates LUA changes in the same profile, `advice.configurationBases` adds the known
+profile values needed to restore that configuration, then applies its selected tuning changes. Selected filter commands
+replace restoration values for the same parameters. Complete arrays and enum
+values use the Rotorflight 4.6 `PROFILE_CONFIG` schema from pinned `settings.c`; unknown or unsupported restorations prevent
+export. Global values apply to every profile and cannot have independent final values. The export describes changes from
+recorded configurations; the viewer has no live controller configuration.
+
+`advice.exportScript(recommendations, picks, meta)` writes the script. Actions with CLI text start selected. Checks and
+items to monitor are never selected by default.
 - The script starts with a backup step ("Save `diff all` before you paste this"). Comment lines (`#`) give the craft, the log
   file and flights, the firmware, the PID profiles analysed, the date, and for each change the from and to values, the
   evidence (finding summary, value ± SE, limit) and the rule.
@@ -1088,8 +1128,8 @@ default.
   same command of an earlier change) gives the flag again: "Change N uses values that are possibly not the values of the log
   header. Before you use these commands, read change N above." The worker writes `advice.script` (the CLI file of the saved
   report) again after `freshnessOf`, so that it has these lines too.
-- Every value is range-checked against advice `RANGE` (from the firmware `settings.c`). A name that is not in `PARAMS` is
-  refused.
+- Ordinary advice uses `PARAMS` and `RANGE`; validated filter replays use the firmware filter schema, and configuration
+  restoration uses `PROFILE_CONFIG`. Each branch checks parameter names, scope, type and range before writing a command.
 - Buttons: "Copy commands" and "Save CLI file" (`.txt`). The pilot pastes the commands in the CLI tab of the Configurator, or
   uses its "Load from file" (Configurator 2.3.0 reads `.txt` or `.config`, and "Execute" sends each line; the firmware CLI
   ignores the text after `#`). There is no preset file: the Presets tab of 2.3.0 loads presets only from a source with an
@@ -1212,7 +1252,9 @@ result of all flights on display, the result is not for other settings (`sameFli
 - The flight list is a `<details>` with the counts in its head ("Flights in the analysis: 6 of 6 flights (8 bench runs, 2 logs with no
   data)", `selectionHead`). Its first drawing in the session closes it when a selection exists; then it keeps the pilot's state
   (`fselOpen`). A log with more than one flight collapses its flights under its row ("2 of 3 flights"). The control that had the
-  focus gets it again when a list is drawn again (`fselFocus`, `fselRefocus`), so Enter and Space on a summary work.
+  focus gets it again when a list is drawn again (`fselFocus`, `fselRefocus`), so Enter and Space on a summary work. Both views
+  preserve the table's vertical and horizontal scroll position on selection changes (`fselState`, `fselRestore`), including
+  when a cached result replaces the whole Analysis verdict.
 - The context bar, the progress text and the report write "All flights in the file (3 logs)", and the report has the row "Flights in
   the analysis" (`fileFlightsText`: "6 flights in 3 logs, 1 bench run").
 
@@ -1233,7 +1275,12 @@ flight. A value that does not change the flight (rescue, blackbox, OSD, ...) nev
   (`health.cjs cliContext` by label). `p.ctxPid` keeps the ctx of the PID profiles (armingOf).
 - The modules that get the labels: `health_gov`, `health_loop`, `health_track`, `health_more`, `health_phase`, `health_rescue`,
   `health_limits` (`DS_MODULES`). `health_setup` (D4, F5, F6, F9) and `health_config` keep the PID profile labels; so do check D8
-  (`ctx.pidLabels`), the F5 spans of `evidence.locate`, and the curves of the views (`pidCtx`).
+  (`ctx.pidLabels`) and the F5 spans of `evidence.locate`.
+- **Curves**: selected-log curves remain available for Analysis. `result.datasets.curves` includes every analysed log,
+  and each selected-log curve entry also has `configurations[]`: the same
+  analyzers rerun on contiguous intervals of one configuration with its materialized header, PID identity, flight mask and
+  time range. The Tuning steps select these entries by `dataset`, so a spectrum never pools different LUA variants of
+  the selected profile.
 - **Findings** (`annotate`): `f.datasetLabel` (the label of the module), `f.dataset`, `f.pidProfile` of the configuration, then,
   after the evidence (it reads the metrics by the label), `f.profile` and the profiles of `other`, `events`, the evidence and its
   spans become the PID profile label. The toolkit text names the configuration where it names the label ("configuration B (PID
@@ -1253,27 +1300,99 @@ flight. A value that does not change the flight (rescue, blackbox, OSD, ...) nev
   configurations that differ in 3 or fewer parameters, only when the parameters change that check: `relevantChecks` from the
   blocks of `hierarchy.cjs`, `DS_RULES`), `r.slope` (`datasets.predict`: 3 or more configurations, 2 SE, only inside the measured
   range). A problem only in older configurations, with a satisfactory result in the newest one, is a watch with no CLI text.
+- **Configuration advice**: `advice.byDataset[id]` reruns the recommendation generators on the selected configuration's
+  findings, gain decisions and materialized header. Tuning uses these recommendations and their matching hierarchy;
+  Analysis retains the file-wide advice above. `datasets.configurationHeader` maps CLI names back to header fields and
+  clears unknown PID values instead of borrowing a different profile's header.
 - **comparisons**: every pair of configurations with a few different parameters, the results of the checks that those parameters
   change first. The checks of an output at its limit (T8, C2, L1-L7: `RATE_CHECKS`) compare the periods at the limit for each
   minute (flight or all time) with the SE of a count; a result with no SE is listed as "no 2-SE test". On the Gaui X4 dump, the yaw
   stop gains 120/80 (E, log 51) against 140/100 (F, log 59): L4 25.5 ± 6.0 against 41.1 ± 7.9 periods for each minute, T8 120 ± 16
   against 105 ± 16 for each minute of flight, neither by 2 SE; T11 and T12 have no SE.
 
-### The filter search (round 3 M2)
+### Control autotune and the next flight
 
-`{ cmd: 'filterTune', id, bytes (the whole file), fileName, options: { cliText, cliName, flightRpm, logs, flights, blockedBy,
-budgetMs, loo } }` -> `{ id, type: 'filterTuned', result }`. The worker decodes the flight logs (`options.logs`, else every log;
-bench runs and logs with no data out) with `filter_tune.EXTRA` and the columns of the phases, masks each segment with the flight
-phase less rescue, level modes and failsafe (`health_more.normalMask` over the flight phase, as the CLI of `filter_tune.cjs`), and
-runs `tune()`. The result has `text` (`filter_tune.texts`: status, summary, parity, recommendation, delay, validation, why, rows,
-in STE) and `recommendations` (`advice.filterRecommendations`): an action only when `recommended.status` is "recommended" and
-`model.passed` (the model agrees with every flight log); else one check `F:filters` that gives the reasons (the log does not give
-the tail rotor notch filters: no fit of `tailOrder`; the model does not agree; less than 3 dB; leave-one-out). The global part (`feature` lines and
-global sets) and one part for each PID profile with cutoffs are a group (`F:filters`): the export takes all or none. Guards: PARAMS
-of the scope, RANGE, the filter floors, a gyro low-pass filter stays on, a static notch Q of 2.0 or more, a from-value of the log
-header or the CLI dump. The export writes `feature NAME` / `feature -NAME` lines of the global values first (`FEATURE_NAMES`, 4.6
-cli.c). Real logs: Fireball 2026-09-29 #3 with its dump: an action, the dynamic notch on (count 2, Q 4.0, 170-370 Hz), -7.01 ± 0.48 dB,
-0.33 ms more delay; Gaui X4 and Fireball 2026-10-05 without a dump: checks (the model does not agree: no tail notch filters).
+The Governor, Cyclic gains, Tail gains, Cyclic compensation and Tail compensation tabs start with the recorded problems.
+Each problem shows its explanation, measured value and limit, configuration, PID profile, log, available time spans and
+evidence links. The first four results stay visible; the complete checks load when their disclosure opens.
+
+Recommended changes follow the problems, before the recorded signal plots. They show the recorded and recommended
+parameter values, their sources and differences, and the advice engine's explanation of how each change can help.
+Each explanation retains its quantitative evidence and links; rules, caveats and flight maneuvers are supporting details.
+There are no new-response measurement columns or replay outcome cards. A proposal never clears a recorded problem.
+Recorded A/B comparisons have their own disclosure, retain uncertainty and the different-flight caveat, and do not
+replace the proposed changes or the selected configuration's primary signal plot.
+
+`{ cmd: 'controlTune', id, configuration, step, analysis }` returns `{ id, type: 'controlTuned', result }`.
+It uses the completed analysis, with `datasets`, `advice.byDataset` and `decisions`, rather than decoding the log again.
+`control_tune.tune` selects the first eligible atomic recommendation group in the existing tuning order. It preserves
+the advice engine's prerequisite gates, numeric evidence, uncertainty, parameter source and current-value caveats.
+It checks the recorded value, PID profile, configuration, legal integer range, step size and exact CLI text again.
+Repeated requests start from the recorded values. Cancellation, reset and changed inputs remove the old proposal from Export.
+
+This is a bounded flight-test proposal, not a closed-loop replay or a new plant-identification algorithm. The actuator
+does not respond to changed gains during analysis. Only an exact, complete C7 gain set with passing model gates can
+show the existing model's tracking-error estimate in a disclosure labeled as unmeasured. Rounded or partial sets cannot reuse that estimate. No synthetic
+after-curve is drawn, and a proposal never clears a recorded problem. A new flight is necessary to measure its response.
+
+`control_tune.flightPlan` maps accepted control changes to stick maneuvers. Governor gains and collective compensation
+use collective steps, including full positive collective only after a smaller step gives stable headspeed and tail control.
+Axis gains use short inputs and stops in each direction. Cyclic feedforward uses constant-rate rolls or flips only when
+the pilot can maintain control. Other families use cyclic steps, yaw load or headspeed changes as applicable.
+The procedure follows the [Rotorflight governor](https://rotorflight.org/docs/Tuning/Tune-Governor),
+[PID tuning](https://rotorflight.org/docs/Tuning/Tuning-description) and
+[feedforward](https://rotorflight.org/docs/Tuning/Tune-Feedforward) guidance. Three repetitions and three-second pauses
+are collection targets chosen by this app, not flight-envelope limits. Three flight logs support the existing
+between-flight uncertainty estimate; their count alone does not ensure useful excitation or valid identification.
+
+`advice.exportScript(recs, picks, meta, true)` returns `{ text, flightPlan }`; without the fourth argument it still returns
+a string. It builds the maneuver list only after selection, atomic-group, conflict and firmware-legality checks.
+The Export page and the saved CLI comments use this same list, labeled by PID profile and linked to the changed parameters.
+The instructions use the project's ASD-STE100 vocabulary and sentence rules. The automated lint checks the text from
+every maneuver family, UI states and exported comments; a manual review checks meaning and one action per sentence.
+
+Run `node --test test/control_tune.test.cjs test/advice.test.cjs test/tuning_dialog.test.cjs test/tuning_worker.test.cjs`
+and `node --test test/ste_text.test.cjs`, then build, install and launch with the normal desktop workflow.
+
+### The filter search
+
+`{ cmd: 'filterTune', id, workspaceKey, bytes, fileName, options: { cliText, cliName, flightRpm, logs, flights, recordedConfigurations, maxAddMs, blockedBy, budgetMs } }`
+returns `{ id, type: 'filterTuned', result }`. The dedicated worker decodes flight samples, supplies confirmed arming-profile
+identity, excludes rescue/level/failsafe periods, and loads `filter_tune`, `filter_replay`, `filter_reconstruct` and `filter_autotune` on demand.
+The v2 search uses native-rate time-domain replay for every candidate, with successive-halving allocation and a reserved
+block holdout. Joint gyro/PID reconstruction reserves one in five gyro outputs for validation. It calibrates the unrecorded
+SDFT update phase from training observations, differentiates adaptive-notch motion during refinement, and tests local
+steps when discrete peak changes stall an interval-wide step. It uses the asymmetric yaw P response when known or identified. Reconstruction blocks
+retain committed samples and complete gyro-filter/SDFT state. Finalists preserve state through each log, and noise is
+scored before downsampling to the Blackbox rate. Original-decimator inversion also
+permits testing new decimation cutoffs. Known motor-RPM and governor settings enable the corresponding upstream paths.
+It checks replay against recorded gyroADC before permitting export. See [Filter autotune](FILTER_AUTOTUNE.md)
+for the firmware path, literature, parameter coverage, assumptions, thresholds and tests.
+
+The result includes `text`, grouped `recommendations`, `model.parity`, `model.coverage`, `capabilities`, `search`,
+`parameters`, `checklist`, `recommended.fullRows`, `recommended.validation.holdout`, `curves`, `traces`,
+`recordedConfigurations` and `cliFile`. Each UI request selects one log or flight. `recordedConfigurations` supplies
+the configuration definitions and interval labels for that source. The worker decodes the original log and detects
+airborne transitions before splitting configuration intervals. Each recorded interval retains its own filter values,
+PID identity and value sources; unlabelled intervals remain explicitly unknown. One complete candidate replaces the
+filter settings across the selected intervals, with cutoffs for each known PID profile. The result lists the intervals
+actually used by replay, including freshness flags, and each trace identifies its recorded configuration and carries the spectrum of that same window. The legacy
+single-`configuration` request remains supported. Coverage records which firmware inputs and settings support each filter family.
+Validated v2 recommendations use firmware legality and measured replay constraints instead of the legacy documentation
+floors. Legacy advice keeps its existing rules. Both exports preserve prerequisite gates and current-value caveats.
+The direct filter CLI writes the complete evaluated setup, all custom bank arrays and profile restoration before `save`.
+
+The worker retains decoded inputs and reconstruction under `workspaceKey`. `{ cmd: 'filterReplay', id, workspaceKey,
+options: { simulate, maxAddMs } }` evaluates manual edits without decoding or reconstructing again. An empty `simulate`
+object replays the recorded setup. A mismatched key is rejected; changing file, flight source, recorded interval values,
+RPM or CLI input invalidates the retained workspace. Selecting a control configuration does not change the filter
+workspace. The maximum added delay defaults to 0.5 ms and accepts 0–20 ms. Manual candidates
+still need baseline and delay/gain/axis checks, but do not need the autotuner's 3 dB improvement threshold.
+
+`filter_checklist.cjs` invokes the existing filter judges from `health_setup`, `health_more` and `health_loop` on both
+recorded and replayed signals, with identical masks and scored intervals. Rows keep check id, log, configuration, profile,
+axis and time range. They classify cleared, remaining and new issues, or an unavailable counterfactual. Physical raw-input
+checks retain their measured result. Mixer/servo output and unknown PID paths are not fabricated from gyro-only replay.
 
 ### The notch orders of the log (no CLI dump)
 
@@ -1313,24 +1432,53 @@ The fit adds 1-2.5 s.
 
 ### Round 3 in the views
 
-- **Configurations** (`result.datasets`, `hierarchy.byDataset`). The Tuning view has the tab "Configurations" (key `configs`): the
-  table of the configurations (id, PID profile, logs, flights, flight time, values; marks for the PID profile values from a different
-  log, the unknown values and the newest configuration), the table "Parameters that are not the same", the values that do not change
-  the flight, the names that the app does not know and the notes of `datasets.cjs`. The configuration menu (`view.dataset`: "all" or
-  an id) filters the diagram (`hierarchy.byDataset[id]`: the nodes, `startHere` and `prereqProblems` of that configuration in its PID
-  profile) and the lists. The views write "Configuration A". Hooks of the Tuning view: `configuration()` ("all" or an id), `setConfiguration(id)` (false when the result has no such
-  configuration), `onConfiguration(cb)` (cb after each change; it returns the function that removes cb). The lens head has the same
-  menu. `TuningDialog.focus({ tab })` opens a tab (the Analysis view links "Configurations"); `focus({ node, fid, recs })` stays.
-  A recommendation shows `r.dataset`, `r.supportedBy`, `r.ab` ([{ a, b, check, axis, names, delta, se, significant, unit, scale,
-  text }]) and `r.slope` ({ name, perUnit, se, datasets, change, changeSe, together, range, check, unit, scale, text }).
-- **Filter values from the flight logs** (the filter search, M2). The Filters step of the diagram and the tab "Filters and vibration"
-  have the panel with the button "Find the best filter values". It starts a new worker with `{ cmd: 'filterTune', id, bytes (the
-  whole file), fileName, selectedLog, logCount, options: { flightRpm (the pilot's value, else the one of the result on display),
-  cliText, cliName, flights (with "Selected flights"), blockedBy (the ids of `hierarchy.nodes.filters.blockedBy`, for example 'rpm') }
-  }` and shows its progress. The view keeps the last 4 results by file, flights, flight rpm and CLI dump, and says when the result on
-  display is for other values. It shows `result.text`, the model check, the test on each flight and the spectra (`result.curves`:
-  raw, recorded, model, candidate and the PID output). Its `recommendations` go into the list of the "CLI file" tab after those of the
-  analysis (the global part and the PID profile parts as one group).
+- **Recorded configurations** (`result.datasets`, `hierarchy.byDataset`) sit below the flight selection and above the
+  tuning tabs, except in Filters. The selector chooses one configuration for the control steps. Expand its recorded values and their
+  sources or compare all configurations without leaving the step. The reference includes log/flight coverage, changed
+  parameters, unknown values, values inherited from another log, and freshness flags. Configurations are not tuning steps.
+  Hooks: `getConfiguration()`, `setConfiguration(id)` and `onConfiguration(cb)`. An Analysis result opens its recorded
+  configuration, preserving this scope. The auxiliary `configs` route remains for existing Analysis links.
+- **Step navigation** is Overview, Filters, Governor, Cyclic gains, Tail gains, Cyclic compensation, Tail
+  compensation, Export. Overview contains the full tuning sequence. Every block has a corresponding step tab, and each
+  step has previous/next links. The Filters block contains the explanation and Autotune action directly. Step selections
+  update one shared pending record; changing the recorded configuration preserves each control draft.
+  Tabs show status text and counts with red for problems or analysis errors, amber for monitor items, green for
+  satisfactory checks and gray for missing data or information. Control status uses the selected configuration's
+  recorded findings; selecting a proposal does not clear them. Filters uses its selected flight source and current,
+  confirmed replay, retaining physical-input problems and recorded problems that replay cannot evaluate. Manual edits
+  and stale results cannot retain a replay clearance. Overview combines those filter results with the selected control
+  configuration. Export flags conflicts and unsupported changes in red and selected changes to examine in amber.
+- **Filter workspace** starts with a log/flight source selector. Each source has its own filter draft. The recorded
+  configuration table lists time ranges, PID profiles, value sources and freshness flags. It opens automatically for
+  multiple or unknown configurations. One editable **Filter parameters** table contains recorded and proposed values.
+  Autotune fills this table and becomes a secondary action after calculation. There is no separate parameter-difference
+  table or Before/After overview. **Show changed values only** compares against every recorded configuration, normalizes
+  enum and array representations, retains unknown values, and preserves edits across replay and tab changes.
+  The maximum added delay defaults to 0.5 ms. Manual edits, recorded-value reset and autotune-value restore use this table.
+  Accepted changes enter the shared draft automatically; Export controls which changes enter the CLI file.
+  Unreplayed edits and stale results cannot enter Export.
+
+  One **Filter checks** shows the recorded results before replay and the original judges' paired results afterward.
+  Previously violated checks stay marked and appear first, including those cleared in replay. New issues and unavailable
+  results remain explicit. A failed model validation cannot display a confirmed clearance. Recorded physical vibration
+  findings remain unchanged inputs. Model validation and filter input coverage are supporting details inside the checklist,
+  rather than a second checklist. The separate recorded-flight checks table is removed.
+
+  **Gyro signals** shows roll, pitch and yaw together. Each axis pairs a time plot with a frequency plot, stacking at narrow
+  widths. One selector identifies the log, configuration, PID profile and full interval for both domains on all axes.
+  Each trace includes its own spectrum, computed from exactly that scored window at the recorded sample rate with no
+  display decimation. The time plot retains native-rate replay samples. Legacy results without interval spectra explicitly
+  identify their spectra as averages over all evaluated windows. Raw data means recorded gyroRAW, Previous filter means
+  recorded gyroADC, and New filter means the calculated output from the same flight input. Shared checkboxes control all
+  six plots without replacing inputs or rerunning analysis; the selection persists across interval and result changes.
+  Missing curves are unavailable. A recorded-only replay disables the new-filter curve. Recorded-versus-model replay plots
+  remain available in a collapsed disclosure. P+D previews are omitted because they represented only the modeled gyro
+  contribution, not the full PID output or the helicopter response. Autotune still evaluates P+D noise and per-path delay.
+
+  Results remain cached by file, flight source, recorded interval values, derived RPM and CLI input. Analysis derives
+  its RPM threshold from the recorded governor data. Filter tuning reuses that threshold only for current inputs.
+  Flight intervals with no complete filter window are excluded before reconstruction and checklist replay. Their
+  coverage limits are reported, and they cannot produce a confirmed recommendation.
 - **Items of the overview** (M3). The Analysis view shows `result.issues` (one item for each check and axis) in their rank, the three
   of `result.top` at the top in plain words, and the cards ranked by their items; `result.areas[area].status` gives the condition of a
   card (a card of small items is "Monitor"). Without `result.issues` the view makes the items from the findings.

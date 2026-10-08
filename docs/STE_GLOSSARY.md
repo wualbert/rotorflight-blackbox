@@ -272,7 +272,7 @@ term that Rotorflight uses (Rule 1.8).
 
 | Category | Name | Technical nouns |
 |---|---|---|
-| 1 | Parts | `accelerometer`, `antenna`, `arm switch`, `battery`, `battery pack`, `bearing`, `belt`, `blade`, `blade grip`, `cell`, `connector`, `damper`, `ESC`, `flight controller`, `gear`, `gyro`, `gyro sensor`, `linkage`, `motor`, `pack`, `pinion`, `pole`, `pulley`, `receiver`, `rotor blade`, `sensor`, `servo`, `shaft`, `skid`, `slider`, `stick`, `swash plate`, `swashplate`, `switch`, `tail blade`, `tail slider`, `tooth`, `transmitter`, `wire` |
+| 1 | Parts | `accelerometer`, `actuator`, `antenna`, `arm switch`, `battery`, `battery pack`, `bearing`, `belt`, `blade`, `blade grip`, `cell`, `connector`, `damper`, `ESC`, `flight controller`, `gear`, `gyro`, `gyro sensor`, `linkage`, `motor`, `pack`, `pinion`, `pole`, `pulley`, `receiver`, `rotor blade`, `sensor`, `servo`, `shaft`, `skid`, `slider`, `stick`, `swash plate`, `swashplate`, `switch`, `tail blade`, `tail slider`, `tooth`, `transmitter`, `wire` |
 | 2 | Machines and their parts | `airframe`, `helicopter`, `main rotor`, `rotor`, `tail`, `tail boom`, `tail rotor` |
 | 3 | Tools and support equipment | `bench` |
 | 6 | Systems, functions and configurations | `angle mode`, `autorotation`, `bailout`, `band-pass`, `band-pass filter`, `bank`, `board alignment`, `center trim`, `channel`, `collective`, `compensation`, `cross-coupling`, `cyclic`, `dynamic notch filter`, `failsafe`, `feedforward`, `filter`, `flight mode`, `governor`, `governor mode`, `gyro alignment`, `gyro filter`, `handover`, `high speed integral`, `high-pass`, `high-pass filter`, `horizon mode`, `I-term relax`, `inertia precompensation`, `level mode`, `loop stall`, `low-pass`, `low-pass filter`, `mixer`, `motor timing`, `motorized tail`, `notch filter`, `PID controller`, `PID loop`, `PID mode`, `pitch compensation`, `precompensation`, `rescue`, `rescue mode`, `RPM filter`, `RPM notch filter`, `setpoint`, `setpoint boost`, `static notch filter`, `stop gain`, `swash phase`, `swash ring`, `swash trim`, `tail center trim`, `tail output limit`, `tail precompensation`, `tail torque assist`, `telemetry`, `throttle`, `throttle hold`, `trainer mode`, `trim`, `voltage compensation` |
@@ -283,7 +283,7 @@ term that Rotorflight uses (Rule 1.8).
 | 15 | Documents and parts of documents | `caution`, `chart`, `colon`, `column`, `comma`, `description`, `diagram`, `documentation`, `font`, `glossary`, `graph`, `hyphen`, `imperative`, `introduction`, `label`, `legend`, `list`, `marker`, `note`, `overview`, `page`, `parenthesis`, `plot`, `quotation mark`, `recommendation`, `reference`, `rule`, `section`, `semicolon`, `sentence`, `strip chart`, `summary`, `table`, `technical noun`, `technical verb`, `text`, `title`, `tooltip`, `warning`, `word` |
 | 16 | Operational conditions | `bench run`, `flight phase`, `idle`, `spool-down`, `spool-up`, `sync loss` |
 | 17 | Colors | `black`, `blue`, `gray`, `green`, `orange`, `red`, `white`, `yellow` |
-| 19 | Computers and software | `Alt`, `analysis`, `prerequisite`, `tuning block`, `app`, `bar`, `blackbox`, `box`, `button`, `canvas`, `CLI block`, `CLI dump`, `clipboard`, `clock`, `Cmd`, `command`, `comment`, `coverage`, `craft name`, `Ctrl`, `cursor`, `debug mode`, `default`, `dialog`, `dump`, `feature`, `field`, `file`, `firmware`, `flight log`, `frame`, `global value`, `header`, `icon`, `key`, `link`, `log`, `log event`, `log file`, `log header`, `log lens`, `log rate`, `log viewer`, `log-profile pair`, `Markdown`, `memory`, `menu`, `module`, `mouse`, `mouse wheel`, `panel`, `parameter`, `parser`, `PID profile`, `preset`, `rate profile`, `scope`, `screen`, `script`, `Shift`, `tab`, `time jump`, `timeline`, `token`, `toolbar`, `toolkit`, `tuning`, `version`, `viewer`, `wheel` |
+| 19 | Computers and software | `autotune`, `replay`, `Alt`, `analysis`, `prerequisite`, `tuning block`, `app`, `bar`, `blackbox`, `box`, `button`, `canvas`, `CLI block`, `CLI dump`, `clipboard`, `clock`, `Cmd`, `command`, `comment`, `coverage`, `craft name`, `Ctrl`, `cursor`, `debug mode`, `default`, `dialog`, `dump`, `feature`, `field`, `file`, `firmware`, `flight log`, `frame`, `global value`, `header`, `icon`, `key`, `link`, `log`, `log event`, `log file`, `log header`, `log lens`, `log rate`, `log viewer`, `log-profile pair`, `Markdown`, `memory`, `menu`, `module`, `mouse`, `mouse wheel`, `panel`, `parameter`, `parser`, `PID profile`, `preset`, `rate profile`, `scope`, `screen`, `script`, `Shift`, `tab`, `time jump`, `timeline`, `token`, `toolbar`, `toolkit`, `tuning`, `version`, `viewer`, `wheel` |
 
 ## Technical verbs
 
@@ -293,7 +293,7 @@ Our technical verbs, by the categories of Rule 1.12.
 |---|---|---|
 | 2a | Computer input and output | `click`, `enter`, `press`, `type` |
 | 2b | User interface | `copy`, `delete`, `disable`, `drag`, `enable`, `export`, `filter`, `paste`, `save`, `scroll`, `sort`, `zoom` |
-| 2c | System operations | `commit`, `debug`, `decode`, `load`, `process`, `update` |
+| 2c | System operations | `replay`, `commit`, `debug`, `decode`, `load`, `process`, `update` |
 | 3a | Engineering | `compensate` |
 | 3d | Navigation and flight | `fly`, `hover`, `land`, `trim` |
 

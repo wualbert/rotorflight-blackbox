@@ -119,7 +119,7 @@ var TuningWorker = (function () {
         power: 'the battery checks at the load steps (P1, P2)', advice: 'recommendations', catalog: 'the STE summaries',
         hierarchy: 'the tuning sequence', evidence: 'the part of the log that gave each result', datasets: 'the configurations of the flights',
         epochs: 'the parts of the log in which the values are possibly not the values of the log header' }; // without that module
-    const ON_DEMAND = ['filter_tune'];                                     // fetched with the others, loaded only by the filterTune command
+    const ON_DEMAND = ['filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_autotune', 'filter_checklist', 'control_tune'];
     const CORE = ['setup', 'gov', 'loop'];                                 // health.cjs MODULES, in its order
     const JUDGED = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power']; // the new modules, judged after health_report.cjs
     const ALL_PHASE = new Set(['rescue', 'limits', 'config', 'power']);    // modules that use all phases of a flight log, rescue included, with no guard time
@@ -1148,8 +1148,11 @@ var TuningWorker = (function () {
             if (rec.flown && !airborneEvents) J.notes.add(`The log does not record AIRBORNE_STATE. Thus, the toolkit (lib.cjs) sets all frames as airborne, and the app finds the flight only from the headspeed (${J.rpm.value} rpm or more) and the gyro rate. The log can be a test on the ground.`, li);
             if (!head.fields && !p.w.skipped && rec.metrics) { head.header = p.w.flight.header; head.fields = fieldsOf(K, p.w, rec); }
             if (head.flight && ctx && rec.metrics && rec.metrics.more && !(selected && J.o.curves)) vibOf(J, p.w, ctx, rec);
-            if (!selected) continue;
-            if (J.o.curves) J.curves.push(curvesOf(J, p.w, ctx, rec, phaseCtx));
+            if (J.o.curves && (selected || ctx && J.DS)) {
+                const curves=curvesOf(J,p.w,ctx,rec,phaseCtx,selected);
+                if (selected) J.curves.push(curves);
+                J.configurationCurves.push(...(curves.configurations||[]));
+            }
         }
         if (selected || head.flight) J.heads.set(li, Object.assign(head, { header: head.header ? JSON.parse(toJson(head.header)) : null }));
         if (cls === 'bench') return;
@@ -1195,12 +1198,38 @@ var TuningWorker = (function () {
     }
 
     const CURVED = ['track', 'more', 'phase'];   // the modules whose curves the views draw (the rescue and limit periods are evidence spans), by PID profile
-    function curvesOf(J, w, ctx, rec, phaseCtx) {
+    function curvesOf(J, w, ctx, rec, phaseCtx, includeOriginal = true) {
         const out = { log: rec.log, segment: rec.segment, fromS: r(w.fromS, 3), seconds: r(w.seconds, 1), track: null, more: null, phase: null };
-        for (const name of CURVED) {
+        for (const name of includeOriginal ? CURVED : []) {
             const M = J.K[name];
             if (!M || typeof M.curves !== 'function' || !rec.metrics || !rec.metrics[name]) continue;
             try { out[name] = M.curves(w, Object.assign({}, pidCtx(name === 'phase' ? phaseCtx : ctx)), rec.metrics[name]); } catch (e) { J.notes.add(`The app cannot make the curves of "${OPTIONAL[name]}.cjs". The error is "${message(e)}".`, rec.log); }
+        }
+        // Keep spectra and time traces specific to each contiguous configuration
+        // interval. A pooled spectrum cannot be separated after its FFT.
+        if (ctx && ctx.pidLabels && J.DS) {
+            out.configurations = [];
+            for (let a=0;a<w.n;) {
+                let b=a+1; while (b<w.n && ctx.profile[b]===ctx.profile[a]) b++;
+                const label=ctx.profile[a], info=J.dsReg.info.get(label), ds=dsNow(J), d=info && ds && ds.datasets.find(x=>dsKey(x)===info.key);
+                if (d) {
+                    const cut=sliceSegment(w,a,b), h=J.DS.configurationHeader(w.flight.header,d);
+                    cut.flight=Object.assign({},cut.flight,{header:h});
+                    const part={log:rec.log,segment:rec.segment,fromS:r(cut.fromS,3),seconds:r(cut.seconds,3),datasetLabel:label,track:null,more:null,phase:null};
+                    for (const name of CURVED) {
+                        const M=J.K[name]; if (!M || typeof M.curves!=='function' || !rec.metrics || !rec.metrics[name]) continue;
+                        const original=pidCtx(name==='phase' ? phaseCtx : ctx), c=Object.fromEntries(Object.entries(original).map(([k,v])=>[k,ArrayBuffer.isView(v)&&v.length===w.n ? v.subarray(a,b) : v]));
+                        c.header=h;
+                        c.profile=new Uint8Array(cut.n).fill(d.pidProfile||0); c.pidLabels=c.profile; c.pidProfileOf=p=>p;
+                        for (const key of ['govHeadspeed','maxThrottle']) if (ctx[key]) c[key]={[d.pidProfile||0]:ctx[key][label]};
+                        if (c.phases && c.phases.code) c.phases=Object.assign({},c.phases,{code:c.phases.code.subarray(a,b),flights:(c.phases.flights||[]).filter(q=>q.t1>cut.fromS&&q.t0<cut.fromS+cut.seconds).map(q=>Object.assign({},q,{t0:Math.max(q.t0,cut.fromS),t1:Math.min(q.t1,cut.fromS+cut.seconds)}))});
+                        try { part[name]=M.curves(cut,c,name==='phase' ? null : M.analyse(cut,c)); }
+                        catch(e) { J.notes.add(`The app cannot make the curves of "${OPTIONAL[name]}.cjs". The error is "${message(e)}".`,rec.log); }
+                    }
+                    out.configurations.push(part);
+                }
+                a=b;
+            }
         }
         return out;
     }
@@ -1345,8 +1374,16 @@ var TuningWorker = (function () {
         if (!A) return { recommendations: [], coverage: [], notes: ['The toolkit file "advice.cjs" is not available. Thus, the results do not include recommendations.'], script: '' };
         const input = JSON.parse(toJson({ findings, decisions, header: J.adviceHeader, cli: J.cliParsed, cliName: J.cliParsed ? J.o.cliName || null : null, fields: J.fields, headerProfile: J.headerProfile, headerProfileInferred: !!J.headerProfileInferred, headerLog: J.headerLog, logBase: 1, logs: logsInput(J),
             datasets: J.dsOut || null, gear: J.gear || null })); // gear: the notch orders of the log (gearFit), when no CLI dump gives the gear ratios
-        try { const a = JSON.parse(toJson(A.advise(input))), recommendations = a.recommendations || [];
-            return { recommendations, coverage: a.coverage || [], notes: a.notes || [], script: scriptOf(J, A, recommendations, findings) }; }
+        try { const a = JSON.parse(toJson(A.advise(input))), recommendations = a.recommendations || [], byDataset={};
+            if (J.dsOut && J.DS) for (const d of J.dsOut.datasets.filter(x=>x.analysed)) {
+                const own=Object.assign({},input,{configurationId:d.id,header:J.DS.configurationHeader(input.header||{},d),headerProfile:d.pidProfile||0,headerProfileInferred:false,
+                    findings:input.findings.filter(f=>(!f.dataset || f.dataset===d.id) && (!Number.isInteger(f.pidProfile) || !f.pidProfile || f.pidProfile===d.pidProfile)),
+                    decisions:(input.decisions||[]).filter(q=>q.dataset===d.id),
+                    datasets:Object.assign({},input.datasets,{datasets:[d],newest:d.id,newestByProfile:{[d.pidProfile||'unknown']:d.id},labels:(input.datasets.labels||[]).filter(q=>q.dataset===d.id)})});
+                const scoped=JSON.parse(toJson(A.advise(own)));
+                byDataset[d.id]=(scoped.recommendations||[]).map(rec=>Object.assign(rec,{id:'configuration:'+d.id+':'+rec.id,dataset:d.id,group:rec.group ? 'configuration:'+d.id+':'+rec.group : rec.group}));
+            }
+            return { recommendations, byDataset, coverage: a.coverage || [], notes: a.notes || [], script: scriptOf(J, A, recommendations, findings) }; }
         catch (e) { const t = `The app cannot make the recommendations of "advice.cjs". The error is "${message(e)}".`; J.notes.add(t); return { recommendations: [], coverage: [], notes: [t], script: '' }; }
     }
     // The CLI file of the saved report (TuningResult advice.script, SPEC2 C5): advice.exportScript with the default picks and
@@ -1555,7 +1592,7 @@ var TuningWorker = (function () {
             // checks), the recommendations that start from it or that it supports, in its PID profile
             if (out && J.dsOut) { out.byDataset = {};
                 for (const d of J.dsOut.datasets.filter(x => x.analysed)) {
-                    const F = findings.filter(f => !f.dataset || f.dataset === d.id), R = advice.recommendations.filter(r => r.dataset === d.id || (r.supportedBy || []).includes(d.id) || (!r.dataset && !(r.supportedBy || []).length));
+                    const F = findings.filter(f => !f.dataset || f.dataset === d.id), R = advice.byDataset && advice.byDataset[d.id] || advice.recommendations.filter(r => r.dataset === d.id || (r.supportedBy || []).includes(d.id) || (!r.dataset && !(r.supportedBy || []).length));
                     const st = JSON.parse(toJson(H.status(F, R, { logs, coverage: advice.coverage, profile: d.pidProfile > 0 ? d.pidProfile : 0 })));
                     out.byDataset[d.id] = { pidProfile: d.pidProfile, nodes: st.nodes, startHere: st.startHere, prereqProblems: st.prereqProblems }; } }
             return out; }
@@ -2016,7 +2053,7 @@ var TuningWorker = (function () {
         if (!(typeof o.flightRpm === 'number' && o.flightRpm > 0 && isFinite(o.flightRpm))) o.flightRpm = null;
         if (!msg.bytes) throw new Error('The command has no log data.');
         const J = { id: msg.id, o, scope, fileName: basename(msg.fileName || 'log.bbl'), t0: Date.now(), ms: { decode: 0, analyse: 0, judge: 0, gains: 0 }, fraction: 0,
-            notes: notesList(), records: [], errorRecords: [], curves: [], segCount: new Map(), header: null, fields: null, headerProfile: null, cliText: o.cliText || null, cliParsed: null,
+            notes: notesList(), records: [], errorRecords: [], curves: [], configurationCurves: [], segCount: new Map(), header: null, fields: null, headerProfile: null, cliText: o.cliText || null, cliParsed: null,
             arming: new Map(), segments: null, heads: new Map(), headerLog: null, adviceHeader: null, cliSel: { profile: null, rateProfile: null },
             vib: [], flightAt: new Map(), cliSections: new Map(), attitude: new Map(), hsLogs: new Map(), hsMapOut: null, armCore: new Map(), armFixed: new Set(), // hsLogs, armCore, armFixed: D12 (hsInfo, armingCore, armWhole)
             epochIn: new Map(), epochs: new Map(), cliStatus: null, dsFull: null }; // epochIn: the input of paramEpochs of each analysed log (epochCollect)
@@ -2276,6 +2313,11 @@ var TuningWorker = (function () {
         if (dsOn(J)) dsCliFilter(J, new Set(J.records.filter(l => l.logClass === 'bench').map(l => l.log))); // datasets.cjs: no section that the log contradicts
         const ds = dsFinal(J);
         J.dsFull = ds; J.dsOut = dsResult(J, ds);
+        for (const part of J.configurationCurves) {
+            const d=J.dsMap && J.dsMap.get(part.datasetLabel); part.dataset=d ? d.id : null;
+        }
+        if (J.dsOut && J.o.curves) J.dsOut.curves=J.configurationCurves;
+        if (J.K.advice && J.K.advice.configurationBases) J.K.advice.configurationBases(J.dsOut);
         annotate(J, judged.findings, ds);
         if (gained) annotateDecisions(J, gained.decisions, gained.segments);
         const advice = adviseAll(J, judged.findings, gained ? gained.decisions : null);
@@ -2284,13 +2326,16 @@ var TuningWorker = (function () {
             if (J.K.advice && typeof J.K.advice.comparisons === 'function') try { J.dsOut.comparisons = JSON.parse(toJson(J.K.advice.comparisons(judged.findings, J.dsOut))); }
                 catch (e) { J.notes.add(`The app cannot compare the configurations. The error is "${message(e)}".`); } }
         // values that are possibly not current (CLAUDE.md): the epochs of each log, f.stale, the stale of the limits periods, r.stale
-        const fresh = freshnessOf(J, judged.findings, gained ? gained.decisions : null, advice.recommendations);
+        const allRecommendations=advice.recommendations.concat(Object.values(advice.byDataset||{}).flat());
+        const fresh = freshnessOf(J, judged.findings, gained ? gained.decisions : null, allRecommendations);
         // the CLI file of the saved report again, with the flag of each change that has r.stale (CLAUDE.md: a comment line before its command)
         if (J.K.advice && advice.recommendations.some(x => x && x.stale)) try { advice.script = scriptOf(J, J.K.advice, advice.recommendations, judged.findings); }
             catch (e) { J.notes.add(`The app cannot make the CLI file of the report. The error is "${message(e)}".`); }
+        // File-wide findings are shared with Analysis. A configuration's advice
+        // must not reclassify another configuration's findings in that view.
         explain(judged.findings, advice.recommendations);
         resultOf(judged.findings, advice.recommendations);
-        present(J, judged.findings, advice.recommendations);
+        present(J, judged.findings, allRecommendations);
         const hierarchy = hierarchyOf(J, judged.findings, advice);
         const iss = issuesOf(J, judged.findings);
         for (const x of iss.issues) x.stale = fresh.epochs ? staleUnion((x.fids || []).map(fid => J.byFid.get(fid)), 'item') : null;
@@ -2451,9 +2496,17 @@ var TuningWorker = (function () {
     // recommendation, delay, validation, why, rows, in STE), recommendations (advice.cjs filterRecommendations: an action only when
     // tune() recommends the set and the model agrees with every flight log), logs, flightRpm, notes and timing. The masks: the flight
     // phases less rescue, level modes and failsafe (health_more normalMask over the flight phase), as the CLI of filter_tune.cjs
+    let filterWorkspace = null;
+    async function filterReplay(msg, post) {
+        if (!filterWorkspace || !msg.workspaceKey || msg.workspaceKey !== filterWorkspace.key)
+            throw new Error('The filter inputs changed. Load the recorded values again.');
+        const J=filterWorkspace.J; J.id=msg.id; J.t0=Date.now(); J.o=Object.assign({},J.o,{simulate:undefined},msg.options||{});
+        return finishFilter(filterWorkspace,msg,post);
+    }
     async function filterTune(msg, post) {
         const J = await begin(Object.assign({}, msg, { options: Object.assign({}, msg.options || {}, { datasets: false, curves: false }) }), post, 'file'); // no gearPlan: tune() fits the notch orders itself
         const idx = new FlightLogIndex(J.bytes), count = idx.getLogCount(), slice = (i) => J.bytes.subarray(idx.getLogBeginOffset(i), idx.getLogBeginOffset(i + 1));
+        const configuration = J.o.configuration || null;
         const sel = flightsWanted(J, count), list = Array.isArray(J.o.logs) && J.o.logs.length ? J.o.logs.filter(l => Number.isInteger(l) && l >= 0 && l < count) : [...Array(count).keys()];
         J.logs = sel ? [...sel.keys()].filter(l => list.includes(l)).sort((a, b) => a - b) : list; J.logCount = count; J.logIndex = J.logs[0] || 0;
         const rpm = userRpm(J); if (rpm) settle(J, rpm); else await firstPass(J, count, slice, 0.02, 0.2, J.logs, true);
@@ -2467,30 +2520,107 @@ var TuningWorker = (function () {
             const d = timedDecode(J, K, slice(li), li, extra); if (d.error) continue;
             hsCollect(J, d, li); epochCollect(J, d, li); armWhole(J, d.segs, d.events, li); // the stale of the recommendations (filterStale): the whole log
             if (sel) d.segs = selectFlights(J, d, li, sel.get(li));
-            const live = d.segs.filter(w => !w.skipped), airborneEvents = live.some(w => w.airborneAt.some(v => !v));
+            const airborneEvents = d.segs.some(w => !w.skipped && w.airborneAt.some(v => !v));
+            if (configuration) d.segs = filterConfigurationSegments(K, d.segs, configuration, li);
+            else if (J.o.recordedConfigurations) d.segs = filterRecordedSegments(K,d.segs,J.o.recordedConfigurations,li);
+            const live = d.segs.filter(w => !w.skipped);
             const preps = live.map((w, s) => prepare(K, w, { segment: s, cli: J.cliText, cliParsed: J.cliParsed, phases: true, airborneEvents }, J));
             if (classOf(preps.map(p => p.ph)) !== 'flight') continue; // a bench run, or no flight phases
             for (const p of preps) { if (!p.ph || !p.ctx) continue; let mask = p.ph.mask;
                 if (K.more) try { mask = K.more.normalMask(p.w, Object.assign({}, p.ctx, { flying: p.ph.mask, phases: p.ph.P, flightMask: p.ph.mask })).mask; }
                     catch (e) { J.notes.add(`The function "normalMask" of "health_more.cjs" stopped. The error is "${message(e)}". Thus, the analysis of the filter values uses all of the flight phase.`, li); }
-                items.push({ w: p.w, mask, flight: true }); runs.set(li, (runs.get(li) || []).concat(runsOf(p.w, mask))); }
+                items.push({ w: p.w, mask, flight: true, armingProfile: configuration ? configuration.pidProfile : p.w.recordedConfiguration ? p.w.recordedConfiguration.profile : null }); runs.set(li, (runs.get(li) || []).concat(runsOf(p.w, mask))); }
             if (!used.includes(li)) used.push(li);
         }
-        const tSearch = Date.now();
+        for (const item of items) {
+            const li = item.w.flight.log, a = armingFinal(J.armCore.get(li), hsFor(J, li));
+            if (!configuration && !item.w.recordedConfiguration && a && a.confirmed && a.profile > 0) item.armingProfile = a.profile;
+        }
+        filterWorkspace={key:msg.workspaceKey||null,J,items,used,runs,prepared:null};
+        return finishFilter(filterWorkspace,msg,post);
+    }
+    function filterConfigurationSegments(K, segments, configuration, log) {
+        if (configuration.pidProfile===null) configuration={...configuration,pidProfile:0};
+        const DS = K.require('./datasets.cjs'), labels = (configuration.labels || []).filter(q => q.log === log && q.dataset === configuration.id && Number.isFinite(q.t0) && Number.isFinite(q.t1) && q.t1 > q.t0);
+        if (!Number.isInteger(configuration.pidProfile) || configuration.pidProfile < 0 || configuration.pidProfile > 6) throw new Error('The PID profile of the configuration is not correct.');
+        const out=[];
+        for (const w of segments) {
+            if (w.skipped) continue;
+            const times=frameTimes(w), mask=Uint8Array.from(times,t=>labels.some(q=>t>=q.t0-0.0005 && t<q.t1-0.0005)?1:0);
+            for (let i=0;i<w.n;) {
+                if (!mask[i]) {i++;continue;}
+                let end=i+1; while(end<w.n && mask[end]) end++;
+                const cut=sliceSegment(w,i,end);
+                cut.flight={...cut.flight,header:DS.configurationHeader(w.flight.header,configuration)};
+                cut.profileAt=new Uint8Array(cut.n).fill(configuration.pidProfile);
+                out.push(cut); i=end;
+            }
+        }
+        return out;
+    }
+    // Keep every interval of a selected flight, including intervals whose
+    // configuration is unknown. Each known interval gets its own recorded
+    // header for baseline reconstruction; the candidate spans all intervals.
+    function filterRecordedSegments(K, segments, timeline, log) {
+        const DS=K.require('./datasets.cjs'), configs=new Map((timeline.datasets||[]).map(d=>[d.id,d]));
+        const labels=(timeline.labels||[]).filter(q=>q.log===log && Number.isFinite(q.t0) && Number.isFinite(q.t1) && q.t1>q.t0);
+        const out=[];
+        for (const w of segments) {
+            if (w.skipped) {out.push(w);continue;}
+            const times=frameTimes(w), at=new Int32Array(w.n).fill(-1);
+            labels.forEach((q,index)=>{for(let i=0;i<w.n;i++)if(times[i]>=q.t0-.0005 && times[i]<q.t1-.0005)at[i]=index;});
+            for(let i=0;i<w.n;) {
+                let end=i+1;while(end<w.n && at[end]===at[i])end++;
+                const q=labels[at[i]], d=q && configs.get(q.dataset), cut=sliceSegment(w,i,end);
+                if(d) {
+                    const profile=d.pidProfile || 0;
+                    if(!Number.isInteger(profile) || profile<0 || profile>6)throw new Error('The PID profile of the configuration is not correct.');
+                    cut.flight={...cut.flight,header:DS.configurationHeader(w.flight.header,d)};
+                    cut.profileAt=new Uint8Array(cut.n).fill(profile);
+                    cut.recordedConfiguration={id:d.id,profile,values:d.values||{},sources:d.sources||{},assumed:!!q.assumed};
+                } else cut.recordedConfiguration={id:null,profile:0,values:{},sources:{}};
+                out.push(cut);i=end;
+            }
+        }
+        return out;
+    }
+    function finishFilter(workspace,msg,post) {
+        const {J,items,used,runs}=workspace,K=J.K,FT=K.require('./filter_tune.cjs'),tSearch=Date.now();
+        J.progress=(text,stage='filter',fraction=null)=>post({id:msg.id,type:'progress',stage,fraction,text});
         J.progress(`The app calculates the vibration for filter values on ${used.length === 1 ? '1 flight log' : `${used.length} flight logs`}.`, 'filter', 0.55);
-        const opts = { cli: J.cliText || null, loo: J.o.loo !== false };
+        const opts = { cli: J.cliText || null, app:self, maxAddMs:J.o.maxAddMs, prepared:workspace.prepared, onPrepared:P=>{workspace.prepared=P;}, progress: (text, fraction) => J.progress(text, 'filter', 0.55 + 0.44 * fraction) };
         // options.blockedBy: the ids of the steps that hold the filters (hierarchy nodes filters.blockedBy, for example 'rpm') or texts
         const G = K.hierarchy && typeof K.hierarchy.graph === 'function' ? (() => { try { return K.hierarchy.graph(); } catch (e) { return null; } })() : null;
         const titles = new Map(G ? [].concat((G.prereq || []).map(n => [n.id, { title: n.title, prereq: true }]), (G.blocks || []).map(n => [n.id, { title: n.title, prereq: false }])) : []);
         const blockedBy = (Array.isArray(J.o.blockedBy) ? J.o.blockedBy : []).map(b => titles.has(b) ? `The ${titles.get(b).prereq ? 'prerequisite' : 'step'} "${titles.get(b).title}" has a problem.` : typeof b === 'string' && /\s/.test(b) ? b : null).filter(Boolean);
         if (num0(J.o.budgetMs) > 0) opts.budgetMs = +J.o.budgetMs;
+        if (J.o.simulate !== undefined) opts.simulate=J.o.simulate;
         const res = FT.tune(items, opts);
+        res.configuration = J.o.configuration ? {id:J.o.configuration.id, pidProfile:J.o.configuration.pidProfile} : null;
+        res.recordedConfigurations=items.flatMap(item=>runsOf(item.w,item.mask).map(span=>({
+            ...(item.w.recordedConfiguration || {id:res.configuration && res.configuration.id || null,profile:item.armingProfile || 0,values:{},sources:{}}),
+            log:item.w.flight.log,t0:span.t0,t1:span.t1
+        })));
         res.text = typeof FT.texts === 'function' ? FT.texts(res, { logBase: 1, cli: !!J.cliText }) : null;
         res.recommendations = K.advice && typeof K.advice.filterRecommendations === 'function'
             ? JSON.parse(toJson(K.advice.filterRecommendations(res, { texts: res.text || {}, cli: !!J.cliText, cliName: J.o.cliName || null, blockedBy }))) : [];
-        filterStale(J, res.recommendations, used, runs);
+        if (res.configuration) for (const r of res.recommendations) { r.dataset=res.configuration.id; r.supportedBy=[res.configuration.id]; }
+        const fullScopes = res.version === 2 ? [...new Map((res.recommended.fullRows || []).map(r => [r.scope + ':' + (r.profile || 0), {scope: r.scope, profile: r.profile || null}])).values()] : [];
+        if(J.o.recordedConfigurations)J.dsFull=J.o.recordedConfigurations;
+        filterStale(J, res.recommendations.concat(fullScopes), used, runs);
+        for(const q of res.recordedConfigurations) {
+            const epochs=J.epochs.get(q.log);
+            q.stale=epochs ? staleFrom(J,touched(epochs,q.log,[[q.t0,q.t1]],s=>s.armed),'period',null) : null;
+        }
+        for (const r of (res.recommended.fullRows || []).concat(res.parameters || [])) {
+            const scope = fullScopes.find(s => s.scope === r.scope && (s.profile || 0) === (r.profile || 0));
+            r.stale = scope ? scope.stale : null;
+        }
         Object.assign(res, { fileName: J.fileName, logs: used, flightRpm: J.rpm, blockedBy, selection: J.selection ? { flights: J.selection.flights.slice(), windows: J.selection.windows.slice(), text: selectionText(J.selection) } : null,
             notes: J.notes.list(), timing: { decodeS: seconds(J.ms.decode), searchS: seconds(Date.now() - tSearch), totalS: seconds(Date.now() - J.t0) } });
+        const sourceText=res.selection ? res.selection.text : `Flight data: ${used.map(li=>'log '+(li+1)).join(', ')}.`;
+        for(const r of res.recommendations)r.text=sourceText+'\n'+(r.text||'');
+        if (res.version === 2) res.cliFile = K.require('./filter_autotune.cjs').cliFile(res, { fileName: J.fileName, recommendations: res.recommendations });
         return res;
     }
     const num0 = (v) => typeof v === 'number' && isFinite(v) ? v : +v || 0;
@@ -2752,7 +2882,7 @@ var TuningWorker = (function () {
     async function exportCli(msg) {
         const K = kit(await sources(), null);
         if (!K.advice || typeof K.advice.exportScript !== 'function') throw new Error('The toolkit file "advice.cjs" is not available, or it has no function "exportScript".');
-        return K.advice.exportScript(Array.isArray(msg.recs) ? msg.recs : [], msg.picks === undefined ? null : msg.picks, msg.meta || {});
+        return K.advice.exportScript(Array.isArray(msg.recs) ? msg.recs : [], msg.picks === undefined ? null : msg.picks, msg.meta || {}, !!msg.withPlan);
     }
     // the rate profile that a CLI dump selects at its end (`rateprofile N`, the CLI index), as health_setup parseCli gives selectedProfile
     const lastRateProfile = (text) => { const all = [...String(text || '').matchAll(/^\s*rateprofile (\d+)/gm)]; return all.length ? +all[all.length - 1][1] : null; };
@@ -2767,13 +2897,18 @@ var TuningWorker = (function () {
             rateProfile: pick(count(/^rateprofile \d+/), Object.keys(cli.rateprofiles || {}).length, lastRateProfile(text)) };
     }
 
+    async function controlTune(msg) {
+        const K = kit(await sources(), null);
+        return K.require('./control_tune.cjs').tune({ analysis: msg.analysis, configuration: msg.configuration, step: msg.step });
+    }
+
     async function init() { const D = await deriveKit(); return { modules: Object.fromEntries(['track', 'more', 'gov', 'catalog'].map(k => [k, !!D[k]])), notes: D.notes.slice() }; }
 
     let queue = Promise.resolve();
     function onmessage(ev) {
         const msg = ev.data || {}, id = msg.id, post = (m) => self.postMessage(m);
         if (msg.cmd === 'cancel') { cancelled.add(id); return; }
-        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned' }[msg.cmd] || 'result';
+        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune, filterReplay, controlTune }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned' }[msg.cmd] || 'result';
         queue = queue.then(() => job ? job(msg, post) : Promise.reject(new Error(`The command "${msg.cmd}" is unknown.`)))
             .then(result => post({ id, type, result }))
             .catch(e => post({ id, type: 'error', message: message(e), stack: String(e && e.stack || '') }))

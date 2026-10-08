@@ -3,9 +3,9 @@
 /**
  * TuningPlot - small dependency-free canvas plots for the Tuning dialog (error curves, spectra, governor, tail).
  *
- *   var plot = TuningPlot.attach(canvas, spec); // draws now and again whenever the canvas is resized
+ *   var plot = TuningPlot.attach(canvas, spec); // draws next frame and again whenever the canvas is resized
  *   plot.update(spec);                          // new data or options; legend toggles are kept by series name
- *   plot.destroy();                             // removes the listeners and the resize observer
+ *   plot.destroy();                             // cancels pending draws, removes listeners and the resize observer
  *
  * spec (every field optional):
  *   title, height  canvas height in css px, optional: without it the canvas keeps its stylesheet height (the Tuning
@@ -69,6 +69,10 @@ var TuningPlot = (function () {
         textScale = scale; K = m.k; FONT = m.font; TITLE_FONT = m.title; ROW = m.row;
     }
     useScale(1);
+
+    function prune() {
+        live.slice().forEach(function (h) { if (h.canvas.isConnected === false) h.destroy(); });
+    }
 
     var finite = Number.isFinite;
     function positive(v) { return v > 0 && v < Infinity; }
@@ -304,21 +308,41 @@ var TuningPlot = (function () {
         if (canvas._tuningPlot) canvas._tuningPlot.destroy(); // one plot per canvas
         var g = canvas.getContext("2d"), cache = document.createElement("canvas"), cg = cache.getContext("2d"),
             hidden = {}, meta = [], L = null, mouse = null, observer = null, dead = false, drawn = "", device = null,
+            frame = null, drawPending = false, hoverPending = false, metaDirty = false, pointer = null,
             ownHeight = false; // the inline height is spec.height, set here
+
+        // Input and resize events can arrive faster than the display refreshes. Keep only the latest state,
+        // and do the layout, data scan and canvas work once in the next frame. A removed pane cancels its work.
+        function flush() {
+            frame = null;
+            if (dead) return;
+            var redraw = drawPending, hover = hoverPending;
+            drawPending = hoverPending = false;
+            if (hover && pointer) mouse = position(pointer);
+            var p = redraw ? draw() : paint();
+            if (hover) {
+                canvas.style.cursor = mouse && legendAt(mouse) ? "pointer" : p && spec.onClick ? "crosshair" : "";
+                if (spec.onHover) spec.onHover(p ? p.x : null, p ? p.info : null);
+            }
+        }
+
+        function schedule(redraw, hover) {
+            if (dead) return;
+            drawPending = drawPending || redraw;
+            hoverPending = hoverPending || hover;
+            if (typeof requestAnimationFrame !== "function") return flush();
+            if (frame === null) frame = requestAnimationFrame(flush);
+        }
 
         function update(newSpec) {
             if (dead) return;
             spec = newSpec || {};
-            meta = (spec.series || []).map(function (s, k) {
-                var n = s && s.x && s.y ? Math.min(s.x.length, s.y.length) : 0;
-                return { s: s, k: k, n: n, sorted: ascending(n && s.x, n), color: (s && s.color) || PALETTE[k % PALETTE.length],
-                    nb: n && s.lo && s.hi ? Math.min(n, s.lo.length, s.hi.length) : 0 }; // nb: points with a band
-            });
+            metaDirty = true;
             if (!canvas.style.width) canvas.style.width = "100%";
             if (!canvas.style.display) canvas.style.display = "block";
             if (spec.height) { canvas.style.height = spec.height + "px"; ownHeight = true; }
             else if (ownHeight) { canvas.style.height = ""; ownHeight = false; } // back to the stylesheet height
-            draw();
+            schedule(true);
         }
 
         // css width and height to lay out in, the device pixel ratio and the backing store's width and height. The
@@ -345,11 +369,20 @@ var TuningPlot = (function () {
                 L = null;
                 return;
             }
+            // Closed details and hidden tabs need no data scan. Their observer schedules this when they open.
+            if (metaDirty) {
+                meta = (spec.series || []).map(function (s, k) {
+                    var n = s && s.x && s.y ? Math.min(s.x.length, s.y.length) : 0;
+                    return { s: s, k: k, n: n, sorted: ascending(n && s.x, n), color: (s && s.color) || PALETTE[k % PALETTE.length],
+                        nb: n && s.lo && s.hi ? Math.min(n, s.lo.length, s.hi.length) : 0 };
+                });
+                metaDirty = false;
+            }
             [canvas, cache].forEach(function (k) { if (k.width !== bw || k.height !== bh) { k.width = bw; k.height = bh; } });
             cg.setTransform(r, 0, 0, r, 0, 0);
             L = render(cg, W, H);
             if (L) L.r = r;
-            paint();
+            return paint();
         }
 
         // Draws the whole plot in css px and returns its layout (axes, plot box, drawn series, markers, legend).
@@ -529,7 +562,7 @@ var TuningPlot = (function () {
             hlabels.forEach(function (q) { lineLabel(q[0], q[1]); }); // the labels after the curves: no line crosses them
             tops.forEach(function (q) { topLabel(q[0], q[1], q[2]); });
             if (!meta.some(function (d) { return d.n; })) {
-                text(c, "no data", (left + right) / 2, (T + B) / 2, "center", "middle", "rgba(255,255,255,0.4)");
+                text(c, spec.emptyText || "no data", (left + right) / 2, (T + B) / 2, "center", "middle", "rgba(255,255,255,0.4)");
             }
             c.restore();
 
@@ -661,21 +694,19 @@ var TuningPlot = (function () {
         }
 
         function onMove(e) {
-            mouse = position(e);
-            var p = paint();
-            canvas.style.cursor = legendAt(mouse) ? "pointer" : p && spec.onClick ? "crosshair" : "";
-            if (spec.onHover) spec.onHover(p ? p.x : null, p ? p.info : null);
+            pointer = { clientX: e.clientX, clientY: e.clientY };
+            schedule(false, true);
         }
         function onLeave() {
-            mouse = null;
-            paint();
-            if (spec.onHover) spec.onHover(null, null);
+            pointer = mouse = null;
+            schedule(false, true);
         }
         function onClick(e) {
+            if (metaDirty) return; // the new data has not been drawn yet
             var m = position(e), entry = legendAt(m), p;
             if (entry) {
                 hidden[entry.name] = !hidden[entry.name];
-                draw();
+                schedule(true);
             } else if (spec.onClick && inPlot(m)) {
                 p = pick(m);
                 spec.onClick(p.x, p.info);
@@ -685,6 +716,8 @@ var TuningPlot = (function () {
         function destroy() {
             if (dead) return;
             dead = true;
+            if (frame !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+            frame = null;
             live = live.filter(function (h) { return h !== handle; });
             if (observer) observer.disconnect();
             canvas.removeEventListener("mousemove", onMove);
@@ -693,19 +726,22 @@ var TuningPlot = (function () {
             if (canvas._tuningPlot === handle) delete canvas._tuningPlot;
             cache.width = cache.height = 0;
             L = null;
+            meta = []; spec = {}; pointer = mouse = null;
         }
 
-        var handle = { update: update, destroy: destroy, redraw: function () { if (!dead) draw(); }, canvas: canvas };
+        var handle = { update: update, destroy: destroy, redraw: function () { schedule(true); }, canvas: canvas };
         canvas._tuningPlot = handle;
-        live = live.filter(function (h) { return h.canvas.isConnected !== false; }).concat([handle]); // a plot taken off the page without destroy() goes
+        prune(); // release observers, queued frames and data of plots removed by their host
+        live.push(handle);
         canvas.addEventListener("mousemove", onMove);
         canvas.addEventListener("mouseleave", onLeave);
         canvas.addEventListener("click", onClick);
         if (typeof ResizeObserver === "function") { // redraws on a new size or pixel ratio, not for our own style.height
             observer = new ResizeObserver(function (entries) {
+                if (dead) return;
                 var e = entries && entries[entries.length - 1], box = e && e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
                 device = box ? [box.inlineSize, box.blockSize] : null; // Chromium 84+
-                if (size().join() !== drawn) draw();
+                if (size().join() !== drawn) schedule(true);
             });
             try { observer.observe(canvas, { box: "device-pixel-content-box" }); } catch (e) { observer.observe(canvas); }
         }
@@ -719,7 +755,7 @@ var TuningPlot = (function () {
         s = isFinite(s) && s > 0 ? Math.min(Math.max(s, SCALE_MIN), SCALE_MAX) : 1;
         if (s === textScale) return textScale;
         useScale(s);
-        live = live.filter(function (h) { return h.canvas.isConnected !== false; });
+        prune();
         live.slice().forEach(function (h) { try { h.redraw(); } catch (e) { console.error(e); } });
         scaleListeners.slice().forEach(function (cb) { try { cb(s); } catch (e) { console.error(e); } });
         return textScale;

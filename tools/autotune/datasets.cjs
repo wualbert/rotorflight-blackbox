@@ -473,6 +473,34 @@ function headerValues(h) {
     return { values, unknown };
 }
 
+// Restore the header representation of a recorded configuration. Profile values
+// absent from this configuration stay unknown, never inherited from another PID profile.
+function configurationHeader(header, dataset) {
+    const h = {...header}, values = dataset.values || {}, keys = new Set(Object.keys(values));
+    const scalar = (name) => Object.prototype.hasOwnProperty.call(values, name) ? values[name] : null;
+    for (const [key, spec] of Object.entries(HEADER)) {
+        const names = typeof spec === 'string' ? [spec] : Array.isArray(spec) ? spec : spec.names || [];
+        if (names.length && (names.some(n => keys.has(n)) || names.some(n => scopeOf(n) === 'profile'))) {
+            const v = names.map(n => scalar(n));
+            h[key] = typeof spec === 'string' ? v[0] : spec.scale ? v.map(x => x === null ? null : x / spec.scale) : v;
+        }
+        if (spec.base) {
+            const ns = [...keys].filter(n => n.startsWith(spec.base + '[')).sort(nameOrder);
+            if (ns.length) h[key] = ns.map(n => scalar(n));
+        }
+    }
+    for (const [name, v] of Object.entries(values)) {
+        if (/^[a-z][a-z0-9_]*$/.test(name) && !Object.values(HEADER).some(x => typeof x === 'string' && x === name)) h[name] = v;
+        const m = /^([a-z][a-z0-9_]*)\[(\d+)\]$/.exec(name);
+        if (m && !Object.values(HEADER).some(x => x && x.base === m[1])) { h[m[1]] = Array.isArray(h[m[1]]) ? h[m[1]].slice() : []; h[m[1]][+m[2]] = v; }
+    }
+    for (const [bit, name] of Object.entries(FEATURES)) if (values['feature ' + name] !== undefined && values['feature ' + name] !== null)
+        h.features = values['feature ' + name] ? (h.features || 0) | (1 << bit) : (h.features || 0) & ~(1 << bit);
+    // Explicit values take precedence over parser unknownHeaders.
+    h.unknownHeaders = (h.unknownHeaders || []).filter(x => !keys.has(x.name));
+    return h;
+}
+
 // The CLI dump: 'set', 'profile', 'rateprofile', 'feature', 'mixer input', 'mixer rule', 'servo' and the craft name. The
 // other commands (aux, adjfunc, rxfail, serial, resource, led, ...) do not change the flight or are hardware, and one dump
 // cannot show a change of them between logs. The shape agrees with health_setup.parseCli, with more fields
@@ -1052,7 +1080,7 @@ function reportText(ds, logBase = 1) {
 }
 
 module.exports = { RULES, GROUPS, UNKNOWN, FEATURES, HEADER, ENUMS, DEFAULTS, ADJUST, PROFILE_NAMES, RATE_NAMES, classify, groupOf, scopeOf, isFlight, nameOrder, differ, table, groups,
-    headerValues, parseCli, cliValues, fitOf, datasets, labelArray, datasetAt, profileMap, compare, resultsOf, predict, idOf, inputsOfFile, reportText };
+    headerValues, configurationHeader, parseCli, cliValues, fitOf, datasets, labelArray, datasetAt, profileMap, compare, resultsOf, predict, idOf, inputsOfFile, reportText };
 if (require.main !== module) return;
 
 // node tools/autotune/datasets.cjs <log file> [--cli <dump>] [--rpm <flight rpm>] [--json <out.json>] [--base 0|1] [--estimates]

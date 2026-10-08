@@ -345,7 +345,8 @@ function analyse(w, ctx) {
         if (R.hz >= 0.45 * rate) out.F10 = { skipped: `The log rate (${r(rate, 0)} Hz) is too low for the check at ${R.hz} Hz.` };
         else {
             for (let a = 0; a < 3; a++) {
-                const D = w.D[a], hasD = !!D && D.some(v => v !== 0), hpD = hasD ? lib.bandpass(D, R.hz, 0.45 * rate, rate) : null, hpU = lib.bandpass(w.u[a], R.hz, 0.45 * rate, rate), acc = {};
+                if (!w.u || !w.u[a]) { res[AXES[a]] = { byProfile: {}, skipped: 'The log does not record the mixer output of this axis.' }; continue; }
+                const D = w.D && w.D[a], hasD = !!D && D.some(v => v !== 0), hpD = hasD ? lib.bandpass(D, R.hz, 0.45 * rate, rate) : null, hpU = lib.bandpass(w.u[a], R.hz, 0.45 * rate, rate), acc = {};
                 for (let s = 0; s + N <= n; s += N) {
                     let all = true; for (let i = s; i < s + N && all; i++) all = ok[i] && prof[i] === prof[s];
                     if (!all) continue;
@@ -385,6 +386,8 @@ function analyse(w, ctx) {
         }
         out.F11 = Object.assign(res, { definition: 'delay = -phase / (2 pi f) of the gyroRAW -> gyroADC cross-spectrum, coherence-weighted over the band, less the logging offset (logTicks gyro samples); gain = |S_rf| / S_rr at the bin nearest gainHz; in-flight windows of about 1 s; SE leave-one-block-out' });
     }
+
+    if (ctx.onlyFilters) return out;
 
     // --- T13: hover tail I trim, per profile
     const limY = limitOf(w.u[2], ok);
@@ -621,6 +624,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
         // F10
         if (M.F10) { const R = RULES.F10; if (M.F10.skipped) add('F10', 'skipped', f, null, { text: M.F10.skipped });
             else for (const ax of AXES) { const m = M.F10[ax]; if (!m) continue;
+                if (m.skipped) { add('F10', 'skipped', f, null, { axis: ax, text: m.skipped }); continue; }
                 const yaw = ax === 'yaw', unit = yaw ? 'fraction' : 'permille', hz = M.F10.hz, win = `windows of ${M.F10.windowS} s`;
                 if (!Object.keys(m.byProfile).length) add('F10', 'note', f, null, { axis: ax, n: 0, unit, thin: true, text: `${NONE} The flight has no window of ${M.F10.windowS} s on one PID profile that the check can use.` });
                 for (const [p, s] of Object.entries(m.byProfile)) {

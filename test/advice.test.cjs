@@ -832,6 +832,7 @@ const SETTINGS = fs.existsSync(SETTINGS_FILE) ? fs.readFileSync(SETTINGS_FILE, '
 const MACRO = { PID_GAIN_MAX: 1000, LPF_MAX_HZ: 1000, DYN_LPF_MAX_HZ: 1000, DYN_NOTCH_COUNT_MAX: 8 };   // flight/dyn_notch_filter.h:29
 function settingRange(name) {
     const line = SETTINGS.split('\n').find(l => l.includes(`"${name}"`) || l.includes(`PARAM_NAME_${name.toUpperCase()},`)); if (!line) return null;
+    if (/MODE_ARRAY/.test(line) && /VAR_UINT8/.test(line)) return [0, 255]; // each array element uses its declared storage type
     const m = /minmaxUnsigned = \{\s*(\w+)\s*,\s*(\w+)\s*\}/.exec(line); if (!m) return [];
     return [m[1], m[2]].map(x => /^\d+$/.test(x) ? +x : MACRO[x]);
 }
@@ -1314,7 +1315,7 @@ test('exportScript: a change with values that are possibly not current (r.stale)
 
 test('loading: siblings only, no Node API at load, Chromium-99 safe, runs through a CommonJS shim', () => {
     const src = fs.readFileSync(path.join(ROOT, 'tools/autotune/advice.cjs'), 'utf8'), code = src.replace(/\/\*[\s\S]*?\*\//g, '');
-    assert.deepEqual([...code.matchAll(/require\(([^)]*)\)/g)].map(m => m[1]), ["'./lib.cjs'", "'./health_setup.cjs'", "'./health_gov.cjs'", "'./health_loop.cjs'", "'./health_track.cjs'", "'./health_more.cjs'", "'./hierarchy.cjs'", "'./catalog.cjs'", "'./health_phase.cjs'", "'./health_rescue.cjs'", "'./health_limits.cjs'", "'./health_config.cjs'", "'./health_power.cjs'", "'./datasets.cjs'"]);
+    assert.deepEqual([...code.matchAll(/require\(([^)]*)\)/g)].map(m => m[1]), ["'./lib.cjs'", "'./health_setup.cjs'", "'./health_gov.cjs'", "'./health_loop.cjs'", "'./health_track.cjs'", "'./health_more.cjs'", "'./hierarchy.cjs'", "'./catalog.cjs'", "'./health_phase.cjs'", "'./health_rescue.cjs'", "'./health_limits.cjs'", "'./health_config.cjs'", "'./health_power.cjs'", "'./datasets.cjs'", "'./control_tune.cjs'"]);
     assert.ok(!/\bprocess\.|\bBuffer\b|__dirname|['"]node:/.test(code));
     assert.ok(!/\.toSorted\(|\.toReversed\(|\.toSpliced\(|Object\.groupBy|Map\.groupBy|Array\.fromAsync|\.with\(/.test(code));
     const mod = { exports: {} };
@@ -1328,7 +1329,7 @@ test('loading: siblings only, no Node API at load, Chromium-99 safe, runs throug
     new Function('require', 'module', 'exports', src)((m) => { if (/health_(track|more|phase)|hierarchy|catalog/.test(m)) throw new Error(`Cannot find module '${m}'`); return require(path.join(ROOT, 'tools/autotune', m)); }, bare, bare.exports);
     const out = bare.exports.advise({ findings: [C3UP], header: HEADER, logs: LOGS, headerProfile: 1 });
     assert.deepEqual(out.recommendations.find(r => r.id.startsWith('C3')).cli, ['profile 0', 'set roll_f_gain = 115']);
-    assert.deepEqual(Object.keys(advice).sort(), ['CHECKS', 'COVERAGE', 'DS_RULES', 'FEATURE_NAMES', 'PARAMS', 'RANGE', 'RULES', 'advise', 'comparisons', 'defaultPicks', 'exportScript', 'filterRecommendations', 'floorsOk', 'script'], 'no unused exports');
+    assert.deepEqual(Object.keys(advice).sort(), ['CHECKS', 'COVERAGE', 'DS_RULES', 'FEATURE_NAMES', 'PARAMS', 'RANGE', 'RULES', 'advise', 'comparisons', 'configurationBases', 'defaultPicks', 'exportScript', 'filterRecommendations', 'floorsOk', 'script'], 'no unused exports');
 });
 
 let esbuild = null; try { esbuild = require('esbuild'); } catch (e) { /* optional */ }
@@ -1963,6 +1964,16 @@ test('round 3 M1: the from-value comes from the newest configuration of the PID 
     assert.deepEqual([run([C3UP]).recommendations.find(x => x.id.startsWith('C3')).dataset, run([C3UP]).recommendations.find(x => x.id.startsWith('C3')).ab], [null, []]);
 });
 
+test('configuration-specific advice can tune an absolute recorded LUA adjustment without treating it as an estimate', () => {
+    const input={configurationId:'B',findings:[{...C3UP,dataset:'B'}],header:HEADER,headerProfile:1,headerLog:5,logs:LOGS,logBase:1,
+        datasets:DSET([DSC('B',1,{roll_f_gain:110},{roll_f_gain:'adjustment'})],{1:'B'})};
+    const scoped=advice.advise(input).recommendations.find(r=>r.id.startsWith('C3'));
+    assert.equal(scoped.from,110);assert.ok(scoped.cli.includes('set roll_f_gain = '+scoped.to));
+    assert.equal(scoped.fromSource,'recorded configuration B, in-flight adjustment');
+    const unscoped=advice.advise({...input,configurationId:null}).recommendations.find(r=>r.id.startsWith('C3'));
+    assert.deepEqual(unscoped.cli,[],'an old adjustment does not establish the current value outside its recorded configuration');
+});
+
 // C14 in three configurations that differ only in pitch_collective_ff_gain (10, 20, 30): the result decreases by 4 for each 1
 const C14DS = (ds, value, o = {}) => f(Object.assign({ module: 'more', id: 'C14', axis: 'pitch', profile: 1, pidProfile: 1, value, se: 10, n: 12, gainChange: value / 2, gainChangeSe: 5, unit: 'per 1000 collective', text: 'c14', dataset: ds }, o));
 const C14SET = (newest) => DSET([DSC('A', 1, { pitch_collective_ff_gain: 10 }), DSC('B', 1, { pitch_collective_ff_gain: 20 }), DSC('C', 1, { pitch_collective_ff_gain: 30 })], { 1: newest });
@@ -2034,6 +2045,17 @@ const FT_RES = (o = {}) => Object.assign({ recommended: Object.assign({ status: 
 const FT_TEXTS = { status: 'recommended', summary: 'The summary.', recommendation: 'The set.', delay: 'The time delay.', validation: 'The test.', parity: 'The model agrees.', why: [],
     rows: [{ name: 'feature DYN_NOTCH', scope: 'global', text: 'Set `feature DYN_NOTCH` on.' }, { name: 'dyn_notch_count', scope: 'global', text: 'Set `dyn_notch_count` from 6 to 2.' },
         { name: 'dyn_notch_q', scope: 'global', text: 'Set `dyn_notch_q` from 25 to 40.' }, { name: 'roll_d_cutoff', scope: 'profile', profile: 1, text: 'Set `roll_d_cutoff` in PID profile 1 from 15 to 12.' }] };
+test('filter replay export reports the chosen delay limit and the actual manual or autotune acceptance rule', () => {
+    for(const mode of ['simulation','autotune']){
+        const res=FT_RES({extra:{version:2,mode,limits:{maxAddMs:2}}});
+        const recs=advice.filterRecommendations(res,{texts:FT_TEXTS});
+        assert.ok(recs.every(r=>r.severity==='action'));
+        const script=advice.exportScript(recs,advice.defaultPicks(recs));
+        assert.match(script,/maximum added time delay is 2 ms/);
+        if(mode==='simulation')assert.doesNotMatch(script,/decrease by 3 dB|80 %/);
+        else assert.match(script,/decrease by 3 dB/);
+    }
+});
 test('round 3 M2: the filter search gives an action only when it recommends the set and the model agrees; the global and PID profile parts export together', () => {
     const recs = advice.filterRecommendations(FT_RES(), { texts: FT_TEXTS, cli: true, cliName: 'dump.txt' });
     assert.deepEqual(recs.map(r => [r.id, r.severity, r.scope, r.profile, r.group, r.groupSize, r.node, r.area, r.confidence]),
@@ -2080,4 +2102,24 @@ test('round 3 M2: no action when the search does not recommend, when the model d
     for (const [k, sc, lim] of [['dyn_notch_count', 'global', [0, 8]], ['dyn_notch_min_hz', 'global', [10, 200]], ['dyn_notch_max_hz', 'global', [100, 500]], ['gyro_notch1_hz', 'global', [0, 1000]],
         ['gyro_notch2_cutoff', 'global', [0, 1000]], ['roll_d_cutoff', 'profile', [0, 250]], ['yaw_gyro_cutoff', 'profile', [0, 250]], ['gyro_lpf2_type', 'global', undefined]])
         assert.deepEqual([advice.PARAMS[k][0], advice.RANGE[k]], [sc, lim], k);
+});
+
+test('configuration export restores the selected LUA variant and rejects mixed alternatives for a PID profile', () => {
+    const ds={datasets:[{id:'A',pidProfile:1,values:{roll_p_gain:50}},{id:'B',pidProfile:1,values:{roll_p_gain:70}}],newestByProfile:{1:'B'},diff:[{name:'roll_p_gain'}]};
+    advice.configurationBases(ds);
+    assert.equal(ds.datasets[0].exportBase.records[0].to,50);assert.equal(ds.datasets[1].exportBase.records.length,0);
+    const base=ds.datasets[0].exportBase.records[0];
+    assert.match(advice.exportScript([base],[base.id]),/profile 0\n[\s\S]*set roll_p_gain = 50/);
+    assert.throws(()=>advice.exportScript([base,{...base,id:'B:edit',dataset:'B'}],[base.id,'B:edit']),/one final configuration/);
+    ds.datasets[0].values.roll_p_gain=null;advice.configurationBases(ds);assert.equal(ds.datasets[0].exportBase.unsupported.length,1);
+    const a={gov_headspeed:2300,roll_d_cutoff:15,iterm_relax_type:1,'iterm_relax_cutoff[0]':8,'iterm_relax_cutoff[1]':9,'iterm_relax_cutoff[2]':10};
+    const b={gov_headspeed:2500,roll_d_cutoff:30,iterm_relax_type:2,'iterm_relax_cutoff[0]':10,'iterm_relax_cutoff[1]':10,'iterm_relax_cutoff[2]':10};
+    ds.datasets[0].values=a;ds.datasets[1].values=b;ds.diff=Object.keys(a).map(name=>({name}));advice.configurationBases(ds);
+    const restore=ds.datasets[0].exportBase;assert.deepEqual(restore.unsupported,[]);
+    const script=advice.exportScript(restore.records);
+    assert.match(script,/set iterm_relax_cutoff = 8,9,10/);assert.match(script,/set iterm_relax_type = RP\n/);
+    assert.match(script,/set roll_d_cutoff = 15/,'a recorded value can be restored within the firmware range');
+    assert.match(script,/set gov_headspeed = 2300/);
+    a['iterm_relax_cutoff[1]']=999;advice.configurationBases(ds);
+    assert.ok(ds.datasets[0].exportBase.unsupported.some(q=>q.name==='iterm_relax_cutoff'));
 });

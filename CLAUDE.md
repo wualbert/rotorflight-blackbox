@@ -13,7 +13,7 @@ make init                 # install dependencies
 make dev-server           # Vite on http://localhost:8080 (terminal 1)
 make dev-client           # NW.js shell against the dev server (terminal 2)
 node --test test/save_file.test.cjs test/video_export.test.cjs
-make apps                 # production build into apps/
+make apps                 # production build; on macOS replaces /Applications/Rotorflight Blackbox.app
 
 # tuning analysis (offline): logs -> segments.json -> report.md
 node tools/autotune/extract.cjs <out dir> <log files...>
@@ -54,6 +54,9 @@ python3 tools/flash_read.py /dev/cu.usbmodemXXXX --out log.bbl [--resume]
 
 ## Rules that bite
 
+- After every implementation change, run `make apps`. On macOS the build must
+  replace `/Applications/Rotorflight Blackbox.app`. Verify and launch that installed
+  copy before reporting completion. See `AGENTS.md`.
 - No module system. Files are classic scripts sharing globals; order in `index.html` is the
   dependency order.
 - A new JS or CSS file needs **both** a tag in `index.html` and an entry in `distSources` in

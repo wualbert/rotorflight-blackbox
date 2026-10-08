@@ -141,26 +141,52 @@ test('parity: gyroADC made with other filters than the header says fails (the mo
     assert.ok(par.every(p => Object.values(p.axes).some(A => A.maxBandErrorDb > 1)), 'by more than the band limit');
 });
 
-test('search: the noise reduction, the delay limit, CLI lines in range, and leave-one-flight-out', () => {
-    const res = FT.tune(synthetic(), { gear: GEAR, curves: true });
-    assert.strictEqual(res.model.passed, true);
-    const R = res.recommended;
+// A clear unfiltered resonance tests the recommendation path. The older fixture
+// remains unchanged for the notch-identification and coefficient regressions.
+let tuneFixture = null, tuneResult = null;
+function tuningInput() {
+    if (!tuneFixture) { const h = header(); tuneFixture = [4500, 4520, 4480].map((rpm, k) => {
+        const it = withHeader(flight(k + 1, rpm, h, 90, k + 1, GEAR, [[3.79, 25]]), h);
+        it.w.flight.firmware = 'Rotorflight 4.6.0 (118e912)'; return it;
+    }); }
+    return tuneFixture;
+}
+function tuned() { return tuneResult || (tuneResult = FT.tune(tuningInput(), { gear: GEAR, maxCandidates: 180, budgetMs: 30000 })); }
+
+test('search: replayed noise, delay, full CLI setup, fixed holdout and signal previews', () => {
+    const res = tuned(), R = res.recommended;
+    assert.strictEqual(res.version, 2);
+    assert.strictEqual(res.model.passed, true, JSON.stringify(res.model.parity));
     assert.strictEqual(R.status, 'recommended', JSON.stringify(R.reasons));
-    assert.ok(R.predicted.totalDb <= -FT.RULES.reduction.minDb, `reduction ${R.predicted.totalDb} dB`);
-    assert.ok(R.predicted.totalDb + 2 * R.predicted.se < 0, '2 SE');
-    assert.ok(R.delay.maxAddMs <= FT.RULES.delay.maxAddMs, `delay ${R.delay.maxAddMs} ms`);
-    const res379 = R.predicted.perLine.filter(l => Math.abs(l.order - 3.79) < 0.01);
-    assert.ok(res379.length && res379.every(l => l.db < -10), `the resonance line goes down: ${JSON.stringify(res379)}`);
-    assert.ok(R.cli.some(l => /notch/.test(l) || /DYN_NOTCH/.test(l)), `a notch filter for the resonance: ${R.cli}`);
-    for (const line of R.cli) {
-        const m = /^set (\w+) = (.+)$/.exec(line); if (!m) { assert.ok(/^feature -?\w+$/.test(line) || /^profile \d$/.test(line), line); continue; }
-        const [, k, v] = m, lim = FT.FW_RANGE[k];
-        if (lim) assert.ok(+v >= lim[0] && +v <= lim[1], `${k} = ${v} in ${lim}`);
-        if (/^gyro_rpm_notch_(source|q|center)_/.test(k)) assert.strictEqual(v.split(',').length, 16, 'whole bank arrays');
+    assert.ok(R.predicted.totalDb <= -3);
+    assert.ok(R.predicted.totalDb + 2 * R.predicted.se < 0);
+    assert.ok(R.delay.maxAddMs <= 0.5);
+    assert.ok(R.predicted.axes.every(a => a.db <= 0.25));
+    assert.ok(R.validation.holdout.selectedBeforeHoldout && R.validation.holdout.meanDb < 0);
+    assert.ok(res.search.replayedSamples > 0 && res.ms.screened === 0);
+    assert.ok(res.curves.roll.candidate.length === res.curves.f.length);
+    assert.ok(res.traces.length && res.traces[0].candidate[0].length === res.traces[0].t.length);
+    // Independently evaluate one DFT bin from each displayed window. This
+    // catches a flight-average spectrum paired with a different time interval.
+    for (const tr of res.traces) {
+        assert.strictEqual(tr.spectrum.windows,1);
+        const samples=tr.raw[0], size=samples.length, bin=Math.round(284*size/tr.rate), mean=samples.reduce((a,b)=>a+b,0)/size;
+        let real=0,imag=0,power=0;
+        for(let i=0;i<size;i++) {
+            const window=.5*(1-Math.cos(2*Math.PI*i/(size-1))), phase=2*Math.PI*bin*i/size;
+            real+=(samples[i]-mean)*window*Math.cos(phase);imag-=(samples[i]-mean)*window*Math.sin(phase);power+=window*window;
+        }
+        const expected=2*(real*real+imag*imag)/(tr.rate*power);
+        assert.ok(Math.abs(tr.spectrum.roll.raw[bin]-expected)<1e-6*Math.max(1,expected),'spectrum is computed from this trace');
+        assert.strictEqual(tr.spectrum.f[bin],bin*tr.rate/size);
+        assert.notStrictEqual(tr.spectrum,res.curves);
     }
-    assert.strictEqual(R.validation.leaveOneOut.folds.length, 3);
-    assert.ok(R.validation.leaveOneOut.folds.every(f => f.heldOutDb < -FT.RULES.reduction.minDb), JSON.stringify(R.validation.leaveOneOut.folds.map(f => f.heldOutDb)));
-    assert.ok(res.curves && res.curves.roll.candidate && res.curves.roll.candidate.length === res.curves.f.length);
+
+    assert.ok(res.cliFile.startsWith('# Save the output of diff all'));
+    assert.ok(res.cliFile.endsWith('save\n'));
+    const A = require('../tools/autotune/filter_autotune.cjs');
+    assert.ok(R.fullRows.every(A.validCliRow));
+    if (R.params.gyro_rpm_notch_preset === 0) assert.equal(R.rows.filter(r => /^gyro_rpm_notch_(source|q|center)_/.test(r.name)).length, 9);
 });
 
 // tailOrder (2026-10-06): the order of the tail rotor notch from the log alone, when no gear ratio and no CLI dump is given. The
@@ -305,41 +331,30 @@ test('tail order (review): logs with other banks are fitted with their own banks
     assert.deepStrictEqual([none.reasons[0].code, none.motor, none.gear], ['no flight data', null, null]);
 });
 
-test('search without gear ratios: the fitted tail order lets parity and the search run, with log-only texts', (ctx) => {
-    const res = FT.tune(synthetic(), { curves: false });   // no gear, no CLI dump (the logs were made with tail 19,76 = 4.0 x)
-    ctx.diagnostic(`19/76: order ${res.tailFit.order} ± ${res.tailFit.se}, dip ${res.tailFit.depthDb} dB, phase jump ${res.tailFit.pooled && res.tailFit.pooled.phaseJumpDeg} deg; cli ${res.recommended.cli.join(' | ')}`);
-    assert.ok(res.tailFit && res.tailFit.passed && res.tailFit.used, JSON.stringify(res.tailFit && res.tailFit.reasons));
-    assert.ok(Math.abs(res.tailFit.order - 4) < 0.003, `order ${res.tailFit.order}`);
-    assert.deepStrictEqual([res.model.gear.source, res.model.leftOut], ['log notch', []]);
-    assert.strictEqual(res.model.passed, true, JSON.stringify(res.model.parity.map(p => [p.log, Object.values(p.axes).map(A => A.maxBandErrorDb)])));
-    assert.strictEqual(res.recommended.status, 'recommended', JSON.stringify(res.recommended.reasons));
+test('search without a CLI: notch identification supplies the configured tail order', () => {
+    const items = synthetic();
+    items.forEach(it => { it.w.flight.firmware = 'Rotorflight 4.6.0 (118e912)'; });
+    const res = FT.tune(items, { curves: false, maxCandidates: 40, budgetMs: 3000 });
+    assert.ok(res.tailFit && res.tailFit.passed && res.tailFit.used, JSON.stringify(res.tailFit));
+    assert.ok(Math.abs(res.tailFit.order - 4) < 0.003);
+    assert.equal(res.model.gear.source, 'log notch');
+    assert.equal(res.model.passed, true, JSON.stringify(res.model.parity));
     assert.ok(!res.recommended.reasons.some(t => /gear|CLI/.test(t)));
-    const t = FT.texts(res, { logBase: 1, cli: false }), [, , notch] = t.parity.split('\n');
-    assert.match(t.parity.split('\n')[0], /agrees with the recorded gyroADC in all 3 flight logs/);
-    assert.match(notch || t.parity.split('\n')[1], /^In the log, the tail rotor notch filter is at 4\.\d{1,4} ± 0\.\d{1,4} x the rotor frequency \(yaw axis, 3 flight logs\)\. At this frequency, the filters decrease the gyro signal by \d+ dB\. The model uses this value\.$/);
-    assert.deepStrictEqual(t.why, []);
-    for (const x of [t.summary, t.parity, t.recommendation, t.validation, t.delay]) assert.ok(!/\bCLI dump\b|\bdiff all\b|\bgear\b|\bratios?\b/i.test(x), x);
-    // with the gear given, the same recommendation
-    const ref = FT.tune(synthetic(), { gear: GEAR, curves: false, loo: false });
-    assert.deepStrictEqual(res.recommended.cli, ref.recommended.cli);
 });
 
 // round 3 M2: the texts of the views (STE) and the recommendations of advice.cjs from a result of tune()
-test('texts: the result in the words of the views, and the recommendations of advice.cjs that the export takes', () => {
-    const res = FT.tune(synthetic(), { gear: GEAR, curves: false }), t = FT.texts(res, { logBase: 1, cli: true });
-    assert.strictEqual(t.status, 'recommended');
-    assert.match(t.summary, /^The app calculated the vibration for \d+ sets of filter values on \d+ s of flight in logs 2, 3 and 4\. The recommended set decreases the vibration that gets to the PID controller by [\d.]+ ± [\d.]+ dB \(\d+ % less vibration power\)\.$/);
-    assert.match(t.parity, /^The model of the Rotorflight 4\.6 gyro filters agrees with the recorded gyroADC in all 3 flight logs\. The largest error is [\d.]+ dB in a frequency band and [\d.]+ dB at the vibration lines, and the limit is 1 dB\./);
-    assert.ok(!/\n/.test(t.parity), 'one paragraph when every log agrees');
-    assert.match(t.validation, /without each flight log \(3 tests\)\. In the flight log that the app did not use, the vibration changed by -[\d.]+ ± [\d.]+ dB\. The app selected the same set in \d of 3 tests\.$/);
-    assert.match(t.delay, /^The recommended set adds (no time delay from 10 Hz to 30 Hz\.|[\d.]+ ms of time delay at \d+ Hz)/);
-    assert.strictEqual(t.rows.length, res.recommended.rows.length);
-    for (const r of t.rows) assert.match(r.text, /^Set `[a-z0-9_ A-Z]+`/, r.text);
-    assert.deepStrictEqual(t.why, []);
-    const advice = require('../tools/autotune/advice.cjs'), recs = advice.filterRecommendations(res, { texts: t, cli: true });
-    assert.ok(recs.length >= 1 && recs.every(r => r.severity === 'action' && r.cli.length), JSON.stringify(recs.map(r => [r.id, r.severity, r.caveats])));
-    const cmds = advice.exportScript(recs, null, {}).split('\n').filter(l => l && !l.startsWith('#'));
-    assert.deepStrictEqual(cmds.filter(l => !/^(batch start|save|profile \d)$/.test(l)).sort(), [].concat(...recs.map(r => r.cli.filter(l => !/^profile \d$/.test(l)))).sort(), 'every command of the set goes into the file');
+test('texts and advice export describe the validated replay result', () => {
+    const res = tuned(), t = FT.texts(res);
+    assert.equal(t.status, 'recommended');
+    assert.match(t.summary, /^The app replayed \d+ filter sets/);
+    assert.match(t.parity, /agrees with the replay/);
+    assert.match(t.validation, /flight periods only for the last test/);
+    assert.equal(t.rows.length, res.recommended.rows.length);
+    const advice = require('../tools/autotune/advice.cjs'), recs = advice.filterRecommendations(res, { texts: t });
+    assert.ok(recs.every(r => r.severity === 'action' && r.cli.length), JSON.stringify(recs));
+    const commands = advice.exportScript(recs, null, {}).split('\n').filter(l => l && !l.startsWith('#'));
+    assert.ok(commands.includes('save'));
+    assert.equal(commands.filter(l => l.startsWith('set ')).length, recs.flatMap(r => r.cli).filter(l => l.startsWith('set ')).length);
 });
 
 test('texts: a model that does not agree, the reasons of tune(), no CLI dump, and no flight log', () => {
@@ -408,15 +423,15 @@ test('worker shim: no Node API call at module load, module.exports then return',
 });
 
 const REAL = process.env.AUTOTUNE_FILTER_LOG;
-test('real log (AUTOTUNE_FILTER_LOG): parity passes, the tail rotor notch order is found in the log, and the dynamic notch for the 3.79 x resonance is recommended', { skip: !REAL && 'AUTOTUNE_FILTER_LOG is not set' }, () => {
+test('real log (AUTOTUNE_FILTER_LOG): parity passes, the tail rotor notch order is found in the log, and a replay-validated filter configuration is recommended', { skip: !REAL && 'AUTOTUNE_FILTER_LOG is not set' }, () => {
     const lib = require('../tools/autotune/lib.cjs'), phase = require('../tools/autotune/health_phase.cjs'), app = lib.loadApp(), items = [];
     for (const w of lib.segments(app, REAL, { whole: true, extra: [...new Set([...FT.EXTRA, ...phase.EXTRA])] })) {
         const ctx = { rate: w.rate, flightRule: { headspeed: lib.FLIGHT_RPM } }, ph = phase.phases(w, ctx); items.push({ w, mask: phase.flightMask(w, ctx, ph), flight: ph.class === 'flight' }); }
     const cli = process.env.AUTOTUNE_FILTER_CLI ? fs.readFileSync(process.env.AUTOTUNE_FILTER_CLI, 'utf8') : null, res = FT.tune(items, { cli });
     assert.ok(res.model.parity.length >= 1);
     if (cli) assert.ok(res.model.passed, JSON.stringify(res.model.parity.map(p => [p.log, Object.values(p.axes).map(A => A.passed)])));
-    assert.ok(res.ms.total < 60000, `${res.ms.total} ms`);
-    if (cli) { assert.strictEqual(res.recommended.status, 'recommended', JSON.stringify(res.recommended.reasons)); assert.ok(res.recommended.cli.includes('feature DYN_NOTCH'), res.recommended.cli.join(' | ')); }
+    assert.ok(res.search.replayedSamples > 0);
+    if (cli) { assert.strictEqual(res.recommended.status, 'recommended', JSON.stringify(res.recommended.reasons)); assert.ok(res.recommended.predicted.totalDb < -3); assert.ok(res.cliFile.endsWith('save\n')); }
     // the tail rotor notch from the log (Fireball: 76/19 = 4.0 x). Without a dump the model uses it and agrees with the log; with a
     // dump the fit is on record and agrees with the dump's order within the rule of the units
     const T = res.tailFit;

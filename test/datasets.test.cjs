@@ -535,3 +535,14 @@ test('7c Gaui X4 dump: flights 49, 50, 51, 58, the yaw gains and the stop gains 
     const est = DS.datasets(logs, null, { useEstimates: true });
     assert.deepEqual(est.datasets.filter(d => d.pidProfile === 1).map(d => d.logs.join('+')), ['49', '50+51', '58']);
 });
+
+test('configuration header replays logged LUA gains and cutoffs without inheriting another profile', () => {
+    const D=require('../tools/autotune/datasets.cjs'), FT=require('../tools/autotune/filter_tune.cjs');
+    const h={rollPID:[60,90,20,10],rollBW:[80,40,20],pitchPID:[50,80,10],pitchBW:[70,25,20],gyro_soft_type:1,features:0};
+    const values={roll_p_gain:75,roll_i_gain:90,roll_d_gain:30,roll_gyro_cutoff:120,roll_d_cutoff:50,'feature DYN_NOTCH':true,gyro_lpf1_type:7};
+    const out=D.configurationHeader(h,{pidProfile:2,values}), cfg=FT.config(out);
+    assert.deepEqual(out.rollPID.slice(0,3),[75,90,30]);assert.deepEqual(out.rollBW.slice(0,2),[120,50]);
+    assert.equal(cfg.pid.header.roll.P,75);assert.equal(cfg.pid.header.roll.gyro_cutoff,120);assert.equal(cfg.pid.header.pitch.P,null);assert.equal(cfg.pid.header.pitch.gyro_cutoff,null);
+    assert.equal(cfg.s.gyro_lpf1_type,7);assert.equal(cfg.s.DYN_NOTCH,true);
+    assert.deepEqual(h.rollPID,[60,90,20,10]);assert.equal(h.features,0,'original header stays unchanged');
+});
