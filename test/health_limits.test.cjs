@@ -77,6 +77,21 @@ test('limits from a CLI dump: the mixer input SR and SP, the servos (mid + min, 
     assert.equal(thr.limits.source, 'firmware'); assert.match(thr.text, /the throttle in this log is more than that value\. Thus, the app does not use it\./);
     const ok = one(run(limited(), { cli, maxThrottle: { 0: 100 } }).F, 'throttle');
     assert.equal(ok.limits.source, 'cli'); assert.equal(ok.limits.byProfile[0], 1000, 'gov_max_throttle 100 %'); assert.ok(ok.events.every(e => e.limit === 1000), 'the limit of the PID profile');
+    assert.equal(ok.throttleLimit.estimated, false);
+});
+
+test('a throttle plateau below the firmware maximum is an inferred limit, including a profile missing from the CLI', () => {
+    const log = limited();
+    log.w.extra['motor[0]'] = Float64Array.from(log.w.extra['motor[0]'], v => Math.round(v * 0.9));
+    for (const ctx of [{}, { maxThrottle: { 1: 90 } }]) {
+        const f = one(run(log, ctx).F, 'throttle');
+        assert.deepEqual(f.throttleLimit, { value: 900, source: 'data', estimated: true });
+        assert.match(f.text, /These periods do not show full throttle/);
+        assert.equal(f.n, 2);
+        within(f.value, 0.28, 0.003, 'unchanged measured plateau duration');
+    }
+    const known = one(run(log, { maxThrottle: { 0: 90 } }).F, 'throttle');
+    assert.deepEqual(known.throttleLimit, { value: 900, source: 'cli', estimated: false });
 });
 
 // round 3 M1: with the labels of the configurations in ctx.profile (js/tuning_worker.js), the I-term limit (L6) of a label comes from

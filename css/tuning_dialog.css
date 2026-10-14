@@ -2017,3 +2017,17 @@
 
 .tuning-ft-checklist > .tuning-table-wrap { max-height: 520px; overflow: auto; }
 .tuning-ft-checks th { position: sticky; top: 0; background: #edf2f6; z-index: 1; }
+/* Next actions precede their measured justification in recommendation cards. */
+.tuning-next-action {
+    padding: 14px 18px;
+    margin: 12px 0;
+    border-left: 4px solid #287fa2;
+    border-radius: 4px;
+    background: #eef7fb;
+    color: #193c4e;
+    max-width: 80em;
+}
+.tuning-next-action-title { font-size: 1.1em; margin: 6px 0 12px; }
+.tuning-next-action li { margin: 7px 0; padding-left: 3px; }
+.tuning-action-measurements { margin: 12px 0; }
+.tuning-action-measurements > summary { cursor: pointer; color: #24566d; font-weight: 600; }

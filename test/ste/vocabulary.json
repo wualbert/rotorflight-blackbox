@@ -430,6 +430,8 @@
     "your": "adj"
   },
   "technicalNouns": {
+    "battery current": "7",
+    "ESC temperature": "7",
     "acceleration": "7",
     "accelerometer": "1",
     "actuator": "1",
@@ -693,6 +695,8 @@
     "rescue": "6",
     "rescue mode": "6",
     "reserve": "7",
+    "resistance": "7",
+    "charger": "3",
     "resonance": "7",
     "response": "7",
     "response time": "7",
@@ -806,9 +810,14 @@
     "yaw": "8",
     "yaw kick": "7",
     "yellow": "17",
-    "zero": "9"
+    "zero": "9",
+    "digital twin": "19",
+    "angular rate": "7",
+    "model confidence": "7",
+    "confidence interval": "7"
   },
   "technicalVerbs": {
+    "charge": "3a",
     "click": "2a",
     "commit": "2c commits committed",
     "compensate": "3a",

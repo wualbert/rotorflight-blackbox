@@ -89,7 +89,8 @@ test('an unnotched rotor-locked line and a weak notch are found; a fixed-frequen
     const F = hs.judge([{ log: 0, start: w.flight.start, header: w.flight.header, metrics: m }], hs.DEFAULT_RULES);
     // F6: 2x rotor notch passes half the line: 6.02 dB
     for (const row of m.F6.rows.filter(r => r.code === 12)) within(row.db, 20 * Math.log10(2), 0.5, `${row.axis} notch 12 profile ${row.profile}`);
-    const f6 = flag(F, 'F6'); assert.equal(f6.length, 6); assert.ok(f6.every(f => /notch 12/.test(f.text)));
+    const f6 = flag(F, 'F6'); assert.equal(f6.length, 6);
+    for(const f of f6){assert.match(f.text,/Examine the notch filter center and bandwidth/);assert.doesNotMatch(f.text,/mis-centred or too narrow/);} assert.ok(f6.every(f => /notch filter source 12/.test(f.text)));
     // F5: the 3.79 line, in both profiles, rotor-locked, 5.3 % from the tail notch
     const f5 = flag(F, 'F5'); assert.equal(f5.length, 2);
     for (const p of [1, 2]) {
@@ -114,7 +115,7 @@ test('header checks: rate, LPF, Q, D cutoff, dynamic notch, aliasing', () => {
     // tail 1st at 4 x 4500/60 = 300 Hz, logged at 500 Hz: alias at 200 Hz; also above the notch ceiling 0.45 x 500
     const row = m.F9.rows.find(v => v.profile === 2 && v.axis === 'roll' && v.code === 21);
     within(row.hz, 300, 5, 'tail notch Hz'); within(row.aliasHz, 200, 5, 'alias'); assert.equal(row.aboveCeiling, true);
-    assert.equal(m.F5.skipped, 'log lacks gyroRAW');
+    assert.equal(m.F5.skipped, 'The log does not have gyroRAW.');
     assert.ok(m.D3.skips.some(s => s.checks.includes('F5')));
     assert.ok(m.D3.skips.some(s => s.checks.includes('power')));   // Ibat all zero
 
@@ -137,7 +138,7 @@ test('a time jump over contiguous loopIteration is a loop stall, not lost frames
     assert.equal(m.D2.missingFrames, 0); assert.equal(m.D2.timeJumps, 0); assert.equal(m.D2.loopStalls, 1); assert.equal(m.D2.iterationJumps, 0);
     within(m.D2.events[0].t, 2.5, 0.01, 'event time'); assert.match(m.D2.events[0].kind, /loop stall/);
     const d2 = hs.judge([{ log: 0, start: 'x', header: w.flight.header, metrics: m }], hs.DEFAULT_RULES).find(f => f.id === 'D2');
-    assert.match(d2.text, /0 frames missing.*1 loop stalls/);
+    assert.match(d2.text, /0 missing frames/); assert.match(d2.text, /number of loop stalls is 1/); assert.equal(d2.counts.loopStalls, 1); assert.equal(d2.counts.missingFrames, 0);
 });
 
 const CLI = `diff all
@@ -186,7 +187,7 @@ test('CLI: parsed, compared with the header, gear ratios used, governor mode che
     assert.deepEqual(m.D4.mismatches.map(v => v.header), ['yawPID[0]']);
     assert.equal(m.setup.rpm.banks.roll.find(b => b.code === 21).order, 4);   // gear from the CLI
     const d4 = hs.judge([{ log: 0, start: 'x', header: w.flight.header, metrics: m }], hs.DEFAULT_RULES).find(f => f.id === 'D4');
-    assert.equal(d4.severity, 'flag'); assert.match(d4.text, /yawPID\[0\] 65 vs yaw_p_gain 70/); assert.match(d4.text, /gov_mode DIRECT but the data shows PID governor/);
+    assert.equal(d4.severity, 'flag'); assert.match(d4.text, /`yawPID\[0\]` is `65`/); assert.match(d4.text, /`yaw_p_gain` is `70`/); assert.match(d4.text, /gov_mode is `DIRECT`, but the data shows `PID governor/); assert.deepEqual(d4.mismatches, m.D4.mismatches);
     // agreeing header: the only flag left is the governor mode
     const w2 = makeW({ seconds: 4, raw: false, hdr: header({ yawPID: [70, 120, 10, 0, 0] }) }), c2 = ctxOf(w2, { cli: CLI }); delete c2.gear;
     const m2 = hs.analyse(w2, c2); assert.equal(m2.D4.mismatches.length, 0); assert.ok(m2.D4.compared > 40);
@@ -202,6 +203,25 @@ test('header change table: gains that changed between logs on the same starting 
     assert.deepEqual(rows.map(r => [r.log, r.since, r.key, r.from, r.to]), [[2, 0, 'yawPID', '80,120,10,0,0', '60,120,10,0,0']]);
     const rows2 = hs.headerChanges([mk(0, 'a', {}, 1), mk(1, 'b', { gyro_lowpass_hz: 80 }, 2)]);
     assert.deepEqual(rows2.map(r => [r.key, r.scope]), [['gyro_lowpass_hz', 'global']]);
+});
+
+test('header history follows recorded log order when the clock is unset or moves backwards', () => {
+    const mk = (log, start, p) => ({ log, start, header: header({ yawPID: [p, 120, 10, 0, 0] }), metrics: { startProfile: 1 } });
+    const rows = hs.headerChanges([
+        mk(49, '2026-10-04T17:54:08.312+00:00', 80),
+        mk(58, '0000-01-01T00:00:00.000+00:00', 100),
+        mk(59, '2026-10-03T12:00:00.000+00:00', 120)
+    ]);
+    assert.deepEqual(rows.map(r => [r.log, r.since, r.from, r.to]), [
+        [58, 49, '80,120,10,0,0', '100,120,10,0,0'],
+        [59, 58, '100,120,10,0,0', '120,120,10,0,0']
+    ]);
+    const files = hs.headerChanges([
+        mk('10:0', '0000-01-01T00:00:00.000+00:00', 120),
+        mk('2:11', '2026-10-04T17:54:08.312+00:00', 100),
+        mk('2:9', '2026-10-04T18:54:08.312+00:00', 80)
+    ]);
+    assert.deepEqual(files.map(r => [r.log, r.since]), [['2:11', '2:9'], ['10:0', '2:11']]);
 });
 
 test('a real capture: the prompt echo "# diff all" is a diff, with the 4.6 defaults filled in', () => {

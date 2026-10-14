@@ -120,17 +120,20 @@ function inConfiguration(x, d) {
 }
 
 function stepLimit(name, from, to) {
+    if (name === 'pitch_collective_ff_gain' && from === 0 && to > 0) return advice.RULES.compensationStart;
     const absolute = { gov_f_gain: advice.RULES.govSteps.F, gov_i_gain: advice.RULES.govSteps.I,
         gov_p_gain: advice.RULES.govSteps.P, yaw_d_gain: advice.RULES.tailDStep, gov_tta_gain: advice.RULES.ttaStep };
     return to > from && absolute[name] ? Math.max(Math.abs(from) * RULES.maxRelativeStep, absolute[name])
         : Math.max(1, Math.abs(from) * RULES.maxRelativeStep); // one integer unit, as advice.change
 }
 
-function eligibility(r, d, step) {
+const held = r => (r.blockedBy || []).length > 0 || (r.causes || []).some(c => c.holds !== false);
+
+function eligibility(r, d, step, conditional = false) {
     if (r.severity !== 'action') return 'This result does not give a parameter change.';
     if (r.scope !== 'profile' || r.profile !== d.pidProfile || !inConfiguration(r, d)) return 'The PID profile or configuration does not agree.';
-    if ((r.blockedBy || []).length || (r.causes || []).some(c => c.holds !== false)) return 'Correct the cause or the previous tuning step first.';
-    if (!PARAMETERS[step].test(r.parameter || '')) return 'This parameter needs a separate check.';
+    if (!conditional && held(r)) return 'Correct the cause or the previous tuning step first.';
+    if (!PARAMETERS[step].test(r.parameter || '')) return 'A different check is necessary for this parameter.';
     if (!finite(r.from) || !Number.isInteger(r.to) || !own(d.values, r.parameter) || d.values[r.parameter] !== r.from)
         return 'The recorded value is unknown or does not agree with this change.';
     const range = advice.RANGE[r.parameter];
@@ -138,9 +141,19 @@ function eligibility(r, d, step) {
     if (Math.abs(r.to - r.from) > stepLimit(r.parameter, r.from, r.to) + 1e-8) return 'The change is more than the step limit.';
     if (!r.rule || !(r.evidence || []).some(e => finite(e.value))) return 'The change has no measured value and rule.';
     const lines = (r.cli || []).map(s => String(s).trim());
+    // A prerequisite suppresses CLI generation, not the measured proposal.
+    // Other invalid/missing commands are never repaired here.
+    if (conditional && held(r) && lines.length === 0) return null;
     if (lines.length !== 2 || lines[0] !== `profile ${d.pidProfile - 1}` || lines[1] !== `set ${r.parameter} = ${r.to}`)
         return 'The CLI text does not agree with this change.';
     return null;
+}
+
+function rowOf(r, d) {
+    return { name: r.parameter, from: r.from, to: r.to, delta: r.to - r.from,
+        percent: r.from === 0 ? null : 100 * (r.to - r.from) / Math.abs(r.from), profile: d.pidProfile,
+        source: r.fromSource || d.sources && d.sources[r.parameter] || 'unknown', stale: r.stale || null,
+        rule: r.rule, evidence: r.evidence, recommendation: r.id };
 }
 
 // Show a prediction only for the complete C7 candidate that actually produced
@@ -166,14 +179,14 @@ function tune(input) {
     const d = ((analysis.datasets || {}).datasets || []).find(q => q.id === input.configuration);
     const result = { version: 1, step, configuration: input.configuration, profile: d && d.pidProfile || null,
         status: 'no-change', verifiedInFlight: false, limitation: LIMITATION,
-        recommendations: [], rows: [], deferred: [], prediction: null, reason: '', rules: RULES };
+        recommendations: [], rows: [], proposals: [], prerequisites: [], experiments: [], guidance: [], deferred: [], prediction: null, reason: '', rules: RULES };
     if (!d) result.reason = 'Select one recorded configuration before autotune.';
     else if (!Number.isInteger(d.pidProfile) || d.pidProfile < 1 || d.pidProfile > 6) result.reason = 'The PID profile is unknown. No control change is available.';
     else if (d.analysed === false || !(d.analysedFlightSeconds > 0)) result.reason = 'This configuration has no flight data in the analysis.';
     else if (!analysis.advice || !own(analysis.advice.byDataset, d.id)) result.reason = 'This configuration has no control recommendations. Start the analysis again.';
     if (result.reason) return result;
 
-    const mine = analysis.advice.byDataset[d.id].filter(r => nodeOf(r) === step), groups = new Map();
+    const all = analysis.advice.byDataset[d.id], mine = all.filter(r => nodeOf(r) === step), groups = new Map();
     for (const r of mine) {
         const key = r.group || r.id;
         if (!groups.has(key)) groups.set(key, []);
@@ -185,19 +198,42 @@ function tune(input) {
         if (!reason && list.some(r => r.group && r.groupSize !== list.length)) reason = 'All changes of this group are necessary for the model.';
         if (!reason && new Set(list.map(r => r.parameter)).size !== list.length) reason = 'Two changes give values for the same parameter.';
         if (!reason && selected.length) reason = 'Test the selected change before this change.';
-        if (reason) { result.deferred.push({ ids: list.map(r => r.id), title: list[0].title, reason }); continue; }
+        if (reason) {
+            result.deferred.push({ ids: list.map(r => r.id), title: list[0].title, reason });
+            if (list.some(held) && list.every(r => !eligibility(r, d, step, true)) &&
+                list.every(r => !r.group || r.groupSize === list.length) && new Set(list.map(r => r.parameter)).size === list.length) {
+                // Conditional proposals are display-only. They never enter the
+                // draft, default selections, prediction or CLI export.
+                result.proposals.push(...list.map(r => Object.assign({}, r, { cli: [], conditional: true,
+                    row: rowOf(r, d), verifiedInFlight: false })));
+            }
+            continue;
+        }
         selected = list;
     }
     result.recommendations = selected.map(r => Object.assign({}, r, { id: 'control:' + r.id, group: r.group ? 'control:' + r.group : null, controlTune: true, verifiedInFlight: false,
         caveats: (r.caveats || []).concat(LIMITATION), rule: r.rule + '\n' + LIMITATION }));
-    result.rows = selected.map(r => ({ name: r.parameter, from: r.from, to: r.to, delta: r.to - r.from,
-        percent: r.from === 0 ? null : 100 * (r.to - r.from) / Math.abs(r.from), profile: d.pidProfile,
-        source: r.fromSource || d.sources && d.sources[r.parameter] || 'unknown', stale: r.stale || null,
-        rule: r.rule, evidence: r.evidence, recommendation: r.id }));
+    result.rows = selected.map(r => rowOf(r, d));
+    // Diagnostic problems can also have a concrete upstream remedy, even when
+    // these measurements do not identify a control-gain target yet.
+    const blocked = mine.filter(r => held(r) && ['action','check'].includes(r.severity));
+    const upstream = new Set(blocked.flatMap(r => (r.holds || []).concat(r.gate && r.gate.held || [])));
+    const causeIds = new Set(blocked.flatMap(r => (r.causes || []).filter(c => c.holds !== false).flatMap(c => c.ids || [])));
+    for (const r of all) if ((r.evidence || []).some(e => causeIds.has(e.id))) upstream.add(nodeOf(r));
+    result.prerequisites = all.filter(r => nodeOf(r) !== step && upstream.has(nodeOf(r)) && ['action','check'].includes(r.severity));
+    // A smaller pilot input does not repair an output limit. Preserve each
+    // diagnosis, including missing-data instructions, even beside a gain trial.
+    // A proposed change must not hide an independent unresolved problem.
+    result.guidance = mine.filter(r => ['check','watch'].includes(r.severity) && !selected.includes(r));
     result.prediction = predictionOf(analysis, d, selected);
-    result.status = selected.length ? 'flight-test-required' : 'no-change';
+    result.status = selected.length ? 'flight-test-required' : result.proposals.length || result.prerequisites.length ? 'prerequisites-required'
+        : result.guidance.some(r => r.severity === 'check') ? 'diagnosis-required' : 'no-change';
     result.reason = selected.length ? 'Test this change before the next tuning step.'
-        : 'The data gives no control change. Examine the measured problems and the limits of the analysis.';
+        : result.proposals.length ? 'These parameter changes must wait. Complete the prerequisite checks. Then do the analysis of a new flight before you use them.'
+        : result.prerequisites.length ? 'Complete the prerequisite checks. Then record a new flight to measure this control problem again.'
+        : result.status === 'diagnosis-required' ? 'The problem is not corrected. These measurements do not identify a gain change. Examine the measurements and next steps below.'
+        : result.guidance.length ? 'These measurements do not show a necessary gain change. The results to monitor and their limits are below.'
+        : 'No measured control problem gives a parameter change for this configuration.';
     result.flightPlan = flightPlan(result.recommendations);
     return result;
 }

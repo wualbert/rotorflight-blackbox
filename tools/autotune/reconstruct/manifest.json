@@ -1,0 +1,30 @@
+{
+  "sourceSha256": "bb102819dab33c48ed7e677ac1fb2ac5bf2073b14f3effaf50de1a06a43c033e",
+  "runtimeSha256": "018d4de345cdbf80f9536077efe1abebaff9db1bb424259edcff32d69262dc8c",
+  "wasmSha256": "5c7ae892e5c1aa31ca085010d7b4b5dad19589df651e3829206f25152ce54f53",
+  "wasmBytes": 18700,
+  "compiler": "clang version 19.1.5-wasi-sdk (https://github.com/llvm/llvm-project ab4b5a2db582958af1ee308a790cfdb42bd24720)",
+  "flags": [
+    "-std=c11",
+    "-O2",
+    "-ffp-contract=off",
+    "-fno-fast-math",
+    "-mexec-model=reactor",
+    "kernel.c",
+    "-lm",
+    "-Wl,--export=malloc",
+    "-Wl,--export=free",
+    "-Wl,--export=rf_solve",
+    "-Wl,--max-memory=1073741824",
+    "-Wl,--strip-all",
+    "-o",
+    "kernel.wasm"
+  ],
+  "exports": [
+    "memory",
+    "_initialize",
+    "rf_solve",
+    "free",
+    "malloc"
+  ]
+}

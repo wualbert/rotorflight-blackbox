@@ -168,7 +168,8 @@ test('stop overshoot asymmetric: the side with the high stop gain is named', () 
     const f = flagged(A.findings, 'T5');
     assert.equal(f.length, 1, show(A.findings));
     assert.equal(f[0].larger, 'cw');
-    assert.match(f[0].text, /lower yaw_cw_stop_gain/);
+    assert.match(f[0].text, /yaw_cw_stop_gain side has more overshoot/);
+    assert.doesNotMatch(f[0].text, /lower yaw_cw_stop_gain/);
     assert.ok(f[0].value > 3, `overshoot ratio ${f[0].value}`);
     // the CW side is the one stopping negative yaw rate, where the firmware sees errorRate > +10
     for (const e of A.metrics.T5.events) assert.equal(e.side === 'cw', e.dir < 0);
@@ -185,11 +186,12 @@ test('collective kick with a wrong-sign precomp', () => {
     const k = flagged(A.findings, 'T6');
     assert.equal(k.length, 1, show(A.findings));
     assert.ok(k[0].towardTorque.mean > 30, `kick toward the torque change ${k[0].towardTorque.mean}`);
-    assert.match(k[0].text, /raise yaw collective FF/);
+    assert.match(k[0].text, /low collective precompensation is one possible cause/);
+    assert.doesNotMatch(k[0].text, /raise yaw collective FF/);
     const p = flagged(A.findings, 'T7');
     assert.equal(p.length, 1, 'precomp vs I flagged');
     assert.ok(p[0].value < -0.5 && p[0].precompScale < 0, `r ${p[0].value}, scale ${p[0].precompScale}`);
-    assert.match(p[0].text, /wrong sign/);
+    assert.match(p[0].text, /incorrect sign/);
     assert.equal(A.metrics.rotation.mainRotor, 'CW', 'rotation read from the tail control, not the precomp');
     assert.equal(A.metrics.rotation.precompAgrees, false);
 });
@@ -225,7 +227,7 @@ test('ground-rate decay without AIRBORNE_STATE events: possible airborne misdete
     const f = flagged(D.findings, 'C10', 'roll');
     assert.ok(f.length >= 1, show(D.findings));
     assert.ok(Math.abs(f[0].value - 2.5) < 0.5, `tau ${f[0].value} s, truth 2.5 s`);
-    assert.match(f[0].text, /airborne misdetection/);
+    assert.match(f[0].text, /airborne condition can be incorrect/);
     const tc = clean.metrics.C10.roll.byProfile[0].bins.find(b => b.spans > 200);
     assert.ok(tc.tauS > 8, `clean tau ${tc.tauS} s, truth ${(1 / 0.046).toFixed(1)} s`);
 });
@@ -267,7 +269,7 @@ test('T4 compares header and recovered yaw P in one unit: the same tune is no ga
     const set = (gains) => ({ T4: { byProfile: { 1: { gains, fast: { hz: { mean: 8, se: 0.05 }, bursts: 20 } } } } });
     const a = set({ header: { P: 60, I: 120, D: 10, stopGain: [150, 110] }, recovered: {} }), b = set({ header: null, recovered: { Pcw: 90, Pccw: 66, I: 120, D: 10 } });
     const F = H.judge([{ log: 'A', metrics: a }, { log: 'B', metrics: b }], H.DEFAULT_RULES).filter(f => f.id === 'T4');
-    assert.deepEqual(F.map(f => f.severity), ['note']); assert.match(F[0].text, /no finding/);
+    assert.deepEqual(F.map(f => f.severity), ['note']); assert.match(F[0].text, /No result/);
     // a real change of base P by 50 % is still seen
     const c = set({ header: null, recovered: { Pcw: 135, Pccw: 99, I: 120, D: 10 } });
     const G = H.judge([{ log: 'A', metrics: a }, { log: 'C', metrics: c }], H.DEFAULT_RULES).filter(f => f.id === 'T4');
@@ -277,11 +279,99 @@ test('T4 compares header and recovered yaw P in one unit: the same tune is no ga
 test('thin evidence and missing fields are said, not judged', () => {
     const R = Object.assign({}, H.DEFAULT_RULES, { C3: Object.assign({}, H.DEFAULT_RULES.C3, { minEvents: 1000 }) });
     const F = H.judge([{ log: 0, metrics: A.metrics }], R).filter(f => f.id === 'C3');
-    assert.ok(F.every(f => f.severity === 'note' && /no finding/.test(f.text)));
+    assert.ok(F.every(f => f.severity === 'note' && /No result/.test(f.text)));
     const cfg = BASE(), { w, ctx } = simulate(9, cfg);
     w.coll = null; w.extra['mixer[3]'] = null; ctx.govState = null;
     const m = H.analyse(w, ctx);
     assert.ok(m.T6.skipped && m.C9.skipped && m.C10.skipped);
     assert.ok(m.notes.some(s => /GOVSTATE/.test(s)));
     assert.ok(H.judge([{ log: 0, metrics: m }]).some(f => f.id === 'T6' && f.severity === 'skipped'));
+});
+
+const rawFinding = (id, metrics, axis) => H.judge([{log:0,metrics}]).find(f=>f.id===id&&(!axis||f.axis===axis));
+const profileMetric = s => ({byProfile:{1:s}});
+const cyclicMetric = s => ({roll:profileMetric(s),pitch:{byProfile:{}}});
+
+test('raw C1 text distinguishes little I reserve from an established tracking failure', () => {
+    const f=rawFinding('C1',{C1:cyclicMetric({longestAtLevel:{0.95:1},limit:0.3,iGain:100,maxRatio:0.98,runs:2})},'roll');
+    assert.equal(f.severity,'flag'); assert.equal(f.value,1);
+    assert.match(f.text,/I-term has a small reserve/);
+    assert.match(f.text,/does not show the cause.*gyro follows the setpoint/);
+    assert.doesNotMatch(f.text,/cannot hold|integrator pinned/);
+});
+
+test('raw C3 and T9 retain FF direction as a hypothesis without an instruction to change F', () => {
+    for (const id of ['C3','T9']) for (const sign of [-1,1]) {
+        const s={iShare:{mean:sign*0.3,se:0.2,n:5},gyroRatio:{mean:1,se:0.01,n:5}};
+        const f=rawFinding(id,{[id]:id==='C3'?cyclicMetric(s):profileMetric(s)},id==='C3'?'roll':undefined);
+        assert.equal(f.severity,'flag'); assert.equal(f.se,0.2);
+        assert.match(f.text,new RegExp(`FF too ${sign>0?'low':'high'}" is one possible cause`));
+        assert.doesNotMatch(f.text,/raise F|lower F/);
+    }
+});
+
+test('raw C4 stop text preserves parser classifications as possible causes even with uncertain overshoot', () => {
+    for (const withRotation of [0.2,0.8]) {
+        const s={overshootPct:{mean:20,se:15,n:5},settleS:{mean:0.5,se:0.3},iWithRotationShare:withRotation};
+        const f=rawFinding('C4',{C4:cyclicMetric(s)},'roll');
+        assert.equal(f.severity,'flag'); assert.equal(f.se,15);
+        assert.match(f.text,withRotation>0.5?/FF too low.*possible cause/:/FF too high.*possible causes/);
+        assert.doesNotMatch(f.text,/raise F|lower F/);
+    }
+});
+
+test('raw T5 reports the larger stop side without bypassing the recommendation uncertainty gate', () => {
+    const stop=mean=>({overshootPct:{mean,se:15,n:5}});
+    for (const side of ['cw','ccw']) {
+        const f=rawFinding('T5',{T5:profileMetric({cw:stop(side==='cw'?20:10),ccw:stop(side==='ccw'?20:10)})});
+        assert.equal(f.severity,'flag'); assert.equal(f.larger,side); assert.ok(f.se>f.value);
+        assert.match(f.text,new RegExp(`yaw_${side}_stop_gain side has more overshoot`));
+        assert.match(f.text,/does not identify a new gain/);
+        assert.doesNotMatch(f.text,/lower yaw_|raise the other/);
+    }
+});
+
+test('raw C6 and T2 preserve I-share classification without identifying a gain or excluding the I loop', () => {
+    for (const id of ['C6','T2']) for (const share of [0.2,0.8]) {
+        const s={windows:10,prominence:8,hz:1.5,amplitude:15,iShareOfControl:share};
+        const f=rawFinding(id,{[id]:id==='C6'?cyclicMetric(s):profileMetric(s)},id==='C6'?'roll':undefined);
+        assert.equal(f.severity,'flag'); assert.equal(f.value,8);
+        if (share>0.5) {
+            assert.match(f.text,/driven by I/); assert.doesNotMatch(f.text,/not driven by I/);
+            assert.match(f.text,/does not identify which gain/);
+        } else {
+            assert.match(f.text,/not driven by I/);
+            assert.match(f.text,/does not show that the I-loop is correct/);
+        }
+        assert.doesNotMatch(f.text,/I too high|P too low/);
+    }
+});
+
+test('raw C11 gives a possible source of high-frequency D power and a signal check', () => {
+    const f=rawFinding('C11',{C11:cyclicMetric({windows:12,share:0.8,perWindow:{mean:0.8,se:0.1}})},'roll');
+    assert.equal(f.severity,'flag'); assert.equal(f.value,0.8);
+    assert.match(f.text,/can come from vibration/); assert.match(f.text,/Examine the gyro spectra/);
+    assert.doesNotMatch(f.text,/D is driven by noise/);
+});
+
+test('raw T6 differentiates possible low or high precompensation from an unknown direction', () => {
+    for (const [mean,se,word] of [[40,5,'low'],[-40,5,'high'],[10,15,null]]) {
+        const s={absPeak:{mean:50,se:5,n:5},towardTorque:{mean,se},withTorqueShare:0.8};
+        const f=rawFinding('T6',{T6:profileMetric(s)});
+        assert.equal(f.severity,'flag'); assert.deepEqual(f.towardTorque,{mean,se});
+        if (word) assert.match(f.text,new RegExp(`${word} collective precompensation is one possible cause`));
+        else assert.match(f.text,/no precompensation direction/);
+        assert.doesNotMatch(f.text,/raise yaw|lower yaw|precomp too small|precomp too large/);
+    }
+});
+
+test('raw T7 presents each fitted direction as an unverified estimate, not an I-flat target', () => {
+    for (const [value,scale,word] of [[-0.8,-0.5,'incorrect sign'],[-0.8,0.5,'too much'],[0.8,1.5,'not sufficient']]) {
+        const s={windows:10,r:{mean:value,se:0.05},slope:0.5,slopeSe:0.1,precompScale:scale};
+        const f=rawFinding('T7',{T7:profileMetric(s)});
+        assert.equal(f.severity,'flag'); assert.equal(f.precompScale,scale);
+        assert.match(f.text,/fit gives a scale estimate/); assert.match(f.text,/estimate does not show that this change is correct/);
+        assert.match(f.text,new RegExp(`fit can show.*${word}`));
+        assert.doesNotMatch(f.text,/I flat at|precomp has the wrong sign/);
+    }
 });

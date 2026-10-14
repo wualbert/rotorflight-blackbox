@@ -324,7 +324,7 @@ function analyse(w, ctx = {}) {
         if (it) for (let i = 1; i < n; i++) { const di = it[i] - it[i - 1]; if (di <= 0 || di > RULE.gap.dtFactor * medIt) { itJumps++; missing += Math.max(0, Math.round(di / medIt) - 1); if (events.length < 500) events.push({ t: r(w.fromS + i / rate, 3), value: di, kind: 'loopIteration jump', unit: 'iterations' }); } }
         out.D2 = { logGaps: fl.gaps === undefined ? null : fl.gaps, frames: fl.frames === undefined ? null : fl.frames, logSeconds: r(fl.durationS, 2), segmentEndS: r(w.fromS + n / rate, 2),
             medianDtUs: r(medDt, 1), timeJumps: t ? jumps : null, loopStalls: t ? stalls : null, missingFrames: t || it ? missing : null, missingFramesFrom: it ? 'loopIteration' : t ? 'time' : null, timeBackwards: t ? backwards : null, iterationStep: medIt, iterationJumps: it ? itJumps : null,
-            events: events.slice(0, 500), skipped: t ? null : 'no time field in the segment (add "time" to EXTRA); only the log gap count is known' }; }
+            events: events.slice(0, 500), skipped: t ? null : 'This segment has no time field. Only the number of parts with no log data is known.' }; }
 
     // D3 field availability
     { const fields = {}, state = (v) => { if (!v) return 'absent'; for (let i = 0; i < v.length; i++) if (v[i] !== 0) return 'present'; return 'zero'; };
@@ -364,7 +364,7 @@ function analyse(w, ctx = {}) {
     // F1-F4, F8: header facts
     const S = out.setup;
     { const act = [S.lpf1.active && { stage: 'lpf1', type: S.lpf1.typeName, hz: S.lpf1.hz }, S.lpf2.active && { stage: 'lpf2', type: S.lpf2.typeName, hz: S.lpf2.hz }, S.lpf1Dynamic.active && { stage: 'lpf1 dynamic', hz: S.lpf1Dynamic.min }].filter(Boolean);
-        out.F1 = { lpf1: S.lpf1, lpf2: S.lpf2, lpf1Dynamic: S.lpf1Dynamic, active: act, rpmFilter: S.rpm.enabled, pidBandwidthHz: { roll: S.bandwidth.roll && S.bandwidth.roll[0], pitch: S.bandwidth.pitch && S.bandwidth.pitch[0], yaw: S.bandwidth.yaw && S.bandwidth.yaw[0] }, skipped: hk(h, 'gyro_soft_type') === null ? 'header lacks gyro_lpf1_type' : null };
+        out.F1 = { lpf1: S.lpf1, lpf2: S.lpf2, lpf1Dynamic: S.lpf1Dynamic, active: act, rpmFilter: S.rpm.enabled, pidBandwidthHz: { roll: S.bandwidth.roll && S.bandwidth.roll[0], pitch: S.bandwidth.pitch && S.bandwidth.pitch[0], yaw: S.bandwidth.yaw && S.bandwidth.yaw[0] }, skipped: hk(h, 'gyro_soft_type') === null ? 'The log header does not have gyro_lpf1_type.' : null };
         out.F2 = { lowestHz: act.length ? Math.min(...act.map(v => v.hz)) : null, active: act };
         const qs = []; for (const ax of lib.AXES) for (const b of S.rpm.banks[ax]) qs.push({ axis: ax, bank: b.bank, code: b.code, q: b.q });
         out.F3 = { rpm: qs, rpmMinQ: qs.length ? Math.min(...qs.map(v => v.q)) : null, dynNotchQ: S.dynNotch.q, dynNotchEnabled: S.dynNotch.enabled };
@@ -382,8 +382,8 @@ function analyse(w, ctx = {}) {
 
     // F5, F6 from raw and filtered gyro against revolutions
     const raw = [0, 1, 2].map(a => x[`gyroRAW[${a}]`] || null);
-    if (!raw.every(Boolean)) { out.F5 = out.F6 = { skipped: 'log lacks gyroRAW' }; return out; }
-    if (flyingN < RULE.order.perRev * RULE.order.revolutions / 4) { out.F5 = out.F6 = { skipped: `too little flight (${out.flyingS} s) for ${RULE.order.revolutions}-revolution windows` }; return out; }
+    if (!raw.every(Boolean)) { out.F5 = out.F6 = { skipped: 'The log does not have gyroRAW.' }; return out; }
+    if (flyingN < RULE.order.perRev * RULE.order.revolutions / 4) { out.F5 = out.F6 = { skipped: `The ${out.flyingS} s of flight is not sufficient for windows of ${RULE.order.revolutions} rotor revolutions.` }; return out; }
     const spec = orderSpectra(w, ctx, raw, S.rpm.banks), revs = RULE.order.revolutions, from = Math.round(RULE.order.from * revs);
     const notchOrders = lib.AXES.map((ax) => S.rpm.banks[ax].filter(b => b.order !== null));
     // F5 lines per profile, summed over axes, with the nearest configured notch of each axis
@@ -398,7 +398,7 @@ function analyse(w, ctx = {}) {
             lines.push({ profile: g.profile, windows: g.windows, headspeed: r(meanSe(g.headspeed).mean, 0), order: r(order, 4), hz: r(order * meanSe(g.headspeed).mean / 60, 1), prominence: r(L.prominence, 1), axes: perAxis, rotorLocked: null });
         }
     }
-    // a line is rotor-locked if the same order stands out in a profile flown at another headspeed (below that profile's
+    // a line is rotor-locked if the same order stands out in a profile flown at a different headspeed (below that profile's
     // Nyquist order); unknown when no such profile exists
     for (const l of lines) {
         const k = Math.round(l.order * revs), tol = Math.max(2, Math.round(RULE.line.sameOrder * l.order * revs)), band = Math.round(RULE.line.band * revs); let best = null;
@@ -426,9 +426,9 @@ function analyse(w, ctx = {}) {
             const ms = meanSe(list);
             rows.push({ axis: lib.AXES[a], code: b.code, kind: b.kind, harmonic: b.harmonic, order: r(b.order, 4), q: b.q, profile: g.profile, headspeed: r(meanSe(g.headspeed).mean, 0),
                 hz: r(b.order * meanSe(g.headspeed).mean / 60, 1), db: r(ms.mean, 2), se: r(ms.se, 2), n: ms.n, pooledDb: er && ef ? r(10 * Math.log10(er / ef), 2) : null,
-                rawAmplitude: er ? r(Math.sqrt(er / g.windows / 1.5) / interpGain(b.order * meanSe(g.headspeed).mean / 60, rate), 2) : null, rawProminence: r(line, 1), events: ev, why: ms.n ? null : 'notch above the Nyquist order of every window' });
+                rawAmplitude: er ? r(Math.sqrt(er / g.windows / 1.5) / interpGain(b.order * meanSe(g.headspeed).mean / 60, rate), 2) : null, rawProminence: r(line, 1), events: ev, why: ms.n ? null : 'The notch filter frequency is more than the Nyquist frequency in all windows.' });
         } });
-    const unknown = []; for (const ax of lib.AXES) for (const b of S.rpm.banks[ax]) if (b.order === null) unknown.push(`${ax} source ${b.code} (${b.kind}): order unknown without gear ratios`);
+    const unknown = []; for (const ax of lib.AXES) for (const b of S.rpm.banks[ax]) if (b.order === null) unknown.push(`The rotor order of ${ax} source ${b.code} (${b.kind}) is unknown. The log does not record its rotor frequency.`);
     out.F6 = { windows: spec.windows.length, rows, notMeasured: unknown };
     return out;
 }
@@ -443,10 +443,11 @@ const HEADER_KEYS = { profile: ['rollPID', 'pitchPID', 'yawPID', 'rollBW', 'pitc
     'gyro_soft_type', 'gyro_lowpass_hz', 'gyro_soft2_type', 'gyro_lowpass2_hz', 'gyro_lowpass_dyn_hz', 'gyro_notch_hz', 'gyro_notch_cutoff', 'dyn_notch_count', 'dyn_notch_q', 'dyn_notch_min_hz', 'dyn_notch_max_hz',
     'gyro_rpm_notch_preset', 'gyro_rpm_notch_min_hz', 'gyro_rpm_notch_source_roll', 'gyro_rpm_notch_q_roll', 'gyro_rpm_notch_source_pitch', 'gyro_rpm_notch_q_pitch', 'gyro_rpm_notch_source_yaw', 'gyro_rpm_notch_q_yaw', 'collectiveRange'] };
 
-// Tuning history: what changed in the header between consecutive logs. Profile gains are compared only between logs
-// that started on the same PID profile; the header holds the profile active at arming.
+// Tuning history follows the recorded log sequence. The RTC can be unset or move backwards, so it cannot order logs.
+// health.cjs uses "file:log" labels for multiple files; those follow the caller's file order, then the recorded log order.
+// Profile gains are compared only between logs that started on the same PID profile; the header holds that profile.
 function headerChanges(flights) {
-    const list = flights.slice().sort((a, b) => String(a.start).localeCompare(String(b.start)) || a.log - b.log), rows = [], s = (v) => Array.isArray(v) ? v.join(',') : String(v);
+    const list = flights.slice().sort((a, b) => String(a.log).localeCompare(String(b.log), 'en', { numeric: true })), rows = [], s = (v) => Array.isArray(v) ? v.join(',') : String(v);
     let prev = null; const prevByProfile = new Map();
     for (const f of list) {
         const h = f.header || {}, sp = f.metrics ? f.metrics.startProfile : null;
@@ -460,81 +461,89 @@ function headerChanges(flights) {
 
 function judge(flights, RULES = DEFAULT_RULES) {
     const F = [], add = (o) => F.push(Object.assign({ profile: null, value: null, se: null, n: null, threshold: null }, o)), R = RULES;
+    const val = (v) => v === null || v === undefined ? 'unknown' : String(v);
+    const quote = (v) => '`' + val(v).replace(/`/g, '') + '`';
+    const para = (...parts) => parts.filter(Boolean).join('\n');
+    const pm = (v, se) => se === null || se === undefined ? `${val(v)} (standard error unknown)` : `${val(v)} ± ${val(se)}`;
     for (const f of flights) {
         const m = f.metrics, log = f.log; if (!m) continue;
-        // D1
         { const t = R.D1, v = m.D1.nominalHz, ok = v >= t.minHz;
             add({ id: 'D1', severity: ok ? 'ok' : 'flag', log, value: v, n: m.n, threshold: `nominal >= ${t.minHz} Hz`, source: t.source,
-                text: `logging ${v} Hz nominal, ${m.D1.measuredHz} Hz by the log clock (Nyquist ${m.D1.nyquistHz} Hz). ` + (ok ? 'Vibration and D-noise checks may run.' : `Below ${t.minHz} Hz: rotor and tail harmonics alias; vibration and D-noise checks should not run.`) }); }
-        // D2
+                text: `The log rate is ${val(v)} Hz from the configuration and ${val(m.D1.measuredHz)} Hz from the clock. The Nyquist frequency is ${val(m.D1.nyquistHz)} Hz. ` + (ok ? 'Vibration and D-term noise checks can operate.' : `At less than ${t.minHz} Hz, aliasing changes the rotor and tail harmonics. Vibration and D-term noise checks cannot operate.`) }); }
         { const t = R.D2, d = m.D2, bad = (d.logGaps || 0) > t.maxGaps || (d.timeJumps || 0) + (d.loopStalls || 0) + (d.timeBackwards || 0) > t.maxJumps || (d.iterationJumps || 0) > t.maxJumps;
             add({ id: 'D2', severity: bad ? 'flag' : d.skipped ? 'note' : 'ok', log, value: (d.timeJumps || 0) + (d.timeBackwards || 0), n: m.n, threshold: `gaps <= ${t.maxGaps}, jumps <= ${t.maxJumps}`, source: t.source,
-                text: `${d.logGaps} logging gaps in the log; in this segment ${d.timeJumps} time jumps (${d.missingFrames} frames missing, by ${d.missingFramesFrom}), ${d.loopStalls || 0} loop stalls (time jumps over contiguous loopIteration: no frame lost), ${d.timeBackwards} non-increasing times, ${d.iterationJumps} loopIteration jumps over ${m.n} frames` + (bad ? '; exclude the spans at the listed times.' : '.') + (d.skipped ? ` ${d.skipped}.` : ''), events: d.events }); }
-        // D3
+                counts: { logGaps: d.logGaps, timeJumps: d.timeJumps, loopStalls: d.loopStalls || 0, timeBackwards: d.timeBackwards, iterationJumps: d.iterationJumps, missingFrames: d.missingFrames },
+                text: para(`The number of parts with no log data is ${val(d.logGaps)}. This segment has ${val(d.timeJumps)} sudden time changes and ${val(d.missingFrames)} missing frames (${quote(d.missingFramesFrom)}).`,
+                    `The number of loop stalls is ${d.loopStalls || 0}. These loop stalls have long time intervals. The loopIteration values follow their usual sequence, with no missing frame.`,
+                    `The number of times that do not increase is ${val(d.timeBackwards)}. There are ${val(d.iterationJumps)} sudden loopIteration changes in ${m.n} frames.`, bad ? 'Do not use the periods at the given times.' : '', d.skipped), events: d.events }); }
         { const sk = m.D3.skips;
-            add({ id: 'D3', severity: sk.length ? 'note' : 'ok', log, value: sk.length, source: R.D3.source,
-                text: sk.length ? 'checks that cannot run: ' + sk.map(s => `${s.checks.join('/')} (${s.missing.join(', ')})`).join('; ') : 'all fields for the checks are present.' }); }
-        // D4
+            add({ id: 'D3', severity: sk.length ? 'note' : 'ok', log, value: sk.length, source: R.D3.source, skips: sk,
+                text: sk.length ? sk.map(s => `Checks ${quote(s.checks.join('/'))} cannot operate. Missing or zero fields: ${quote(s.missing.join(', '))}.`).join('\n') : 'The log has all fields that the checks use.' }); }
         if (!m.D4) { /* no CLI dump: no D4 result */ }
         else if (m.D4.skipped) add({ id: 'D4', severity: 'skipped', log, source: R.D4.source, text: m.D4.skipped });
         else { const d = m.D4, mm = d.mismatches, gm = d.cliOnly.gov_mode, gd = d.cliOnly.govModeFromData, govClash = gm && gd && ((/DIRECT|LIMIT|OFF/.test(gm) && /^PID/.test(gd)) || (/ELECTRIC|NITRO/.test(gm) && /^no PID/.test(gd)));
-            add({ id: 'D4', severity: mm.length || govClash ? 'flag' : 'ok', log, profile: d.profileCompared, value: mm.length, n: d.compared, threshold: 'any disagreement', source: R.D4.source,
-                text: `header vs CLI (${d.cliKind}, CLI profile ${d.profileCompared}, chosen by ${d.profileChosenBy}): ${mm.length} of ${d.compared} values differ` + (mm.length ? ': ' + mm.slice(0, 12).map(v => `${v.header} ${v.headerValue} vs ${v.cli} ${v.cliValue}${v.from === 'default' ? ' (default)' : ''}`).join('; ') + (mm.length > 12 ? '; ...' : '') + '. Trust the log header for header keys.' : '.')
-                    + (govClash ? ` CLI gov_mode ${gm} but the data shows ${gd}: trust the data for the mode.` : '') }); }
-        // F1
+            add({ id: 'D4', severity: mm.length || govClash ? 'flag' : 'ok', log, profile: d.profileCompared, value: mm.length, n: d.compared, threshold: 'any disagreement', source: R.D4.source, mismatches: mm,
+                text: para(`The log header and CLI dump have ${mm.length} different values out of ${d.compared}. The check uses CLI ${quote(`profile ${d.profileCompared}`)} (${quote(d.cliKind)}, ${quote(d.profileChosenBy)}).`,
+                    mm.length ? mm.slice(0, 12).map(v => `${quote(v.header)} is ${quote(v.headerValue)} in the log header. ${quote(v.cli)} is ${quote(v.cliValue)} in the CLI dump${v.from === 'default' ? ' (default value)' : ''}.`).join('\n') + (mm.length > 12 ? `\nThere are ${mm.length - 12} more differences.` : '') + '\nUse the log header for these values.' : '',
+                    govClash ? `The CLI gov_mode is ${quote(gm)}, but the data shows ${quote(gd)}. Use the data for the governor mode.` : '') }); }
         { const x = m.F1;
             if (x.skipped) add({ id: 'F1', severity: 'skipped', log, source: R.F1.source, text: x.skipped });
             else { const none = !x.active.length, bad = none && x.rpmFilter;
                 add({ id: 'F1', severity: bad ? 'flag' : none ? 'note' : 'ok', log, value: x.active.length, threshold: 'a gyro LPF when RPM filters are on', source: R.F1.source,
-                    text: none ? `no gyro LPF active (lpf1 ${x.lpf1.typeName} ${x.lpf1.hz} Hz, lpf2 ${x.lpf2.typeName} ${x.lpf2.hz} Hz, dynamic ${x.lpf1Dynamic.min}-${x.lpf1Dynamic.max} Hz)${x.rpmFilter ? ' with RPM filters on' : ''}; only the PID bandwidth filter (gyro_cutoff ${x.pidBandwidthHz.roll}/${x.pidBandwidthHz.pitch}/${x.pidBandwidthHz.yaw} Hz) smooths the gyro before P.`
-                        : 'gyro LPF: ' + x.active.map(v => `${v.stage} ${v.type || ''} ${v.hz} Hz`).join(', ') + '.' }); } }
-        // F2
+                    text: none ? para(`No gyro low-pass filter is on. LPF1 is ${quote(x.lpf1.typeName)} at ${val(x.lpf1.hz)} Hz, and LPF2 is ${quote(x.lpf2.typeName)} at ${val(x.lpf2.hz)} Hz.`,
+                        `The LPF1 frequency range is ${val(x.lpf1Dynamic.min)} to ${val(x.lpf1Dynamic.max)} Hz. RPM filters are ${x.rpmFilter ? 'on' : 'off'}.`,
+                        `Only the PID bandwidth filter changes the gyro signal before P. Its gyro_cutoff values are ${quote([x.pidBandwidthHz.roll, x.pidBandwidthHz.pitch, x.pidBandwidthHz.yaw].map(val).join('/'))} Hz.`)
+                        : 'The gyro low-pass filters are ' + x.active.map(v => `${quote(v.stage)} (${quote(v.type || 'dynamic low-pass filter')}, ${val(v.hz)} Hz)`).join(', ') + '.' }); } }
         { const t = R.F2, v = m.F2.lowestHz;
-            if (v === null) add({ id: 'F2', severity: 'skipped', log, source: t.source, text: 'no gyro LPF active, nothing to compare (see F1).' });
-            else add({ id: 'F2', severity: v < t.flagHz ? 'flag' : v < t.noteHz ? 'note' : 'ok', log, value: v, threshold: `< ${t.flagHz} Hz flag, < ${t.noteHz} Hz note`, source: t.source, text: `lowest gyro LPF cutoff ${v} Hz.` }); }
-        // F3
+            if (v === null) add({ id: 'F2', severity: 'skipped', log, source: t.source, text: 'No gyro low-pass filter is on. Thus, there is no cutoff to compare (check F1).' });
+            else add({ id: 'F2', severity: v < t.flagHz ? 'flag' : v < t.noteHz ? 'note' : 'ok', log, value: v, threshold: `< ${t.flagHz} Hz flag, < ${t.noteHz} Hz note`, source: t.source, text: `The lowest gyro low-pass filter cutoff is ${v} Hz.` }); }
         { const t = R.F3, x = m.F3, low = x.rpm.filter(v => v.q < t.minQ), dynLow = x.dynNotchEnabled && x.dynNotchQ !== null && x.dynNotchQ < t.minQ;
             add({ id: 'F3', severity: low.length || dynLow ? 'flag' : x.rpm.length ? 'ok' : 'note', log, value: x.rpmMinQ, n: x.rpm.length, threshold: `Q >= ${t.minQ}`, source: t.source,
-                text: x.rpm.length ? `RPM notch Q ${x.rpmMinQ}..${Math.max(...x.rpm.map(v => v.q))} over ${x.rpm.length} banks` + (low.length ? `; below ${t.minQ}: ` + low.map(v => `${v.axis} ${v.code} Q ${v.q}`).join(', ') : '') + (x.dynNotchEnabled ? `; dynamic notch Q ${x.dynNotchQ}` : '; dynamic notch off') + '.' : 'no RPM notch banks configured.' }); }
-        // F4
+                text: para(x.rpm.length ? `The RPM notch filter Q is ${val(x.rpmMinQ)} to ${Math.max(...x.rpm.map(v => v.q))} in ${x.rpm.length} banks.` : 'The configuration has no RPM notch filter bank.',
+                    low.length ? `The banks with Q less than ${t.minQ} are ${quote(low.map(v => `${v.axis} ${v.code} Q ${v.q}`).join(', '))}.` : '',
+                    x.dynNotchEnabled ? `The dynamic notch filter Q is ${val(x.dynNotchQ)}.` : 'The dynamic notch filter is off.') }); }
         { const t = R.F4; for (const [ax, v] of Object.entries(m.F4.dtermCutoffHz)) { if (v === null || v === undefined) continue; const dev = v - t.targetHz;
-            add({ id: 'F4', severity: Math.abs(dev) > t.toleranceHz ? 'note' : 'ok', log, profile: ax, value: v, threshold: `${t.targetHz} +- ${t.toleranceHz} Hz (advisory)`, source: t.source, text: `${ax} D cutoff ${v} Hz, ${dev >= 0 ? '+' : ''}${dev} Hz from the documented ~${t.targetHz} Hz; advisory only.` }); } }
-        // F8
+            add({ id: 'F4', severity: Math.abs(dev) > t.toleranceHz ? 'note' : 'ok', log, profile: ax, value: v, threshold: `${t.targetHz} +- ${t.toleranceHz} Hz (advisory)`, source: t.source,
+                text: `The ${ax} D-term cutoff is ${v} Hz. The difference from the approximately ${t.targetHz} Hz in the documentation is ${dev >= 0 ? '+' : ''}${dev} Hz. This is information only.` }); } }
         { const x = m.F8, t = R.F8, uncovered = m.F5 && m.F5.lines ? m.F5.lines.filter(l => l.prominence >= R.F5.minProminence && l.axes.every(a => !a.nearestNotch || a.nearestNotch.distance > R.F5.maxDistance)) : [];
             const forced = x.pidHz !== null && x.pidHz < t.minPidHz;
-            add({ id: 'F8', severity: (!x.enabled && uncovered.length) || forced ? 'note' : 'ok', log, value: x.enabled, threshold: `PID rate >= ${t.minPidHz} Hz`, source: t.source,
-                text: `dynamic notch ${x.enabled ? 'on' : 'off'} (count ${x.count}), PID rate ${x.pidHz} Hz` + (forced ? `: forced off below ${t.minPidHz} Hz` : '') + (!x.enabled && uncovered.length ? `; ${uncovered.length} strong line-profile pair(s) without RPM notch coverage (see F5).` : '.') }); }
-        // F9
+            add({ id: 'F8', severity: (!x.enabled && uncovered.length) || forced ? 'note' : 'ok', log, value: x.enabled, threshold: `PID rate >= ${t.minPidHz} Hz`, source: t.source, uncoveredLines: !x.enabled ? uncovered.length : 0, forcedOff: forced,
+                text: para(`The dynamic notch filter is ${x.enabled ? 'on' : 'off'} (count ${val(x.count)}). The PID loop rate is ${val(x.pidHz)} Hz.`,
+                    forced ? `The firmware turns this filter off at less than ${t.minPidHz} Hz.` : '',
+                    !x.enabled && uncovered.length ? `${uncovered.length} strong pairs of a line and a PID profile have no RPM notch filter (check F5).` : '') }); }
         { const x = m.F9, over = x.rows.filter(v => v.aboveNyquist || v.aboveCeiling), unk = x.rows.filter(v => v.hz === null);
             add({ id: 'F9', severity: over.length ? 'note' : unk.length ? 'note' : 'ok', log, value: over.length, n: x.rows.length, threshold: `harmonic > Nyquist ${x.nyquistHz} Hz or > notch ceiling ${x.notchCeilingHz} Hz`, source: R.F9.source,
-                text: (over.length ? over.map(v => `profile ${v.profile} ${v.axis} source ${v.code} at ${v.hz} Hz (${v.headspeed} rpm)` + (v.aboveNyquist ? ` above Nyquist, logged alias ${v.aliasHz} Hz` : '') + (v.aboveCeiling ? `, notch clamped to ${v.clampedToHz} Hz` : '')).join('; ') : 'every configured notch below Nyquist and the notch ceiling')
-                    + (unk.length ? `; ${unk.length} bank-profile pairs of unknown frequency (no gear ratios)` : '') + '.' }); }
-        // F5
+                text: para(over.length ? over.map(v => `In PID profile ${v.profile}, the ${v.axis} source ${v.code} is at ${v.hz} Hz (${v.headspeed} rpm).` + (v.aboveNyquist ? ` This is more than the Nyquist frequency, with an alias at ${v.aliasHz} Hz in the log.` : '') + (v.aboveCeiling ? ` The notch filter frequency is at its limit of ${v.clampedToHz} Hz.` : '')).join('\n') : 'All measured notch filter frequencies are less than the Nyquist frequency and the notch filter limit.',
+                    unk.length ? `The frequency is unknown for ${unk.length} pairs of a bank and a PID profile.` : '') }); }
         if (m.F5.skipped) add({ id: 'F5', severity: 'skipped', log, source: R.F5.source, text: m.F5.skipped });
         else for (const p of m.F5.profiles) {
             const t = R.F5, ls = m.F5.lines.filter(l => l.profile === p.profile);
-            if (p.windows < t.minWindows) { add({ id: 'F5', severity: 'note', log, profile: p.profile, n: p.windows, threshold: `>= ${t.minWindows} windows`, source: t.source, text: `no finding: ${p.windows} window(s) at ${p.headspeed} rpm, too few.` }); continue; }
+            if (p.windows < t.minWindows) { add({ id: 'F5', severity: 'note', log, profile: p.profile, n: p.windows, thin: true, threshold: `>= ${t.minWindows} windows`, source: t.source, text: `No result: there are ${p.windows} windows at ${p.headspeed} rpm. A minimum of ${t.minWindows} windows is necessary.` }); continue; }
             const bad = ls.filter(l => l.prominence >= t.minProminence && l.axes.some(a => a.amplitude > 0 && (!a.nearestNotch || a.nearestNotch.distance > t.maxDistance)));
-            add({ id: 'F5', severity: bad.length ? 'flag' : 'ok', log, profile: p.profile, value: bad.length ? bad[0].order : null, n: p.windows, threshold: `prominence >= ${t.minProminence} with no notch within ${t.maxDistance * 100} %`, source: t.source,
-                text: bad.length ? bad.map(l => `line at ${l.order} x rotor (${l.hz} Hz, prominence ${l.prominence}${l.rotorLocked === true ? ', rotor-locked' : l.rotorLocked === false ? ', absent at the same order at another headspeed: not rotor-locked' : ''}): nearest notch ` + l.axes.map(a => `${a.axis} ${a.nearestNotch ? `${a.nearestNotch.code} at ${a.nearestNotch.order} (${(a.nearestNotch.distance * 100).toFixed(1)} %)` : 'none'}`).join(', ')).join('; ')
-                    : `${ls.length} line(s) of prominence >= ${RULE.line.minProminence}; every one of prominence >= ${t.minProminence} has a notch within ${t.maxDistance * 100} % on every axis.` + (m.F5.tailOrderKnown ? '' : ' Tail notch orders unknown (no gear ratios): tail lines count as uncovered.') }); }
-        // F6
+            add({ id: 'F5', severity: bad.length ? 'flag' : 'ok', log, profile: p.profile, value: bad.length ? bad[0].order : null, n: p.windows, threshold: `prominence >= ${t.minProminence} with no notch within ${t.maxDistance * 100} %`, source: t.source, lines: bad,
+                text: bad.length ? bad.map(l => para(`The line is at ${l.order} times the main rotor frequency (${l.hz} Hz, prominence ${l.prominence}).`,
+                    l.rotorLocked === true ? 'The line keeps this rotor order at a different headspeed.' : l.rotorLocked === false ? 'The line is missing at this rotor order at a different headspeed. It is not a rotor harmonic.' : '',
+                    l.axes.map(a => a.nearestNotch ? `The nearest ${a.axis} notch filter is source ${a.nearestNotch.code} at rotor order ${a.nearestNotch.order} (distance ${(a.nearestNotch.distance * 100).toFixed(1)} %).` : `There is no ${a.axis} notch filter.`).join(' '))).join('\n')
+                    : para(`There are ${ls.length} lines with a prominence of ${RULE.line.minProminence} or more. Each line with a prominence of ${t.minProminence} or more has a notch filter at a distance of ${t.maxDistance * 100} % or less on all axes.`, m.F5.tailOrderKnown ? '' : 'The tail notch filter orders are unknown. The check treats tail lines as lines with no notch filter.') }); }
         if (m.F6.skipped) add({ id: 'F6', severity: 'skipped', log, source: R.F6.source, text: m.F6.skipped });
         else { const t = R.F6;
             for (const row of m.F6.rows) {
-                const base = { id: 'F6', log, profile: row.profile, value: row.db, se: row.se, n: row.n, threshold: `>= ${t.minDb} dB`, source: t.source };
-                const what = `${row.axis} notch ${row.code} (${row.kind} ${row.harmonic}, ${row.order} x rotor, ${row.hz} Hz, Q ${row.q}) at ${row.headspeed} rpm`;
-                if (row.n < t.minWindows) add(Object.assign(base, { severity: 'note', text: `no finding: ${what} measured in ${row.n} window(s)` + (row.why ? ` (${row.why})` : '') + '.' }));
-                else if (row.rawProminence < t.minLineProminence) add(Object.assign(base, { severity: 'ok', text: `no finding: ${what}: raw line prominence ${row.rawProminence} < ${t.minLineProminence}, nothing to attenuate; ${row.db} +- ${row.se} dB over ${row.n} windows.` }));
-                else add(Object.assign(base, { severity: row.db < t.minDb ? 'flag' : 'ok', text: `${what}: ${row.db} +- ${row.se} dB (pooled ${row.pooledDb} dB) over ${row.n} windows, raw ${row.rawAmplitude} deg/s, prominence ${row.rawProminence}` + (row.db < t.minDb ? ': mis-centred or too narrow.' : '.') }));
+                const base = { id: 'F6', axis: row.axis, notchSource: row.code, log, profile: row.profile, value: row.db, se: row.se, n: row.n, threshold: `>= ${t.minDb} dB`, source: t.source };
+                const what = `The ${row.axis} notch filter source ${row.code} is ${quote(row.kind)} harmonic ${row.harmonic} at ${val(row.hz)} Hz (${val(row.headspeed)} rpm). The rotor order is ${val(row.order)}, and Q is ${val(row.q)}.`;
+                if (row.n < t.minWindows) add(Object.assign(base, { severity: 'note', thin: true, text: para(`No result: the notch filter was measured in ${row.n} windows. A minimum of ${t.minWindows} is necessary.`, what, row.why) }));
+                else if (row.rawProminence < t.minLineProminence) add(Object.assign(base, { severity: 'ok', thin: true, text: para('No result: the raw line is less than the measurement limit.', what, `The raw line prominence is ${val(row.rawProminence)}, less than ${t.minLineProminence}. There is no strong line for the filters to decrease.`, `The decrease in vibration is ${pm(row.db, row.se)} dB in ${row.n} windows.`) }));
+                else add(Object.assign(base, { severity: row.db < t.minDb ? 'flag' : 'ok', text: para(what, `The decrease in vibration is ${pm(row.db, row.se)} dB in ${row.n} windows. From all windows together, the value is ${val(row.pooledDb)} dB. The raw amplitude is ${val(row.rawAmplitude)} deg/s, with prominence ${val(row.rawProminence)}.`, row.db < t.minDb ? 'The decrease in vibration is less than the limit. Examine the notch filter center and bandwidth before a filter change.' : '') }));
             }
             for (const s of m.F6.notMeasured) add({ id: 'F6', severity: 'skipped', log, source: t.source, text: s }); }
-        // setup facts
         { const s = m.setup, b = (ax) => s.rpm.banks[ax].map(v => `${v.code}${v.order !== null ? `@${r(v.order, 3)}x` : ''}/Q${v.q}`).join(' ');
-            add({ id: 'SETUP', severity: 'note', log, source: 'log header', text: `${s.firmware}; log ${s.logRateHz} Hz (PID ${s.pidHz}, gyro ${s.gyroSampleHz}, decimation ${s.gyroDecimationHz} Hz); LPF1 ${s.lpf1.typeName} ${s.lpf1.hz}, LPF2 ${s.lpf2.typeName} ${s.lpf2.hz}; dyn notch ${s.dynNotch.enabled ? 'on' : 'off'}; RPM preset ${s.rpm.preset} min ${s.rpm.minHz} Hz, roll ${b('roll')}, pitch ${b('pitch')}, yaw ${b('yaw')}; `
-                + `PID R ${s.pid.roll} P ${s.pid.pitch} Y ${s.pid.yaw}; BW R ${s.bandwidth.roll} P ${s.bandwidth.pitch} Y ${s.bandwidth.yaw}; gov ${s.governor.gains} (${s.governor.order}); yaw stop ${s.yaw.stopGain}, precomp ${s.yaw.precomp}, inertia ${s.yaw.inertia}, TTA ${s.yaw.tta}.` }); }
+            add({ id: 'SETUP', severity: 'note', log, source: 'log header', setup: s, text: para(`The firmware is ${quote(s.firmware)}. The log rate is ${val(s.logRateHz)} Hz, with PID at ${val(s.pidHz)} Hz and gyro at ${val(s.gyroSampleHz)} Hz. The gyro decimation rate is ${val(s.gyroDecimationHz)} Hz.`,
+                `LPF1 is ${quote(s.lpf1.typeName)} at ${val(s.lpf1.hz)} Hz. LPF2 is ${quote(s.lpf2.typeName)} at ${val(s.lpf2.hz)} Hz. The dynamic notch filter is ${s.dynNotch.enabled ? 'on' : 'off'}.`,
+                `The RPM filter preset is ${val(s.rpm.preset)}, with a minimum of ${val(s.rpm.minHz)} Hz. The bank values are roll ${quote(b('roll'))}, pitch ${quote(b('pitch'))} and yaw ${quote(b('yaw'))}.`,
+                `The PID values are roll ${quote(s.pid.roll)}, pitch ${quote(s.pid.pitch)} and yaw ${quote(s.pid.yaw)}. The bandwidth values are roll ${quote(s.bandwidth.roll)}, pitch ${quote(s.bandwidth.pitch)} and yaw ${quote(s.bandwidth.yaw)}.`,
+                `The governor gains are ${quote(s.governor.gains)} (${quote(s.governor.order)}). The yaw values are stop ${quote(s.yaw.stopGain)}, precompensation ${quote(s.yaw.precomp)}, inertia ${quote(s.yaw.inertia)} and TTA ${quote(s.yaw.tta)}.`) }); }
     }
-    for (const c of headerChanges(flights)) add({ id: 'H', severity: 'note', log: c.log, profile: c.scope, value: c.to, source: R.H ? R.H.source : 'log header', text: `${c.key}: ${c.from} -> ${c.to} (since log ${c.since}, ${c.scope})` });
+    for (const c of headerChanges(flights)) add({ id: 'H', severity: 'note', log: c.log, profile: c.scope, value: c.to, source: R.H ? R.H.source : 'log header', headerKey: c.key, from: c.from, since: c.since,
+        text: `${quote(c.key)} changed from ${quote(c.from)} to ${quote(c.to)} since log ${c.since} (${quote(c.scope)}).` });
     return F;
 }
 

@@ -395,13 +395,13 @@ test('with a result: the panel lists the results of the window, and they follow 
     assert.match(h, /Results in this time window <span class="log-lens-count">5<\/span>/);
     for (const s of ['Problem', 'Monitor', 'Information', 'Check C12, roll: the tracking error is 52 ± 3 % of the setpoint.', 'Value: 52.0 ± 3.0 %.',
         'Limit: <code>value - 2 SE &gt; 0.45 flag, value &gt; 0.3 note</code>', 'Time in the log: 5.0 s to 12.0 s.', 'C12, roll, PID profile 1',
-        'Time in the log: 14.0 s to 16.0 s.', 'Show in the log', 'Show the measurement', 'Toolkit text (not STE)']) {
+        'Time in the log: 14.0 s to 16.0 s.', 'Show in the log', 'Show the measurement', 'Analysis information']) {
         assert.ok(h.includes(s), s);
     }
     assert.match(h, /data-lens-act="compare" data-fid="fA" data-arg="track:roll"/);
     assert.match(h, /data-lens-act="compare" data-fid="fF" data-arg="lines:roll"/);
     assert.ok(!/data-lens-act="compare" data-fid="fI"/.test(h), 'R1 has no plot in the lens');
-    assert.match(h, /<details data-ste="quoted"><summary>Toolkit text \(not STE\)<\/summary>toolkit text of C12<\/details>/);
+    assert.match(h, /<details data-ste="quoted"><summary>Analysis information<\/summary>toolkit text of C12<\/details>/);
     assert.equal(app.html('notice'), '', 'no notice with a result that has spans');
     // the timeline: headspeed of the result curves, the spans by status in the span strip
     const ctx = app.timeline.ctx;
@@ -719,7 +719,7 @@ test('escapes what comes from the log, the toolkit and the workers, and marks te
     assert.match(app.html('findings'), /Limit: <code>&lt;img/, 'the threshold of the toolkit as code');
     assert.match(app.html('values'), /<div class="log-lens-note" data-ste="quoted">The yaw setpoint is &lt;img src=x/, 'the text of the worker, escaped and quoted');
     assert.match(app.html('values'), /<ul class="log-lens-notes" data-ste="quoted"><li>The log does not record &quot;govTarget&quot;\.<\/li>/);
-    assert.match(app.html('findings'), /<details data-ste="quoted"><summary>Toolkit text \(not STE\)<\/summary>&lt;img/);
+    assert.match(app.html('findings'), /<details data-ste="quoted"><summary>Analysis information<\/summary>&lt;img/);
     // a reader that fails: our sentence, then its message quoted
     const r = await shown({ result: null, readError: HOSTILE });
     assert.match(r.html('values'), /The app cannot read the data of this time window\. <span data-ste="quoted">&lt;img/);

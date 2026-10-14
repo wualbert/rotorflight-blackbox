@@ -1,4 +1,5 @@
 'use strict';
+const Math = require('./filter_math.cjs');
 
 // Deterministic, constrained successive-halving search. All objective values,
 // latency estimates and plots come from filter_replay on recorded samples.
@@ -7,6 +8,7 @@ const FT = require('./filter_tune.cjs');
 const replay = require('./filter_replay.cjs');
 const reconstruct = require('./filter_reconstruct.cjs');
 const setup = require('./health_setup.cjs');
+const checklist = require('./filter_checklist.cjs');
 const AXES = ['roll', 'pitch', 'yaw'];
 const RULES = Object.freeze({ window: 1024, leadS: 2, blockS: 30, noiseHz: 30,
     nyquistShare: 0.8, parityDb: 1, parityDelayMs: 0.3, maxAddMs: 0.5,
@@ -37,10 +39,19 @@ function prepare(items, opts) {
     const cli = opts.cli ? typeof opts.cli === 'string' ? setup.parseCli(opts.cli) : opts.cli : null;
     let fit = opts.tailFit || null;
     if (!opts.gear && !fit && opts.logGear !== false) fit = FT.tailOrder(items, opts);
-    const segments = [], windows = [], excluded = [], notes = [];
+    const segments = [], windows = [], excluded = [], unmeasured = [], notes = [];
     for (const item of items) {
         const w = item.w || item;
         if (w.skipped || item.flight === false) continue;
+        const mask = masks(item, opts);
+        // Ground, rescue and other excluded modes are outside the filter
+        // analysis domain. They cannot invalidate coverage of flight input.
+        // Brief flight/profile periods can have valid input without a complete
+        // spectral window. Report their measurement limit separately below.
+        if (!mask.some(Boolean)) {
+            notes.push('Log ' + (w.flight.log + 1) + ': a period has no flight samples for filter analysis.');
+            continue;
+        }
         const raw = AXES.map((_, a) => w.extra && w.extra[`gyroRAW[${a}]`]);
         if (!raw.every(Boolean)) { excluded.push({ log: w.flight.log, reason: 'The log has no raw gyro data.' }); continue; }
         const cfg = FT.config(w.flight.header, { cli, gear: opts.gear, logGear: fit && fit.gear, actualRate: w.flight.actualRate });
@@ -48,7 +59,7 @@ function prepare(items, opts) {
         cfg.rates.scale=reconstruct.schedulerScale(w.extra.time,cfg.rates.logHz,cfg.rates.scale);
         const model = FT.compile(cfg), firmware = w.flight.firmware || w.flight.header['Firmware revision'] || '';
         const unsupported = !/Rotorflight 4\.6\.0\b/.test(firmware);
-        const mask = masks(item, opts), originalProfiles = w.profileAt || new Uint8Array(w.n);
+        const originalProfiles = w.profileAt || new Uint8Array(w.n);
         const firstProfile = item.armingProfile || opts.armingProfile || originalProfiles[0] || 0;
         const prof = Uint8Array.from(originalProfiles, p => p || firstProfile);
         const seg = { id: segments.length, w, cfg, model, raw, n: w.n, hs: w.hs, tail: w.extra.tailspeed,
@@ -78,8 +89,19 @@ function prepare(items, opts) {
                 hs: w.hs[st + (N >> 1)], rate: cfg.rates.logHz, held: false });
         }
         if (windows.length === firstWindow) {
-            excluded.push({ log: seg.log, fromS: seg.fromS, toS: seg.fromS + seg.n / cfg.rates.logHz,
-                reason: 'This flight period has no complete filter window.' });
+            let longest=0,run=0,eligible=0,invalidInput=false;
+            for(let i=0;i<w.n;i++) {
+                if(!mask[i]){run=0;continue;}
+                eligible++;
+                if(!Number.isFinite(raw[0][i]+raw[1][i]+raw[2][i]+w.hs[i]))invalidInput=true;
+                if(i&&mask[i-1]&&seg.time&&(!(seg.time[i]>seg.time[i-1])||seg.time[i]-seg.time[i-1]>1.8e6/cfg.rates.logHz))invalidInput=true;
+                run=i&&mask[i-1]&&prof[i]===prof[i-1]?run+1:1;longest=Math.max(longest,run);
+            }
+            const period={log:seg.log,profile:firstProfile,configuration:w.recordedConfiguration&&w.recordedConfiguration.id||null,
+                fromS:seg.fromS,toS:seg.fromS+seg.n/cfg.rates.logHz};
+            if(!invalidInput&&longest<lead+N)unmeasured.push({...period,eligibleS:eligible/cfg.rates.logHz,requiredS:(lead+N)/cfg.rates.logHz,
+                reason:'This period is too short for the filter signal checks. Its signal change is not measured.'});
+            else excluded.push({...period,reason:'This flight period has no complete filter window.'});
             continue;
         }
         segments.push(seg);
@@ -93,9 +115,19 @@ function prepare(items, opts) {
     const targetProfiles = {};
     for (const seg of segments) {
         seg.observers = {};
+        seg.observerValidation = {};
         for (const profile of new Set(windows.filter(w=>w.seg===seg).map(w=>w.profile))) {
             const ws = windows.filter(w=>w.seg===seg&&w.profile===profile), ps=paths(ws[0],{});
-            seg.observers[profile] = ps.map((p,a)=>p.known?p:reconstruct.pidObserver(seg,ws,a)||p);
+            const inherited=seg.w.recordedConfiguration&&seg.w.recordedConfiguration.assumed;
+            const training=inherited?reconstruct.pidTraining(seg,ws):null;
+            seg.observers[profile] = ps.map((p,a)=>{
+                if(!p.known)return reconstruct.pidObserver(seg,ws,a)||p;
+                if(!training)return p;
+                const checked=reconstruct.validatePidObserver(seg,ws,a,p,training);
+                (seg.observerValidation[profile]||(seg.observerValidation[profile]=[]))[a]=checked.validation;
+                if(checked.validation.contradicted)notes.push(`Log ${seg.log+1}, PID profile ${profile}, ${AXES[a]}: ${checked.validation.reason} The replay uses the gyro output for this axis.`);
+                return checked.observer;
+            });
         }
         const ws=windows.filter(w=>w.seg===seg);
         seg.timingCalibration=reconstruct.calibrateTiming(seg,ws);
@@ -104,7 +136,7 @@ function prepare(items, opts) {
     for (const w of windows) paths(w, {}).forEach((p, a) => {
         if (p.known) for (const kind of ['gyro', 'd']) targetProfiles[pidKey(w.profile, AXES[a], kind)] = p[`${kind}_cutoff`];
     });
-    return { segments, windows, units, ref, targetProfiles, cli, fit, excluded, notes, opts, evaluations: 0, samples: 0 };
+    return { segments, windows, units, ref, targetProfiles, cli, fit, excluded, unmeasured, notes, opts, evaluations: 0, samples: 0 };
 }
 
 function paths(w, changes) {
@@ -113,10 +145,19 @@ function paths(w, changes) {
         const recorded = p > 0 && (p === w.seg.firstProfile ? cfg.pid.header[ax] : cfg.pid.cli[p] && cfg.pid.cli[p][ax]);
         const known = recorded && ['gyro_cutoff', 'd_cutoff', 'P', 'D'].every(k => Number.isFinite(recorded[k]));
         const base = known ? recorded : cfg.pid.header[ax];
-        return { gyro_cutoff: changes[pidKey(p, ax, 'gyro')] === undefined ? base.gyro_cutoff : changes[pidKey(p, ax, 'gyro')],
+        const path = { gyro_cutoff: changes[pidKey(p, ax, 'gyro')] === undefined ? base.gyro_cutoff : changes[pidKey(p, ax, 'gyro')],
             d_cutoff: changes[pidKey(p, ax, 'd')] === undefined ? base.d_cutoff : changes[pidKey(p, ax, 'd')],
             Kp: (base.P || 0) * require('./lib.cjs').SCALE.P[a], Kd: (base.D || 0) * require('./lib.cjs').SCALE.D[a],
             ...(known && base.stopGain ? {stopGain:base.stopGain} : {}), known: !!known };
+        const validation=w.seg.observerValidation&&w.seg.observerValidation[p]&&w.seg.observerValidation[p][a];
+        if(validation&&validation.contradicted) {
+            // An observer repairs the inverse constraints only. It does not
+            // make the inherited profile known for P+D scoring or CLI export.
+            const observer=w.seg.observers[p][a];
+            return {...path,Kp:observer.Kp,Kd:observer.Kd,...(observer.stopGain?{stopGain:observer.stopGain}:{}),
+                known:false,contradicted:true};
+        }
+        return path;
     });
 }
 
@@ -193,7 +234,7 @@ function evaluate(P, changes, wins, keep = false, continuous = false) {
         results.push({ w, m, trace: save ? { y: out.y, out: out.out, native:out.native } : null }); if(!full)P.samples += out.samples;
     }
     P.evaluations++;
-    return { changes, results };
+    return { changes, results, outputs: keep && continuous ? whole : undefined };
 }
 
 function compare(candidate, base, limits = RULES) {
@@ -318,13 +359,87 @@ function capabilities(P) {
     ];
 }
 
+// Compose repairs so a low-delay notch improvement cannot repeatedly displace
+// the LPF or RPM-bank change needed by a recorded problem. These are proposals,
+// not accepted settings: every combination still needs replay and validation.
+function repairCandidate(P, changes) {
+    const c={...changes},s={...P.ref.s,...c},minHz=setup.DEFAULT_RULES.F2.flagHz,minQ=Math.ceil(10*setup.DEFAULT_RULES.F3.minQ);
+    const banks=clone(FT.effectiveBanks(s)),codes=[10,11,12,13,14,15,16,17,18,21,22,23,24,25,26,27,28];
+    let bankChange=false;
+    if(banks.every(Boolean)) {
+        for(const f of P.trainingChecklistBefore || []) if(f.id==='F5'&&f.severity==='flag') {
+            const seg=P.segments.find(seg=>seg.id===f.segment); if(!seg)continue;
+            for(const line of f.lines || []) {
+                if(line.rotorLocked===false)continue;
+                const source=codes.map(code=>setup.decodeNotchSource(code,seg.cfg.gear)).find(d=>d.enabled===true&&d.order>0&&Math.abs(line.order/d.order-1)<=setup.RULE.line.sameOrder);
+                if(!source)continue; // A resonance is not an RPM harmonic.
+                for(const axis of line.axes || []) {
+                    const a=AXES.indexOf(axis.axis); if(a<0||!(axis.amplitude>0))continue;
+                    const near=banks[a].some(b=>{
+                        const d=setup.decodeNotchSource(b.source,seg.cfg.gear),order=d.order*(1+(b.center||0)/10000);
+                        return d.enabled===true&&order>0&&Math.abs(line.order/order-1)<=setup.DEFAULT_RULES.F5.maxDistance;
+                    });
+                    if(near&&!s.RPM_FILTER)c.RPM_FILTER=true;
+                    if(!near&&banks[a].length<16) {banks[a].push({source:source.code,q:60,center:0});bankChange=true;}
+                }
+            }
+        }
+        if(s.RPM_FILTER||c.RPM_FILTER||bankChange)for(const bank of banks)for(const b of bank)if(b.q<minQ){b.q=minQ;bankChange=true;}
+        if(bankChange) {
+            c.RPM_FILTER=true;c.gyro_rpm_notch_preset=0;
+            AXES.forEach((ax,a)=>['source','q','center'].forEach(k=>{c[`gyro_rpm_notch_${k}_${ax}`]=Array.from({length:16},(_,i)=>banks[a][i]?banks[a][i][k]:0);}));
+        }
+    }
+    const active=slot=>s[`gyro_lpf${slot}_type`]>0&&(s[`gyro_lpf${slot}_static_hz`]>0||slot===1&&s.gyro_lpf1_dyn_min_hz>0);
+    if((c.RPM_FILTER===undefined?s.RPM_FILTER:c.RPM_FILTER)&&!active(1)&&!active(2)) {
+        c.gyro_lpf1_type=1;c.gyro_lpf1_static_hz=Math.floor(Math.min(1000,...P.segments.map(seg=>.45*seg.cfg.rates.filterHz)));
+        c.gyro_lpf1_dyn_min_hz=0;c.gyro_lpf1_dyn_max_hz=0;
+    }
+    for(const slot of [1,2]) if(active(slot)&&s[`gyro_lpf${slot}_static_hz`]>0&&s[`gyro_lpf${slot}_static_hz`]<minHz)c[`gyro_lpf${slot}_static_hz`]=minHz;
+    if(active(1)&&s.gyro_lpf1_dyn_min_hz>0&&s.gyro_lpf1_dyn_min_hz<minHz) {
+        c.gyro_lpf1_dyn_min_hz=minHz;c.gyro_lpf1_dyn_max_hz=Math.max(minHz,s.gyro_lpf1_dyn_max_hz);
+    }
+    if(s.DYN_NOTCH&&s.dyn_notch_q<minQ)c.dyn_notch_q=minQ;
+    return c;
+}
+
+function checkPriority(a,b) {
+    const A=a.checks,B=b.checks;
+    if(A&&B) return Number(!A.passed)-Number(!B.passed) || A.newIssues-B.newIssues || (A.worsened||0)-(B.worsened||0) || (A.configurationIssues||0)-(B.configurationIssues||0) ||
+        (A.remaining+A.unverified)-(B.remaining+B.unverified) || (B.improved||0)-(A.improved||0);
+    return (a.configurationIssues||0)-(b.configurationIssues||0);
+}
+function rankCandidates(a,b) {
+    return checkPriority(a,b) || a.score.db-b.score.db;
+}
+function selectFinalist(candidates) {
+    if(!candidates.length)return null;
+    const benefit=q=>q.checks&&q.checks.passed&&(q.checks.corrected>0||q.score.db<=-RULES.minReductionDb);
+    const eligible=candidates.filter(benefit),ranked=(eligible.length?eligible:candidates).slice().sort(rankCandidates),best=ranked[0];
+    // Fix the comparison to one training-only reference. Pairwise uncertainty
+    // comparisons would make sorting nontransitive. Reserved periods are not
+    // available here and cannot select a fallback after their test fails.
+    const allowanceDb=Number.isFinite(best.score.se)&&best.score.se>0?best.score.se:0;
+    const pool=ranked.filter(q=>checkPriority(q,best)===0&&q.score.db<=best.score.db+allowanceDb+1e-9);
+    const delay=q=>q.score.delay&&Number.isFinite(q.score.delay.maxAddMs)?q.score.delay.maxAddMs:Infinity;
+    pool.sort((a,b)=>delay(a)-delay(b)||a.score.db-b.score.db||key(a.changes).localeCompare(key(b.changes)));
+    return {candidate:pool[0],bestDb:best.score.db,allowanceDb,candidates:pool.length};
+}
+
 function candidates(P, current = {}) {
-    const ref = settings(P.ref, current), s = ref.s, out = [], seen = new Set(), add = (family, change) => {
-        const c = Object.assign({}, current, change), k = key(c);
+    const ref = settings(P.ref, current), s = ref.s, out = [], seen = new Set(), push = (family, c) => {
+        const k = key(c);
         if (seen.has(k)) return; seen.add(k);
         if (invalid(P, c).length) return;
         out.push({ family, changes: c });
     };
+    const add=(family,change)=>{
+        const c=Object.assign({},current,change);
+        push(family,repairCandidate(P,c));
+        push(family,c);
+    };
+    const repaired=repairCandidate(P,current);
+    if(key(repaired)!==key(current))push('check repair',repaired);
     if (P.segments.every(seg => Number.isFinite(seg.cfg.s.gyro_decimation_hz))) for (const hz of [0, 150, 200, 250, 300, 350, 400, 500, 600, 800, 1000]) add('gyro decimation', { gyro_decimation_hz: hz });
     if (s.motor_rpm_lpf && P.segments.every(seg => seg.cfg.s.motor_rpm_lpf)) for (const hz of [10, 25, 50, 75, 100, 150, 200, 250]) {
         const values = s.motor_rpm_lpf.slice(); values[0] = hz;
@@ -421,17 +536,24 @@ function invalid(P, changes) {
     return why;
 }
 
-function validCliRow(r) {
-    if (r.name === 'motor_rpm_lpf') { const values = String(r.to).split(',').map(Number); return values.length === 4 && values.every(x=>Number.isInteger(x)&&x>=0&&x<=255); }
+function validCliValue(r) {
+    if (r.name === 'motor_rpm_lpf') { const values = String(r.to).split(',').map(Number); return /^\d+(,\d+){3}$/.test(String(r.to)) && values.every(x=>Number.isInteger(x)&&x>=0&&x<=255); }
     if (r.name === 'feature RPM_FILTER' || r.name === 'feature DYN_NOTCH') return typeof r.to === 'boolean';
     if (/^gyro_lpf[12]_type$/.test(r.name)) return FT.FW.LPF.includes(r.to);
     const array = /^gyro_rpm_notch_(source|q|center)_(roll|pitch|yaw)$/.exec(r.name);
     if (array) {
         const values = String(r.to).split(',').map(Number);
-        return values.length === 16 && values.every(x => Number.isInteger(x) && (array[1] === 'source' ? x === 0 || x >= 10 && x <= 18 || x >= 20 && x <= 28 : array[1] === 'q' ? x >= 0 && x <= 255 : x >= -32768 && x <= 32767));
+        return /^-?\d+(,-?\d+){15}$/.test(String(r.to)) && values.every(x => Number.isInteger(x) && (array[1] === 'source' ? x === 0 || x >= 10 && x <= 18 || x >= 20 && x <= 28 : array[1] === 'q' ? x >= 0 && x <= 255 : x >= -32768 && x <= 32767));
     }
     const range = FT.FW_RANGE[r.name] || (/^gyro_lpf1_dyn_(min|max)_hz$/.test(r.name) ? [0, 1000] : /^(roll|pitch|yaw)_(gyro|d)_cutoff$/.test(r.name) ? [0, 250] : null);
     return !!range && Number.isInteger(r.to) && r.to >= range[0] && r.to <= range[1] && (r.scope !== 'profile' || Number.isInteger(r.profile) && r.profile >= 1 && r.profile <= 6);
+}
+function validCliRow(r) {
+    if (!r || !['global', 'profile'].includes(r.scope) || !['header', 'cli'].includes(r.source) || r.from === null || r.from === undefined) return false;
+    const profileValue = /^(roll|pitch|yaw)_(gyro|d)_cutoff$/.test(r.name);
+    if (profileValue !== (r.scope === 'profile')) return false;
+    if (profileValue && !(Number.isInteger(r.profile) && r.profile >= 1 && r.profile <= 6)) return false;
+    return validCliValue(r) && validCliValue({...r, to:r.from});
 }
 
 function sample(wins, n) {
@@ -471,9 +593,58 @@ function commands(rows) {
     return out;
 }
 
+function cliExportStatus(res, meta = {}) {
+    const refuse = reasons => ({ available: false, reasons: [...new Set(reasons)] });
+    const retry = ' Keep the recorded values. Start autotune again with the selected flight data.';
+    const inspect = ' Keep the recorded values. Examine this value in the Configurator.';
+    const profile = ' Keep the recorded values. The recorded data must identify the PID profile before export.';
+    if (!res || !res.recommended) return refuse(['There is no filter result for CLI export. Start autotune with the selected flight data.']);
+    if (!res.model || !res.model.passed || res.recommended.status !== 'recommended')
+        return refuse(res.recommended.reasons && res.recommended.reasons.length ? res.recommended.reasons : ['The filter replay gives no recommended configuration.' + retry]);
+    // Empty simulation parameters replay each interval's recorded values, not
+    // a common target. The reference configuration was not tested as a change.
+    if (res.mode === 'simulation' && res.recommended.params && !Object.keys(res.recommended.params).length)
+        return refuse(['Recorded filter replay. No filter values changed.']);
+    if (res.checklist) {
+        const checks=checklist.assess(res.checklist);
+        if(!checks.passed)return refuse(checks.reasons);
+    }
+    const recs = meta.recommendations || res.recommendations || [], blocked = (res.blockedBy || []).concat(recs.flatMap(r => r.blockedBy || []));
+    const causes = recs.flatMap(r => (r.causes || []).filter(c => c && c.holds));
+    if (blocked.length || causes.length)
+        return refuse(['CLI export must wait for the filter prerequisite checks. Examine the prerequisite checks.'].concat(blocked, causes.map(c => c.text).filter(Boolean)));
+    const rows = res.recommended.fullRows || res.recommended.rows;
+    if (!Array.isArray(rows) || !rows.length) return refuse(['The filter result gives no parameter values for CLI export.' + retry]);
+    const bad = [];
+    for (const r of rows) {
+        if (validCliRow(r)) continue;
+        if (!r) { bad.push('The filter result contains an empty parameter row.' + retry); continue; }
+        const name = '`' + String(r.name) + '`', profileValue = /^(roll|pitch|yaw)_(gyro|d)_cutoff$/.test(r.name);
+        if (!['global', 'profile'].includes(r.scope) || profileValue !== (r.scope === 'profile'))
+            bad.push('The scope of ' + name + ' does not agree with its firmware scope.' + retry);
+        else if (profileValue && !(Number.isInteger(r.profile) && r.profile >= 1 && r.profile <= 6))
+            bad.push('The PID profile of ' + name + ' is unknown.' + profile);
+        else if (!['header', 'cli'].includes(r.source) || r.from === null || r.from === undefined)
+            bad.push('The recorded value of ' + name + ' is unknown.' + inspect);
+        else if (!validCliValue({...r, to:r.from})) bad.push('The recorded value of ' + name + ' is not correct.' + inspect);
+        else bad.push('The new value of ' + name + ' is out of the firmware CLI range. Set a value in the firmware CLI range. Then simulate again.');
+    }
+    if (bad.length) return refuse(bad);
+    const seen = new Map();
+    for (const r of rows) {
+        const id = `${r.scope}:${r.scope === 'profile' ? r.profile : ''}:${r.name}`, values = `${r.from}|${r.to}`;
+        if (seen.has(id) && seen.get(id) !== values) bad.push('The filter result gives different values for `' + r.name + '` in the same scope.' + retry);
+        seen.set(id, values);
+    }
+    if (bad.length) return refuse(bad);
+    const boot = meta.bootProfile || res.bootProfile;
+    if (rows.some(r => r.scope === 'profile') && !(Number.isInteger(boot) && boot >= 1 && boot <= 6))
+        return refuse(['The PID profile to set again after CLI export is unknown.' + profile]);
+    return { available: true, reasons: [] };
+}
+
 function cliFile(res, meta = {}) {
-    if (!res.model.passed || res.recommended.status !== 'recommended') return '';
-    if ((meta.recommendations || res.recommendations || []).some(r => (r.blockedBy || []).length)) return '';
+    if (!cliExportStatus(res, meta).available) return '';
     const rows = res.recommended.fullRows || res.recommended.rows, clean = x => String(x == null ? '' : x).replace(/[^\x20-\x7e]/g, '_');
     // Keep the complete provenance without exceeding the firmware CLI line
     // buffer. Sanitize first, then prefix every wrapped line as a comment.
@@ -485,10 +656,8 @@ function cliFile(res, meta = {}) {
         }
         lines.push('# ' + rest); return lines;
     };
-    if (rows.some(r => !['header', 'cli'].includes(r.source) || !validCliRow(r))) return '';
     const profiles = [...new Set(rows.filter(r => r.scope === 'profile').map(r => r.profile))];
     const boot = meta.bootProfile || res.bootProfile;
-    if (profiles.length && !(boot >= 1 && boot <= 6)) return '';
     const out = ['# Save the output of diff all before loading this file.', '# Rotorflight filter autotune',
         ...comment('Craft: ' + (meta.craft || res.craft || '')), ...comment('File: ' + (meta.fileName || res.fileName || '')),
         ...comment('Firmware: ' + (res.firmware || '')), ...comment('Generated: ' + (meta.date || new Date().toISOString())),
@@ -498,9 +667,12 @@ function cliFile(res, meta = {}) {
         '# PID profiles: ' + (profiles.length ? profiles.join(', ') : 'global filters only'),
         '# Replay noise change: ' + res.recommended.predicted.totalDb + ' dB',
         '# Maximum added time delay: ' + delayLimit(res.limits && res.limits.maxAddMs) + ' ms.',
-        res.mode==='simulation' ? '# Rule: replay agreement and the delay, gain-loss and per-axis noise limits.'
-            : '# Rule: replay agreement, noise reduction, control-band delay and reserved flight periods.',
+        res.mode==='simulation' ? '# Rule: filter problem improvement, no new or increased problems, replay agreement and the delay, gain-loss and per-axis noise limits.'
+            : '# Rule: filter problem improvement, no new or increased problems, replay agreement, noise reduction, control-band delay and reserved flight periods.',
         '# This replay predicts filtering of the recorded input. It does not predict a new closed-loop flight.'];
+    const checks=res.recommended.validation&&res.recommended.validation.checks;
+    if(checks&&checks.remaining)out.push(...comment('Filter problems not corrected: '+checks.ids.remaining.join(', ')+'. Examine the filter checks.'));
+    for(const q of res.unmeasuredPeriods||[])out.push(...comment('Signal change not measured: log '+(q.log+1)+', '+q.fromS.toFixed(3)+' to '+q.toS.toFixed(3)+' s. '+q.reason));
     if (res.model.reconstructed) out.push('# Firmware multichannel reconstruction; every fifth gyro output was reserved for validation.');
     for(const q of res.recordedConfigurations || [])out.push(...comment('Log '+(q.log+1)+', '+q.t0.toFixed(2)+' to '+q.t1.toFixed(2)+' s: configuration '+(q.id||'unknown')+', PID profile '+(q.profile||'unknown')+'.'));
     for (const rec of meta.recommendations || res.recommendations || []) if (rec.stale) out.push(...comment('Values possibly not current: ' + rec.stale.text));
@@ -582,6 +754,9 @@ function parameterTable(P, changes = {}) {
 
 function manualChanges(P, supplied) {
     if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied)) throw Error('The edited filter values are not valid.');
+    // An empty request means each interval's own recorded configuration.
+    // Expanding it from P.ref would silently flatten mixed configurations.
+    if (!Object.keys(supplied).length) return {};
     const schema = new Map(parameterTable(P).map(r=>[r.key,r])), changes = {};
     for (const [key,value] of Object.entries(supplied)) {
         const row=schema.get(key);
@@ -615,10 +790,10 @@ function tune(items, opts = {}) {
     const P = opts.prepared || prepare(items, opts);
     P.evaluations=0; P.samples=0;
     const result = { version: 2, mode: manual ? 'simulation' : 'autotune', limits, method: 'constrained successive halving, firmware-rate time-domain replay',
-        capabilities: capabilities(P), bench: P.excluded, notes: P.notes, model: { passed: false, parity: [], leftOut: [], rules: { bandDb: RULES.parityDb, delayMs: RULES.parityDelayMs } },
+        capabilities: capabilities(P), bench: P.excluded, unmeasuredPeriods:P.unmeasured||[], notes: P.notes, model: { passed: false, parity: [], leftOut: [], rules: { bandDb: RULES.parityDb, delayMs: RULES.parityDelayMs } },
         recommended: { status: 'no flight log', reasons: [], rows: [], cli: [], validation: {} }, curves: null,
         units: { kind: 'block', n: P.units.length }, tailFit: P.fit ? Object.assign({}, P.fit, { used: P.segments.some(s => s.cfg.gear && s.cfg.gear.source === 'log notch') }) : null };
-    if (!P.windows.length) { result.recommended.reasons.push('There are no complete flight windows with the required filter inputs.'); result.ms = { total: Date.now() - started }; return result; }
+    if (!P.windows.length) { result.recommended.reasons.push('There are no complete flight windows with the necessary filter inputs.'); result.cliExport = cliExportStatus(result); result.ms = { total: Date.now() - started }; return result; }
     const training = P.windows.filter(w => !w.held), heldout = P.windows.filter(w => w.held);
     const short = sample(training, opts.screenWindows || 8), medium = sample(training, 24);
     let reconstructedWindows=0;
@@ -631,6 +806,12 @@ function tune(items, opts = {}) {
     const edited=manual ? manualChanges(P,opts.simulate) : null;
     const baseShort = evaluate(P, {}, short), baseMedium = evaluate(P, {}, medium);
     P.trainingBase = baseShort;
+    const trainP={...P,windows:training,checklistBefore:null},heldP={...P,windows:heldout,checklistBefore:null};
+    const baseTrain=evaluate(P,{},training,true,true);
+    trainP.checklistBefore=checklist.findings(trainP,null,opts.app);
+    P.trainingChecklistBefore=trainP.checklistBefore;
+    const hasTargets=trainP.checklistBefore.some(f=>f.replayable!==false&&f.severity==='flag');
+    const trainingBaseline=checklist.findings(trainP,{},opts.app,{outputs:baseTrain.outputs});
     const ref = P.ref, budget = opts.budgetMs || RULES.budgetMs, searchStart = Date.now();
     const tried = [], seen = new Set(), finalists = [], maxCandidates = opts.maxCandidates || RULES.maxCandidates;
     let proposals = manual ? [] : candidates(P), incumbent = {}, timedOut = false;
@@ -641,35 +822,51 @@ function tune(items, opts = {}) {
             if (Date.now() - searchStart > budget) { timedOut = true; break; }
             let c, sc;
             try { c = evaluate(P, proposal.changes, short); sc = judge(c, baseShort); } catch (e) { tried.push({ family: proposal.family, reason: String(e.message) }); continue; }
-            tried.push({ family: proposal.family, db: round(sc.db), valid: sc.valid });
-            if (sc.valid && sc.db < -0.05) scored.push({ ...proposal, score: sc });
+            const configurationIssues=checklist.configurationIssues(P,proposal.changes).length;
+            tried.push({ family: proposal.family, db: round(sc.db), valid: sc.valid, configurationIssues });
+            if (sc.valid && (sc.db < -0.05 || hasTargets)) scored.push({ ...proposal, score: sc, configurationIssues });
             if (tried.length % 10 === 0) progress(`The app replayed ${tried.length} filter sets.`, Math.min(0.65, 0.1 + 0.55 * (Date.now() - searchStart) / budget));
         }
-        scored.sort((a, b) => a.score.db - b.score.db);
+        scored.sort(rankCandidates);
         const promoted = [];
         for (const q of scored.slice(0, 12)) { const ev = evaluate(P, q.changes, medium), sc = judge(ev, baseMedium); if (sc.valid) promoted.push({ ...q, score: sc }); }
-        promoted.sort((a, b) => a.score.db - b.score.db);
+        promoted.sort(rankCandidates);
         finalists.push(...promoted.slice(0, RULES.finalists).map(q => ({ ...q, round: roundNo })));
         if (!promoted.length || timedOut) break;
         incumbent = promoted[0].changes; proposals = candidates(P, incumbent);
     }
     progress('The app tests the best sets on all training windows.', 0.7);
-    const baseTrain = evaluate(P, {}, training, true, true), ranked = [];
+    const ranked = [];
     let bestFull = null;
     // Keep a feasible simpler design from each search round. Ranking only the
     // most aggressive refinements can discard every feasible fallback when a
     // sparsely sampled profile exposes extra delay at the full-data stage.
-    const ordered = finalists.sort((a, b) => a.score.db - b.score.db), full = [], fullSeen = new Set();
+    const ordered = finalists.sort(rankCandidates), full = [], fullSeen = new Set();
     const addFull = q => { if (q && !fullSeen.has(key(q.changes)) && full.length < RULES.finalists) { fullSeen.add(key(q.changes)); full.push(q); } };
     for (let r = 0; r < 3; r++) addFull(ordered.find(q => q.round === r));
     for (const family of new Set(ordered.map(q => q.family))) addFull(ordered.find(q => q.family === family));
     for (const q of ordered) addFull(q);
     for (const q of full) {
         const ev = evaluate(P, q.changes, training, true, true), sc = judge(ev, baseTrain);
-        if (sc.valid) { ranked.push({ ...q, score: sc }); if (!bestFull || sc.db < bestFull.score.db) bestFull = { ...q, score: sc, ev }; }
+        if (sc.valid) {
+            const checks=checklist.assess(checklist.compare(trainP,q.changes,{app:opts.app,baseline:trainingBaseline,outputs:ev.outputs}));
+            const candidate={...q,score:sc,checks}; ranked.push(candidate);
+            if (!bestFull || rankCandidates(candidate,bestFull)<0)bestFull={...candidate,ev};
+        }
     }
-    ranked.sort((a, b) => a.score.db - b.score.db);
-    if (manual) { const ev=evaluate(P,edited,training,true,true); bestFull={changes:edited,score:judge(ev,baseTrain),ev}; }
+    ranked.sort(rankCandidates);
+    let selection=null;
+    if(!manual&&ranked.length) {
+        const selected=selectFinalist(ranked),q=selected.candidate;
+        selection={bestNoiseDb:round(selected.bestDb),noiseAllowanceDb:round(selected.allowanceDb),candidates:selected.candidates,
+            selectedNoiseDb:round(q.score.db),selectedDelayMs:q.score.delay.maxAddMs};
+        if(!bestFull||key(bestFull.changes)!==key(q.changes))bestFull={...q,ev:evaluate(P,q.changes,training,true,true)};
+    }
+    if (manual) {
+        const ev=evaluate(P,edited,training,true,true);
+        bestFull={changes:edited,score:judge(ev,baseTrain),ev,
+            checks:checklist.assess(checklist.compare(trainP,edited,{app:opts.app,baseline:trainingBaseline,outputs:ev.outputs}))};
+    }
     const chosen = bestFull || { changes: {}, score: judge(baseTrain, baseTrain), ev: baseTrain };
     // The choice is now frozen. Holdout cannot select a different candidate.
     progress('The app checks the fixed set on the reserved flight periods.', 0.9);
@@ -678,37 +875,51 @@ function tune(items, opts = {}) {
     const holdPassed = hold.valid && hold.db < 0 && improvedBlocks / hold.units.length >= RULES.minHeldoutShare;
     const allBase = { results: baseTrain.results.concat(baseHeld.results) }, allCand = { results: chosen.ev.results.concat(testHeld.results) };
     const par = parity(allBase, P), combined = judge(allCand, allBase), reasons = [];
+    const baselineOutputs=new Map([...baseTrain.outputs,...baseHeld.outputs]),candidateOutputs=new Map([...chosen.ev.outputs,...testHeld.outputs]);
+    const heldChecks=checklist.assess(checklist.compare(heldP,chosen.changes,{app:opts.app,outputs:testHeld.outputs,
+        baseline:checklist.findings(heldP,{},opts.app,{outputs:baseHeld.outputs})}),{requireProgress:false});
+    result.checklist=checklist.compare(P,chosen.changes,{app:opts.app,outputs:candidateOutputs,
+        baseline:checklist.findings(P,{},opts.app,{outputs:baselineOutputs})});
+    const checkResult=checklist.assess(result.checklist),recordedOnly=manual&&!Object.keys(edited).length;
+    if(!recordedOnly) {
+        for(const assessment of [chosen.checks,heldChecks,checkResult])if(assessment)for(const reason of assessment.reasons)if(!reasons.includes(reason))reasons.push(reason);
+    }
     const unsupported = P.segments.some(s => s.unsupported);
-    if (unsupported) reasons.push('This firmware version has no confirmed replay model.');
+    if (unsupported) reasons.push('The replay model is not for this firmware version.');
     if (new Set(P.segments.map(s => s.w.flight.craft).filter(Boolean)).size > 1) reasons.push('The selected logs contain more than one helicopter.');
-    if (P.excluded.length) reasons.push('Some selected logs cannot be replayed with their recorded filter inputs.');
+    if (P.excluded.length) reasons.push('Some selected flight periods have no complete replay. Examine the flight periods not used.');
     if (!par.every(p => p.passed)) reasons.push('The recorded filter configuration does not agree with the replay on all axes.');
     if (P.units.length < RULES.minUnits || heldout.length < RULES.minWindows) reasons.push('There are not sufficient flight periods to select the values and test them with different data.');
-    if (!manual && !(chosen.score.db <= -RULES.minReductionDb)) reasons.push('No tested set decreases vibration by 3 dB or more within the time delay and control-band limits.');
+    const corrective=chosen.checks&&chosen.checks.passed&&chosen.checks.corrected>0;
+    if (!manual && !corrective && !(chosen.score.db <= -RULES.minReductionDb)) reasons.push('No filter set in the analysis decreases vibration by 3 dB or more in the replay limits.');
     if (!manual && !(combined.se !== null && combined.db + 2 * combined.se < 0)) reasons.push('The decrease is not more than two standard errors across flight periods.');
-    if (!chosen.score.valid || !combined.valid) reasons.push('The proposed values exceed the time delay or control-band limits.');
-    if (manual ? !hold.valid : !holdPassed) reasons.push('The selected values do not give a satisfactory result in the different flight periods.');
+    if (!chosen.score.valid || !combined.valid) reasons.push('The replay is out of the time delay, control-band or vibration limits.');
+    if (manual ? !hold.valid : !holdPassed) {
+        if(hold.delay.maxAddMs>limits.maxAddMs)reasons.push(`In the flight periods for the last test, added filter time delay is ${round(hold.delay.maxAddMs)} ms. The limit is ${limits.maxAddMs} ms.`);
+        else reasons.push('The selected values do not give a satisfactory result in the different flight periods.');
+    }
     const rows = rowsFor(P, chosen.changes), fullRows = rowsFor(P, chosen.changes, true);
     if (fullRows.some(r => !['header', 'cli'].includes(r.source)) || ['RPM_FILTER', 'DYN_NOTCH'].some(k => typeof ref.s[k] !== 'boolean')) reasons.push('Some filter values are not recorded. The app cannot make a complete CLI configuration.');
-    if (fullRows.some(r => !validCliRow(r))) reasons.push('The filter configuration contains a value outside the firmware CLI range.');
+    if (fullRows.some(r => !validCliRow(r))) reasons.push('The filter configuration contains a value out of the firmware CLI range.');
     const reconstructed = P.segments.some(s => s.cfg.rates.logHz !== s.cfg.rates.filterHz || s.cfg.rates.offsetTicks !== 0);
     const coverage = P.segments.map(s => ({ log: s.log, firmware: s.firmware, gyroHz:s.cfg.rates.gyroHz, logHz: s.cfg.rates.logHz, filterHz: s.cfg.rates.filterHz, pidHz: s.cfg.rates.pidHz,
             rawOffsetUs: s.cfg.rates.offsetTicks / s.cfg.rates.gyroHz * 1e6, schedulerMultiplier:s.cfg.rates.scale, timingCalibration:s.timingCalibration,
+            observerValidation:s.observerValidation,
             reconstructed: s.cfg.rates.logHz !== s.cfg.rates.filterHz || s.cfg.rates.offsetTicks !== 0 }));
     Object.assign(result, { ms: { total: Date.now() - started, search: Date.now() - searchStart, exactEvaluations: P.evaluations, screened: 0, simulations: P.evaluations, timedOut },
         craft: P.segments[P.segments.length - 1].w.flight.craft || '', fileName: P.segments[P.segments.length - 1].file || '',
         firmware: P.segments[P.segments.length - 1].firmware, bootProfile: P.cli && P.cli.selectedProfile !== null ? P.cli.selectedProfile + 1 : opts.armingProfile || P.segments[P.segments.length - 1].firstProfile || null,
-        search: { tested: tried.length, families: [...new Set(tried.map(t => t.family))], finalistCount: ranked.length, replayedSamples: P.samples, trainingWindows: training.length, heldoutWindows: heldout.length },
-        current: { settings: ref.s, from: ref.from }, model: { ...result.model, passed: !unsupported && !P.excluded.length && par.every(p => p.passed), parity: par,
+        search: { tested: tried.length, families: [...new Set(tried.map(t => t.family))], finalistCount: ranked.length, selection, replayedSamples: P.samples, trainingWindows: training.length, heldoutWindows: heldout.length },
+        current: { settings: ref.s, from: ref.from }, model: { ...result.model, passed: !unsupported && !P.excluded.length && par.every(p => p.passed), supported:!unsupported, parity: par,
             coverage, reconstructed, reconstructionMethod:'firmware multichannel reconstruction', continuousValidation:true, gear: ref.gear,
             observers:P.segments.map(s=>({log:s.log,profiles:s.observers})),
             notes: reconstructed ? ['The app reconstructs gyro samples with the recorded gyro and PID signals. The sample fit omits every fifth gyro output. Finalists run continuously through each log.'] : [] },
         recommended: { status: reasons.length ? 'not recommended' : 'recommended', reasons, params: chosen.changes, rows, fullRows,
             cli: reasons.length ? [] : commands(rows), predicted: { totalDb: round(combined.db), se: round(combined.se), axes: combined.axes }, delay: combined.delay,
-            validation: { holdout: { unit: '30 s flight block', blocks: hold.n, windows: heldout.length, meanDb: round(hold.db), se: round(hold.se),
+            validation: { checks:{...checkResult,training:chosen.checks||null,heldout:heldChecks}, holdout: { unit: '30 s flight block', blocks: hold.n, windows: heldout.length, meanDb: round(hold.db), se: round(hold.se),
                 improvedBlocks, requiredShare: RULES.minHeldoutShare, passed: holdPassed, selectedBeforeHoldout: !manual,
                 withinLimits:hold.valid,delay:hold.delay,axes:hold.axes } } },
-        curves: opts.curves === false ? null : curves(allBase, allCand), candidates: ranked.map(q => ({ family: q.family, db: round(q.score.db), changes: q.changes })) });
+        curves: opts.curves === false ? null : curves(allBase, allCand), candidates: ranked.map(q => ({ family: q.family, db: round(q.score.db), se:round(q.score.se),delay:q.score.delay,changes: q.changes,checks:q.checks })) });
     // One trace per interval/profile; its spectrum uses exactly this window
     // at the recorded sample rate, rather than the flight-wide average.
     result.traces = [];
@@ -733,22 +944,24 @@ function tune(items, opts = {}) {
     }
     result.parameters=parameterTable(P,chosen.changes);
     progress('The app compares the filter checks before and after replay.',0.97);
-    result.checklist=require('./filter_checklist.cjs').compare(P,chosen.changes,{app:opts.app});
-    result.checklist.confirmed=result.model.passed;
+    checklist.verify(result.checklist,result.model);
     progress('The filter replay is complete.', 1);
+    result.cliExport = cliExportStatus(result);
     result.cliFile = cliFile(result);
     return result;
 }
 
 function texts(res) {
     const R = res.recommended, good = R.status === 'recommended', p = R.predicted || {}, h = R.validation && R.validation.holdout;
+    const recordedOnly = res.mode === 'simulation' && R.params && !Object.keys(R.params).length;
     const rows = (R.rows || []).map(r => ({ ...r, text: `Set \`${r.name}\` to \`${r.to}\`.` }));
     return { status: R.status, summary: `The app replayed ${res.search ? res.search.tested : 0} filter sets on recorded gyro samples.`,
-        recommendation: good && res.mode === 'simulation' ? 'The changed values pass the replay limits. Examine the checks and signals before export.' : good ? `The recommended set decreases the vibration in the replay by ${round(-p.totalDb, 2)} ± ${round(p.se, 2)} dB. Examine all filter values below.` : R.reasons.join('\n'),
+        recommendation: (good && recordedOnly ? 'Recorded filter replay. No filter values changed. Each interval uses its recorded configuration.' : good && res.mode === 'simulation' ? 'The changed values are in the replay limits. Examine the checks and signals before export.' : good ? `The recommended set decreases the vibration in the replay by ${round(-p.totalDb, 2)} ± ${round(p.se, 2)} dB. Examine all filter values below.` : R.reasons.join('\n')) +
+            (good&&!recordedOnly&&R.validation&&R.validation.checks&&R.validation.checks.remaining?' Some filter problems are not corrected. Examine the filter checks.':''),
         parity: res.model.passed ? 'The recorded configuration agrees with the replay on all measured axes.' : 'The recorded configuration does not agree with the replay on all axes.',
         delay: R.delay ? `The largest measured increase in filter time delay is ${R.delay.maxAddMs} ms. The limit is ${res.limits ? res.limits.maxAddMs : RULES.maxAddMs} ms.` : '',
-        validation: h && res.mode === 'simulation' ? 'The changed values use all selected flight periods. These periods are not an independent test after manual changes.' : h ? `The app uses ${h.blocks} flight periods only for the last test. It selects the values with the other periods. These values change vibration by ${h.meanDb} dB in those periods.` : '',
+        validation: h && recordedOnly ? 'The replay uses all selected flight periods with their recorded values. No filter values changed.' : h && res.mode === 'simulation' ? 'The changed values use all selected flight periods. These periods do not give a different test after changes that you enter.' : h ? `The app uses ${h.blocks} flight periods only for the last test. It selects the values with the other periods. These values change vibration by ${h.meanDb} dB in those periods.` : '',
         why: R.reasons, rows };
 }
 
-module.exports = { RULES, tune, texts, delayLimit, parameterTable, manualChanges, prepare, paths, settings, evaluate, compare, parity, capabilities, candidates, invalid, rowsFor, commands, cliFile, validCliRow };
+module.exports = { RULES, tune, texts, delayLimit, parameterTable, manualChanges, prepare, paths, settings, evaluate, compare, parity, capabilities, candidates, repairCandidate, rankCandidates, selectFinalist, invalid, rowsFor, commands, cliFile, cliExportStatus, validCliRow };

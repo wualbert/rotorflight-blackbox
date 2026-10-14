@@ -1,4 +1,5 @@
 'use strict';
+const Math = require('./filter_math.cjs');
 
 /**
  * Filter analysis and firmware coefficient helpers (SPEC3 G). Public tune() now

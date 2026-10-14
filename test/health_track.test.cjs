@@ -279,7 +279,7 @@ test('a self-excited roll oscillation is flagged; the same amplitude driven by t
     assert.equal(p1.value, 1);
     assert.equal(p1.unit, 'count');
     within(p1.events[0].t, 30, 1.2, 'onset time of the self-excited burst');
-    assert.match(p1.text, /^The number of roll oscillations at 10-20 Hz that increase with no stick input is 1 of \d+\. /);
+    assert.match(p1.text, /^The number of roll oscillations at 10-20 Hz that increase with small stick input is 1 of \d+\. /);
     const ev = osc.metrics.osc.roll.events, self = ev.find(e => e.selfExcited), driven = ev.find(e => e.t > 89 && e.t < 92), jolt = ev.find(e => e.t > 74 && e.t < 76);
     within(self.hz, 12, 0.5, 'burst frequency');
     // its size is band-passed (the 10-20 Hz band passes 0.60 of a 12 Hz sine); as a sine it is the 220 deg/s simulated
@@ -320,7 +320,7 @@ test('stick-free windows from a single block are thin: no standard error, no jud
     const s = one.metrics.osc.pitch.byProfile[2], f = find(one.findings, 'C5', 'pitch', 2)[0];
     assert.ok(s.blocks === 1 && s.stickFree >= H.DEFAULT_RULES.C5.minWindows && s.shares[20] > 0.2 && s.sharesSe[20] === null, JSON.stringify(s.shares));
     assert.ok(f.severity === 'note' && f.thin === true, JSON.stringify(f));
-    assert.match(f.text, new RegExp(`^The data is not sufficient for a result\\. The number of periods of 10 s with windows where the stick does not cause the error is 1\\. A minimum of ${H.DEFAULT_RULES.C5.minBlocks} is necessary for a standard error\\.\n`));
+    assert.match(f.text, new RegExp(`^The data is not sufficient for a result\\. The number of periods of 10 s with windows selected by the stick check is 1\\. A minimum of ${H.DEFAULT_RULES.C5.minBlocks} is necessary for a standard error\\.\n`));
     const q = find(one.findings, 'C5', 'pitch', 1)[0]; assert.ok(q.severity === 'note' && !q.thin && /^The pitch error has an oscillation/.test(q.text), 'profile 1 has the blocks');
 });
 
@@ -329,7 +329,7 @@ test('two blocks are thin too: a jackknife over two has one degree of freedom', 
         spectrumWindows: 0, peak: null, peakHz: null, peakHzSe: null, peakInBand: null, bursts: 0, selfExcitedBursts: [] };
     const F = H.judge([{ log: 0, metrics: { osc: { pitch: { band: [8, 16], gain: [0.47, 0.64], byProfile: { 1: s }, all: s } } } }]), f = find(F, 'C5', 'pitch', 1)[0];
     assert.deepEqual([H.RULE.minJack, H.DEFAULT_RULES.C5.minBlocks, H.DEFAULT_RULES.T1.minBlocks], [3, 3, 3]);
-    assert.ok(f.severity === 'note' && f.thin === true); assert.match(f.text, /^The data is not sufficient for a result\. The number of periods of 10 s with windows where the stick does not cause the error is 2\. A minimum of 3 is necessary for a standard error\./);
+    assert.ok(f.severity === 'note' && f.thin === true); assert.match(f.text, /^The data is not sufficient for a result\. The number of periods of 10 s with windows selected by the stick check is 2\. A minimum of 3 is necessary for a standard error\./);
 });
 
 test('thin data and missing fields are said, not judged', () => {

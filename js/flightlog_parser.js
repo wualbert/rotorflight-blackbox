@@ -515,6 +515,7 @@ var FlightLogParser = function(logData) {
     // Lets add the custom extensions
     var completeSysConfig = $.extend({}, defaultSysConfig, defaultSysConfigExtension);
     this.sysConfig = Object.create(completeSysConfig); // Object.create(defaultSysConfig);
+    this.sysConfig.loggedHeaderFields = [];
 
     /*
      * Event handler of the signature (frameValid, frame, frameType, frameOffset, frameSize)
@@ -611,6 +612,11 @@ var FlightLogParser = function(logData) {
         // Translate the fieldName to the sysConfig parameter name. The fieldName has been changing between versions
         // In this way is easier to maintain the code
         fieldName = translateFieldName(fieldName);
+        // Preserve actual H-line provenance through JSON and configuration
+        // materialization. Own properties alone cannot distinguish copied
+        // parser defaults from values that this log recorded.
+        if (that.sysConfig.loggedHeaderFields.indexOf(fieldName) === -1)
+            that.sysConfig.loggedHeaderFields.push(fieldName);
 
         switch (fieldName) {
             case "I interval":
@@ -1645,6 +1651,7 @@ var FlightLogParser = function(logData) {
         // Lets add the custom extensions
         var completeSysConfig = $.extend({}, defaultSysConfig, defaultSysConfigExtension);
         this.sysConfig = Object.create(completeSysConfig); // Object.create(defaultSysConfig);
+        this.sysConfig.loggedHeaderFields = [];
 
         this.frameDefs = {};
 

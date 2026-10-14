@@ -30,6 +30,7 @@ const HEADER = {
 };
 const LOGS = [{ log: 5, start: '2026-10-04T10:00:00', flown: true, flyingS: 100, profileSeconds: { 1: 60, 2: 40 }, targetOf: { 1: 2300, 2: 2500 } },
     { log: 6, start: '2026-10-04T11:00:00', flown: true, flyingS: 90, profileSeconds: { 1: 90 }, targetOf: { 1: 2300 } }];
+const GOV_RESPONSE = { unsaturated: { mean: 0.07, se: 0.005, n: 10 }, saturated: { mean: null, se: null, n: 0 }, feedforward: { mean: 0.3, se: 0.01, n: 10 } };
 let FID = 0; // the worker gives every finding a fid before advice (SPEC2 D4)
 const f = (o) => Object.assign({ fid: `t${++FID}`, module: 'loop', severity: 'flag', log: 5, profile: 1, value: null, se: null, n: 10, threshold: null, source: 'pipeline, unvalidated', text: '', times: [] }, o);
 const run = (findings, o = {}) => advice.advise(Object.assign({ findings, decisions: null, header: HEADER, cli: null, logs: LOGS, fields: null, headerProfile: 1, headerLog: 5 }, o));
@@ -229,7 +230,8 @@ test('notes: excluded spans are named for the pilot and zeros are left out', () 
 test('T13: a constant hover yaw I names the trim and the collective precomp, never the P/I/D gains', () => {
     const r = only(run([f({ module: 'more', id: 'T13', value: -0.24, se: 0.004, text: 'hover yaw I -303 +- 5 permille' })]), 'T13');
     assert.deepEqual(r.cli, []);
-    assert.match(r.text, /tail_center_trim .*yaw_collective_ff_gain/);
+    assert.match(r.text, /tail center trim and mechanical center/);
+    assert.match(r.text, /If the I-term changes with collective, use check T7/);
 });
 
 test('F5: an RPM notch only for main harmonics 1-8 (sources 11-18); higher lines point at the dynamic or a static notch', () => {
@@ -258,7 +260,7 @@ test('F5: on a motorised tail no tail harmonic sits at a fixed rotor order', () 
     const r = only(run([f({ module: 'setup', id: 'F5', value: 7.9, text: 'line at 7.9 x rotor (300.2 Hz, prominence 9.1): nearest notch roll none, pitch none, yaw none' })], { cli: mot }), 'F5');
     assert.doesNotMatch(r.text, /the nearest tail harmonic is/);
     assert.match(r.text, /on a motorized tail \(tail_rotor_mode MOTORIZED\) the tail rotor speed does not follow the main rotor/);
-    assert.match(only(run([f({ id: 'T8', value: 2, text: '20 episodes' })], { cli: mot }), 'T8').text, /On a tail with a motor, the tail torque assist \(gov_tta_gain, steps of 10\) helps the tail/);
+    assert.match(only(run([f({ id: 'T8', value: 2, text: '20 episodes' })], { cli: mot }), 'T8').text, /If the output stays at its limit with a yaw error, examine the tail pitch range and linkage/);
 });
 
 test('F6: attenuation below 10 dB is a check; one not below 10 dB by 2 SE is a watch', () => {
@@ -298,14 +300,21 @@ test('F7, F11: a vibration level change and a large measured filter delay are ch
 
 test('G0, G1: DIRECT is information, FALLBACK a check, the glitch proxy a watch', () => {
     assert.equal(only(run([f({ module: 'gov', id: 'G0', severity: 'note', profile: null, value: 0, text: 'govSum and govI are 0 in flight: DIRECT or LIMIT, no PID governor.' })]), 'G0').severity, 'info');
-    assert.equal(only(run([f({ module: 'gov', id: 'G1', profile: null, value: 2, text: '2 FALLBACK entries at 30.1 s' })]), 'G1').severity, 'check');
+    const fallback = only(run([f({ module: 'gov', id: 'G1', profile: null, value: 2, text: '2 FALLBACK entries at 30.1 s' })]), 'G1');
+    assert.equal(fallback.severity, 'check');
+    assert.equal(fallback.title, 'Examine the cause of FALLBACK');
+    assert.match(fallback.text, /FALLBACK does not show that the RPM source is incorrect/);
+    assert.match(fallback.text, /FALLBACK mode switch that is on/);
+    assert.match(fallback.text, /Examine the FALLBACK mode switch, RPM signal, headspeed and throttle at each entry/);
+    assert.match(fallback.text, /If you find an RPM source problem, repair it/);
+    assert.doesNotMatch(fallback.text, /Repair the RPM source|signal was not available|signal is not available or not correct/);
     assert.equal(only(run([f({ module: 'gov', id: 'G1', severity: 'note', profile: null, value: 3, text: '3 glitch-proxy events in flight' })]), 'G1:proxy').severity, 'watch');
 });
 
 test('G2, G5, G6, G8, G10, G11, G13, G14: diagnostics are checks without CLI', () => {
     for (const id of ['G2', 'G5', 'G6', 'G8', 'G10', 'G11', 'G13', 'G14']) {
         const r = only(run([f({ module: 'gov', id, value: 1, text: `${id} finding` })]), id);
-        assert.equal(r.severity, 'check', id);
+        assert.equal(r.severity, ['G5', 'G10'].includes(id) ? 'watch' : 'check', id);
         assert.deepEqual(r.cli, [], id);
     }
     const cells = only(run([f({ module: 'gov', id: 'G13', severity: 'note', profile: null, text: 'no finding: cell count ambiguous (inferred); Vbat in flight 22.1 -> 21.0 V. The log does not record the cell count' })]), 'G13:cells');
@@ -315,7 +324,7 @@ test('G2, G5, G6, G8, G10, G11, G13, G14: diagnostics are checks without CLI', (
 });
 
 test('G3: droop with F carrying less than half raises gov_f_gain by the documented 10; headroom is a check', () => {
-    const r = only(run([f({ module: 'gov', id: 'G3', log: [5, 6], value: 0.07, se: 0.005, text: 'droop 7.00 % +- 0.50 %; F carries 30 % of the added govSum. F carries less than half: F too low (GOVT)' })]), 'G3');
+    const r = only(run([f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5, 6], value: 0.07, se: 0.005, text: 'droop 7.00 % +- 0.50 %; F carries 30 % of the added govSum. F carries less than half: F too low (GOVT)' })]), 'G3');
     assert.deepEqual([r.from, r.to], [10, 20]);                                  // header govPID F 10, step 10
     assert.deepEqual(r.cli, ['profile 0', 'set gov_f_gain = 20']);
     assert.match(r.caveats.join(' '), /The step of the documentation, 10, is 50 % or more of the value 10/);
@@ -327,9 +336,9 @@ test('G4: overshoot at load onset lowers gov_f_gain; against a G3 raise it becom
     const g4 = f({ module: 'gov', id: 'G4', log: [5], value: 0.05, se: 0.004, text: 'headspeed overshoots 5.00 % +- 0.40 % on collective rises (load onset), F carries 40 % of the added govSum: F too high (GOVT)' });
     const r = only(run([g4], { cli: CLI }), 'G4');
     assert.deepEqual([r.from, r.to, r.direction], [10, 0, 'lower']);
-    const both = only(run([g4, f({ module: 'gov', id: 'G3', log: [5], value: 0.06, se: 0.01, severity: 'note', text: 'droop 6 %: F too low (GOVT)' })]), 'G4');
+    const both = only(run([g4, f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, severity: 'flag', text: 'droop 7 %: F too low (GOVT)' })]), 'G3');
     assert.equal(both.severity, 'check');
-    assert.match(both.caveats.join(' '), /The checks do not agree on gov_f_gain: G4 decreases it to 0 and G3 increases it to 20 \(less than 2 SE\)/);
+    assert.match(both.caveats.join(' '), /The checks do not agree on gov_f_gain: G3 increases it to 20 and G4 decreases it to 0/);
     assert.equal(only(run([f({ module: 'gov', id: 'G4', log: [5], value: 0.05, se: 0.004, text: 'overshoot after collective drops 5 %' })]), 'G4:drop').severity, 'check');
 });
 
@@ -367,7 +376,7 @@ test('G12: a wrong headspeed factor is an action with the pole count that would 
 
 test('C1, C2, C6, C10, C11: diagnostics are checks; landed while moving is a watch (CYC-LANDED refuted it)', () => {
     for (const [id, axis] of [['C1', 'roll'], ['C2', null], ['C6', 'pitch'], ['C10', null], ['C11', 'pitch']]) {
-        const r = only(run([f({ id, axis, value: 0.9, se: 0.01, text: `${axis || ''} ${id} finding at an output limit (mixer[1])` })]), id);
+        const r = only(run([f({ id, axis, value: id === 'C6' ? 12 : 0.9, se: 0.01, text: `${axis || ''} ${id} finding at an output limit (mixer[1])` })]), id);
         assert.equal(r.severity, 'check', id);
         assert.deepEqual(r.cli, [], id);
     }
@@ -389,11 +398,14 @@ test('C3: F x (1 + I share), pooled over logs, bounded to 20 %', () => {
     assert.deepEqual([ratio.severity, ratio.parameter], ['check', null]);
 });
 
-test('C4: FF too low raises F one 10 % step; FF too high is a check (F, relax or B)', () => {
+test('C4: stop I direction gives a bounded F trial in either direction', () => {
     const low = only(run([f({ id: 'C4', axis: 'pitch', value: 25, se: 3, settleS: { mean: 0.2, se: 0.02 }, text: 'pitch stops: overshoot 25 %: I charged with the rotation at the stop: FF too low (raise F)' })]), 'C4');
     assert.deepEqual([low.from, low.to], [100, 110]);
     const high = only(run([f({ id: 'C4', axis: 'pitch', value: 25, se: 3, text: 'pitch stops: FF too high (lower F), or relax/B' })]), 'C4');
-    assert.equal(high.severity, 'check');
+    assert.equal(high.severity, 'action');
+    assert.deepEqual([high.from, high.to, high.cli], [100, 90, ['profile 0', 'set pitch_f_gain = 90']]);
+    assert.match(high.text, /not a measured best value/);
+    assert.match(high.caveats.join(' '), /relax and B gain/);
     const settle = only(run([f({ id: 'C4', axis: 'pitch', value: 5, se: 3, settleS: { mean: 0.6, se: 0.05 }, text: 'FF too low (raise F)' })]), 'C4');
     assert.equal(settle.severity, 'action', 'the settling time clears 0.3 s by 2 SE although the overshoot does not');
 });
@@ -450,13 +462,73 @@ test('C12, T11: every measured pair of the PID profile is pooled, ok ones too; t
     assert.equal(recs(run(ok), 'T11').length, 0, 'ok pairs alone give no recommendation');
 });
 
-test('C14: the measured pitch_collective_ff_gain change, bounded to 20 %; from 0 no relative step', () => {
+test('C14: measured compensation has a bounded first step from zero', () => {
     const c14 = f({ module: 'more', id: 'C14', axis: 'pitch', value: 30, se: 4, threshold: '|slope| - 2 SE > 20, a gain change >= 10, the fast coupling not of the other sign by 2 SE', gainChange: 30, gainChangeSe: 8, from: 50, to: 80, unit: 'per 1000 collective', text: 'pitch I + O 30.0 +- 4.0 per 1000 collective: raise pitch_collective_ff_gain 50 -> 80' });
     const r = only(run([c14]), 'C14');
     assert.deepEqual([r.from, r.to], [50, 60]);                                  // 50 + 30 bounded to 50 x 1.2
     assert.deepEqual(r.cli, ['profile 0', 'set pitch_collective_ff_gain = 60']);
     const zero = only(run([c14], { header: Object.assign({}, HEADER, { pitch_compensation: 0 }) }), 'C14');
-    assert.deepEqual([zero.severity, zero.cli], ['check', []]);
+    assert.deepEqual([zero.severity, zero.from, zero.to, zero.cli], ['action', 0, 10, ['profile 0', 'set pitch_collective_ff_gain = 10']]);
+    assert.match(zero.rule, /measured change minus 2 SE/);
+});
+
+test('control trials retain uncertainty, profile scope, source and prerequisite checks', () => {
+    const stop = over => f({id:'C4',axis:'pitch',value:25.7,se:2.9,settleS:{mean:0.2,se:0.02},text:'FF too high (lower F)',...over});
+    const target = only(run([stop()]),'C4');
+    assert.deepEqual([target.parameter,target.from,target.to],['pitch_f_gain',100,90]);
+    assert.equal(target.evidence[0].value,25.7);
+    assert.equal(target.evidence[0].se,2.9);
+    assert.match(target.rule,/more than 10 %/);
+    assert.equal(only(run([stop({value:13,se:3})]),'C4').cli.length,0,'below 2 SE');
+    assert.equal(recs(run([stop({thin:true})]),'C4').length,0,'thin data produces no trial');
+    const mixed = only(run([stop(),stop({log:6,text:'FF too low (raise F)'})]),'C4');
+    assert.equal(mixed.parameter,null,'contradictory stop directions do not pick a gain');
+    const other = only(run([stop({profile:2})]),'C4');
+    assert.equal(other.from,null,'no borrowing the arming-profile value');
+    assert.deepEqual(other.cli,[]);
+    const held = only(run([stop(),f({module:'setup',id:'F1',profile:null,value:0})],
+        {header:{...HEADER,gyro_soft_type:0,gyro_lowpass_hz:0}}),'C4');
+    assert.equal(held.to,90,'prerequisite does not erase a quantitative proposal');
+    assert.ok(held.blockedBy.length);
+    assert.ok(held.holds.includes('filters'),'guard prerequisites remain available to control autotune');
+    assert.deepEqual(held.cli,[]);
+});
+
+test('C14: zero start cannot exceed the positive measured change minus 2 SE', () => {
+    const base=f({module:'more',id:'C14',axis:'pitch',value:50,se:2,gainChange:11,gainChangeSe:4,unit:'per 1000 collective'});
+    const opts={header:{...HEADER,pitch_compensation:0}};
+    assert.deepEqual(only(run([base],opts),'C14').cli,[],'a lower confidence bound of 3 does not pass the minimum gain-change rule');
+    assert.equal(only(run([{...base,gainChange:19}],opts),'C14').to,10,'a justified start remains bounded to 10');
+    for(const gainChangeSe of [null,6]) {
+        const r=only(run([{...base,gainChangeSe}],opts),'C14');
+        assert.deepEqual(r.cli,[],'unknown uncertainty or unresolved direction cannot start a gain');
+    }
+});
+
+test('G5 and G10 generate quantified governor trials with saturation and uncertainty gates', () => {
+    const slow=f({module:'gov',id:'G5',value:2,se:0.1});
+    const p=only(run([slow]),'G5');
+    assert.deepEqual([p.from,p.to,p.cli],[40,50,['profile 0','set gov_p_gain = 50']]);
+    assert.equal(only(run([{...slow,value:0.4,se:0.2}]),'G5').cli.length,0);
+    for(const id of ['G6','L1']) {
+        const r=only(run([slow,f({module:'gov',id,value:90,channel:'throttle',text:'median throttle 90 %'})]),'G5');
+        assert.deepEqual(r.cli,[]);assert.match(r.blockedBy.join(' '),/throttle/);
+    }
+    const coherent=f({module:'gov',id:'G10',value:0.9,se:0.03});
+    const g=only(run([coherent]),'G10');
+    assert.deepEqual([g.from,g.to,g.cli],[40,36,['profile 0','set gov_gain = 36']]);
+    assert.equal(only(run([{...coherent,value:0.61,se:0.1}]),'G10').cli.length,0);
+});
+
+test('C6 and T2 lower I only with measured I dominance, retaining unknown spectral uncertainty', () => {
+    for(const [id,axis,from] of [['C6','pitch',100],['T2','yaw',120]]) {
+        const peak=f({id,axis,value:12,n:9,text:'slow oscillation driven by I: I too high or P too low'});
+        const r=only(run([peak]),id);
+        assert.deepEqual([r.from,r.to],[from,from*0.9]);
+        assert.match(r.text,/no SE/);assert.match(r.text,/50 %/);
+        const other=only(run([{...peak,text:'slow oscillation not driven by I'}]),id);
+        assert.equal(other.parameter,null);assert.equal(other.cli.length,0);
+    }
 });
 
 test('F10, C14: the estimate pooled over the logs of a profile must pass the module threshold by 2 SE (their findings give it as text)', () => {
@@ -478,14 +550,14 @@ test('F10, C14: the estimate pooled over the logs of a profile must pass the mod
 // Tail
 // ---------------------------------------------------------------------------------------------
 
-test('T2, T4, T8, T13, T14: tail diagnostics are checks; a motorised tail mentions TTA in steps of 10', () => {
+test('T2, T4, T8, T13, T14: tail diagnostics are checks; a motorised tail needs a diagnosis before a hardware or TTA change', () => {
     for (const [id, sev] of [['T2', 'flag'], ['T3', 'flag'], ['T4', 'note'], ['T8', 'flag'], ['T10', 'flag'], ['T13', 'flag'], ['T14', 'flag']]) {
-        const r = only(run([id === 'T14' ? T14F() : f({ id, severity: sev, value: 1, se: 0.1, threshold: 0.15, text: `${id} finding: suspect mechanics` })]), id);
+        const r = only(run([id === 'T14' ? T14F() : f({ id, severity: sev, value: id === 'T2' ? 12 : 1, se: 0.1, threshold: 0.15, text: `${id} finding: suspect mechanics` })]), id);
         assert.equal(r.severity, id === 'T4' ? 'watch' : 'check', id);   // T4: its frequency test is the one TAIL-FREQ refuted
         assert.deepEqual(r.cli, [], id);
     }
     const mot = only(run([f({ id: 'T8', value: 2, text: '20 episodes' })], { cli: setup.parseCli(CLI_TEXT.replace('# master\n', '# master\nset tail_rotor_mode = MOTORIZED\n')) }), 'T8');
-    assert.match(mot.text, /the tail torque assist \(gov_tta_gain, steps of 10\) helps the tail/);
+    assert.match(mot.text, /the log does not show a correct mechanical change/);
 });
 
 test('T14: the present yaw setup leads; flags measured on other yaw gains are context, never the target', () => {
@@ -505,7 +577,7 @@ test('T14: the present yaw setup leads; flags measured on other yaw gains are co
     // D-M4: 20 % or less of the value at this time), and the estimate stays information
     const now = only(run([...setups, oldFlag, T14F({ gain: 60, se: 10, f: { log: 6 } })]), 'T14');
     assert.deepEqual([now.severity, now.profile, now.from, now.to, now.direction, now.cli], ['check', 1, 0, null, 'raise', []]);
-    assert.match(now.text, /A yaw_inertia_precomp_gain change of 60 ± 10 supplies the tail feedback/);
+    assert.match(now.text, /The fit estimates a yaw_inertia_precomp_gain change of 60 ± 10/);
     assert.match(now.text, /yaw_inertia_precomp_gain is 0 \(log header, PID profile 1 at the start of the log\)\. The app cannot calculate a step from 0, but a flight with a small value gives a new measurement\./);
     assert.doesNotMatch(now.text, /Increase yaw_inertia|from 0 to/, 'a check has no instruction to change a value');
     // a gain that is not 0: the step is 20 % or less of it, and the caveats give the full estimate
@@ -518,7 +590,7 @@ test('T14: the present yaw setup leads; flags measured on other yaw gains are co
     assert.match(step.caveats.join(' '), /Check T14 uses the headspeed ramps of all PID profiles of a log\. Thus, the estimate is correct for PID profile 1 only if all PID profiles have the same yaw_inertia_precomp_gain/);
     const big = only(run([T14F({ gain: 300, se: 40, f: { log: 6 } })], { header: Object.assign({}, HEADER, { yaw_inertia_precomp: [200, 25] }) }), 'T14');
     assert.deepEqual([big.severity, big.from, big.to], ['check', 200, 240]);
-    assert.match(big.caveats.join(' '), /The necessary value, 500 ± 40, is more than the firmware maximum, 250\./);
+    assert.match(big.caveats.join(' '), /The estimate, 500 ± 40, is more than the firmware maximum, 250\./);
     assert.match(big.text.split('\n')[1], /^The measured log \(log 6\) has 6 headspeed ramps, and 100 % of them have the sign of the estimate\./);
     // an inferred arming profile is no confirmed source: PID profile unknown, no from-value (the Fireball "from 0 to 94")
     const inf = only(run([T14F()], { headerProfileInferred: true }), 'T14');
@@ -531,12 +603,65 @@ test('T14: the present yaw setup leads; flags measured on other yaw gains are co
     assert.deepEqual([only(run([p2], { cli: cli2 }), 'T14').from, only(run([p2], { cli: cli2 }), 'T14').to, only(run([p2], { cli: cli2 }), 'T14').fromSource], [40, 48, 'CLI dump, section `profile 1`']);
     const noGain = only(run([T14F()], { header: Object.assign({}, HEADER, { yaw_inertia_precomp: undefined }) }), 'T14');
     assert.deepEqual([noGain.severity, noGain.to], ['check', null]);
-    assert.match(noGain.text, /The analysis gives an increase of yaw_inertia_precomp_gain on PID profile 1 by 20 % or less\./);
-    assert.match(noGain.caveats.join(' '), /The measurement gives a change of 60\. Without the value at this time, the app cannot limit the step to 20 %/);
+    assert.match(noGain.text, /do not give all yaw PID, stop and inertia values/);
+    assert.match(noGain.text, /Start a new log with PID profile 1 selected to record its values/);
+    assert.doesNotMatch(noGain.text, /analysis gives an increase|with these values/);
     // without the setups of the logs every measured log is pooled
     const all = only(run([oldFlag, quiet]), 'T14');
     assert.equal(all.severity, 'watch', 'the two flights disagree: pooled 68 +- 145 (the between-flight SE)');
     assert.match(all.text, /The 2 measured logs together \(logs 5 and 6\)/);
+});
+
+test('T14: unknown or partial selected yaw values give a measurement plan, not a comparison or target', () => {
+    const observed = T14F({ gain: 60, se: 10, f: { log: 15, pidProfile: 3 } });
+    const knownElsewhere = setupOf(15, '80,120,14,20,0', '120,80');
+    const incomplete = [
+        { yawPID: Array(6).fill(null), yaw_stop_gain: [null, null], yaw_inertia_precomp: [null, null] },
+        { yawPID: undefined }, { yawPID: [80, 120, 14, 20] }, { yawPID: [80, 120, null, 20, 0] },
+        { yaw_stop_gain: [120] }, { yaw_stop_gain: [120, NaN] },
+        { yaw_inertia_precomp: undefined }, { yaw_inertia_precomp: [50, null] },
+    ];
+    for (const partial of incomplete) {
+        const r = only(run([knownElsewhere, observed], { header: Object.assign({}, HEADER, partial), headerProfile: 3, headerLog: 15 }), 'T14');
+        assert.deepEqual([r.severity, r.profile, r.from, r.to, r.cli], ['check', 3, null, null, []]);
+        assert.match(r.title, /selected yaw values unknown/);
+        assert.match(r.text, /cannot compare these results with the selected yaw values/);
+        assert.match(r.text, /Start a new log with PID profile 3 selected to record its values/);
+        assert.match(r.text, /Then record 3 headspeed ramps or more in flight/);
+        assert.doesNotMatch(r.text, /Only other yaw values|with these values|yaw PID ,|stop ,|inertia ,|analysis gives an increase|Arm the helicopter.*record/);
+        assert.ok(r.evidence.some(e => e.fid === observed.fid), 'The measured result stays accessible.');
+    }
+    const unidentified = only(run([T14F({ f: { log: 15, profile: 0, pidProfile: 0 } })], { header: {}, headerProfile: 0 }), 'T14');
+    assert.deepEqual([unidentified.profile, unidentified.from, unidentified.to, unidentified.cli], [0, null, null, []]);
+    assert.match(unidentified.text, /Start a new log with the PID profile that you will test selected to record its values/);
+});
+
+test('T14: equal complete yaw setups pool their evidence, and partial source setups do not match', () => {
+    const header = Object.assign({}, HEADER, { yaw_inertia_precomp: [50, 25] });
+    const complete = (log) => f({ module: 'setup', id: 'SETUP', severity: 'note', log, profile: null,
+        setup: { pid: { yaw: [80, 120, 14, 20, 0] }, yaw: { stopGain: [120, 80], inertia: [50, 25] } } });
+    const a = T14F({ gain: 60, se: 10, f: { log: 5 } }), b = T14F({ gain: 60, se: 10, f: { log: 6 } });
+    const equal = only(run([complete(5), complete(6), a, b], { header }), 'T14');
+    assert.deepEqual([equal.severity, equal.from, equal.to, equal.cli], ['check', 50, 60, []]);
+    assert.match(equal.text, /logs 5 and 6\) have 12 headspeed ramps/);
+    assert.doesNotMatch(equal.text, /selected yaw values unknown|Only other yaw values/);
+    for (const partial of [
+        f({ module: 'setup', id: 'SETUP', severity: 'note', log: 5, profile: null,
+            setup: { pid: { yaw: [80, 120, null, 20, 0] }, yaw: { stopGain: [120, 80], inertia: [50, 25] } } }),
+        f({ module: 'setup', id: 'SETUP', severity: 'note', log: 5, profile: null,
+            text: SETUP_TEXT('80,120,,20,0', '120,80', '50,25') }),
+    ]) {
+        const r = only(run([partial, complete(6), a, b], { header }), 'T14');
+        assert.deepEqual([r.from, r.to, r.cli], [50, 60, []]);
+        assert.match(r.text, /log 6\) have 6 headspeed ramps/);
+        assert.match(r.caveats.join(' '), /log 5 \(values unknown\)/);
+        assert.match(r.caveats.join(' '), /their yaw values are different or unknown/);
+        assert.doesNotMatch(r.caveats.join(' '), /measured them with different gains/);
+        const onlyPartial = only(run([partial, a], { header }), 'T14');
+        assert.deepEqual([onlyPartial.severity, onlyPartial.from, onlyPartial.to, onlyPartial.cli], ['watch', null, null, []]);
+        assert.match(onlyPartial.text, /measured results have different or unknown yaw values/);
+        assert.doesNotMatch(onlyPartial.text, /The measured log .* has 6|fit estimates/);
+    }
 });
 
 test('T5: the larger side loses one 10 % step when the ratio clears 1.5 by 2 SE', () => {
@@ -585,7 +710,7 @@ test('T9: yaw F one 10 % step in the direction of the I share; a zero F gets no 
 const decision = (o) => Object.assign({ axis: 'pitch', bin: 2250, flights: 5, windows: 400, change: true, reason: undefined, validBand: [1, 15],
     changes: [{ gain: 'F', multiplier: 0.8, from: 100.01, to: 80.01, improves: 'tracking', dTrack: 1.4, seTrack: 0.5, atBound: true }],
     tracking: [2.9, 1.5], dTrack: 1.4, seTrack: 0.5, disturbance: [9.9, 9.9], total: [10.4, 10.1], lowFreqGain: [1.12, 0.98],
-    gates: { V1: { value: 0.016, limit: 0.05, pass: true } } }, o);
+    gates: { V1: { value: 0.016, limit: 0.05, pass: true }, V2a: { pass: true }, V2b: { pass: true }, V3: { pass: true } } }, o);
 
 test('C7: a report.cjs change becomes the CLI of its profile when the recovered gain matches the configured one', () => {
     const r = only(run([], { decisions: [decision()] }), 'C7');
@@ -600,7 +725,9 @@ test('C7: a report.cjs change becomes the CLI of its profile when the recovered 
     // from the flights of PID profile 2, an estimate, and there is no CLI text; never the header value of PID profile 1
     const p2 = only(run([], { decisions: [decision({ bin: 2500 })], headerProfile: 1 }), 'C7');
     assert.deepEqual([p2.profile, p2.from, p2.to, p2.cli], [2, 100, 80, []]);
-    assert.match(p2.text, /Set pitch_f_gain on PID profile 2 from approximately 100 to 80 \(the gain that the gain model calculated from the flights of PID profile 2\)/);
+    assert.match(p2.text, /This change must wait|conditional proposal/i);
+    assert.match(p2.text, /analysis gives a change of pitch_f_gain.*approximately 100.*80/i);
+    assert.doesNotMatch(p2.text, /Set pitch_f_gain/);
     assert.match(p2.caveats.join(' '), /The log header gives the values of PID profile 1 only, the PID profile at the start of the log\. The value of pitch_f_gain on PID profile 2 is unknown\. The value 100 is an estimate from the log\. Thus, there is no CLI text\./);
     const p2b = only(run([], { decisions: [decision({ bin: 2500, changes: [Object.assign({}, decision().changes[0], { from: 120.4 })] })], headerProfile: 1 }), 'C7');
     assert.deepEqual([p2b.from, p2b.to], [120, 96], 'the recovered gain of PID profile 2, not the header F 100 of PID profile 1');
@@ -623,7 +750,7 @@ test('C7: yaw P on another profile than the header: a match of P x mean stop gai
     const d = decision({ axis: 'yaw', bin: 2500, changes: [{ gain: 'P', multiplier: 0.9, from: 80.5, to: 72.5, improves: 'disturbance' }] });
     const r = only(run([], { decisions: [d] }), 'C7');
     assert.deepEqual([r.cli, r.from, r.to], [[], null, null], 'P 70 with stops 130/100 gives the same product, and the header is PID profile 1');
-    assert.match(r.text, /Decrease yaw_p_gain on PID profile 2 by 10 %\./);
+    assert.match(r.text, /analysis gives a decrease of yaw_p_gain on PID profile 2 by 10 %\./i);
     assert.match(r.caveats.join(' '), /The value of yaw_p_gain on PID profile 2 is unknown\. Thus, there is no CLI text\./);
     // the header of the arming profile PID profile 2 gives P and the two stop gains of PID profile 2: they agree with the model
     const own = only(run([], { decisions: [decision({ axis: 'yaw', bin: 2500, changes: d.changes })], headerProfile: 2 }), 'C7');
@@ -675,9 +802,12 @@ test('guard 1: an F6 flag that stands (below 10 dB by 2 SE) holds loop-gain rais
 });
 
 test('guard 2: a G12 or G1 flag blocks governor and RPM-notch changes', () => {
-    const g3 = f({ module: 'gov', id: 'G3', log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
+    const g3 = f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
     assert.deepEqual(only(run([g3, f({ module: 'gov', id: 'G12', profile: null, value: 1.1, se: 0.001, text: 'line at 1.1' })]), 'G3:').blockedBy, ['Check G12 shows an incorrect headspeed. The governor and the RPM notch filters use this headspeed. Correct motor_poles or the RPM sensor first.']);
-    assert.deepEqual(only(run([g3, f({ module: 'gov', id: 'G1', profile: null, value: 1, text: '1 FALLBACK entry' })]), 'G3:').cli, []);
+    const held = only(run([g3, f({ module: 'gov', id: 'G1', profile: null, value: 1, text: '1 FALLBACK entry' })]), 'G3:');
+    assert.deepEqual(held.cli, []);
+    assert.match(held.blockedBy.join(' '), /cause and the RPM signal must be examined/);
+    assert.doesNotMatch(held.blockedBy.join(' '), /RPM signal was not available/);
 });
 
 test('guard 2: a G12 factor error beyond the 2 % notch tolerance also holds cyclic and tail changes; a small one and G1 do not', () => {
@@ -709,7 +839,7 @@ test('guard 3: an axis at its output limit gets "authority, not gains" and no ra
 });
 
 test('guard 3: no governor raise while the tail is at its limit (T8) or G10 implicates the governor on that profile; lowering stays', () => {
-    const g3 = f({ module: 'gov', id: 'G3', log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F carries less than half: F too low (GOVT)' });
+    const g3 = f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F carries less than half: F too low (GOVT)' });
     const t8 = (profile) => f({ id: 'T8', profile, value: 3.8, text: '73 episodes, 3.8 s at an output limit (mixer[2], servo[3])' });
     const held = only(run([g3, t8(1)]), 'G3');
     assert.deepEqual(held.cli, []);
@@ -718,7 +848,7 @@ test('guard 3: no governor raise while the tail is at its limit (T8) or G10 impl
     assert.deepEqual(only(run([g3, t8(2)]), 'G3').cli, ['profile 0', 'set gov_f_gain = 20'], 'the tail limit of another profile');
     const g10 = only(run([g3, f({ module: 'gov', id: 'G10', value: 0.7, se: 0.05, text: 'coherence 0.7 at the wag peak' })]), 'G3');
     assert.deepEqual(g10.cli, []);
-    assert.match(g10.blockedBy.join(' '), /Check G10 shows that the governor causes the tail oscillation \(coherence 0\.7 ± 0\.05, 1 log-profile pair\)/);
+    assert.match(g10.blockedBy.join(' '), /Check G10 shows related headspeed and tail oscillations \(coherence 0\.7 ± 0\.05, 1 log-profile pair\)\. This does not (?:show|prove) which loop causes the oscillation/);
     const g4 = f({ module: 'gov', id: 'G4', log: [5], value: 0.05, se: 0.004, text: 'headspeed overshoots 5.00 % on collective rises (load onset): F too high (GOVT)' });
     assert.deepEqual(only(run([g4, t8(1)], { cli: CLI }), 'G4').cli, ['profile 0', 'set gov_f_gain = 0'], 'detuning is the remedy GOVT gives');
 });
@@ -735,7 +865,7 @@ test('guard 5: relative steps are bounded to 20 %, also after rounding; document
     assert.deepEqual([g9.from, g9.to], [50, 40]);                                                                      // GOVT cut by 1/3, bounded to 20 %
     const g18 = only(run([f({ module: 'gov', id: 'G9', value: 9, se: 1, text: '(P-type)' })], { header: Object.assign({}, HEADER, { govPID: [18, 50, 0, 10, 40] }) }), 'G9');
     assert.equal(g18.to, 15, '18 x 0.8 = 14.4 must not round to 14 (-22 %)');
-    assert.deepEqual(only(run([f({ module: 'gov', id: 'G3', log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' })]), 'G3').to, 20); // the documented F step 10
+    assert.deepEqual(only(run([f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' })]), 'G3').to, 20); // the documented F step 10
 });
 
 test('guard 5: every value stays within its firmware range (settings.c); at a limit the step is a watch', () => {
@@ -747,7 +877,7 @@ test('guard 5: every value stays within its firmware range (settings.c); at a li
     assert.deepEqual(stop.cli, ['profile 0', 'set yaw_ccw_stop_gain = 25']);
     assert.match(stop.caveats.join(' '), /The firmware range of yaw_ccw_stop_gain is 25 to 250, and the CLI does not accept a value out of it\. Thus, 23 becomes 25\./);
     assert.equal(only(run([f({ id: 'T7', value: 0.8, se: 0.05, precompScale: 1.44, text: 'x' })], h({ yaw_precomp: [5, 10, 230] })), 'T7').to, 250);   // 230 x 1.2 = 276
-    assert.equal(only(run([f({ module: 'gov', id: 'G3', log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' })], h({ govPID: [40, 50, 0, 245, 40] })), 'G3').to, 250);
+    assert.equal(only(run([f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' })], h({ govPID: [40, 50, 0, 245, 40] })), 'G3').to, 250);
     assert.equal(only(run([f({ module: 'more', id: 'C14', axis: 'pitch', value: 60, se: 5, gainChange: 100, gainChangeSe: 10, text: 'c14' })], h({ pitch_compensation: 240 })), 'C14').to, 250); // 240 + 48 bounded
     const floor = only(run([t5], h({ yaw_stop_gain: [120, 25] })), 'T5');
     assert.deepEqual([floor.severity, floor.cli], ['watch', []]);
@@ -769,7 +899,7 @@ test('guard 7: log profile p is CLI profile p-1; profile 0 gets no CLI and asks 
     const zero = only(run([t5(0)]), 'T5');
     assert.deepEqual(zero.cli, []);
     assert.deepEqual([zero.from, zero.to], [null, null], 'no from-value: the header is PID profile 1');
-    assert.match(zero.text, /Decrease yaw_ccw_stop_gain by 10 % \(PID profile unknown\)\./);
+    assert.match(zero.text, /analysis gives a decrease of yaw_ccw_stop_gain by 10 % \(PID profile unknown\)\./i);
     assert.match(zero.caveats.join(' '), /The PID profile of this result is unknown \(PID profile unknown\), and the value of yaw_ccw_stop_gain is also unknown\. Thus, there is no CLI text\./);
     // a change with sets on PID profile unknown (a report.cjs decision whose bin no profile flies) gets the rule 7 caveat
     const two = only(run([t5(2)], { cli: CLI }), 'T5');                       // the CLI diff has no stop gain for profile 1: the 4.6 default 80
@@ -782,7 +912,7 @@ test('guard 7: a profile the CLI capture lacks (a plain diff prints the current 
     const out = run([f({ id: 'T5', profile: 3, value: 2, se: 0.2, larger: 'ccw', text: 'stops' })], { cli: plain });
     const r = only(out, 'T5');
     assert.deepEqual(r.cli, [], 'the default 80 was an assumption: profile 2 is not in the capture');
-    assert.match(r.caveats.join(' '), /The CLI dump has no section `profile 2`, because `diff` or `dump` without `all` shows only the active PID profile\. Thus, there is no CLI text\. The log header records the values of PID profile 3 only when the pilot arms the helicopter in PID profile 3\./);
+    assert.match(r.caveats.join(' '), /The CLI dump has no section `profile 2`, because `diff` or `dump` without `all` shows only the active PID profile\. Thus, there is no CLI text\. The log header records the values of PID profile 3 only when a new log starts in PID profile 3\./);
     assert.doesNotMatch(r.caveats.join(' '), /diff all/, 'no text asks for a new CLI dump (user rule 2026-10-06)');
     assert.deepEqual([r.from, r.to], [null, null], 'not the header value of PID profile 1, not the default');
     assert.match(out.notes.join(' '), /The CLI dump has only the section `profile 0`, of 6\. Possibly, `diff` without `all` shows only the active PID profile/);
@@ -792,7 +922,7 @@ test('guard 7: a profile the CLI capture lacks (a plain diff prints the current 
 });
 
 test('guard 8: no governor gain change where G0 says DIRECT/LIMIT, or the CLI says so and no log shows a PID governor', () => {
-    const g3 = f({ module: 'gov', id: 'G3', log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
+    const g3 = f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
     const direct = run([g3, f({ module: 'gov', id: 'G0', severity: 'note', profile: null, value: 0, text: 'govSum and govI are 0 in flight: DIRECT or LIMIT' })]);
     assert.equal(recs(direct, 'G3').length, 0);
     assert.match(direct.notes.join(' '), /because the governor does not control the headspeed \(check G0 DIRECT or LIMIT\)/);
@@ -873,6 +1003,8 @@ test('H staleness: a change measured before the latest change of its parameter g
     assert.deepEqual([old.title, old.from, old.to, old.direction], ['Measure yaw_ccw_stop_gain again', 80, null, 'check']);
     assert.match(old.text, /yaw_ccw_stop_gain is 80 at this time \(log header/);
     assert.doesNotMatch(old.text, /to 72/);
+    const structured = only(run([t5, Object.assign({}, h, { headerKey: 'yaw_stop_gain', from: '120,100', since: 5, text: 'The diagnostic wording can change.' })], { headerLog: 6 }), 'T5');
+    for (const key of ['severity','cli','title','from','to','direction','text','caveats']) assert.deepEqual(structured[key], old[key], key);
     assert.equal(only(run([Object.assign({}, t5, { log: 6 }), h], { headerLog: 6 }), 'T5').cli.length, 2, 'measured after the change, on the analysed log');
 });
 
@@ -894,7 +1026,7 @@ test('profiles: a from-value comes only from that PID profile (its CLI section o
     const out = run([T5F(), T5F({ profile: 2 })]), p1 = only(out, 'T5:yaw_ccw_stop_gain:p1'), p2 = only(out, 'T5:yaw_ccw_stop_gain:p2');
     assert.deepEqual([p1.from, p1.to, p1.fromSource, p1.cli], [80, 72, 'log header, PID profile 1 at the start of the log', ['profile 0', 'set yaw_ccw_stop_gain = 72']]);
     assert.deepEqual([p2.from, p2.to, p2.fromSource, p2.cli], [null, null, null, []], 'the header of PID profile 1 is not a value of PID profile 2');
-    assert.match(p2.text, /Decrease yaw_ccw_stop_gain on PID profile 2 by 10 %\./);
+    assert.match(p2.text, /analysis gives a decrease of yaw_ccw_stop_gain on PID profile 2 by 10 %\./i);
     assert.doesNotMatch(p2.text + p2.caveats.join(' '), /from 80|to 72/);
     for (const [r, p] of [[p1, 1], [p2, 2]]) { assert.ok(r.evidence.every(e => e.profile === p), r.id); assert.equal(r.profile, p); }
     // an inferred arming profile is not confirmed: the header then gives no PID profile value at all
@@ -905,10 +1037,10 @@ test('profiles: a from-value comes only from that PID profile (its CLI section o
     const cli = setup.parseCli(CLI_TEXT + 'set yaw_ccw_stop_gain = 100\n'), withCli = only(run([T5F({ profile: 2 })], { cli }), 'T5');
     assert.deepEqual([withCli.from, withCli.to, withCli.fromSource, withCli.cli], [100, 90, 'CLI dump, section `profile 1`', ['profile 1', 'set yaw_ccw_stop_gain = 90']]);
     // a governor F step on PID profile 2: not from the header F 10 of PID profile 1, and from the CLI section when it has one
-    const g3 = f({ module: 'gov', id: 'G3', profile: 2, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
+    const g3 = f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, profile: 2, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
     const noCli = only(run([g3]), 'G3');
     assert.deepEqual([noCli.from, noCli.to, noCli.cli], [null, null, []]);
-    assert.match(noCli.text, /Increase gov_f_gain on PID profile 2 by 10\./);
+    assert.match(noCli.text, /analysis gives an increase of gov_f_gain on PID profile 2 by 10\./i);
     assert.deepEqual([only(run([g3], { cli: CLI }), 'G3').from, only(run([g3], { cli: CLI }), 'G3').to], [25, 35], 'CLI `profile 1` has gov_f_gain 25');
 });
 
@@ -929,7 +1061,7 @@ test('profiles: causes, merges and the export keep each PID profile apart', () =
     const text = advice.exportScript(out.recommendations, [p1.id, p2.id], {});
     assert.deepEqual(commands(text), ['batch start', 'profile 0', 'set yaw_ccw_stop_gain = 72', 'save']);
     assert.match(text, /# Change 1 of 1: Decrease the yaw CCW stop gain\n#   Recommendation `T5:yaw_ccw_stop_gain:p1`\.\n#   PID profile 1, CLI `profile 0`\./);
-    assert.match(flat(text), /Not in the file: Decrease the yaw CCW stop gain \(`T5:yaw_ccw_stop_gain:p2`\)\./, 'a forced pick of the held change is refused');
+    assert.match(flat(text), /Not in the file: The yaw CCW stop gain: a decrease \(to examine\) \(`T5:yaw_ccw_stop_gain:p2`\)\./, 'a forced pick of the held change is refused');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -938,7 +1070,7 @@ test('profiles: causes, merges and the export keep each PID profile apart', () =
 
 const SEQUENCE = () => [C3UP, T5F(), f({ id: 'T8', value: 4, text: '60 episodes, 4.07 s at an output limit (mixer[2], servo[3])' }),
     f({ module: 'setup', id: 'F5', value: 3.789, text: 'line at 3.789 x rotor (284 Hz, prominence 400): nearest notch roll none, pitch none, yaw none' }),
-    f({ module: 'gov', id: 'G3', log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' }), f({ module: 'gov', id: 'G12', profile: null, value: 1.006, se: 0.001, text: 'main rotor line at 1.006 x' }),
+    f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' }), f({ module: 'gov', id: 'G12', profile: null, value: 1.006, se: 0.001, text: 'main rotor line at 1.006 x' }),
     f({ module: 'track', id: 'C5', axis: 'pitch', value: 2, unit: 'bursts', text: '2 self-excited bursts at 12 Hz' }), f({ module: 'setup', id: 'D2', profile: null, value: 0, text: '0 logging gaps in the log; in this segment 0 time jumps (0 frames missing, by loopIteration), 1 loop stalls' })];
 
 test('sequence: every recommendation has its node; the list follows the step and row of the node; fid and summary in every evidence row', () => {
@@ -1124,6 +1256,8 @@ test('coverage: a row per group, every PAIRS parameter covered, statuses from th
     assert.deepEqual([gear.status, /The log does not record the values that these checks use\./.test(gear.detail)], ['not-in-log', true]);
     const servo = run([f({ module: 'limits', id: 'L5', severity: 'skipped', limitUnknown: true, text: 'servo[0]: the limit is unknown. The log header does not record the servo limits.' })]).coverage.find(r => r.group === 'Servos');
     assert.equal(servo.status, 'not-in-log');
+    const recorded = run([f({ module: 'setup', id: 'F6', severity: 'skipped', text: 'The rotor order is unknown. The log does not record its rotor frequency.' })]).coverage.find(r => r.group === 'Motor poles and gear ratios');
+    assert.equal(recorded.status, 'not-in-log');
     const raw = run([], { fields: { 'gyroRAW[0]': 'absent' } }).coverage.find(r => r.group === 'Motor poles and gear ratios');
     assert.equal(raw.status, 'needs-fields', 'without raw gyro F5/F6 cannot run even with a dump');
     assert.match(raw.detail, /The log does not have these fields: `gyroRAW\[0\]`\./);
@@ -1315,7 +1449,7 @@ test('exportScript: a change with values that are possibly not current (r.stale)
 
 test('loading: siblings only, no Node API at load, Chromium-99 safe, runs through a CommonJS shim', () => {
     const src = fs.readFileSync(path.join(ROOT, 'tools/autotune/advice.cjs'), 'utf8'), code = src.replace(/\/\*[\s\S]*?\*\//g, '');
-    assert.deepEqual([...code.matchAll(/require\(([^)]*)\)/g)].map(m => m[1]), ["'./lib.cjs'", "'./health_setup.cjs'", "'./health_gov.cjs'", "'./health_loop.cjs'", "'./health_track.cjs'", "'./health_more.cjs'", "'./hierarchy.cjs'", "'./catalog.cjs'", "'./health_phase.cjs'", "'./health_rescue.cjs'", "'./health_limits.cjs'", "'./health_config.cjs'", "'./health_power.cjs'", "'./datasets.cjs'", "'./control_tune.cjs'"]);
+    assert.deepEqual([...code.matchAll(/require\(([^)]*)\)/g)].map(m => m[1]), ["'./lib.cjs'", "'./health_setup.cjs'", "'./health_gov.cjs'", "'./health_loop.cjs'", "'./health_track.cjs'", "'./health_more.cjs'", "'./hierarchy.cjs'", "'./catalog.cjs'", "'./health_phase.cjs'", "'./health_rescue.cjs'", "'./health_limits.cjs'", "'./health_config.cjs'", "'./health_power.cjs'", "'./datasets.cjs'", "'./filter_checklist.cjs'", "'./control_tune.cjs'"]);
     assert.ok(!/\bprocess\.|\bBuffer\b|__dirname|['"]node:/.test(code));
     assert.ok(!/\.toSorted\(|\.toReversed\(|\.toSpliced\(|Object\.groupBy|Map\.groupBy|Array\.fromAsync|\.with\(/.test(code));
     const mod = { exports: {} };
@@ -1351,7 +1485,7 @@ test('A1: the PID profile of a finding is the worker\'s pidProfile (1-6) first, 
     // no pidProfile (not confirmed): label 0 stays "PID profile unknown"
     assert.deepEqual([only(run([T5F({ profile: 0 })]), 'T5').profile, only(run([T5F({ profile: 0, pidProfile: null })]), 'T5').cli], [0, []]);
     // a G6 flag of PID profile 1 by pidProfile is the headroom caveat of a G3 change of PID profile 1
-    const g3 = f({ module: 'gov', id: 'G3', profile: 0, pidProfile: 1, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
+    const g3 = f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, profile: 0, pidProfile: 1, log: [5], value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
     assert.match(only(run([g3, f({ module: 'gov', id: 'G6', profile: 0, pidProfile: 1, value: 90, text: 'median throttle 90 %' })]), 'G3').caveats.join(' '), /Check G6 shows a problem with the throttle headroom \(PID profile 1\)/);
     // C7: the governor target of the stretch before the first change (targetOf '0') is the confirmed arming profile's
     const logs = (basis, confirmed) => [{ log: 5, start: '2026-10-04T10:00:00', flown: true, flyingS: 100, profileSeconds: { 0: 100 }, targetOf: { 0: 2300 }, armingProfile: 1, armingBasis: basis, armingConfirmed: confirmed }];
@@ -1606,9 +1740,22 @@ test('F5 on many logs: the caveat of a line gives the range of each PID profile 
 test('D-M5: G6 states the rule that flagged; D6 explains the guard time; RANGE_FIRST does not claim a sufficient range; G9 below 2 SE claims no oscillation', () => {
     const g6 = f({ module: 'gov', id: 'G6', value: 67.8, n: 33502, threshold: { median: 85, runS: 0.1, deficit: 0.02 }, text: 'median throttle 67.8 % (p95 82.5 %), 1.86 % of ACTIVE time at the ceiling 1000 (guessed); 1 runs >= 100 ms at the ceiling with headspeed > 2 % below target at 374.774 s (0.625 s, 13.5 %). Saturation, not a gain problem' });
     const r = only(run([g6]), 'G6');
-    assert.equal(r.text.split('\n').slice(1).join('\n'), 'The median throttle is 67.8 % (log 5, PID profile 1). In 1 result, the throttle stayed at its maximum for 100 ms or more with the headspeed more than 2 % low (1 period). '
-        + 'The longest period is 0.625 s at 374.774 s, with the headspeed 13.5 % low (log 5, PID profile 1). Thus, the throttle headroom was not sufficient at these times, and the governor did not keep the headspeed. '
-        + 'A lower target headspeed or a battery with more cells gives more headroom.');
+    assert.match(r.text, /The median throttle is 67\.8 % \(log 5, PID profile 1\)/);
+    assert.match(r.text, /The longest period is 0\.625 s at 374\.774 s, with the headspeed 13\.5 % low/);
+    assert.match(r.procedure.steps.join(' '), /If headspeed falls before full throttle, examine the governor response/);
+    assert.match(r.procedure.steps.join(' '), /At full throttle, examine battery voltage, battery current and ESC temperature/);
+    assert.match(r.procedure.title, /before you increase governor gains/);
+    assert.match(r.procedure.steps.join(' '), /If voltage is less than the battery limit or the ESC limits power, correct that problem/);
+    assert.match(r.procedure.after, /After these checks/);
+    assert.match(r.procedure.after, /can decrease tail authority/);
+    assert.deepEqual(r.cli, [], 'a diagnostic procedure does not select a gain or headspeed');
+    const inferred = only(run([{ ...g6, throttleLimit: { value: 904, estimated: true } }]), 'G6');
+    assert.match(inferred.procedure.title, /^Examine the throttle limit/);
+    assert.match(inferred.procedure.steps[0], /governor maximum throttle value/);
+    assert.match(inferred.text, /does not show the available throttle reserve/);
+    assert.doesNotMatch(inferred.text, /stayed at its maximum|headroom was not sufficient/);
+    assert.deepEqual(inferred.cli, []);
+    assert.doesNotMatch(r.text, /battery with more cells/);
     assert.doesNotMatch(r.text, /The median throttle is more than 85|Decrease the target headspeed/);
     assert.match(r.caveats.join(' '), /Check G6 gives no SE, because the median throttle and the number of periods at the maximum come from all samples/);
     assert.match(only(run([f({ module: 'gov', id: 'G6', value: 90, text: 'median throttle 90 %' })]), 'G6').text, /The median throttle is more than 85 %\. Thus, the throttle headroom is too small\./);
@@ -1626,7 +1773,10 @@ test('D-M5c: a change from SPOOLUP to ACTIVE after the liftoff gives the procedu
     const g16 = PH('G16', { log: 0, value: 0.0711, se: null, n: 1, overshoot: 0.0711, throttleStepPct: -0.02, settleS: 1, reference: 'govTarget', events: [{ t: 8.553, value: 0.0711 }] });
     const d7 = D7F(0, false, { flights: [{ t0: 7.279, t1: 376.8 }] });
     const r = only(run([g16, d7], { logBase: 1 }), 'G16');
-    assert.match(r.text, /The change to ACTIVE came 1\.27 s after the liftoff at 7\.28 s \(log 1, PID profile 1\), and the rotor load causes a part of the error\. Keep the collective low until the governor is ACTIVE\. Then do the liftoff in one movement\.$/);
+    assert.match(r.text, /The change to ACTIVE came 1\.27 s after the liftoff at 7\.28 s \(log 1, PID profile 1\)\./);
+    assert.match(r.text, /A change in rotor load can cause part of the error\. Compare collective, throttle and headspeed around this change before you adjust the governor\./);
+    assert.match(r.text, /Keep the collective low until the governor is ACTIVE\. Then do the liftoff in one movement\.$/);
+    assert.doesNotMatch(r.text, /rotor load causes a part of the error/);
     // the fields of health_phase (afterLiftoff, afterLiftoffS, liftoffT) give the same, without D7
     const own = only(run([PH('G16', { log: 0, value: 0.0711, n: 1, events: [{ t: 8.553, value: 0.0711 }], afterLiftoff: true, afterLiftoffS: 1.274, liftoffT: 7.279 })], { logBase: 1 }), 'G16');
     assert.match(own.text, /The change to ACTIVE came 1\.27 s after the liftoff at 7\.28 s/);
@@ -1650,7 +1800,7 @@ test('D-M5e: a check or a watch has no instruction to change a value (titles and
         f({ module: 'setup', id: 'F5', log: 6, value: 9, text: 'line at 9 x rotor (340 Hz, prominence 40): nearest notch roll none, pitch none, yaw none' })]);
     const out = run(findings, { cli: CLI, header: Object.assign({}, HEADER, { rollPID: [50, 200, 0, 100, 0], gyro_rpm_notch_q_roll: pad([80, 15, 60, 50]) }) });
     const soft = out.recommendations.filter(r => r.severity === 'check' || r.severity === 'watch');
-    assert.ok(soft.length >= 25, String(soft.length));
+    assert.ok(soft.length >= 20, String(soft.length)); // numeric trial recommendations are actions now
     const VERB = /^(Increase|Decrease|Raise|Lower|Reduce|Set|Change|Add|Use|Make the|Adjust|Multiply|Enable|Turn)\b/, TITLE = /^(Increase|Decrease|Raise|Lower|Reduce|Set|Add|Use|Make the|Adjust|Enable)\b/; // "Change from ..." is a noun
     for (const r of soft) {
         assert.ok(!TITLE.test(r.title), `${r.id} ${r.severity} title: ${r.title}`);
@@ -1770,7 +1920,7 @@ test('review V3: no developer reference in the texts; the sources are one quoted
     assert.doesNotMatch(g16.caveats.join(' ') + g16.text, /8\.3 Hz to 8\.7 Hz|3 of 3 flights/);
     assert.match(g16.text, /The change to ACTIVE came 1\.27 s after the liftoff at 7\.28 s/, 'the numbers of the text come from the log');
     const g6 = only(out, 'G6');
-    assert.match(g6.caveats.join(' '), /On a different helicopter \("SAB Fireball"\), a test showed that 56 % to 71 % of each decrease started before the maximum\. This result is not from your logs\./);
+    assert.match(g6.caveats.join(' '), /The output limit does not show the cause of the headspeed decrease before the throttle got to that limit\./);
 });
 
 // review V4: a recommendation from a measured result of the flights is 'measured'; one from the configuration only, or with
@@ -1832,17 +1982,22 @@ test('G19, T15, D8: checks of the rescue, never CLI; G19 on "Set the governor", 
     const g = only(out, 'G19'), t = only(out, 'T15'), d = only(out, 'D8');
     assert.deepEqual([g.node, g.severity, g.cli], ['governor', 'check', []]);
     assert.match(g.text.split('\n')[1], /^At the rescue, the headspeed decreases to 41\.5 % less than the target \(log 14, PID profile 2\)\./);
-    assert.match(g.text, /At the throttle limit, the governor cannot hold the headspeed, and gain changes cannot correct this\./);
+    assert.match(g.text, /This shows a small throttle reserve\./);
     assert.match(g.text, /In FALLBACK, the firmware decreases the throttle by gov_fallback_drop\. In RECOVERY, the throttle increases at the rate of gov_recovery_time\./);
-    assert.match(g.text, /decrease rescue_pull_up_collective/); assert.doesNotMatch(g.text, /gear|pulley|teeth/i, 'gear rule');
+    assert.doesNotMatch(g.text, /decrease rescue_pull_up_collective/); assert.match(g.text, /This log does not measure the effect of that change/); assert.doesNotMatch(g.text, /gear|pulley|teeth/i, 'gear rule');
     assert.match(g.text, /The throttle gets to 100 %\. Thus, a larger gov_max_throttle cannot give more throttle\./);
-    assert.match(only(run([G19F({ throttleMax: 900 })]), 'G19').text, /The throttle gets to only 90 %\. Examine gov_max_throttle: a larger value gives more throttle\./);
+    assert.match(only(run([G19F({ throttleMax: 900 })]), 'G19').text, /The throttle gets to 90 %\. Compare this with gov_max_throttle and the ESC output range\./);
     assert.deepEqual([t.node, t.severity, t.axis, t.cli], ['tailcomp', 'check', 'yaw', []]);
     assert.match(t.text.split('\n')[1], /^At the rescue, the largest yaw error is 138 deg\/s more than the largest yaw error before the rescue/);
-    assert.match(t.text, /The tail output is at its limit for 0\.02 s in the first 1\.5 s\. At its limit, the tail does not have sufficient authority\./);
+    assert.match(t.text, /The tail output is at its limit for 0\.02 s in the first 1\.5 s\./);
     assert.match(t.text, /Examine yaw_collective_ff_gain, because the pull-up of the rescue is a large collective step\./);
     assert.deepEqual([d.node, d.severity, d.cli], ['rescue', 'check', []]);
-    assert.match(d.text, /^At 1 rescue, the PID profile changes when the rescue starts\. In log 13, PID profile 2 changes to PID profile 1\.$/m); assert.match(d.text, /Put the rescue on a switch that does not change the PID profile\./);
+    assert.match(d.text, /^At 1 rescue, the PID profile changes near the rescue start\. In log 13, PID profile 2 changes to PID profile 1\.$/m);
+    assert.match(d.text, /The time of a PID profile change does not identify its source/);
+    assert.match(d.text, /Examine the transmitter, Modes tab and Adjustments tab/);
+    assert.match(d.text, /If the rescue switch changes the PID profile incorrectly, put the PID profile change on a different switch/);
+    assert.match(d.text, /test the rescue switch on the ground with the motor off/);
+    assert.doesNotMatch(d.text, /Put the rescue on a switch|then flies with the gains/);
     // T15 in a log where the PID profile changes at the rescue (D8): the cause is named, and rule K23 makes it a possible result
     assert.doesNotMatch(t.text, /check D8/, 'the D8 flag is of another rescue');
     const tAt = RS('T15', { value: 138, peak: 231, base: 93, atLimitS: 0.02, axis: 'yaw', profile: 1, log: 13, events: [{ t: 105.5, t1: 107, tS: 105.543, value: 138, bad: true }] });
@@ -1851,13 +2006,37 @@ test('G19, T15, D8: checks of the rescue, never CLI; G19 on "Set the governor", 
     assert.deepEqual(t.causes.map(c => c.rule), ['K23']);
 });
 
-test('G1 at an overload of G19 (rule K22): a watch with its cause, the RPM step not a problem, no hold of governor changes', () => {
+test('T15: a rescue profile change cannot establish changed tail gains when the settings are unknown or equal', () => {
+    const tAt = RS('T15', { value: 138, peak: 231, base: 93, atLimitS: 0.02, axis: 'yaw', profile: 2, log: 15,
+        events: [{ t: 151.3, t1: 152.8, tS: 151.372, value: 138, bad: true }] });
+    const dAt = RS('D8', { value: 1, profile: 2, log: 15, fromProfile: 3, toProfile: 2,
+        events: [{ t: 150.3, t1: 151.4, tS: 151.372, value: 1 }] });
+    const values = 'set yaw_p_gain = 80\nset yaw_i_gain = 120\nset yaw_d_gain = 14\nset yaw_f_gain = 20\nset yaw_b_gain = 0\n'
+        + 'set yaw_base_thrust = 5\nset yaw_cyclic_ff_gain = 10\nset yaw_collective_ff_gain = 60\nset yaw_inertia_precomp_gain = 0\n';
+    const equal = setup.parseCli(`dump all\nprofile 1\n${values}profile 2\n${values}`);
+    assert.deepEqual(equal.profiles['1'], equal.profiles['2'], 'The two PID profiles have equal recorded tail settings.');
+    for (const cli of [null, equal]) {
+        const r = only(run([tAt, dAt], { cli, headerProfile: 2, headerLog: 15 }), 'T15');
+        assert.match(r.text, /At this rescue, the PID profile also changes \(check D8\)\. This can change the tail gains and the precompensation\./);
+        assert.doesNotMatch(r.text, /This changes the tail gains|gains (?:are|become) different/);
+        assert.deepEqual([r.severity, r.cli], ['check', []]);
+        assert.ok(r.causes.some(c => c.rule === 'K23' && c.ids.includes('D8')), 'The observed profile change remains a related check.');
+    }
+});
+
+test('G1 at an overload of G19 (rule K22): overload context cannot clear the RPM prerequisite', () => {
     const g1 = f({ module: 'gov', id: 'G1', profile: null, value: 1, log: 14, times: [193.686], text: '1 FALLBACK entry at 193.686 s (0.213 s long). RPM signal lost or glitching' });
-    const out = run([g1, G19F()]), g1s = (o) => o.recommendations.filter(x => /^G1(:|$)/.test(x.id)), r = g1s(out)[0];
-    assert.equal(g1s(out).length, 1);
-    assert.deepEqual([r.id, r.severity, r.title], ['G1:overload', 'watch', 'FALLBACK at a headspeed decrease at full throttle']);
-    assert.match(r.text, /possibly a result of this large load, and the RPM signal is possibly correct/);
+    const out = run([g1, G19F()]), g1s = (o) => o.recommendations.filter(x => /^G1(:|$)/.test(x.id)), r = g1s(out).find(x => x.id === 'G1:overload');
+    assert.deepEqual(g1s(out).map(x => [x.id,x.severity]), [['G1','check'],['G1:overload','watch']]);
+    assert.equal(r.title, 'FALLBACK at a headspeed decrease at full throttle');
+    assert.match(r.text, /same time does not show that the RPM signal is correct/);
+    assert.match(r.text, /RPM prerequisite stays open/);
     assert.deepEqual(r.causes.map(c => [c.rule, c.ids]), [['K22', ['G19']]]);
+    for (const item of g1s(out)) {
+        const context = item.causes.find(c => c.rule === 'K22');
+        assert.ok(context, item.id);
+        assert.equal(context.holds, false, 'The overload context cannot delay the RPM check that governor tuning requires.');
+    }
     // a FALLBACK at another time stays a problem of the RPM signal
     const other = run([Object.assign({}, g1, { fid: 'g1b', times: [54.622] }), G19F()]);
     assert.deepEqual(g1s(other).map(x => [x.id, x.severity]), [['G1', 'check']]);
@@ -1877,9 +2056,9 @@ test('L1-L7: one item for each output and PID profile with its periods; a proble
     assert.match(r1.text.split('\n')[1], /^The throttle is at its limit in 3 periods, for a total of 2\.486 s \(log 14, PID profile 2\)\. In log 14, the period from 149\.61 s to 151\.03 s is 1\.42 s long, in flight\./);
     assert.match(r1.text, /from 193\.32 s to 193\.58 s is 0\.26 s long, in flight, before a rescue\./);
     assert.match(r1.text, /Other outputs are at their limits at the same time: collective stick\./);
-    assert.match(r1.text, /Decrease the load at these times\. For example, decrease the collective or rescue_pull_up_collective\./);
+    assert.match(r1.procedure.steps.join(' '), /If headspeed falls before full throttle, examine the governor response/);
     assert.deepEqual([r4.node, r4.severity, r4.axis], ['tailcomp', 'watch', 'yaw']);
-    assert.match(r4.text, /A larger tail pitch range \(if the mechanical parts let it\), larger tail blades or a higher headspeed \(gov_headspeed\) give the tail more authority\./);
+    assert.match(r4.text, /If the output stays at its limit with a yaw error, examine the tail pitch range and linkage/);
     assert.deepEqual([r5.node, r5c.node, r7.node, r6.node], ['tailcomp', 'cyclic', 'controller', 'cyclic'], 'the tail servo with the tail authority; a cyclic servo and the roll I-term with the cyclic gains; the collective command with the flight controller (the radio)');
     for (const r of [r1, r4, r5, r5c, r7, r6]) { assert.deepEqual(r.cli, [], r.id); assert.doesNotMatch(r.text, /gear|pulley|teeth/i, `${r.id}: gear rule`); }
     // the tail at its limit is the possible first cause of a tail kick at the rescue that comes after it (K24)
@@ -1892,15 +2071,29 @@ test('L1-L7: one item for each output and PID profile with its periods; a proble
 });
 
 // coordinator, round 2: a FALLBACK with no rescue can also be an overload (check G20 of health_rescue.cjs, Fireball 2026-10-05 log 12)
-test('G1 at an overload of G20 with no rescue (rule K22): a watch with its cause; a FALLBACK with no overload sign stays a problem of the RPM signal', () => {
+test('L1 distinguishes an inferred throttle plateau from a confirmed maximum', () => {
+    const plateau = LM('L1', 'throttle', { value: 0.33, n: 1,
+        limits: { lo: null, hi: 932, source: 'data' },
+        throttleLimit: { value: 932, source: 'data', estimated: true },
+        events: [{ t: 154.24, t1: 154.57, tS: 154.24, t1S: 154.57, seconds: 0.33, limit: 932 }] });
+    const rec = only(run([plateau]), 'L1:throttle');
+    assert.equal(rec.title, 'Examine the throttle limit');
+    assert.match(rec.text, /These periods do not show full throttle/);
+    assert.equal(rec.procedure.title, 'Examine the throttle limit before you increase governor gains.');
+    assert.match(rec.procedure.steps[0], /Compare the governor maximum throttle/);
+    assert.deepEqual(rec.cli, []);
+});
+
+test('G1 at an overload of G20 with no rescue (rule K22): all FALLBACKs retain RPM validation', () => {
     const g1 = f({ module: 'gov', id: 'G1', profile: null, value: 2, log: 11, times: [54.622], text: '2 FALLBACK entries at 54.622 s (0.203 s long, headspeed 4529, max 5015, 0 glitch-proxy samples within 0.5 s); 159.549 s (0.204 s long, headspeed 5029). RPM signal lost or glitching' });
     const ev = (start, kind) => ({ t: start - 0.2, t1: start + 0.05, start, tS: start - 0.014, kind, value: kind === 'overload' ? 0.05 : null, bad: kind !== 'overload' });
     const g20 = (kinds) => f({ module: 'rescue', id: 'G20', severity: 'note', profile: null, log: 11, value: kinds.filter(k => k === 'overload').length, n: kinds.length, unit: 'count', events: [ev(54.622, kinds[0]), ev(159.549, kinds[1])] });
     const both = run([g1, g20(['overload', 'overload'])]), r = both.recommendations.filter(x => /^G1(:|$)/.test(x.id));
-    assert.deepEqual(r.map(x => [x.id, x.severity]), [['G1:overload', 'watch']]);
-    assert.deepEqual(r[0].causes.map(c => [c.rule, c.ids, c.holds]), [['K22', ['G20'], false]]);
-    assert.ok(r[0].evidence.some(e => e.id === 'G20'), 'the G20 rows are evidence');
-    if (H) assert.equal(H.status([g1, g20(['overload', 'overload'])], both.recommendations, {}).nodes.rpm.status, 'ok', 'no problem of the RPM signal');
+    assert.deepEqual(r.map(x => [x.id, x.severity]), [['G1','check'],['G1:overload','watch']]);
+    const context = r.find(x => x.id === 'G1:overload');
+    assert.deepEqual(context.causes.map(c => [c.rule, c.ids, c.holds]), [['K22', ['G20'], false]]);
+    assert.ok(context.evidence.some(e => e.id === 'G20'), 'the G20 rows are evidence');
+    if (H) assert.equal(H.status([g1, g20(['overload', 'overload'])], both.recommendations, {}).nodes.rpm.status, 'problem', 'coincident overload cannot verify the RPM signal');
     // one of the two FALLBACKs with no overload sign: a problem of the RPM signal (the times of the text count, not only the first)
     const one = run([g1, g20(['overload', 'signal'])]);
     assert.deepEqual(one.recommendations.filter(x => /^G1(:|$)/.test(x.id)).map(x => [x.id, x.severity]), [['G1', 'check']]);
@@ -1917,10 +2110,10 @@ test('SPEC3 F: the text of a change is symptom, why, number, change and effect; 
     assert.match(p[1], /^For each 1 deg of collective, the pitch I-term and O-term add 0\.124 ± 0\.026 deg of cyclic pitch/);
     assert.doesNotMatch(r.text, /1000 units|2 SE test/, 'no internal quantity without its meaning');
     // round 3 M5: the full measured correction and the step
-    assert.match(p[2], /^The full change is an increase of 62\. Make the change in steps\. Set pitch_collective_ff_gain on PID profile 1 from 10 to 12 \(.*\)\. After the flight, do the analysis again\. Then the helicopter pitches less when the collective changes, and the pitch I-term stays nearer to zero\.$/);
+    assert.match(p[2], /^The full change is an increase of 62\. Make the change in steps\. Set pitch_collective_ff_gain on PID profile 1 from 10 to 12 \(.*\)\. After the flight, do the analysis again\. This change can decrease the pitch movement after a collective change\. The next flight must measure this effect\.$/);
     // a check: symptom and why first, no effect sentence
     const t8 = only(run([f({ id: 'T8', value: 4, text: '60 episodes, 4.07 s at an output limit (mixer[2], servo[3])' })]), 'T8');
-    assert.match(t8.text, /^The tail output stays at its limit\.\n/); assert.doesNotMatch(t8.text, /calibrat/i);
+    assert.match(t8.text, /^The tail output stays at its limit\./); assert.doesNotMatch(t8.text, /calibrat/i);
     // C10 landed while at flight speed: information, never a problem or a watch ("not a bug, just slow to take off")
     const landed = only(run([f({ id: 'C10', value: 2, text: '2 s with the rotor at speed while the firmware says landed' })]), 'C10:landed');
     assert.equal(landed.severity, 'info'); assert.match(landed.text, /This is not a problem\. The helicopter only becomes airborne slowly after the spool-up\./);
@@ -1948,7 +2141,7 @@ test('round 3 M1: the from-value comes from the newest configuration of the PID 
     // no source shows the value: unknown, no CLI
     const none = at({ roll_f_gain: null }, { roll_f_gain: 'none' });
     assert.deepEqual([none.from, none.cli], [null, []]);
-    assert.ok(none.caveats.some(c => /No log header gives the value of roll_f_gain in the newest configuration of PID profile 1\. Thus, there is no CLI text\. The log header records the values of PID profile 1 only when the pilot arms the helicopter in PID profile 1\./.test(c)), J(none.caveats));
+    assert.ok(none.caveats.some(c => /No log header gives the value of roll_f_gain in the newest configuration of PID profile 1\. Thus, there is no CLI text\. The log header records the values of PID profile 1 only when a new log starts in PID profile 1\./.test(c)), J(none.caveats));
     assert.ok(!none.caveats.some(c => /CLI dump|diff all/.test(c)), 'no CLI dump: no text asks for one (user rule 2026-10-06)');
     // a header of a log whose PID profile at arming is only an estimate: the value as an estimate, no CLI
     const est = at({ roll_f_gain: 110 }, { roll_f_gain: 'estimate' });
@@ -1990,14 +2183,14 @@ test('round 3 M1: A/B pairs of the configurations that differ in a few parameter
     assert.ok(r.slope && r.slope.name === 'pitch_collective_ff_gain', J(r.slope));
     within(r.slope.perUnit, -4, 1e-6, 'slope'); assert.deepEqual([r.slope.datasets, r.slope.range], [['A', 'B', 'C'], [10, 30]]);
     within(r.slope.change, -4 * (r.to - r.from), 1e-6, 'the predicted change of the result');
-    assert.match(r.text, /In configurations A, B and C, check C14 changes by .* for each 1 of `pitch_collective_ff_gain`\. Thus, the change from 20 to 24 gives /);
+    assert.match(r.text, /In configurations A, B and C, check C14 changes by .* for each 1 of `pitch_collective_ff_gain`\. The slope gives an estimate of .* for a step from 20 to 24\. This is not a measured response to that step\./);
     assert.ok(r.sources.some(s => /2 SE or more, and a slope only inside the range/.test(s)), J(r.sources));
     // the newest configuration C at the end of the range: 30 -> 36 is out of it, so no slope, and the text says why
     const out = go('C');
     assert.equal(out.slope, null); assert.match(out.text, /The measured slope of check C14 is for `pitch_collective_ff_gain` from 10 to 30\. The change goes out of this range, thus the app does not use the slope\./);
     // two configurations with no difference by 2 SE
     const flat = go('B', [C14DS('A', 84), C14DS('B', 80), C14DS('C', 82)]);
-    assert.ok(flat.ab.length && flat.ab.every(q => !q.significant) && /not more than 2 SE\. Thus, the logs show no effect of these parameters on this result\./.test(flat.text), flat.text);
+    assert.ok(flat.ab.length && flat.ab.every(q => !q.significant) && /not more than 2 SE\. These logs cannot identify an effect of these parameters on this result\./.test(flat.text), flat.text);
 });
 
 test('round 3 M1: a problem only in older configurations while the newest one is satisfactory is a watch with no CLI text', () => {
@@ -2064,7 +2257,7 @@ test('round 3 M2: the filter search gives an action only when it recommends the 
     assert.deepEqual(recs[1].cli, ['profile 0', 'set roll_d_cutoff = 12']);
     assert.deepEqual(recs[0].fromSets, { 'feature DYN_NOTCH': false, dyn_notch_count: '6', dyn_notch_q: '25' });
     assert.deepEqual([recs[0].fromSource, recs[1].fromSource], ['log header', 'CLI dump "dump.txt"']);
-    assert.match(recs[0].text, /^The summary\.\nThe set\.\nThe time delay\.\nThe test\.\nThe model agrees\.\nSet `feature DYN_NOTCH` on\. Set `dyn_notch_count` from 6 to 2\. Set `dyn_notch_q` from 25 to 40\.\nThen less vibration gets to the PID controller and the servos\.$/);
+    assert.match(recs[0].text, /^The summary\.\nThe set\.\nThe time delay\.\nThe test\.\nThe model agrees\.\nSet `feature DYN_NOTCH` on\. Set `dyn_notch_count` from 6 to 2\. Set `dyn_notch_q` from 25 to 40\.\nThe replay estimates the change of vibration with these values\. A new flight must measure the response\.$/);
     assert.match(recs[0].rule, /^The app recommends a set of filter values only if the filter model agrees with the recorded gyroADC \(1 dB, 0\.3 ms\)\. .* Sources: "/);
     // the export: the feature line first in the global values, the PID profile part as `profile 0`; the group goes in together or not at all
     const text = advice.exportScript(recs, null, { logBase: 1 }), cmd = text.split('\n').filter(l => l && !l.startsWith('#'));
@@ -2122,4 +2315,42 @@ test('configuration export restores the selected LUA variant and rejects mixed a
     assert.match(script,/set gov_headspeed = 2300/);
     a['iterm_relax_cutoff[1]']=999;advice.configurationBases(ds);
     assert.ok(ds.datasets[0].exportBase.unsupported.some(q=>q.name==='iterm_relax_cutoff'));
+});
+
+test('structured setup measurements preserve recommendations when diagnostic wording changes', () => {
+    const pairs = [
+        ['lost frames', { id: 'D2', profile: null, value: 3, text: '1 logging gaps in the log; in this segment 3 time jumps (40 frames missing, by loopIteration), 0 loop stalls' },
+            { counts: { logGaps: 1, timeJumps: 3, timeBackwards: 0, iterationJumps: 0, loopStalls: 0, missingFrames: 40 } }],
+        ['loop stalls', { id: 'D2', profile: null, value: 0, text: '0 logging gaps in the log; in this segment 0 time jumps (0 frames missing, by loopIteration), 2 loop stalls' },
+            { counts: { logGaps: 0, timeJumps: 0, timeBackwards: 0, iterationJumps: 0, loopStalls: 2, missingFrames: 0 } }],
+        ['missing fields', { id: 'D3', severity: 'note', profile: null, value: 1, text: 'checks that cannot run: F5/F6/F7 (gyroRAW[0] absent, gyroRAW[1] absent, gyroRAW[2] absent)' },
+            { skips: [{ checks: ['F5','F6','F7'], missing: ['gyroRAW[0] absent','gyroRAW[1] absent','gyroRAW[2] absent'] }] }],
+        ['dynamic notch', { id: 'F8', severity: 'note', profile: null, text: 'dynamic notch off; 2 lines without RPM notch coverage; forced off below 1000 Hz' }, { uncoveredLines: 2, forcedOff: true }],
+        ['notch line', { id: 'F5', value: 3, text: 'line at 3 x rotor (150 Hz, prominence 90, rotor-locked): nearest notch roll none, pitch none, yaw none', filterPass: [{ hz: 150, roll: 0.01, pitch: 0.01, yaw: 0.01 }] },
+            { lines: [{ order: 3, hz: 150, prominence: 90, rotorLocked: true, axes: ['roll','pitch','yaw'].map(axis => ({ axis, amplitude: 5, nearestNotch: null })) }] }],
+        ['header change', { id: 'H', severity: 'note', profile: 'start profile 1', value: '100', text: 'yawPID: 80 -> 100 (since log 4, start profile 1)' }, { headerKey: 'yawPID', from: '80', since: 4 }],
+        ['CLI mismatch', { id: 'D4', profile: 0, text: D4_TEXT }, { mismatches: [{ cli: 'yaw_collective_ff_gain', header: 'yaw_precomp[2]', headerValue: 60, cliValue: 70 }] }],
+    ];
+    const decisions = out => out.recommendations.map(({ id, severity, title, text, parameter, from, to, cli, blockedBy, caveats }) => ({ id, severity, title, text, parameter, from, to, cli, blockedBy, caveats }));
+    for (const [name, row, data] of pairs) {
+        const old = f(Object.assign({ module: 'setup' }, row));
+        const next = Object.assign({}, old, data, { text: 'The diagnostic wording can change.' });
+        const a = decisions(run([old], { cli: CLI })), b = decisions(run([next], { cli: CLI }));
+        assert.ok(a.length > 0, name);
+        assert.deepEqual(b, a, name);
+    }
+});
+
+test('structured yaw setup and header changes keep stale gain proposals blocked', () => {
+    const legacy = [setupOf(5, '80,120,10,0,0', '120,80'), setupOf(6, '80,120,14,20,0', '120,80')];
+    const typed = legacy.map((row, i) => Object.assign({}, row, { text: 'The diagnostic wording can change.', setup: {
+        pid: { yaw: i ? HEADER.yawPID : [80,120,10,0,0] }, yaw: { stopGain: [120,80], inertia: [0,25] }
+    } }));
+    const oldFlag = T14F({ gain: 300, se: 40, f: { log: 5 } });
+    const quiet = T14F({ gain: 10, se: 20, f: { log: 6, severity: 'note', events: [1,2,3,4,-5,6].map((v,i) => ({t:i,value:v*5,toward:8})) } });
+    const a = only(run([...legacy,oldFlag,quiet]),'T14'), b = only(run([...typed,oldFlag,quiet]),'T14');
+    for (const key of ['severity','title','text','to','cli','caveats']) assert.deepEqual(b[key],a[key],key);
+    assert.equal(b.severity,'watch'); assert.deepEqual(b.cli,[]);
+    const catalog = require('../tools/autotune/catalog.cjs');
+    assert.deepEqual(catalog.headerChange({headerKey:'yawPID',from:'80',value:'100',since:4,text:'Changed wording.'}), {key:'yawPID',from:'80',to:'100',since:4});
 });

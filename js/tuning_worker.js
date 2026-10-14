@@ -115,11 +115,15 @@ var TuningWorker = (function () {
     const REQUIRED = ['lib', 'health', 'health_setup', 'health_gov', 'health_loop', 'health_report'];
     const GAINS = ['extract', 'report'];                                   // needed for options.gains only
     const OPTIONAL = { track: 'health_track', more: 'health_more', phase: 'health_phase', rescue: 'health_rescue', limits: 'health_limits', config: 'health_config', power: 'health_power', advice: 'advice', catalog: 'catalog', hierarchy: 'hierarchy', evidence: 'evidence', datasets: 'datasets', epochs: 'param_epochs' };
+    const CHECK_LABELS = { setup: 'the recorded configuration', gov: 'the governor response', loop: 'the control loops',
+        track: 'the response to inputs', more: 'the filters and the governor', phase: 'the flight phases',
+        rescue: 'the rescue response', limits: 'the control limits', config: 'the configuration', power: 'the power system' };
     const LOST = { track: 'its checks', more: 'its checks', phase: 'the flight phases and the ground checks', rescue: 'the rescue checks', limits: 'the checks of the control limits', config: 'the rescue check of each PID profile (D9)',
         power: 'the battery checks at the load steps (P1, P2)', advice: 'recommendations', catalog: 'the STE summaries',
         hierarchy: 'the tuning sequence', evidence: 'the part of the log that gave each result', datasets: 'the configurations of the flights',
         epochs: 'the parts of the log in which the values are possibly not the values of the log header' }; // without that module
-    const ON_DEMAND = ['filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_autotune', 'filter_checklist', 'control_tune'];
+    const ON_DEMAND = ['filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'control_tune',
+        'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline'];
     const CORE = ['setup', 'gov', 'loop'];                                 // health.cjs MODULES, in its order
     const JUDGED = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power']; // the new modules, judged after health_report.cjs
     const ALL_PHASE = new Set(['rescue', 'limits', 'config', 'power']);    // modules that use all phases of a flight log, rescue included, with no guard time
@@ -582,7 +586,7 @@ var TuningWorker = (function () {
         for (const [name, M] of Object.entries(K.analysers)) {
             const run = name === 'phase' ? !!phaseCtx : ALL_PHASE.has(name) ? (fm ? true : !ph && flown) : name === 'setup' || (name === 'gov' && G) || (flown && !(thin && name === 'loop'));
             if (!run) { rec.metrics[name] = null; continue; }
-            J.progress(`Log ${fl.log + 1}: the app does the checks of "${OPTIONAL[name] || `health_${name}`}.cjs".`);
+            J.progress(`Log ${fl.log + 1}: the app examines ${CHECK_LABELS[name] || 'the flight data'}.`);
             const c = Object.assign({}, name === 'phase' ? phaseCtx : ALL_PHASE.has(name) ? allCtx(ctx, phaseCtx, rec) : name === 'gov' ? govCtx : name === 'track' || name === 'more' ? newCtx : attCtx);
             if (name === 'setup' && c.pidLabels) c.profile = c.pidLabels; // D4 and the F5, F6 and F9 rows: the PID profile labels
             try { rec.metrics[name] = name === 'gov' && G ? govAllPhases(M, w, c, flying, G) : M.analyse(w, c); } catch (e) { rec.errors[name] = String(e && e.stack || e); }
@@ -893,8 +897,8 @@ var TuningWorker = (function () {
             J.notes.add(`At the start of ${list}, "govRequest" is ${x.headspeed} rpm. In the PID profile changes of ${mapScope(J)}, only PID profile ${p} has this value (${seen}). ` +
                 `Thus, ${one ? 'this log starts' : 'these logs start'} in PID profile ${p}.`);
         }
-        // a PID profile that flies in the analysis, which no flight log starts in: the log header has its values only when the pilot
-        // arms the helicopter in it. True and useful only when the app can then identify it (a headspeed of the map that no other
+        // a PID profile that flies in the analysis, which no flight log starts in: the log header has its values only when a new
+        // log starts in it. True and useful only when the app can then identify it (a headspeed of the map that no other
         // PID profile has) and no CLI dump gives its section
         if (J.scope !== 'file' || !J.hsLogs || !J.hsLogs.size) return;
         const M = hsMap(J), starts = new Set([...J.arming.values()].filter(a => a.confirmed && a.profile > 0).map(a => a.profile)), cli = J.cliParsed && J.cliParsed.profiles || {};
@@ -902,8 +906,8 @@ var TuningWorker = (function () {
         for (const p of [...flown].sort((a, b) => a - b)) {
             const h = M.table[p];
             if (starts.has(p) || [].concat(h).every(v => M.identify(v).profile !== p) || cli[p - 1]) continue; // one of its values identifies it
-            J.notes.add(`No flight log in the analysis starts in PID profile ${p}. The log header records the values of the PID profile that is active when you arm the helicopter. ` +
-                `Thus, the log header has the values of PID profile ${p} only when you arm the helicopter in PID profile ${p}.`);
+            J.notes.add(`No flight log in the analysis starts in PID profile ${p}. The log header records the values of the PID profile that is active when a new log starts. ` +
+                `Thus, the log header has the values of PID profile ${p} only when a new log starts in PID profile ${p}.`);
         }
     }
     // After the main pass, before the judgement: without a first pass (a flight rpm of the user and no configurations), the map had
@@ -1111,7 +1115,8 @@ var TuningWorker = (function () {
         for (const e of Array.isArray(f.events) ? f.events : []) conv(e);
         if (f.evidence && typeof f.evidence === 'object') { const e = f.evidence; if (Number.isInteger(e.profile)) e.profile = f.profile; if (e.dataset === undefined) e.dataset = f.dataset;
             for (const q of [].concat(e.spans || [], e.context || [])) conv(q); }
-        if (typeof f.text === 'string' && J.dsMap) f.text = f.text.replace(/(?<!\b(?:CLI|rate) )\b(PID )?profile (\d+)\b/g, (m, pid, n) => { const d = J.dsMap.get(+n); return d ? configText(d) : m; });
+        // D8 describes actual PID profile transitions from ctx.pidLabels, not the pooled configuration labels.
+        if (f.id !== 'D8' && typeof f.text === 'string' && J.dsMap) f.text = f.text.replace(/(?<!\b(?:CLI|rate) )\b(PID )?profile (\d+)\b/g, (m, pid, n) => { const d = J.dsMap.get(+n); return d ? configText(d) : m; });
     }
 
     // records, curves, header and fields of one decoded log; parser errors are kept apart (health.cjs puts them last). With
@@ -1164,7 +1169,7 @@ var TuningWorker = (function () {
     // a bench run gets only the log class of health_phase.cjs (its D7, which lists the run as not analysed: advice, hierarchy)
     function benchPhase(K, p, J) {
         if (typeof K.phase.analyse !== 'function') return;
-        J.progress(`Log ${p.rec.log + 1}: the app does the checks of "health_phase.cjs".`);
+        J.progress(`Log ${p.rec.log + 1}: the app examines the flight phases.`);
         try { p.rec.metrics.phase = K.phase.analyse(p.w, Object.assign({}, p.ctx, { phases: p.ph.P, flightMask: p.ph.mask })); } catch (e) { p.rec.errors.phase = String(e && e.stack || e); }
     }
 
@@ -1272,16 +1277,19 @@ var TuningWorker = (function () {
         return { findings: findings.sort(bySeverity), markdown: files.get('/v/report.md') };
     }
 
-    // extract.cjs then report.cjs on the whole file, as `node extract.cjs /v/out <file>` and `node report.cjs /v/out`
+    // Extract only selected logs. The first pass still reads all headers for
+    // profile provenance; flightSegments retains exact within-log selection.
     function gains(J, src, bytes) {
         const lost = GAINS.filter(n => !src.texts[`${n}.cjs`]);
         if (lost.length) { J.notes.add(`The app did not calculate the gains, because ${and(lost.map(n => `"${n}.cjs" (${src.missing[`${n}.cjs`]})`))} ${lost.length > 1 ? 'are' : 'is'} not available.`); return null; }
-        const files = new Map([[`/v/${J.fileName}`, bytes]]), count = J.logCount || 1, D = J.K.lib.DEFAULTS;
+        const files = new Map([[`/v/${J.fileName}`, bytes]]), selected = J.selection ? J.logs : null,
+            count = selected ? selected.length : J.logCount || 1, D = J.K.lib.DEFAULTS;
         try {
             let found = null; // extract.cjs ends with "<n> flights, <n> segments, <n> skipped -> <file>"
-            runCli(src, J.K.rpm, 'extract.cjs', ['/v/out', `/v/${J.fileName}`], files, (l) => {
+            runCli(src, J.K.rpm, 'extract.cjs', ['/v/out', `/v/${J.fileName}`].concat(selected ? ['--logs=' + selected.join(',')] : []), files, (l) => {
                 const s = /^\d+ flights, (\d+) segments,/.exec(l); if (s) found = +s[1];
-                const m = /#(\d+)/.exec(l); J.progress(`"extract.cjs": "${l}"`, 'gains', m ? 0.6 + 0.3 * Math.min(1, (+m[1] + 1) / count) : null); });
+                const m = /#(\d+)/.exec(l), position = m ? selected ? selected.indexOf(+m[1]) + 1 : +m[1] + 1 : 0;
+                J.progress(m ? `The app calculates gain segments for log ${+m[1] + 1}.` : 'The app calculates the gains from the selected flight data.', 'gains', m ? 0.6 + 0.3 * Math.min(1, position / count) : null); });
             delete self.__bytes; files.delete(`/v/${J.fileName}`);
             if (found === 0) { J.notes.add(`The app did not calculate the gains, because "extract.cjs" found no applicable segment. A segment is a minimum of ${D.minSegmentS} s of flight with one PID profile, no rescue and no missing data. ` +
                 `Its median headspeed is ${r(D.minHeadspeed, 0)} rpm or more (5/6 of the flight rpm ${J.rpm.value}).`); return null; }
@@ -2240,8 +2248,9 @@ var TuningWorker = (function () {
             const c = vibs.filter(c => c.log === f.log && !c.vib.filtOnly).sort((a, b) => b.vib.windows - a.vib.windows)[0];
             if (!c) continue;
             const v = c.vib, S = (v.byProfile && v.byProfile[f.profile]) || v;
-            f.filterPass = [...String(f.text).matchAll(/line at [\d.]+ x rotor \(([\d.]+) Hz/g)].map(m => {
-                const hz = +m[1], o = { hz };
+            const frequencies = Array.isArray(f.lines) ? f.lines.map(l => l.hz) : [...String(f.text).matchAll(/line at [\d.]+ x rotor \(([\d.]+) Hz/g)].map(m => +m[1]);
+            f.filterPass = frequencies.filter(hz => typeof hz === 'number' && isFinite(hz)).map(hz => {
+                const o = { hz };
                 for (const ax of ['roll', 'pitch', 'yaw']) {
                     const s = S[ax], k = s && s.pass ? Math.round(hz / (s.f[1] - s.f[0])) : -1; let best = null;
                     for (let j = k - 1; j <= k + 1; j++) if (j >= 0 && s && s.pass && j < s.pass.length && isFinite(s.pass[j])) best = Math.max(best === null ? 0 : best, s.pass[j]);
@@ -2444,7 +2453,7 @@ var TuningWorker = (function () {
         const cut = (v) => v ? v.subarray(a, b) : v, three = (x) => Array.isArray(x) ? x.map(cut) : x, T = w.extra && w.extra.time, rate = w.flight && w.flight.actualRate || w.rate;
         return Object.assign({}, w, { n: b - a, cutAt: (w.cutAt || 0) + a, fromS: T ? w.fromS + (T[a] - T[0]) / 1e6 : w.fromS + a / rate, seconds: (b - a) / w.rate,
             sp: three(w.sp), gyro: three(w.gyro), u: three(w.u), P: three(w.P), I: three(w.I), D: three(w.D), F: three(w.F), B: three(w.B), hs: cut(w.hs), coll: cut(w.coll),
-            profileAt: cut(w.profileAt), airborneAt: cut(w.airborneAt), govStateAt: cut(w.govStateAt), rescueAt: cut(w.rescueAt),
+            profileAt: cut(w.profileAt), airborneAt: cut(w.airborneAt), govStateAt: cut(w.govStateAt), rescueAt: cut(w.rescueAt), filterMask: cut(w.filterMask),
             extra: Object.fromEntries(Object.entries(w.extra || {}).map(([k, v]) => [k, cut(v)])) });
     }
     // the selection in words (STE: no semicolon): "Flights in the analysis: log 1 (all flights), log 2 flight 2 (50.0 s to 83.0 s)."
@@ -2479,7 +2488,7 @@ var TuningWorker = (function () {
         await checkpoint(J.id);
         const judged = judgeTimed(J);
         let gained = null;
-        if (J.o.gains) { await checkpoint(J.id); const t = Date.now(); J.progress('The app calculates the gains of the file with "extract.cjs" and "report.cjs".', 'gains', 0.6); gained = gains(J, J.src, J.bytes); J.ms.gains += Date.now() - t; }
+        if (J.o.gains) { await checkpoint(J.id); const t = Date.now(); J.progress('The app calculates the gains from the selected flight data.', 'gains', 0.6); gained = gains(J, J.src, J.bytes); J.ms.gains += Date.now() - t; }
         return finish(J, judged, gained);
     }
 
@@ -2504,7 +2513,7 @@ var TuningWorker = (function () {
         return finishFilter(filterWorkspace,msg,post);
     }
     async function filterTune(msg, post) {
-        const J = await begin(Object.assign({}, msg, { options: Object.assign({}, msg.options || {}, { datasets: false, curves: false }) }), post, 'file'); // no gearPlan: tune() fits the notch orders itself
+        const J = await begin(Object.assign({}, msg, { options: Object.assign({}, msg.options || {}, { datasets: false, curves: false }) }), post, 'file'); // reuse accepted file notch evidence, or let tune() fit the selected flights
         const idx = new FlightLogIndex(J.bytes), count = idx.getLogCount(), slice = (i) => J.bytes.subarray(idx.getLogBeginOffset(i), idx.getLogBeginOffset(i + 1));
         const configuration = J.o.configuration || null;
         const sel = flightsWanted(J, count), list = Array.isArray(J.o.logs) && J.o.logs.length ? J.o.logs.filter(l => Number.isInteger(l) && l >= 0 && l < count) : [...Array(count).keys()];
@@ -2519,17 +2528,23 @@ var TuningWorker = (function () {
             J.progress(`The app loads log ${li + 1} of ${count} for the analysis of the filter values.`, 'decode', 0.2 + 0.3 * k / Math.max(1, J.logs.length));
             const d = timedDecode(J, K, slice(li), li, extra); if (d.error) continue;
             hsCollect(J, d, li); epochCollect(J, d, li); armWhole(J, d.segs, d.events, li); // the stale of the recommendations (filterStale): the whole log
-            if (sel) d.segs = selectFlights(J, d, li, sel.get(li));
             const airborneEvents = d.segs.some(w => !w.skipped && w.airborneAt.some(v => !v));
-            if (configuration) d.segs = filterConfigurationSegments(K, d.segs, configuration, li);
-            else if (J.o.recordedConfigurations) d.segs = filterRecordedSegments(K,d.segs,J.o.recordedConfigurations,li);
             const live = d.segs.filter(w => !w.skipped);
             const preps = live.map((w, s) => prepare(K, w, { segment: s, cli: J.cliText, cliParsed: J.cliParsed, phases: true, airborneEvents }, J));
             if (classOf(preps.map(p => p.ph)) !== 'flight') continue; // a bench run, or no flight phases
+            // Detect flight and excluded modes in the whole segment. A profile
+            // change must not restart phase detection and discard flight data.
             for (const p of preps) { if (!p.ph || !p.ctx) continue; let mask = p.ph.mask;
                 if (K.more) try { mask = K.more.normalMask(p.w, Object.assign({}, p.ctx, { flying: p.ph.mask, phases: p.ph.P, flightMask: p.ph.mask })).mask; }
                     catch (e) { J.notes.add(`The function "normalMask" of "health_more.cjs" stopped. The error is "${message(e)}". Thus, the analysis of the filter values uses all of the flight phase.`, li); }
-                items.push({ w: p.w, mask, flight: true, armingProfile: configuration ? configuration.pidProfile : p.w.recordedConfiguration ? p.w.recordedConfiguration.profile : null }); runs.set(li, (runs.get(li) || []).concat(runsOf(p.w, mask))); }
+                p.w.filterMask = mask; }
+            if (sel) d.segs = selectFlights(J, d, li, sel.get(li));
+            if (configuration) d.segs = filterConfigurationSegments(K, d.segs, configuration, li);
+            else if (J.o.recordedConfigurations) d.segs = filterRecordedSegments(K,d.segs,J.o.recordedConfigurations,li);
+            for (const w of d.segs) { if (w.skipped || !w.filterMask) continue;
+                const mask = w.filterMask;
+                items.push({ w, mask, flight: true, armingProfile: configuration ? configuration.pidProfile : w.recordedConfiguration ? w.recordedConfiguration.profile : null });
+                runs.set(li, (runs.get(li) || []).concat(runsOf(w, mask))); }
             if (!used.includes(li)) used.push(li);
         }
         for (const item of items) {
@@ -2575,20 +2590,41 @@ var TuningWorker = (function () {
                 if(d) {
                     const profile=d.pidProfile || 0;
                     if(!Number.isInteger(profile) || profile<0 || profile>6)throw new Error('The PID profile of the configuration is not correct.');
+                    // Keep the original log header and interval source distinct
+                    // from the synthetic header used by existing display paths.
+                    cut.originalHeader=w.originalHeader || w.flight.header;
                     cut.flight={...cut.flight,header:DS.configurationHeader(w.flight.header,d)};
                     cut.profileAt=new Uint8Array(cut.n).fill(profile);
-                    cut.recordedConfiguration={id:d.id,profile,values:d.values||{},sources:d.sources||{},assumed:!!q.assumed};
+                    cut.recordedConfiguration={id:d.id,profile,values:d.values||{},sources:d.sources||{},assumed:!!q.assumed,
+                        interval:{log,t0:q.t0,t1:q.t1,source:{...(q.source||{})},assumed:!!q.assumed}};
                 } else cut.recordedConfiguration={id:null,profile:0,values:{},sources:{}};
                 out.push(cut);i=end;
             }
         }
         return out;
     }
+    // Analysis already identifies these constant notch orders across the file.
+    // A single flight can be too short or have an ambiguous dip. Retain the
+    // accepted file evidence only for logs that contributed to that analysis.
+    function filterNotchFit(J,used) {
+        const f=J.o.notchFit;
+        if(J.cliText||J.o.logGear===false||!f||!f.used||!Array.isArray(f.logs)||!used.length||!used.every(log=>f.logs.includes(log)))return null;
+        const valid=g=>g&&g.passed===true&&Number.isFinite(g.order)&&g.order>0&&Number.isFinite(g.se)&&g.se>=0&&g.n>=3&&!(g.reasons||[]).length;
+        const T=valid(f.tail)?f.tail.order:null,M=valid(f.motor)?f.motor.order:null;
+        if(T===null&&M===null)return null;
+        return {...(f.tail||{passed:false,reasons:[{code:'no tail rotor notch'}]}),motor:f.motor||null,basis:'log notch',sourceLogs:f.logs.slice(),
+            gear:{main:M===null?null:[1,M],tail:T===null?null:[1,T],tailOrder:T,motorOrder:M,motorisedTail:T===null?null:false,source:'log notch'}};
+    }
     function finishFilter(workspace,msg,post) {
         const {J,items,used,runs}=workspace,K=J.K,FT=K.require('./filter_tune.cjs'),tSearch=Date.now();
         J.progress=(text,stage='filter',fraction=null)=>post({id:msg.id,type:'progress',stage,fraction,text});
         J.progress(`The app calculates the vibration for filter values on ${used.length === 1 ? '1 flight log' : `${used.length} flight logs`}.`, 'filter', 0.55);
         const opts = { cli: J.cliText || null, app:self, maxAddMs:J.o.maxAddMs, prepared:workspace.prepared, onPrepared:P=>{workspace.prepared=P;}, progress: (text, fraction) => J.progress(text, 'filter', 0.55 + 0.44 * fraction) };
+        const notchFit=filterNotchFit(J,used);
+        if(notchFit) {
+            opts.tailFit=notchFit;
+            J.notes.add('The replay uses the RPM notch filter frequencies from the analysis of this file.');
+        }
         // options.blockedBy: the ids of the steps that hold the filters (hierarchy nodes filters.blockedBy, for example 'rpm') or texts
         const G = K.hierarchy && typeof K.hierarchy.graph === 'function' ? (() => { try { return K.hierarchy.graph(); } catch (e) { return null; } })() : null;
         const titles = new Map(G ? [].concat((G.prereq || []).map(n => [n.id, { title: n.title, prereq: true }]), (G.blocks || []).map(n => [n.id, { title: n.title, prereq: false }])) : []);
@@ -2617,10 +2653,14 @@ var TuningWorker = (function () {
             r.stale = scope ? scope.stale : null;
         }
         Object.assign(res, { fileName: J.fileName, logs: used, flightRpm: J.rpm, blockedBy, selection: J.selection ? { flights: J.selection.flights.slice(), windows: J.selection.windows.slice(), text: selectionText(J.selection) } : null,
-            notes: J.notes.list(), timing: { decodeS: seconds(J.ms.decode), searchS: seconds(Date.now() - tSearch), totalS: seconds(Date.now() - J.t0) } });
+            notes: [...new Set([...(res.notes || []), ...J.notes.list()])], timing: { decodeS: seconds(J.ms.decode), searchS: seconds(Date.now() - tSearch), totalS: seconds(Date.now() - J.t0) } });
         const sourceText=res.selection ? res.selection.text : `Flight data: ${used.map(li=>'log '+(li+1)).join(', ')}.`;
         for(const r of res.recommendations)r.text=sourceText+'\n'+(r.text||'');
-        if (res.version === 2) res.cliFile = K.require('./filter_autotune.cjs').cliFile(res, { fileName: J.fileName, recommendations: res.recommendations });
+        if (res.version === 2) {
+            const F = K.require('./filter_autotune.cjs'), meta = { fileName: J.fileName, recommendations: res.recommendations };
+            res.cliExport = F.cliExportStatus(res, meta);
+            res.cliFile = F.cliFile(res, meta);
+        }
         return res;
     }
     const num0 = (v) => typeof v === 'number' && isFinite(v) ? v : +v || 0;
@@ -2897,9 +2937,154 @@ var TuningWorker = (function () {
             rateProfile: pick(count(/^rateprofile \d+/), Object.keys(cli.rateprofiles || {}).length, lastRateProfile(text)) };
     }
 
-    async function controlTune(msg) {
+    // Assertions belong to exact source bytes and explicit log indexes. File
+    // names and firmware calendar values cannot transfer a saved assertion.
+    function bindParameterContinuity(options, files) {
+        const saved=options.parameterContinuity, request=options.parameterContinuityRequest;
+        if (saved !== undefined && !Array.isArray(saved)) throw new Error('The parameter information has no log group.');
+        const indexes=(list, count)=>Array.isArray(list)&&list.length>0&&list.every(i=>Number.isInteger(i)&&i>=0&&i<count);
+        const verified=file=>file&&file.verifiedBytes===true&&/^[a-f0-9]{64}$/.test(file.sha256||'');
+        const statement=value=>typeof value==='string'&&value.trim().length>0;
+        const assertions=(saved||[]).map(a=>{
+            if (!a || a.scope!=='parameters' || a.basis!=='user-assertion' || !statement(a.statement))
+                throw new Error('Select the check for constant parameter values.');
+            const matched=files.filter(file=>file.sha256===a.sourceSha256);
+            if (!matched.length || matched.some(file=>!verified(file)))
+                throw new Error('The parameter information does not refer to this flight file.');
+            if (matched.some(file=>!indexes(a.localLogIndexes,file.logs)))
+                throw new Error('The parameter information refers to a log out of this flight file.');
+            return {sourceSha256:a.sourceSha256,localLogIndexes:[...new Set(a.localLogIndexes)].sort((a,b)=>a-b),
+                scope:'parameters',basis:'user-assertion',statement:a.statement.trim()};
+        });
+        if (request !== undefined) {
+            if (!request || request.confirmed!==true || !statement(request.statement))
+                throw new Error('Select the check for constant parameter values.');
+            const count=files.reduce((n,file)=>n+file.logs,0);
+            if (!indexes(request.logIndexes,count)) throw new Error('The parameter information refers to a log out of this flight file.');
+            const groups=new Map();
+            for (const log of new Set(request.logIndexes)) {
+                const file=files.find(file=>Number.isInteger(file.logOffset)&&log>=file.logOffset&&log<file.logOffset+file.logs);
+                if (!verified(file)) throw new Error('The app cannot identify the source file for the parameter information.');
+                if (request.sourceSha256 && request.sourceSha256!==file.sha256)
+                    throw new Error('The parameter information does not refer to this flight file.');
+                if (!groups.has(file.sha256)) groups.set(file.sha256,[]);
+                groups.get(file.sha256).push(log-file.logOffset);
+            }
+            // A new explicit group replaces the saved group for that source.
+            // The union of different groups would assert an extra relationship.
+            for (let i=assertions.length-1;i>=0;i--) if(groups.has(assertions[i].sourceSha256)) assertions.splice(i,1);
+            for (const [sourceSha256,logs] of groups) assertions.push({sourceSha256,localLogIndexes:[...new Set(logs)].sort((a,b)=>a-b),
+                scope:'parameters',basis:'user-assertion',statement:request.statement.trim()});
+        }
+        return assertions;
+    }
+
+    // Identification uses native decoded samples, not the display curves or
+    // gain recommendations. Detect phases before any configuration/time cut.
+    async function controlInputs(msg, post) {
+        const analysis = msg.analysis || {}, configuration = ((analysis.datasets || {}).datasets || []).find(d => d.id === msg.configuration);
+        if (!configuration || !msg.bytes) return { items: [], configuration, excluded: [], options: msg.options || {} };
+        const J = await begin(Object.assign({}, msg, { options: Object.assign({}, msg.options || {}, { datasets: false, curves: false }) }), post, 'file');
+        const contentHash = self.crypto && self.crypto.subtle ? Array.from(new Uint8Array(await self.crypto.subtle.digest('SHA-256',J.bytes)),
+            value=>value.toString(16).padStart(2,'0')).join('') : null;
+        J.o.sysid = Object.assign({},J.o.sysid || {});
+        if (J.o.sysid.seed === undefined && contentHash) J.o.sysid.seed = parseInt(contentHash.slice(0,8),16);
+        const idx = new FlightLogIndex(J.bytes), count = idx.getLogCount(), slice = i => J.bytes.subarray(idx.getLogBeginOffset(i), idx.getLogBeginOffset(i + 1));
+        const declaredFiles=J.o.sourceFiles&&J.o.sourceFiles.length?J.o.sourceFiles:[{fileName:J.fileName,byteOffset:0,bytes:J.bytes.length}],sourceFiles=[];
+        let sourceEnd=0;
+        for(const declared of declaredFiles.slice().sort((a,b)=>a.byteOffset-b.byteOffset)){
+            if(!Number.isInteger(declared.byteOffset)||!Number.isInteger(declared.bytes)||declared.byteOffset!==sourceEnd||declared.bytes<=0||sourceEnd+declared.bytes>J.bytes.length)
+                throw new Error('The source files do not agree with the input file.');
+            const end=sourceEnd+declared.bytes,sourceLogs=[];
+            for(let li=0;li<count;li++){const start=idx.getLogBeginOffset(li);if(start>=sourceEnd&&start<end)sourceLogs.push(li);}
+            const hash=sourceEnd===0&&end===J.bytes.length?contentHash:self.crypto&&self.crypto.subtle?
+                Array.from(new Uint8Array(await self.crypto.subtle.digest('SHA-256',J.bytes.subarray(sourceEnd,end))),v=>v.toString(16).padStart(2,'0')).join(''):null;
+            if(hash&&declared.sha256&&hash!==declared.sha256)throw new Error('The source file data does not agree with the input file.');
+            sourceFiles.push({fileName:declared.fileName,sha256:hash,bytes:declared.bytes,byteOffset:sourceEnd,
+                logOffset:sourceLogs.length?sourceLogs[0]:null,logs:sourceLogs.length,lastRecordedStart:null,verifiedBytes:!!hash});sourceEnd=end;
+        }
+        if(sourceEnd!==J.bytes.length)throw new Error('The source files do not include all input data.');
+        J.o.parameterContinuity=bindParameterContinuity(J.o,sourceFiles);
+        delete J.o.parameterContinuityRequest;
+        // The bare-airframe twin can use different gain sets. Each interval
+        // retains its own configuration; the control search selects its target
+        // configuration again after identification and data partitioning.
+        const labels = analysis.datasets.labels || configuration.labels || [];
+        const selected = flightsWanted(J, count), logs = [...new Set(labels.map(q => q.log))].filter(li => li >= 0 && li < count && (!selected || selected.has(li)));
+        J.logs = logs; J.logCount = count; J.logIndex = logs[0] || 0;
+        const rpm = userRpm(J); if (rpm) settle(J, rpm); else await firstPass(J, count, slice, 0.02, 0.15, logs, true);
+        const K = J.K, items = [], excluded = [], limitCoverage = [];
+        if (!K.phase || !K.more) throw new Error('The flight phase and flight mode checks are necessary for the helicopter model.');
+        const extra = [...new Set(K.extraAll.concat(K.phase.EXTRA || [], K.more.EXTRA || [],
+            ['time', 'govRequest', 'tailspeed', 'motor[0]', 'mixer[3]', 'axisO[0]', 'axisO[1]', 'axisO[2]',
+                'gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'servo[0]', 'servo[1]', 'servo[2]', 'servo[3]',
+                'rcCommand[0]', 'rcCommand[1]', 'rcCommand[2]', 'rcCommand[3]',
+                'Vbat', 'Ibat', 'altitude', 'vario', 'attitude[0]', 'attitude[1]', 'attitude[2]']))];
+        for (const [k, li] of logs.entries()) {
+            await checkpoint(J.id);
+            J.progress(`The app selects flight data from log ${li + 1} for the helicopter model.`, 'model', 0.15 + 0.35 * k / Math.max(1, logs.length));
+            const d = timedDecode(J, K, slice(li), li, extra);
+            if (d.error) { excluded.push({ log: li, reason: 'The app cannot read this flight log.' }); continue; }
+            const airborneEvents = d.segs.some(w => !w.skipped && w.airborneAt.some(v => !v));
+            const sourceFile=sourceFiles.find(file=>li>=file.logOffset&&li<file.logOffset+file.logs);
+            if(!sourceFile)throw new Error('The flight log has no source file.');
+            for(const w of d.segs){const start=w.flight&&w.flight.start;
+                if(typeof start==='string'&&/^(?!0000)\d{4}-\d{2}-\d{2}T/.test(start)&&Number.isFinite(Date.parse(start))&&
+                    (!sourceFile.lastRecordedStart||Date.parse(start)>Date.parse(sourceFile.lastRecordedStart)))sourceFile.lastRecordedStart=start;}
+            for (const [segment, w] of d.segs.entries()) {
+                if (w.skipped) { excluded.push({log:li,reason:w.skipped}); continue; }
+                const p = prepare(K, w, { segment, cli: J.cliText, cliParsed: J.cliParsed, phases: true, airborneEvents }, J);
+                if (!p.ph || !p.ph.flight) { w.filterMask = new Uint8Array(w.n); continue; }
+                // A failed or missing mode check cannot expand the fit domain.
+                w.filterMask = K.more.normalMask(w, Object.assign({}, p.ctx, { flying:p.ph.mask, phases:p.ph.P, flightMask:p.ph.mask })).mask;
+            }
+            if (selected) d.segs = selectFlights(J, d, li, selected.get(li));
+            const cuts = filterRecordedSegments(K, d.segs, {datasets:analysis.datasets.datasets,labels}, li);
+            for (const w of cuts) {
+                if (!w.filterMask || !w.recordedConfiguration || !w.recordedConfiguration.id) {
+                    excluded.push({log:li,fromS:w.fromS,toS:w.fromS+w.n/(w.flight.actualRate||w.rate),
+                        reason:'The flight period has no known configuration or flight phase.'});
+                    continue;
+                }
+                const epochs = (analysis.epochs || []).find(e => e.log === li), times = frameTimes(w);
+                const stale = epochs ? epochs.spans.filter(e => e.t0 < times[times.length - 1] && e.t1 > times[0] && e.reasons && e.reasons.length) : [];
+                const saturation = new Uint8Array(w.n);
+                const channels = K.limits && K.limits.channels ? K.limits.channels(w,
+                    {header:w.flight.header,cli:J.cliText,cliParsed:J.cliParsed},w.profileAt,w.filterMask) : [];
+                for (const channel of channels) {
+                    // Use the existing measured/recorded limit evidence. A
+                    // servo's observed extreme is not a physical travel limit.
+                    if (!['L1','L2','L3','L4','L5','L6'].includes(channel.id)) continue;
+                    limitCoverage.push({log:li,configuration:w.recordedConfiguration.id,channel:channel.field,
+                        limits:channel.limits || null,unknown:channel.unknown || null});
+                    if (!channel.limitAt || channel.unknown) continue;
+                    for (let i=0;i<w.n;i++) {
+                        const bounds=channel.limitAt(i),value=channel.v[i],tol=K.limits.RULE.tol;
+                        if (bounds && ((Number.isFinite(bounds.lo) && value<=bounds.lo+tol*Math.abs(bounds.lo)) ||
+                            (Number.isFinite(bounds.hi) && value>=bounds.hi-tol*Math.abs(bounds.hi)))) saturation[i]=1;
+                    }
+                }
+                items.push({ w, source:{file:sourceFile,logIndex:li,localLogIndex:li-sourceFile.logOffset},saturation, configuration:w.recordedConfiguration.id, ctx: { flying:w.filterMask, eligible:w.filterMask,
+                    rate:w.flight.actualRate || w.rate, header:w.flight.header, configuration:w.recordedConfiguration.id, airborneEvents },
+                    stale, epochs:epochs ? epochs.spans.filter(e=>e.t0<times[times.length-1]&&e.t1>times[0]) : [],
+                    profile:w.recordedConfiguration.profile });
+            }
+        }
+        return { items, configuration, excluded, options:J.o, cli:J.cliParsed, flightRpm:J.rpm,
+            fileName:J.fileName, source:{ fileName:J.fileName,sha256:contentHash,files:sourceFiles,configuration:configuration.id, profile:configuration.pidProfile,
+                values:configuration.values, sources:configuration.sources,configurations:analysis.datasets.datasets, labels, epochs:analysis.epochs || [],limitCoverage } };
+    }
+    async function systemIdentify(msg, post) {
+        const K = kit(await sources(), null), input = await controlInputs(msg, post);
+        const result=await K.require('./control_pipeline.cjs').identify(input, { progress:text=>post({id:msg.id,type:'progress',stage:'model',text}) });
+        return Object.assign(result,{parameterContinuity:input.source?input.options.parameterContinuity:[],sourceFiles:input.source&&input.source.files||[]});
+    }
+    async function controlTune(msg, post) {
         const K = kit(await sources(), null);
-        return K.require('./control_tune.cjs').tune({ analysis: msg.analysis, configuration: msg.configuration, step: msg.step });
+        const input = await controlInputs(msg, post);
+        const result=await K.require('./control_pipeline.cjs').tune(Object.assign(input, { analysis:msg.analysis, step:msg.step,
+            configurationId:msg.configuration }), { progress:text=>post({id:msg.id,type:'progress',stage:'model',text}) });
+        return Object.assign(result,{parameterContinuity:input.source?input.options.parameterContinuity:[],sourceFiles:input.source&&input.source.files||[]});
     }
 
     async function init() { const D = await deriveKit(); return { modules: Object.fromEntries(['track', 'more', 'gov', 'catalog'].map(k => [k, !!D[k]])), notes: D.notes.slice() }; }
@@ -2908,14 +3093,14 @@ var TuningWorker = (function () {
     function onmessage(ev) {
         const msg = ev.data || {}, id = msg.id, post = (m) => self.postMessage(m);
         if (msg.cmd === 'cancel') { cancelled.add(id); return; }
-        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune, filterReplay, controlTune }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned' }[msg.cmd] || 'result';
+        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune, filterReplay, controlTune, systemIdentify }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned', systemIdentify:'systemIdentified' }[msg.cmd] || 'result';
         queue = queue.then(() => job ? job(msg, post) : Promise.reject(new Error(`The command "${msg.cmd}" is unknown.`)))
             .then(result => post({ id, type, result }))
             .catch(e => post({ id, type: 'error', message: message(e), stack: String(e && e.stack || '') }))
             .then(() => { cancelled.delete(id); delete self.__bytes; });
     }
 
-    return { onmessage, sources, kit, deriveKit, rpmEvidence, autoRpm, rpmWhy, viewerText, timeMapOf, hsInfo, hsMap, RPM, TIMEMAP, WINDOW, HS, READS, fresh: { readsOf, reasonsFor, measuredIn, placesIn, cutTo }, CANCELED }; // all but onmessage for tests
+    return { onmessage, sources, kit, controlInputs, bindParameterContinuity, deriveKit, rpmEvidence, autoRpm, rpmWhy, viewerText, timeMapOf, hsInfo, hsMap, RPM, TIMEMAP, WINDOW, HS, READS, fresh: { readsOf, reasonsFor, measuredIn, placesIn, cutTo }, CANCELED }; // all but onmessage for tests
 })();
 
 self.onmessage = TuningWorker.onmessage;

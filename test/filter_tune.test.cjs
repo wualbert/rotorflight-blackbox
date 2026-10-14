@@ -415,7 +415,7 @@ test('worker shim: no Node API call at module load, module.exports then return',
     const file = path.join(__dirname, '../tools/autotune/filter_tune.cjs'), src = fs.readFileSync(file, 'utf8');
     assert.ok(/module\.exports = \{[\s\S]*?\};\nif \(require\.main !== module\) return;/.test(src), 'module.exports, then the return');
     const trap = new Proxy({}, { get: (t, k) => { throw new Error(`Node API used at load: ${String(k)}`); } });
-    const req = (name) => /^node:/.test(name) ? trap : name === './lib.cjs' ? require('../tools/autotune/lib.cjs') : name === './health_setup.cjs' ? require('../tools/autotune/health_setup.cjs') : (() => { throw new Error(`not available in the shim: ${name}`); })();
+    const req = (name) => /^node:/.test(name) ? trap : name === './filter_math.cjs' ? require('../tools/autotune/filter_math.cjs') : name === './lib.cjs' ? require('../tools/autotune/lib.cjs') : name === './health_setup.cjs' ? require('../tools/autotune/health_setup.cjs') : (() => { throw new Error(`not available in the shim: ${name}`); })();
     const mod = { exports: {} };
     // eslint-disable-next-line no-new-func
     new Function('require', 'module', 'exports', 'process', '__dirname', '__filename', src)(Object.assign(req, { main: undefined }), mod, mod.exports, { env: {} }, '', file);

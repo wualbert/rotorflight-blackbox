@@ -69,11 +69,15 @@ const DEFAULTS = { minFlightS: 30, minSegmentS: 20, minHeadspeed: FLIGHT_RPM * 5
 
 function* segments(app, file, options = {}) {
     const o = Object.assign({}, DEFAULTS, options);
+    if (o.logs !== undefined && (!Array.isArray(o.logs) || o.logs.some(li => !Number.isInteger(li) || li < 0)))
+        throw new Error('The log selection must contain nonnegative integer indices.');
+    const selected = o.logs === undefined ? null : new Set(o.logs);
     app.__bytes = new Uint8Array(fs.readFileSync(file));
     const log = vm.runInContext('new FlightLog(__bytes)', app);
     const EVENT = vm.runInContext('FlightLogEvent', app);
 
     for (let li = 0; li < log.getLogCount(); li++) {
+        if (selected && !selected.has(li)) continue;
         if (log.getLogError(li) || !log.openLog(li)) continue;
         const sc = log.getSysConfig(), tMin = log.getMinTime(), tMax = log.getMaxTime();
         const durationS = (tMax - tMin) / 1e6;

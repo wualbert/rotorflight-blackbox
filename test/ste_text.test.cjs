@@ -6,7 +6,7 @@
 //   - catalog.cjs summaries for synthetic findings of every check id (with the D7, G15-G18 and C15 phase checks), and for the
 //     real findings in analysis/ when present
 //   - hierarchy.cjs titles, chips, edge texts, K rules, and the status reasons (also for each PID profile) for synthetic findings
-//   - the finding texts of our modules (health_track, health_more, health_phase), advice() outputs, the comment lines of the
+//   - the finding texts of all health modules, advice() outputs, the comment lines of the
 //     CLI scripts (advice script and exportScript), evidence and hierarchy outputs: the tests of those parts run again in
 //     worker threads with the module exports wrapped, and every output is read
 //   - the rendered Tuning view, the log lens and the Analysis verdict: the node:vm harnesses of their tests run again, and
@@ -16,7 +16,7 @@
 //     the messages of js/tuning_snippet.js, the view shell (index.html, js/main.js) and the STE rules in CLAUDE.md
 //   - with AUTOTUNE_REAL_LOG set: also the TuningResults of test/tuning_worker.test.cjs (slow), of AUTOTUNE_RESCUE_LOG too when set
 // Not linted: <code>, <pre>, [data-ste="quoted"] (toolkit text that is not STE, log-derived strings, quotes), CLI text,
-// the upstream Flight analysis text (js/flight_analysis*.js) and the text of the other session's modules (finding `text`).
+// the upstream Flight analysis text (js/flight_analysis*.js).
 //
 //   node --test test/ste_text.test.cjs
 //
@@ -349,7 +349,7 @@ function htmlTexts(html) {
             continue;
         }
         const quoted = /\bdata-ste\s*=\s*["']?quoted/i.test(attrs), selfClosing = /\/\s*$/.test(attrs) || VOID.has(tag);
-        // the summary of a quoted disclosure is our label: "Toolkit text (not STE)"
+        // the summary of a quoted disclosure is our label: "Analysis information"
         const unskip = tag === 'summary' && stack.length > 0 && stack[stack.length - 1].tag === 'details' && stack[stack.length - 1].quoted;
         if (BLOCK.has(tag) && !skipped()) flush();
         if (!(skipped() && !unskip) && !quoted) for (const a of attrs.matchAll(/\s(title|placeholder|aria-label|alt)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
@@ -450,6 +450,12 @@ function recommendationTexts(recs, add) {
         const where = r.id || 'recommendation';
         add(r.title, 'label', `${where} title`);
         add(r.text, 'message', `${where} text`);
+        if (r.procedure) {
+            add(r.procedure.title, 'instruction', `${where} next action`);
+            for (const step of r.procedure.steps || []) add(step, 'instruction', `${where} procedure step`);
+            add(r.procedure.after, 'message', `${where} procedure follow-up`);
+            add(r.procedure.success, 'message', `${where} procedure outcome`);
+        }
         add(r.rule, 'message', `${where} rule`);
         for (const c of [].concat(r.caveats || [])) add(c, 'note', `${where} caveat`);
         for (const b of [].concat(r.blockedBy || [])) add(typeof b === 'string' ? b : b && (b.text || b.why), 'message', `${where} blockedBy`);
@@ -487,8 +493,8 @@ function statusTexts(st, add, depth = 0) {
     for (const k of ['profiles', 'byProfile', 'perProfile']) if (st[k] && typeof st[k] === 'object') for (const x of Object.values(st[k])) statusTexts(x, add, depth + 1);
 }
 function causesTexts(list, add) { for (const c of [].concat(list || [])) if (c) { add(c.name, 'label', `cause ${c.rule}`); for (const s of [].concat(c.first || [])) add(s, 'message', `cause ${c.rule} step`); } }
-// our modules (SPEC2 3.4, section 6): the finding text is ours, so it must be STE. The text of the other session's modules is not
-const OUR_MODULES = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power'];
+// All health modules write user-visible diagnostic text, including the raw text in saved reports.
+const OUR_MODULES = ['setup', 'gov', 'loop', 'track', 'more', 'phase', 'rescue', 'limits', 'config', 'power'];
 function findingTexts(F, add, module) {
     for (const f of [].concat(F || [])) {
         if (!f || typeof f !== 'object') continue;
@@ -515,7 +521,8 @@ function filterTexts(t, add) {
     for (const w of [].concat(t.why || [])) add(w, 'message', 'filter search reason');
     for (const r of [].concat(t.rows || [])) if (r) add(r.text, 'message', `filter search ${r.name}`);
 }
-function filterResultTexts(r, add) { if (!r || typeof r !== 'object') return; filterTexts(r.text, add); recommendationTexts(r.recommendations, add); for (const n of [].concat(r.notes || [])) add(n, 'note', 'filter search note'); }
+function filterExportTexts(status, add) { for (const reason of status && status.reasons || []) add(reason, 'message', 'filter CLI export reason'); }
+function filterResultTexts(r, add) { if (!r || typeof r !== 'object') return; filterTexts(r.text, add); filterExportTexts(r.cliExport, add); recommendationTexts(r.recommendations, add); for (const n of [].concat(r.notes || [])) add(n, 'note', 'filter search note'); }
 // The values that are possibly not current (CLAUDE.md, 2026-10-06): the spans of result.epochs and result.freshness, the
 // stale flag of each finding, limits period, recommendation, issue and gains decision, and the conflicts of result.cliStatus
 // (a CLI dump that does not agree with the log)
@@ -558,14 +565,19 @@ const READERS = {
         tune: (out,add) => {
             add(out.reason,'message','control result'); add(out.limitation,'message','control limitation');
             for (const item of out.deferred || []) add(item.reason,'message','control change that must wait');
-            recommendationTexts(out.recommendations,add); controlPlanTexts(out.flightPlan,add);
+            recommendationTexts([].concat(out.recommendations || [], out.proposals || [], out.prerequisites || [], out.experiments || [], out.guidance || []),add);
+            controlPlanTexts(out.flightPlan,add);
         }
     },
     'tools/autotune/catalog.cjs': { summary: (out, add, args) => add(out, 'message', `summary ${args[0] && args[0].id}`), issues: (out, add) => issueTexts(out, add) },
     'tools/autotune/datasets.cjs': { datasets: (out, add) => datasetTexts(out, add) },
     'tools/autotune/filter_tune.cjs': { texts: (out, add) => filterTexts(out, add) },
+    'tools/autotune/filter_autotune.cjs': { texts: filterTexts, cliExportStatus: filterExportTexts, tune: filterResultTexts },
     'tools/autotune/hierarchy.cjs': { status: (out, add) => statusTexts(out, add), causesOf: (out, add) => causesTexts(out, add) },
     'tools/autotune/evidence.cjs': { forFinding: (out, add) => evidenceTexts(out, add), forDecision: (out, add) => evidenceTexts(out, add) },
+    'tools/autotune/health_setup.cjs': { judge: (out, add) => findingTexts(out, add, 'setup') },
+    'tools/autotune/health_gov.cjs': { judge: (out, add) => findingTexts(out, add, 'gov') },
+    'tools/autotune/health_loop.cjs': { judge: (out, add) => findingTexts(out, add, 'loop') },
     'tools/autotune/health_track.cjs': { judge: (out, add) => findingTexts(out, add, 'track') },
     'tools/autotune/health_more.cjs': { judge: (out, add) => findingTexts(out, add, 'more') },
     'tools/autotune/health_phase.cjs': { judge: (out, add) => findingTexts(out, add, 'phase') },
@@ -660,7 +672,8 @@ function dataSet() {
 function instrument(ctx, owner, add) {
     const D = dataSet();
     const sink = (kind, value) => { const who = callerScript(owner); if (who && DOM_SCRIPTS.has(who)) add(who, value, kind === 'html' ? 'html' : 'block', kind, D.data); };
-    const cache = new WeakMap();
+    const cache = new WeakMap(), originals = new WeakMap();
+    const unwrap = v => v && (typeof v === 'object' || typeof v === 'function') && originals.has(v) ? originals.get(v) : v;
     const wrapJq = (o) => {
         if (!o || typeof o !== 'object' || o.then) return o;
         if (cache.has(o)) return cache.get(o);
@@ -672,12 +685,19 @@ function instrument(ctx, owner, add) {
                 return function (...args) {
                     if (TEXT_METHODS[k] && typeof args[0] === 'string') sink(TEXT_METHODS[k], args[0]);
                     if ((k === 'attr' || k === 'prop') && /^(?:title|placeholder|aria-label|alt)$/.test(args[0]) && typeof args[1] === 'string') sink('text', args[1]);
+                    // Event handlers receive DOM targets too. Wrap them so their native
+                    // mutation calls unwrap proxy arguments and preserve node identity.
+                    if (k === 'on' && typeof args[args.length - 1] === 'function') {
+                        const handler = args[args.length - 1];
+                        args[args.length - 1] = function (...events) { return handler.apply(wrapDom(this), events); };
+                    }
                     const r = v.apply(this === p ? t : this, args);
                     return r === t ? p : wrapJq(r);
                 };
             },
         });
         cache.set(o, p);
+        originals.set(p, o);
         return p;
     };
     const wrapDom = (o) => {
@@ -690,13 +710,14 @@ function instrument(ctx, owner, add) {
                 if (typeof v === 'function') return function (...args) {
                     if (k === 'setAttribute' && /^(?:title|placeholder|aria-label|alt)$/.test(args[0]) && typeof args[1] === 'string') sink('text', args[1]);
                     if (k === 'insertAdjacentHTML' && typeof args[1] === 'string') sink('html', args[1]);
-                    const r = v.apply(this === p ? t : this, args);
+                    const r = v.apply(this === p ? t : this, args.map(unwrap));
                     return DOM_RESULTS.test(k) ? wrapDom(r) : r;
                 };
                 return /^(?:parentNode|parentElement|firstChild|lastChild|firstElementChild|lastElementChild|nextSibling|previousSibling|body|documentElement)$/.test(k) ? wrapDom(v) : v;
             },
         });
         cache.set(o, p);
+        originals.set(p, o);
         return p;
     };
     if (typeof ctx.$ === 'function') {
@@ -993,6 +1014,14 @@ function snippetSource() {
     const src = fs.readFileSync(abs, 'utf8');
     return { items: sentenceLiterals(src).map((x) => ({ text: x.text, kind: 'block', where: `${rel}:${lineOf(src, x.at)}` })), errors: [] };
 }
+function digitalTwinSource() {
+    const items=[];
+    for (const rel of ['tools/autotune/control_pipeline.cjs','tools/autotune/system_id.cjs','tools/autotune/firmware_controller.cjs','tools/autotune/firmware_sensor.cjs']) {
+        const src=fs.readFileSync(path.join(ROOT,rel),'utf8');
+        for (const x of sentenceLiterals(src)) items.push({text:x.text,kind:x.kind,where:`${rel}:${lineOf(src,x.at)}`});
+    }
+    return {items,errors:[]};
+}
 // The markup of the views (index.html) and the strings of the "Show in the log" functions of js/main.js
 function elementsOf(html, re) {
     const out = [];
@@ -1077,6 +1106,10 @@ const HARVEST = [
     { file: 'test/log_lens.test.cjs', expect: ['js/log_lens.js'] },
     ...[...DOM_SCRIPTS].filter((f) => /_view\.js$/.test(f)).map((f) => ({ file: `test/${path.basename(f, '.js')}.test.cjs`, expect: [f] })),
     { file: 'test/advice.test.cjs', expect: ['tools/autotune/advice.cjs', ...(adviceExports().includes('exportScript') ? [SCRIPT_SOURCE] : [])] },
+    { file: 'test/recommendation_paths.test.cjs', expect: ['tools/autotune/advice.cjs'] },
+    { file: 'test/health_setup.test.cjs', expect: ['tools/autotune/health_setup.cjs'] },
+    { file: 'test/health_gov.test.cjs', expect: ['tools/autotune/health_gov.cjs'] },
+    { file: 'test/health_loop.test.cjs', expect: ['tools/autotune/health_loop.cjs'] },
     { file: 'test/health_track.test.cjs', expect: ['tools/autotune/health_track.cjs'] },
     { file: 'test/health_more.test.cjs', expect: ['tools/autotune/health_more.cjs'] },
     { file: 'test/health_phase.test.cjs', expect: fs.existsSync(path.join(ROOT, 'tools/autotune/health_phase.cjs')) ? ['tools/autotune/health_phase.cjs'] : [] },
@@ -1089,6 +1122,7 @@ const HARVEST = [
     { file: 'test/evidence.test.cjs', expect: ['tools/autotune/evidence.cjs'] },
     { file: 'test/datasets.test.cjs', expect: ['tools/autotune/datasets.cjs'] },          // round 3 M1
     { file: 'test/filter_tune.test.cjs', expect: ['tools/autotune/filter_tune.cjs'] },    // round 3 M2
+    { file: 'test/filter_autotune.test.cjs', expect: ['tools/autotune/filter_autotune.cjs'] },
     { file: 'test/tuning_worker.test.cjs', expect: ['TuningResult'], env: 'AUTOTUNE_REAL_LOG', timeoutS: 3600, heapMb: 12000 },
 ];
 // The names that advice.cjs exports (read from the source: the module is not loaded in the main thread for this)
@@ -1167,7 +1201,7 @@ function mainThread() {
             ['CAUTION: Incorrect gains can cause oscillations. Do a hover test.', 'message', ['SAFE'], 'CAUTION: If the tail has an oscillation, land the helicopter. Incorrect gains can cause damage.'],
             ['NOTE: Record the log at 1 kHz.', 'message', ['NOTEIMP'], 'NOTE: This app does not send data to the flight controller.'],
             ['If the log records `gyroRAW`, the check can operate.', 'note', [], null],
-            ['Arm the helicopter in PID profile 2.', 'note', ['NOTEIMP'], 'The log header records the values of PID profile 2 only when the pilot arms the helicopter in PID profile 2.'],
+            ['Arm the helicopter in PID profile 2.', 'note', ['NOTEIMP'], 'The log header records the values of PID profile 2 only when a new log starts in PID profile 2.'],
             ['TUNE puts the filters before the gains.', 'note', [], null],
             ['The gain is 10. The gain is 11. The gain is 12. The gain is 13. The gain is 14. The gain is 15. The gain is 16.', 'message', ['PARA'],
                 'The gain is 10. The gain is 11. The gain is 12. The gain is 13. The gain is 14. The gain is 15.'],
@@ -1215,10 +1249,10 @@ function mainThread() {
 
     test('rendered HTML: block elements are texts, the attributes are labels, and code, pre and data-ste="quoted" are left out', () => {
         const got = htmlTexts('<div class="x" title="Show the &quot;Tuning&quot; view again"><h3>Recommendations</h3><p>The log header has these values:</p><ul><li>The D gain</li></ul>'
-            + '<pre>set x = 1;</pre><p>Type <code>save; exit</code> in the CLI.</p><details data-ste="quoted"><summary>Toolkit text (not STE)</summary>ratio vs. target; e.g. 3</details>'
+            + '<pre>set x = 1;</pre><p>Type <code>save; exit</code> in the CLI.</p><details data-ste="quoted"><summary>Analysis information</summary>ratio vs. target; e.g. 3</details>'
             + '<span data-ste="quoted">&lt;img src=x&gt;.bbl</span><button type="button" aria-label="Close">&times;</button><svg><text x="1">1 Set up</text></svg></div>');
         assert.deepEqual(got, [{ text: 'Show the "Tuning" view again', kind: 'label' }, { text: 'Recommendations', kind: 'label' }, { text: 'The log header has these values:', kind: 'block' },
-            { text: 'The D gain', kind: 'item' }, { text: 'Type in the CLI.', kind: 'block' }, { text: 'Toolkit text (not STE)', kind: 'label' }, { text: 'Close', kind: 'label' }, { text: '×', kind: 'label' },
+            { text: 'The D gain', kind: 'item' }, { text: 'Type in the CLI.', kind: 'block' }, { text: 'Analysis information', kind: 'label' }, { text: 'Close', kind: 'label' }, { text: '×', kind: 'label' },
             { text: '1 Set up', kind: 'label' }]);
     });
 
@@ -1262,6 +1296,7 @@ function mainThread() {
         const groups = new Map();
         const group = (name) => { if (!groups.has(name)) groups.set(name, { items: [], errors: [], via: new Set(), missing: null }); return groups.get(name); };
         const direct = [['tools/autotune/catalog.cjs (summary of every check id)', catalogSource], ['tools/autotune/hierarchy.cjs (titles, texts, status reasons)', hierarchySource],
+            ['digital twin (model and firmware messages)', digitalTwinSource],
             ['js/tuning_worker.js (notes, progress, window observations)', workerSource], ['js/tuning_snippet.js (messages)', snippetSource],
             ['view shell (index.html, js/main.js)', shellSource], ['CLAUDE.md (STE rules)', ruleSource]];
         for (const [name, fn] of direct) {

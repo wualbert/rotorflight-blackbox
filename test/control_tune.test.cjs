@@ -38,7 +38,7 @@ test('profile, flight, source, gate, cause, evidence, range and CLI checks fail 
         i=>{i.analysis.datasets.datasets[0].analysedFlightSeconds=0;}, i=>{i.analysis.datasets.datasets[0].analysed=false;},
         i=>{delete i.analysis.advice.byDataset.A;}, i=>{i.analysis.datasets.datasets[0].values.roll_p_gain=100;},
         i=>{i.analysis.advice.byDataset.A[0].profile=2;}, i=>{i.analysis.advice.byDataset.A[0].dataset='B';},
-        i=>{i.analysis.advice.byDataset.A[0].blockedBy=['filters'];}, i=>{i.analysis.advice.byDataset.A[0].causes=[{holds:true}];},
+        i=>{i.analysis.advice.byDataset.A[0].blockedBy=['Correct the filters first.'];}, i=>{i.analysis.advice.byDataset.A[0].causes=[{holds:true}];},
         i=>{i.analysis.advice.byDataset.A[0].evidence=[];}, i=>{i.analysis.advice.byDataset.A[0].rule='';},
         i=>{i.analysis.advice.byDataset.A[0].to=1001;}, i=>{i.analysis.advice.byDataset.A[0].to=55.5;},
         i=>{i.analysis.advice.byDataset.A[0].to=70;}, i=>{i.analysis.advice.byDataset.A[0].cli=[];},
@@ -57,7 +57,7 @@ test('joint gain candidates are indivisible and predictions require the exact ev
     d.gates.V3.pass=true;
     d.changes[1].to=21.8;assert.equal(CT.tune(i).prediction,null,'rounded values are not the exact modeled candidate');
     d.changes[1].to=22;d.dataset='B';assert.equal(CT.tune(i).prediction,null,'other configuration');
-    recs[1].blockedBy=['filters'];assert.equal(CT.tune(i).recommendations.length,0);
+    recs[1].blockedBy=['Correct the filters first.'];assert.equal(CT.tune(i).recommendations.length,0);
     recs.pop();assert.equal(CT.tune(i).recommendations.length,0,'missing group member');
 });
 test('repeated autotune retains the recorded base and current-value caveats reach the CLI', () => {
@@ -96,5 +96,55 @@ test('flight plan covers each supported control parameter family and refuses blo
     }
     const r=recommendation({group:'joint',groupSize:2});
     assert.equal(advice.exportScript([r],null,{},true).flightPlan.maneuvers.length,0);
-    assert.equal(CT.flightPlan([recommendation({blockedBy:['filters']})]).maneuvers.length,0);
+    assert.equal(CT.flightPlan([recommendation({blockedBy:['Correct the filters first.']})]).maneuvers.length,0);
+});
+
+test('blocked control changes keep numeric proposals and concrete prerequisite changes out of Export', () => {
+    const r=recommendation({parameter:'pitch_f_gain',from:100,to:90,axis:'pitch',cli:[],
+        blockedBy:['The filter change comes first.'],gate:{held:['filters']},
+        evidence:[{id:'C4',fid:'stops',value:25.7,se:2.9,unit:'%',threshold:10}]});
+    const i=input([r]);
+    i.analysis.advice.byDataset.A.push({id:'filter',node:'filters',dataset:'A',severity:'action',scope:'global',
+        parameter:'gyro_lpf1_static_hz',from:0,to:100,cli:['set gyro_lpf1_static_hz = 100'],
+        evidence:[{id:'F1',value:0}],text:'Set the gyro low-pass filter to 100 Hz.'});
+    const out=CT.tune(i);
+    assert.equal(out.status,'prerequisites-required');
+    assert.equal(out.proposals.length,1);assert.deepEqual([out.proposals[0].row.from,out.proposals[0].row.to],[100,90]);
+    assert.equal(out.proposals[0].evidence[0].se,2.9);
+    assert.equal(out.prerequisites[0].to,100);
+    assert.deepEqual(out.recommendations,[]);assert.deepEqual(out.rows,[]);
+    assert.deepEqual(out.proposals[0].cli,[]);assert.equal(out.prediction,null);
+    assert.deepEqual(advice.defaultPicks(out.proposals),[]);
+    assert.doesNotMatch(advice.exportScript(out.proposals,null,{}),/set pitch_f_gain/);
+    r.gate=null;r.holds=['filters'];
+    assert.equal(CT.tune(i).prerequisites[0].to,100,'a guard prerequisite remains visible without a direct hierarchy gate');
+    const diagnostic=input([{...r,severity:'check',parameter:null,from:null,to:null}]);
+    diagnostic.analysis.advice.byDataset.A.push(i.analysis.advice.byDataset.A[1]);
+    const next=CT.tune(diagnostic);
+    assert.equal(next.status,'prerequisites-required');
+    assert.equal(next.prerequisites[0].to,100,'an upstream change is useful even without an identified gain target');
+    assert.deepEqual(next.recommendations,[]);assert.deepEqual(next.proposals,[]);
+    r.to=80;r.from=200;assert.equal(CT.tune(i).proposals.length,0,'inconsistent base cannot be a proposal');
+});
+
+test('control accepts a justified zero compensation start but not an oversized one', () => {
+    const i=input([recommendation({node:'cycomp',parameter:'pitch_collective_ff_gain',axis:'pitch',from:0,to:10})]);
+    i.step='cycomp';
+    assert.equal(CT.tune(i).rows[0].to,10);
+    const r=i.analysis.advice.byDataset.A[0];r.to=11;r.cli[1]='set pitch_collective_ff_gain = 11';
+    assert.deepEqual(CT.tune(i).recommendations,[]);
+});
+
+test('output limits retain the diagnosis without inventing a gain or corrective experiment', () => {
+    for(const [step,id] of [['governor','G6'],['cyclic','C2'],['tailcomp','T8']]) {
+        const r=recommendation({node:step,parameter:null,severity:'check',cli:[],
+            evidence:[{id,fid:'limit',value:2.5,unit:'s'}]});
+        const i=input([r]);i.step=step;
+        const out=CT.tune(i);
+        assert.equal(out.status,'diagnosis-required');assert.equal(out.experiments.length,0);
+        assert.match(out.reason,/problem is not corrected/);
+        assert.equal(out.guidance[0].evidence[0].value,2.5);
+        assert.deepEqual(out.recommendations,[]);
+        r.severity='watch';assert.equal(CT.tune(i).experiments.length,0);
+    }
 });

@@ -6,7 +6,7 @@ test('reconstruction reuse requires the same source, recording, observations, se
     const dir=fs.mkdtempSync(path.join(os.tmpdir(),'rf-reuse-test-'));
     try {
         const input=path.join(dir,'flight.bbl'),reportFile=path.join(dir,'report.json');fs.writeFileSync(input,'recorded input');fs.mkdirSync(path.join(dir,'job'));
-        const sourceSha256=Object.fromEntries(['filter_replay','filter_reconstruct','filter_tune'].map(n=>{const f='tools/autotune/'+n+'.cjs';return [f,sha(path.join(root,f))];}));
+        const sourceSha256=Object.fromEntries(['filter_replay','filter_reconstruct','filter_tune','filter_math','filter_solve'].map(n=>{const f='tools/autotune/'+n+'.cjs';return [f,sha(path.join(root,f))];}));
         const report={sourceSha256,reconstructionCache:dir,recordings:[{inputSha256:sha(input),result:'job/filter_tune.json'}]};
         fs.writeFileSync(reportFile,JSON.stringify(report));
         const seg={cfg:{s:{gyro_lpf1_static_hz:100}},n:3,log:0,firstProfile:1,fromS:0,observers:{},
@@ -23,7 +23,13 @@ test('reconstruction reuse requires the same source, recording, observations, se
         }
         assert.throws(()=>restore(seg,[{...windows[0],held:true}]),/flight windows differ/);
         fs.writeFileSync(input,'different input');assert.throws(()=>reuseReconstruction(reportFile,input),/recorded input differs/);
-        report.sourceSha256['tools/autotune/filter_replay.cjs']='changed';fs.writeFileSync(reportFile,JSON.stringify(report));
-        assert.throws(()=>reuseReconstruction(reportFile,input),/Reconstruction source differs/);
+        for (const name of ['filter_replay','filter_math','filter_solve']) {
+            const file='tools/autotune/'+name+'.cjs',original=report.sourceSha256[file];
+            report.sourceSha256[file]='changed';fs.writeFileSync(reportFile,JSON.stringify(report));
+            assert.throws(()=>reuseReconstruction(reportFile,input),/Reconstruction source differs/);
+            delete report.sourceSha256[file];fs.writeFileSync(reportFile,JSON.stringify(report));
+            assert.throws(()=>reuseReconstruction(reportFile,input),/Reconstruction source differs/);
+            report.sourceSha256[file]=original;
+        }
     }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });

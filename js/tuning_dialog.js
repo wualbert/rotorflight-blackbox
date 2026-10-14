@@ -36,8 +36,8 @@
  * Times: evidence spans and every request to the viewer are frame seconds from the log start (the viewer clock). The
  * modules and curves use index time (fromS + i / actualRate); toFrame converts with the worker's time map of the segment.
  *
- * Text is ASD-STE100 (docs/STE_GLOSSARY.md). Toolkit text that is not STE (the finding texts of the other modules,
- * thresholds, sources, worker messages) is shown in elements marked data-ste="quoted".
+ * Text is ASD-STE100 (docs/STE_GLOSSARY.md). Analysis information can contain recorded values, formulas and source quotations.
+ * These details remain in elements marked data-ste="quoted"; producer text is checked in its own module.
  *
  * Advice only: nothing is sent to a flight controller. Every string that comes from the log or the worker is escaped
  * before it becomes HTML.
@@ -76,7 +76,7 @@ var TuningDialog = (function () {
         error: "Analysis error", problem: "Problem", monitor: "Monitor", satisfactory: "Satisfactory", information: "Information",
         insufficient: "Not sufficient data", notMeasured: "Not measured"
     };
-    var STATUS_ORDER = ["error", "problem", "monitor", "satisfactory", "information", "insufficient", "notMeasured"];
+    var STATUS_ORDER = ["error", "problem", "monitor", "insufficient", "notMeasured", "satisfactory", "information"];
 
     // Status of a step of the tuning sequence (tools/autotune/hierarchy.cjs status()); "start": a Problem in startHere
     var NODE_STATUS = {
@@ -112,10 +112,10 @@ var TuningDialog = (function () {
     var MODULE_AREA = { gov: "governor", loop: "cyclic", track: "cyclic" };
     var REC_AREA = {
         precondition: "data", logging: "data", mechanical: "data", filters: "filters", governor: "governor",
-        tail: "tail", cyclic: "cyclic", rates: "rates"
+        tail: "tail", tailcomp: "tail", cyclic: "cyclic", cycomp: "cyclic", rates: "rates"
     };
     var REC_AREA_LABEL = {
-        precondition: "Data", logging: "Log", mechanical: "Mechanical", filters: "Filters", governor: "Governor", tail: "Tail", cyclic: "Cyclic", rates: "Rates"
+        precondition: "Data", logging: "Log", mechanical: "Mechanical", filters: "Filters", governor: "Governor", tail: "Tail", tailcomp: "Tail compensation", cyclic: "Cyclic", cycomp: "Cyclic compensation", rates: "Rates"
     };
     var REC_SEVERITY = {
         action: { label: "Change", status: "problem", rank: 0 }, check: { label: "Check", status: "monitor", rank: 1 },
@@ -434,7 +434,7 @@ var TuningDialog = (function () {
 
     // D5: our modules mark a note without sufficient data with `thin`; the other modules write "no finding"
     function isThin(f) {
-        return !!f.thin || /^no finding/i.test(String(f.text || ""));
+        return !!f.thin || /^no (?:finding|result)/i.test(String(f.text || ""));
     }
 
     // The status of a finding: the worker's (catalog.cjs status, after explain), else from its severity
@@ -478,7 +478,7 @@ var TuningDialog = (function () {
     // Navigation reports outstanding results, independent of which tab was visited
     // or which proposed changes were selected. Missing checks cannot turn green.
     function tabStatus(states) {
-        var counts = {}, order = ['error', 'problem', 'monitor', 'insufficient', 'notMeasured', 'satisfactory', 'information'];
+        var counts = {}, order = STATUS_ORDER;
         states.forEach(function (s) { counts[s] = (counts[s] || 0) + 1; });
         var key = order.find(function (s) { return counts[s]; }) || 'notMeasured';
         var counted = /^(error|problem|monitor)$/.test(key);
@@ -543,7 +543,9 @@ var TuningDialog = (function () {
 
     // CLI text to show and to export: none while a gate or a cause holds the item, none for an unknown PID profile (D12)
     function hasCli(rec) {
-        return Array.isArray(rec.cli) && rec.cli.length > 0 && !isBlocked(rec) && !heldByCause(rec) && profileNo(rec) !== 0;
+        var authorized=controlCliAuthorization.get(rec);
+        return Array.isArray(rec.cli) && rec.cli.length > 0 && !isBlocked(rec) && !heldByCause(rec) && profileNo(rec) !== 0 &&
+            (!automaticControlChange(rec) || recordedConfigurationCli.has(rec) || authorized && authorized());
     }
 
     // Why a recommendation has no CLI text, and thus is not in the CLI file
@@ -551,6 +553,7 @@ var TuningDialog = (function () {
         if (isBlocked(rec)) return 'This recommendation has no CLI text. First, correct the steps in the "Blocked" list. Then start the analysis again.';
         if (heldByCause(rec)) return "This recommendation has no CLI text. Correct the cause first. Then start the analysis again.";
         if (profileNo(rec) === 0) return "The PID profile of this recommendation is unknown. Thus, it has no CLI text.";
+        if (automaticControlChange(rec)) return "A new digital twin result that agrees with all model checks is necessary for control gain commands.";
         return "This recommendation has no CLI text.";
     }
 
@@ -996,12 +999,12 @@ var TuningDialog = (function () {
 
     // ---------------------------------------------------------------------------------------------
     // D12: the PID profile at the start of a log (js/tuning_worker.js armingCore and armingFinal, result.profiles.arming[]). The
-    // log header has the values of the PID profile that is active when the pilot arms the helicopter, and the log records no PID
+    // log header has the values of the PID profile that is active when a new log starts, and the log records no PID
     // profile before the first change. The worker confirms it from the log ("event": a change at the first frame; "headspeed":
     // "govRequest" at the start against the headspeed of each PID profile at the logged changes of the file) or from a CLI dump
     // that the pilot loaded ("cli", "cliTarget"). "govTarget" and "fileTarget" are estimates only (js/tuning_worker.js CONFIRMS)
 
-    var START_NOTE = "The log header has the values of the PID profile that is active when the pilot arms the helicopter.";
+    var START_NOTE = "The log header has the values of the PID profile that is active when a new log starts.";
     var BASIS_SHORT = { event: "the log event", headspeed: '"govRequest"', cli: "the CLI dump", cliTarget: "the CLI dump" };
 
     // The arming result of log li: { log, profile (1-6, 0 unknown), basis, confirmed, estimate, headspeed }, or null (a bench run,
@@ -1707,10 +1710,10 @@ var TuningDialog = (function () {
         return d && (textOf(d.bound) || textOf(d.limit)) || threshold(f.threshold);
     }
 
-    // The toolkit text of a finding (not STE), collapsed under its STE summary (SPEC2 D6)
+    // Detailed measurement text, collapsed under its concise summary (SPEC2 D6).
     function toolkitText(text) {
         if (!oneLine(text)) return "";
-        return '<details class="tuning-toolkit" data-ste="quoted"><summary>Toolkit text (not STE)</summary>' + esc(text) + "</details>";
+        return '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary>' + esc(text) + "</details>";
     }
 
     // The two filters of the result lists (SPEC3 E): filter = { thin, ok }, true to show the results with the status "Not
@@ -1792,8 +1795,8 @@ var TuningDialog = (function () {
         return '<div class="tuning-muted" data-ste="quoted"' + (short !== text ? ' title="' + esc(text) + '"' : "") + ">" + esc(short) + (short !== text ? "&hellip;" : "") + "</div>";
     }
 
-    function cliBlock(text, env) {
-        return '<div class="tuning-cli"><button type="button" class="btn btn-default btn-xs tuning-copy" data-copy="' + env.copy(text) +
+    function cliBlock(text, env, rec) {
+        return '<div class="tuning-cli"><button type="button" class="btn btn-default btn-xs tuning-copy" data-copy="' + env.copy(text, rec) +
             '">Copy</button><pre>' + esc(text) + "</pre></div>";
     }
 
@@ -1821,7 +1824,7 @@ var TuningDialog = (function () {
             });
             return "<li><strong>" + esc([c.rule, c.name].filter(Boolean).join(" ")) + "</strong>" +
                 (up.length ? ": " + esc(upstreamText(up, false)) : "") +
-                (links.length ? '<div>Do first: ' + links.map(function (x) {
+                (links.length ? '<div>' + (rec.severity === 'action' && c.holds !== false ? 'Do first: ' : 'Related checks: ') + links.map(function (x) {
                     return '<a href="#" class="tuning-goto-rec" data-rec="' + x.i + '">' + esc(recommendationTitle(x.rec)) + "</a>";
                 }).join(", ") + "</div>" : "") + stepsHtml(c.first) + "</li>";
         }).join("") + "</ul></div>";
@@ -1850,6 +1853,22 @@ var TuningDialog = (function () {
         return Object.prototype.hasOwnProperty.call(CONFIDENCE, c) ? CONFIDENCE[c] : "";
     }
 
+    function procedureHtml(rec) {
+        var p = rec && rec.procedure;
+        if (!p || !p.title || !Array.isArray(p.steps) || !p.steps.length) return "";
+        return '<section class="tuning-next-action" aria-label="Next steps"><div class="tuning-label">Do next</div>' +
+            '<p class="tuning-next-action-title"><strong>' + mdCode(p.title) + '</strong></p><ol>' +
+            p.steps.map(function(s) { return '<li>' + mdCode(s) + '</li>'; }).join('') + '</ol>' +
+            (p.after ? '<p><strong>After these checks</strong></p>' + ftParas(p.after) : '') +
+            (p.success ? '<p class="tuning-muted"><strong>Result to look for:</strong> ' + mdCode(p.success) + '</p>' : '') + '</section>';
+    }
+
+    function recommendationBody(rec, hideProcedure) {
+        var action = procedureHtml(rec);
+        return action ? (hideProcedure ? '' : action) + '<details class="tuning-action-measurements"><summary>Measurements</summary>' +
+            ftParas(rec.text) + '</details>' : ftParas(rec.text);
+    }
+
     function recCard(rec, i, entry, env) {
         var sev = REC_SEVERITY[rec.severity] || REC_SEVERITY.info, area = REC_AREA_LABEL[rec.area] || cap(rec.area), graph = graphOf(entry.result);
         var held = isBlocked(rec) ? "blocked" : causesOf(rec).length ? "possible" : sev.status;
@@ -1857,7 +1876,7 @@ var TuningDialog = (function () {
             '<div class="tuning-rec-head"><div class="tuning-rec-badges">' + recBadges(rec) + '</div><div class="tuning-rec-title">' + esc(recommendationTitle(rec)) + "</div>" +
                 '<div class="tuning-muted">' + esc([area, profileText(rec), typeof rec.dataset === "string" && rec.dataset ? configLabel(rec.dataset) : "", confidenceText(rec.confidence),
                     groupOf(rec) ? "Group " + groupLabel(groupOf(rec)) : ""].filter(Boolean).join(" · ")) + "</div></div>" +
-            (rec.text ? '<div class="tuning-rec-text">' + esc(rec.text) + "</div>" : "") +
+            recommendationBody(rec) +
             (rec.parameter ? '<div class="tuning-rec-param">' + parameterHtml(rec.parameter) + " " + esc(paramText(rec)) + "</div>" : "") +
             staleRecHtml(rec) + // r.stale: the caveat with its text (CLAUDE.md "Values that are possibly not current")
             recConfigHtml(rec, entry.result) +
@@ -1867,7 +1886,7 @@ var TuningDialog = (function () {
             causesHtml(rec, entry, env) +
             bulletList((rec.caveats || []).map(function (c) { return esc(oneLine(c)); }), "Note", "is-caveat") +
             findingsTable(Array.isArray(rec.evidence) ? rec.evidence : [], { evidence: true, showLog: true, where: "recs:" + i, empty: "This recommendation has no result." }, env) +
-            (hasCli(rec) ? cliBlock(rec.cli.join("\n"), env) : '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>") +
+            (hasCli(rec) ? cliBlock(rec.cli.join("\n"), env, rec) : '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>") +
         "</div>";
     }
 
@@ -2482,7 +2501,7 @@ var TuningDialog = (function () {
                 esc(typeof rec.dataset === "string" && rec.dataset ? ", " + configLabel(rec.dataset) : "") + "</div>" +
             (isBlocked(rec) ? '<div class="tuning-node-rec-blocked">Blocked: ' + rec.blockedBy.map(function (b) { return blockedItem(b, graph); }).join(", ") + "</div>" : "") +
             (focus && ruleText(rec) ? '<div class="tuning-rec-rule"><div class="tuning-label">Rule</div><div>' + esc(ruleText(rec)) + "</div></div>" : "") +
-            (focus ? (hasCli(rec) ? cliBlock(rec.cli.join("\n"), env) : '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>") : "") +
+            (focus ? (hasCli(rec) ? cliBlock(rec.cli.join("\n"), env, rec) : '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>") : "") +
         "</li>";
     }
 
@@ -2523,7 +2542,7 @@ var TuningDialog = (function () {
                         return '<a href="#" class="tuning-node-link" data-node="' + esc(x) + '">' + esc(graph.byId[x].title) + "</a>";
                     }).join(", ") : "<strong>" + esc([p.rule, p.name || rule.name].filter(Boolean).join(" ")) + "</strong>";
                     return "<li>" + (head || esc(oneLine(p.rule))) + (up.length ? ": " + esc(upstreamText(up, true)) : "") +
-                        (rule.first ? '<div class="tuning-muted">Do first:</div>' + stepsHtml(rule.first) : "") + "</li>";
+                        (rule.first ? '<div class="tuning-muted">Checks to examine:</div>' + stepsHtml(rule.first) : "") + "</li>";
                 }).join("") + "</ul></div>";
             }
             var before = graph.edges.filter(function (x) { return x.to === id && (x.kind === "gate" || x.kind === "order"); });
@@ -2751,10 +2770,11 @@ var TuningDialog = (function () {
         var retained=plan.rows.filter(function(q){return changed.indexOf(q)<0;});
         function table(rows) {
             return '<div class="tuning-table-wrap"><table class="tuning-table"><thead><tr><th>Parameter</th><th>Scope</th><th>Before</th><th>After</th><th>Tuning step</th><th>Source</th></tr></thead><tbody>' + rows.map(function(q){
-                return '<tr class="' + (q.conflict ? 'tuning-ft-regression' : changed.indexOf(q)>=0 ? 'tuning-ft-changed' : '') + '"><td><code>' + esc(q.name) + '</code></td><td>' + esc(q.scope === 'global' ? 'All PID profiles' : q.scope === 'profile' ? profileLabel(q.index + 1) : 'Rate profile ' + (q.index + 1)) + '</td><td><code>' + esc(q.from == null ? 'Unknown' : String(q.from)) + '</code></td><td><code>' + esc(q.values.map(String).join(' / ')) + '</code>' + (q.conflict ? ' Different values' : '') + '</td><td>' + esc(q.steps.map(function(k){var t=TABS.find(function(t){return t.key===k;});return t?t.title:k;}).join(', ')) + q.stale.map(function(t){return '<p class="tuning-muted">' + esc(t) + '</p>';}).join('') + '</td><td>' + esc(q.configurations.map(configLabel).concat(q.filterSources || []).join(', ')) + '</td></tr>';
+                return '<tr class="' + (q.conflict ? 'tuning-ft-regression' : changed.indexOf(q)>=0 ? 'tuning-ft-changed' : '') + '"><td><code>' + esc(q.name) + '</code></td><td>' + esc(q.scope === 'global' ? 'All PID profiles' : q.scope === 'profile' ? profileLabel(q.index + 1) : 'Rate profile ' + (q.index + 1)) + '</td><td><code>' + esc(q.from == null ? 'Unknown' : String(q.from)) + '</code></td><td><code>' + esc(q.values.map(String).join(' / ')) + '</code>' + (q.conflict ? ' Different values' : '') + '</td><td>' + esc(q.steps.map(function(k){var t=TABS.find(function(t){return t.key===k;});return k==='configuration'?'Recorded configuration values':t?t.title:k;}).join(', ')) + q.stale.map(function(t){return '<p class="tuning-muted">' + esc(t) + '</p>';}).join('') + '</td><td>' + esc(q.configurations.map(configLabel).concat(q.filterSources || []).join(', ')) + '</td></tr>';
             }).join('') + '</tbody></table></div>';
         }
         return '<section class="tuning-pending-diff"><h5 class="tuning-h">Selected parameter changes</h5><p>These values come from all tuning steps. The CLI file uses this same selection.</p>' +
+            (plan.rows.some(function(q){return q.steps.indexOf('configuration')>=0;}) ? '<p>The CLI file also sets the recorded configuration values below. These values can be different from the newest configuration.</p>' : '') +
             (plan.conflicts.length ? '<p class="tuning-na">Two selected changes give different values for the same parameter. Select one before export.</p>' : '') + table(changed) +
             (retained.length ? '<details><summary>Values that do not change in the CLI file (' + retained.length + ')</summary>' + table(retained) + '</details>' : '') + '</section>';
     }
@@ -3398,7 +3418,6 @@ var TuningDialog = (function () {
         about: "The app uses a model of the gyro filters of the firmware. It calculates gyro samples between the recorded samples. It uses the recorded gyro and PID signals. " +
             "Then the app tries other filter values. It finds the values that give the smallest vibration in the PID output, with a small increase of the time delay.",
         start: "Autotune",
-        again: "Autotune again",
         running: "The app calculates the filter values. Wait for the result.",
         canceled: "You canceled the analysis of the filter values.",
         failed: "The analysis of the filter values stopped because of an error.",
@@ -3441,8 +3460,12 @@ var TuningDialog = (function () {
     // changes go in together (group "FT:filters"): the model calculated the decrease for all of them
     function filterRecs(res) {
         if (!res || typeof res !== "object") return [];
+        var refused = res.cliExport && res.cliExport.available === false;
         if (Array.isArray(res.recommendations)) return res.recommendations.filter(function (x) { return x && typeof x === "object" && typeof x.id === "string"; })
-            .map(function (x) { return Object.assign({}, x, { filterSearch: true }); });
+            .map(function (x) { return Object.assign({}, x, { filterSearch: true }, refused ? {
+                cli: [], blockedBy: x.severity === 'action' ? Array.from(new Set((x.blockedBy || []).concat(res.cliExport.reasons || []))) : x.blockedBy || []
+            } : {}); });
+        if (refused) return [];
         var rec = res.recommended;
         if (!rec || rec.status !== "recommended" || !Array.isArray(rec.cli) || !rec.cli.length) return [];
         var groups = [{ scope: "global", index: null, lines: [] }];
@@ -3502,10 +3525,12 @@ var TuningDialog = (function () {
     // The recommendation of a calculation in STE: the worker's text, else sentences from the numbers
     function ftRecText(res) {
         var t = res.text || {}, rec = res.recommended || {}, p = rec.predicted || {};
+        if (res.mode === 'simulation' && rec.status === 'recommended' && rec.params && !Object.keys(rec.params).length)
+            return 'Recorded filter replay. No filter values changed. Each interval uses its recorded configuration.';
         if (typeof t.recommendation === "string" && t.recommendation.trim()) return mdCode(t.recommendation);
         if (rec.status === "no flight log") return esc(FT.noFlight);
         if (rec.status !== "recommended") return esc("The app does not recommend a change of the filter values.");
-        return esc("Set the filter values of the table. " + (isNum(p.totalDb) ? "The model calculates a " + dbChange(p.totalDb, p.se) + " of the vibration in the PID output." : ""));
+        return esc("The table shows the calculated filter values. " + (isNum(p.totalDb) ? "The model calculates a " + dbChange(p.totalDb, p.se) + " of the vibration in the PID output." : ""));
     }
 
     // The change of the time delay in STE
@@ -3528,7 +3553,7 @@ var TuningDialog = (function () {
                 "Then it calculated the change of the vibration in the data that it did not use. The vibration decreased in " + less + " of " + folds.length + (block ? " periods." : " logs.") +
                 (v && isNum(v.heldOutMeanDb) ? " The mean change is a " + dbChange(v.heldOutMeanDb, v.heldOutSe) + "." : "") +
                 (v && isNum(v.sameAsFull) ? " In " + v.sameAsFull + " of " + folds.length + " tests, the app found the same values." : ""));
-        return '<h6 class="tuning-h">' + esc(res.version === 2 ? "Test on different flight periods" : FT.validation) + '</h6><p class="tuning-ft-text">' + text + "</p>" + (folds.length ? '<div class="tuning-table-wrap"><table class="tuning-table tuning-ft-folds"><thead><tr><th>' +
+        return '<h6 class="tuning-h">' + esc(res.mode === 'simulation' ? "Replay of selected flight periods" : res.version === 2 ? "Test on different flight periods" : FT.validation) + '</h6><p class="tuning-ft-text">' + text + "</p>" + (folds.length ? '<div class="tuning-table-wrap"><table class="tuning-table tuning-ft-folds"><thead><tr><th>' +
             (block ? "Period that the app did not use" : "Log that the app did not use") + "</th><th>Change of the vibration in it</th><th>Same values</th></tr></thead><tbody>" + folds.map(function (q) {
                 var same = res.recommended && res.recommended.params && q.chosen ? JSON.stringify(q.chosen) === JSON.stringify(res.recommended.params) : null;
                 return "<tr><td>" + esc(unitText(q.unit)) + '</td><td class="tuning-num">' + esc(isNum(q.heldOutDb) ? num(q.heldOutDb) + " dB" : "") + "</td><td>" + esc(same === null ? "" : same ? "Yes" : "No") + "</td></tr>";
@@ -3562,15 +3587,15 @@ var TuningDialog = (function () {
             out[0].caption='The curves compare raw gyro data with the previous and new filter outputs.';
             out[1].caption='The curves compare the vibration from the gyro in P and D.';
             if (res.recommended.status !== "recommended") out.forEach(function (it) {
-                it.caption = it.caption.replace(/recommended values/g, "tested values (not confirmed)");
-                if (it.spec) it.spec.series.forEach(function (s) { if (s.ftCurve === 'new') s.name = 'New filter (calculated, not confirmed)'; });
+                it.caption = it.caption.replace(/recommended values/g, "tested values (no recommendation)");
+                if (it.spec) it.spec.series.forEach(function (s) { if (s.ftCurve === 'new') s.name = 'New filter (calculated, no recommendation)'; });
             });
             out[1].caption += " Unknown PID profiles use the header values for this plot only.";
         }
         var tr = res.traces && res.traces[traceIndex || 0], ai = AXES.indexOf(axis);
         if (tr && ai >= 0) {
             var tx = { label: "time in the log", unit: "s" }, tested = res.recommended && res.recommended.status === "recommended";
-            var prefix = tested ? "New filter (calculated)" : "New filter (calculated, not confirmed)";
+            var prefix = tested ? "New filter (calculated)" : "New filter (calculated, no recommendation)";
             var nativeTrace = tr.native || tr;
             out.unshift(item({ title: "Replayed gyro signals, " + axis, x: tx, y: { label: "gyro rate", unit: "deg/s" },
                 series: [line("Raw data", tr.t, tr.raw[ai], C.grey, { ftCurve: "raw" }), line("Previous filter (recorded)", tr.t, tr.logged[ai], C.blue, { ftCurve: "old" }),
@@ -3599,11 +3624,17 @@ var TuningDialog = (function () {
         function recordedRow(f) {
             var status = findingStatus(f), before = {status:STATUS[status] || status, issues:status === 'problem' || status === 'error' ? 1 : 0, findings:[f]};
             return {id:f.id,title:f.noun || '',log:f.log,configuration:f.dataset,profile:profileNo(f),axis:findingAxis(f),before:before,
+                replayable:false,confirmed:!!check && f.id === 'F7',
                 after:check && f.id === 'F7' ? before : null, outcome:check && f.id === 'F7' ? 'Unchanged input' : 'Not replayed',
                 detail:f.id === 'F7' ? 'The replay uses the same recorded vibration source.' : ''};
         }
         var physical = (recorded || []).filter(function(f){return f.id === 'F7';});
         var rows = check ? (check.rows || []).filter(function(q){return q.id !== 'F7' || !physical.length;}).concat(physical.map(recordedRow)) : (recorded || []).map(recordedRow);
+        rows=rows.map(function(row){
+            var independent=row.basis === 'configuration' || row.basis === 'recorded input' || ['F1','F2','F3','F4','F5','F8','F9'].indexOf(row.id)>=0;
+            return Object.assign({},row,{confirmed:row.confirmed === undefined ? independent || !check || check.confirmed !== false : row.confirmed,
+                basis:row.basis || (['F1','F2','F3','F4'].indexOf(row.id)>=0 ? 'configuration' : independent ? 'recorded input' : 'replay')});
+        });
         return rows.slice().sort(function(a,b){return Number(!!(b.before && b.before.issues)) - Number(!!(a.before && a.before.issues)) ||
             Number(b.outcome === 'New issue') - Number(a.outcome === 'New issue');});
     }
@@ -3611,12 +3642,13 @@ var TuningDialog = (function () {
     function filterTabStates(model) {
         var res = model.result, check = res && res.checklist, states;
         var current = model.state === 'done' && !model.stale && !model.dirty;
-        if (current && check && check.confirmed !== false) {
+        if (current && check) {
             states = filterChecklistRows(res, model.recordedChecks).reduce(function (out, row) {
                 // An unavailable replay does not clear a recorded problem. Physical
                 // vibration keeps the recorded result, as in the visible checklist.
                 var after = row.after, before = row.before;
-                if ((!after || row.outcome === 'Not evaluated') && before && before.issues) out.push('problem');
+                if ((!after || !row.confirmed || row.outcome === 'Not evaluated') && before && before.issues) out.push('problem');
+                if(!row.confirmed && row.outcome !== 'Unchanged input')return out.concat('notMeasured');
                 if (!after) return out.concat('notMeasured');
                 if (after.issues) return out.concat('problem');
                 var findings = after.findings || [];
@@ -3624,6 +3656,7 @@ var TuningDialog = (function () {
                     ({Pass: 'satisfactory', Satisfactory: 'satisfactory', Information: 'information', Monitor: 'monitor',
                         'Insufficient data': 'insufficient', 'Not sufficient data': 'insufficient'}[after.status] || 'notMeasured'));
             }, []);
+            if(check.confirmed === false)states.push('insufficient');
         } else {
             states = (model.recordedChecks || []).map(findingStatus);
             if (current && check && check.confirmed === false) states.push('insufficient');
@@ -3636,32 +3669,46 @@ var TuningDialog = (function () {
     function filterChecklistHtml(res, recorded, support) {
         var check = res && res.checklist, confirmed = !check || check.confirmed !== false;
         var rows = filterChecklistRows(res, recorded);
-        var outcomeLabels = {'Cleared in replay':'Not found in replay',Remains:'Not corrected','New issue':'New problem',Unchanged:'No change','Not evaluated':'Not measured','Unchanged input':'Same input'};
+        var outcomeLabels = {'Cleared in replay':'Corrected in replay',Remains:'Not corrected','New issue':'New problem',Unchanged:'No change','Not evaluated':'Not measured','Unchanged input':'Same input'};
         var statusLabels = {Issue:'Problem',Pass:'Satisfactory','Not evaluated':'Not measured','Insufficient data':'Not sufficient data'};
         var html = '<section class="tuning-ft-checklist"><h5 class="tuning-h">Filter checks</h5>' +
-            '<p class="tuning-muted">The recorded data and replay use the same checks and limits. Previous problems are shown first.</p>';
+            '<p class="tuning-muted">The recorded data and replay use the same checks and limits. Previous problems are shown first.</p>' +
+            '<p class="tuning-muted">Autotune uses the filter problems to select and check the calculated values. Checks that the replay cannot measure stay open.</p>';
         if (!rows.length) return html + '<p class="tuning-muted">To see the filter checks, load recorded values.</p>' + (support || '') + '</section>';
-        if (check && confirmed) {
-            var count = function(outcome){return rows.filter(function(q){return q.outcome === outcome;}).length;};
-            html += '<p>' + esc(plural(count('Cleared in replay'),'previous problem') + ' not found in replay. ' + plural(count('Remains') + rows.filter(function(q){return q.outcome === 'Unchanged input' && q.before.issues;}).length,'previous problem') + ' not corrected. ' + plural(count('New issue'),'new problem') + '. ' + count('Not evaluated') + ' not measured.') + '</p>';
+        if (check) {
+            var count = function(outcome){return rows.filter(function(q){return q.confirmed && q.outcome === outcome;}).length;};
+            var unmeasured=rows.filter(function(q){return !q.confirmed || q.outcome === 'Not evaluated';}).length;
+            html += '<p>' + esc(plural(count('Cleared in replay'),'previous problem') + ' corrected. ' + plural(count('Remains') + rows.filter(function(q){return q.outcome === 'Unchanged input' && q.before.issues;}).length,'previous problem') + ' not corrected. ' + plural(count('New issue'),'new problem') + '. ' + unmeasured + ' not measured.') + '</p>';
+            var improved=rows.filter(function(q){return q.confirmed && q.outcome === 'Remains' && q.trend === 'improved';}).length;
+            if(improved)html += '<p>' + esc(plural(improved,'previous problem') + (improved === 1 ? ' decreases in replay. Its result is not satisfactory.' : ' decrease in replay. Their results are not satisfactory.')) + '</p>';
+            var unverified=rows.filter(function(q){return q.before && q.before.issues && (!q.confirmed || q.outcome === 'Not evaluated');}).length;
+            if(unverified)html += '<p>' + esc(plural(unverified,'previous problem') + (unverified === 1 ? ' also has' : ' also have') + ' no confirmed result in replay.') + '</p>';
         }
-        if (!confirmed) html += '<p class="tuning-na">The recorded configuration fails the model check. The new results are not confirmed.</p>';
+        if (!confirmed) html += '<p class="tuning-na">' + ((res.model && res.model.parity || []).some(function(p){return !p.passed;}) ?
+            'The recorded filter output does not agree with the replay.' : res.bench && res.bench.length ?
+                'Some selected flight periods have no complete replay.' : 'The signal replay is not confirmed.') + ' The filter parameter checks do not use the signal replay.</p>';
+        if(res && res.unmeasuredPeriods && res.unmeasuredPeriods.length)html += '<details><summary>Short periods without signal checks (' + res.unmeasuredPeriods.length + ')</summary><p>These periods are too short for a filter measurement. The replay results apply to the measured periods.</p><ul>' +
+            res.unmeasuredPeriods.map(function(q){return '<li>' + esc('Log ' + logLabel(q.log) + ', ' + num(q.fromS) + ' s to ' + num(q.toS) + ' s: ' + q.reason) + '</li>';}).join('') + '</ul></details>';
         html += '<div class="tuning-table-wrap"><table class="tuning-table tuning-ft-checks"><thead><tr><th>Check</th><th>Flight data</th><th>Recorded</th><th>New parameters</th><th>Result</th></tr></thead><tbody>';
         rows.forEach(function(q){
-            var prior = !!(q.before && q.before.issues), cleared = confirmed && q.outcome === 'Cleared in replay';
-            var outcome = !confirmed && q.outcome !== 'Unchanged input' ? 'Not confirmed' : q.outcome;
+            var prior = !!(q.before && q.before.issues), cleared = q.confirmed && q.outcome === 'Cleared in replay';
+            var outcome = !q.confirmed && q.replayable !== false && q.outcome !== 'Unchanged input' ? 'Replay not confirmed' : q.outcome;
+            var outcomeLabel=cleared && q.basis === 'configuration' ? 'Parameter problem corrected' : q.confirmed && q.outcome === 'Remains' && q.trend === 'improved' ? 'Decreased, not corrected' : outcomeLabels[outcome] || outcome || 'Not measured';
             function cell(side) {
                 var x = q[side], findings = x && x.findings || [];
-                return (x ? esc(statusLabels[x.status] || x.status || 'Not measured') + (x.issues ? ' (' + x.issues + ')' : '') : 'Not replayed') +
+                var label=x ? statusLabels[x.status] || x.status || 'Not measured' : 'Not replayed';
+                if(side === 'after' && !q.confirmed && q.replayable !== false)label='Not confirmed';
+                return esc(label) + (x && x.issues ? ' (' + x.issues + ')' : '') +
                     (findings.length ? '<details><summary>Values and rule</summary><div data-ste="quoted">' + findings.map(function(f){
                         return '<p>' + esc(f.summary || f.text || '') + '</p><code>' + esc(f.threshold || '') + '</code>';
                     }).join('') + '</div></details>' : '');
             }
             html += '<tr class="' + [prior ? 'tuning-ft-prior-issue' : '', cleared ? 'tuning-ft-cleared' : '', q.outcome === 'New issue' ? 'tuning-ft-regression' : ''].filter(Boolean).join(' ') + '"><td>' +
-                esc(q.id + (q.title ? ': ' + q.title : '')) + (prior ? '<small>' + badge('Previous problem','monitor') + '</small>' : '') + '</td><td>' +
+                esc(q.id + (q.title ? ': ' + q.title : '') + (isNum(q.notchSource) ? ', source ' + q.notchSource : '')) + (prior ? '<small>' + badge('Previous problem','monitor') + '</small>' : '') + '</td><td>' +
                 esc([isNum(q.log) ? 'Log ' + logLabel(q.log) : '',q.configuration ? configLabel(q.configuration) : '',isNum(q.profile) ? profileLabel(q.profile) : '',q.axis].filter(Boolean).join(', ')) +
-                (isNum(q.fromS) && isNum(q.toS) ? '<small>' + esc(secs(q.fromS) + ' to ' + secs(q.toS)) + '</small>' : '') + '</td><td>' + cell('before') + '</td><td>' + cell('after') +
-                '</td><td>' + badge(outcomeLabels[outcome] || outcome || 'Not measured',cleared ? 'satisfactory' : prior || q.outcome === 'New issue' ? 'monitor' : 'information') +
+                (isNum(q.fromS) && isNum(q.toS) ? '<small>' + esc(num(q.fromS) + ' s to ' + num(q.toS) + ' s') + '</small>' : '') + '</td><td>' + cell('before') + '</td><td>' + cell('after') +
+                '</td><td>' + badge(outcomeLabel,cleared ? 'satisfactory' : prior || q.outcome === 'New issue' ? 'monitor' : 'information') +
+                (q.confirmationReason ? '<p>' + esc(q.confirmationReason) + '</p>' : q.basis === 'configuration' ? '<p>This check uses the filter parameters. A signal replay is not necessary.</p>' : '') +
                 (q.detail ? '<p>' + esc(q.detail) + '</p>' : '') + '</td></tr>';
         });
         return html + '</tbody></table></div>' + (support || '') + '</section>';
@@ -3675,11 +3722,47 @@ var TuningDialog = (function () {
         });
     }
 
+    function filterCliUnavailable(res) {
+        var rec = res && res.recommended;
+        return !!(rec && rec.status === 'recommended' && !res.cliFile &&
+            (!rec.params || Object.keys(rec.params).length));
+    }
+
+    function filterCliUnavailableHtml(res) {
+        if (!filterCliUnavailable(res)) return '';
+        var reasons = res.cliExport && res.cliExport.reasons || [];
+        return '<div class="tuning-ft-export-hold"><h6 class="tuning-h">Filter CLI not available</h6>' +
+            '<p>Keep the recorded filter values.</p>' +
+            (reasons.length ? '<ul>' + reasons.map(function(reason){return '<li>' + mdCode(reason) + '</li>';}).join('') + '</ul>' :
+                '<p>The app cannot prepare a filter CLI file. Examine the filter checks before you use the calculated values.</p>') + '</div>';
+    }
+
+    function filterOutcomeHtml(res) {
+        var rec = res.recommended || {}, excluded = res.bench || [];
+        var checks=rec.validation && rec.validation.checks;
+        if (rec.status === 'recommended') return '<p>The replay is in the vibration and time delay limits.</p>' +
+            (checks && checks.remaining ? '<p>The replay predicts less vibration. ' + esc(plural(checks.remaining,'measured filter problem')) + (checks.remaining === 1 ? ' is' : ' are') + ' not corrected. See the filter checks below.</p>' : '') +
+            (filterCliUnavailable(res) ? filterCliUnavailableHtml(res) : '<p>Next: Examine the CLI changes. Test the filter values in a new flight before the next tuning step.</p>');
+        var html = '<div class="tuning-ft-outcome"><h6 class="tuning-h">Next step</h6><p>Keep the recorded values. The checks of the calculated values are not all satisfactory. No CLI commands are available.</p>';
+        if (rec.reasons && rec.reasons.length) html += '<ul>' + rec.reasons.map(function(reason){return '<li>' + esc(reason) + '</li>';}).join('') + '</ul>';
+        if (excluded.length) {
+            html += '<h6 class="tuning-h">Flight periods not used</h6><ul>' + excluded.map(function(q){return '<li>' + esc('Log ' + logLabel(q.log) +
+                (isNum(q.fromS) && isNum(q.toS) ? ', ' + num(q.fromS) + ' s to ' + num(q.toS) + ' s' : '') + ': ' + q.reason) + '</li>';}).join('') + '</ul>';
+            html += '<p>Select a different flight with complete filter data.</p>';
+            if (excluded.some(function(q){return /no complete filter window/.test(q.reason);})) html += '<p>For the next flight, keep each PID profile active for a longer flight period.</p>';
+            if (excluded.some(function(q){return /no raw gyro/.test(q.reason);})) html += '<p>For the next flight, include the raw gyro data.</p>';
+        }
+        if ((res.model && res.model.parity || []).some(function(p){return !p.passed;})) html += '<p>Examine the replay model and input coverage below. A filter change cannot correct a replay error.</p>';
+        if (!excluded.length && res.model && res.model.passed) html += '<p>For a different time delay limit, change the limit and click Autotune again.</p>';
+        return html + '</div>';
+    }
+
     function filterWorkspaceHtml(m, env, opts) {
         var res = m.result, rec = res && res.recommended || {}, running = m.state === 'running', dirty = !!m.dirty,
             delay = m.maxAddMs === undefined ? .5 : m.maxAddMs, plots = [], compact = opts.compact,
             baseline = res && res.recordedConfigurations || m.baseline || [], recordedOnly = !!rec.params && !Object.keys(rec.params).length,
-            accepted = rec.status === 'recommended';
+            accepted = rec.status === 'recommended',
+            autotuned = m.hasAutotune || (res && res.mode !== 'simulation' && !m.stale);
         function detail(key,label,cls) {
             return '<details class="' + cls + '"' + (opts.openDetails && opts.openDetails[key] ? ' open' : '') + '><summary data-ft-detail="' + key + '">' + label + '</summary>';
         }
@@ -3698,23 +3781,38 @@ var TuningDialog = (function () {
         if (running) {
             var frac = isNum(m.fraction) ? Math.max(0,Math.min(1,m.fraction)) : 0;
             html += '<div class="tuning-ft-progress" role="status"><div class="tuning-progress-track"><div class="tuning-progress-bar tuning-ft-bar" style="width:' + (100*frac).toFixed(1) + '%"></div></div><span class="tuning-ft-progress-text">' + esc(m.text || FT.running) + '</span></div><button type="button" class="btn btn-default btn-sm tuning-ft-cancel">Cancel</button>';
-        } else html += '<button type="button" class="btn ' + (res ? 'btn-default' : 'btn-primary') + ' btn-sm tuning-ft-start"' + (opts.disabled ? ' disabled' : '') + '>' + (res ? 'Autotune again' : 'Autotune') + '</button>';
+        } else {
+            if (!autotuned) html += '<button type="button" class="btn btn-primary btn-sm tuning-ft-start"' + (opts.disabled ? ' disabled' : '') + '>Autotune</button>';
+            if (res) html += '<button type="button" class="btn btn-primary btn-sm tuning-ft-simulate"' + (opts.disabled ? ' disabled' : '') + '>Simulate again</button>';
+        }
         html += '</div></div>';
         if (m.unavailable) return {html:html + '<p class="tuning-na">' + esc(m.unavailable) + '</p></section></section>',plots:plots};
         if (m.state === 'failed') html += notice('error',esc(FT.failed) + ' ' + quoted(esc(m.error && (m.error.detail || m.error.message) || '')));
         if (m.state === 'canceled') html += '<p class="tuning-muted">' + esc(FT.canceled) + '</p>';
-        if (m.stale) html += notice('info','The inputs or time delay limit changed. Use autotune, or replay the changed values.');
+        if (m.stale) html += notice('info','The inputs or time delay limit changed. Click Autotune to calculate new values, or simulate the selected values.');
         if (compact) return {html:html + (res ? '<p>' + ftRecText(res) + '</p>' : '') + '</section><a href="#" class="tuning-tab-link" data-tab="filters">Open filter tuning</a></section>',plots:plots};
         var controls = '<div class="tuning-ft-controls"><label>Maximum added time delay (ms) <input class="tuning-ft-delay" type="number" min="0" max="20" step="0.05" value="' + esc(String(delay)) + '"' + (running ? ' disabled' : '') + '></label>' +
             '<span class="tuning-muted">Default: 0.5 ms. The limit applies to the increase from the recorded configuration at 10–30 Hz.</span></div>';
         html += controls;
         if (!res) return {html:html + '<p class="tuning-muted">Autotune calculates the parameter values. To change the recorded values, load them first.</p><button type="button" class="btn btn-default btn-sm tuning-ft-load"' +
             (opts.disabled || running ? ' disabled' : '') + '>Load recorded values</button></section>' + filterChecklistHtml(null,m.recordedChecks) + '</section>',plots:plots};
-        html += '<p>' + badge(accepted ? (res.mode === 'simulation' ? 'Replay checks satisfactory' : 'Values calculated') : 'No recommendation',accepted ? 'satisfactory' : 'monitor') + ' ' + ftRecText(res) + '</p>';
-        if (recordedOnly) html += '<p class="tuning-muted">Recorded filter replay. No filter values changed. Each interval uses its recorded configuration.</p>';
+        var previous = dirty || m.stale || running;
+        html += '<p>' + badge(previous ? 'Previous replay result' : accepted ? (res.mode === 'simulation' ? 'Replay limits satisfactory' : 'Values calculated') : 'No recommendation',previous ? 'information' : accepted ? 'satisfactory' : 'monitor') +
+            (recordedOnly && accepted ? '' : ' ' + ftRecText(res)) + '</p>';
+        if (previous) html += '<p class="tuning-muted">These results use the previous values or time delay limit.</p>';
+        if (recordedOnly) html += '<p class="tuning-muted">' + (res.mode === 'simulation' ? 'Recorded filter replay.' : 'Autotune selected no filter change.') + ' No filter values changed. Each interval uses its recorded configuration.</p>';
+        if (accepted && !previous) {
+            var remaining = filterChecklistRows(res,m.recordedChecks).reduce(function(ids,q){
+                var unresolved = q.after && q.after.issues || ((!q.after || q.outcome === 'Not evaluated') && q.before && q.before.issues);
+                if (unresolved && ids.indexOf(q.id) < 0) ids.push(q.id);
+                return ids;
+            },[]);
+            if (remaining.length) html += '<p>Filter checks with remaining problems: ' + esc(remaining.join(', ')) + '.</p><p>Before the flight test, examine the remaining problems in Filter checks.</p>';
+        }
+        if ((!recordedOnly || !accepted) && !dirty && !m.stale && !running) html += filterOutcomeHtml(res);
         if (!recordedOnly && rec.delay && isNum(rec.delay.maxAddMs)) html += '<p>Added time delay: <strong>' + esc(num(rec.delay.maxAddMs) + ' ms') + '</strong></p>';
-        html += '<p class="tuning-ft-draft-note' + (dirty ? '' : ' tuning-hide') + '">Replay the changed values. The plots and checks show the last replay.</p>' +
-            '<div class="tuning-ft-section-head"><div class="tuning-ft-actions"><button type="button" class="btn btn-default btn-sm tuning-ft-simulate"' + (running ? ' disabled' : '') + '>Replay values</button>' +
+        html += '<p class="tuning-ft-draft-note' + (dirty ? '' : ' tuning-hide') + '">Simulate the changed values again. The plots and checks show the last result.</p>' +
+            '<div class="tuning-ft-section-head"><div class="tuning-ft-actions">' +
             '<button type="button" class="btn btn-default btn-sm tuning-ft-reset"' + (running ? ' disabled' : '') + '>Use recorded values</button>' +
             '<button type="button" class="btn btn-default btn-sm tuning-ft-restore"' + (running || !m.hasAutotune ? ' disabled' : '') + '>Use autotune values</button></div>' +
             '<label class="tuning-ft-hide-label"><input type="checkbox" class="tuning-ft-hide-unchanged"' + (opts.hideUnchanged ? ' checked' : '') + '> Show changed values only</label></div>' +
@@ -3738,8 +3836,9 @@ var TuningDialog = (function () {
         // presenting another checklist with different apparent criteria.
         var support = detail('diagnostics','Replay model and input coverage','tuning-ft-diagnostics') + '<h6 class="tuning-h">Model check</h6><p class="tuning-muted">' +
             esc(FT.modelNote(res.model && res.model.rules)) + '</p>' + parityHtml(res.model) + ftValidationHtml(res);
-        if (res.bench && res.bench.length) support += '<ul>' + res.bench.map(function(q){return '<li>' + esc('Log ' + logLabel(q.log) + ': ' + q.reason) + '</li>';}).join('') + '</ul>';
         if (res.model && res.model.coverage) support += '<p>' + res.model.coverage.map(function(c){return esc('Log ' + logLabel(c.log) + ': gyro ' + c.gyroHz + ' Hz, filters ' + c.filterHz + ' Hz, recorded samples ' + c.logHz + ' Hz.');}).join(' ') + '</p>';
+        var notes = (Array.isArray(res.notes) ? res.notes : []).concat(res.model && Array.isArray(res.model.notes) ? res.model.notes : []).filter(function(n){return typeof n === 'string' && n.trim();});
+        if (notes.length) support += '<h6>Analysis information</h6><ul>' + notes.map(function(n){return '<li>' + esc(n) + '</li>';}).join('') + '</ul>';
         support += '<h6>Filter analysis coverage</h6><div class="tuning-table-wrap"><table class="tuning-table"><thead><tr><th>Parameters</th><th>Result</th><th>Inputs and limits</th></tr></thead><tbody>' +
             (res.capabilities || []).map(function(c){return '<tr><td><code>' + esc(c.names) + '</code></td><td>' + esc(c.status) + '</td><td>' + esc(c.detail) + '</td></tr>';}).join('') + '</tbody></table></div></details>';
         html += filterChecklistHtml(res,m.recordedChecks,support);
@@ -3756,7 +3855,7 @@ var TuningDialog = (function () {
             esc('Log ' + logLabel(t.log) + ', ' + (t.configuration ? configLabel(t.configuration) : 'configuration unknown') + ', ' + profileLabel(t.profile) + ', ' + t.t[0].toFixed(3) + ' to ' + t.t[t.t.length-1].toFixed(3) + ' s') + '</option>';}).join('') + '</select></label>';
         html += '<p class="tuning-muted">' + (local ? 'Each spectrum uses the selected time interval at the recorded sample rate.' : 'The spectra average all flight windows used by the replay. The time plots show the selected interval only.') + '</p>' +
             '<p class="tuning-muted">Raw data is recorded gyroRAW. Previous filter is recorded gyroADC. New filter is calculated from the same flight input.</p>' +
-            (accepted || recordedOnly ? '' : '<p class="tuning-na">The new filter result is not confirmed.</p>') +
+            (accepted || recordedOnly ? '' : '<p class="tuning-na">The new filter result is not recommended.</p>') +
             '<fieldset class="tuning-ft-curves"><legend>Show curves on all axes</legend>' + [{key:'raw',name:'Raw data',color:C.grey},{key:'old',name:'Previous filter (recorded)',color:C.blue},{key:'new',name:'New filter (calculated)',color:C.green}].map(function(q){
                 var available = pairs.some(function(p){return [p.time,p.frequency].some(function(it){return it && it.spec.series.some(function(s){return s.ftCurve === q.key;});});});
                 return '<label><input type="checkbox" class="tuning-ft-curve" data-ft-curve="' + q.key + '"' + (available && (!opts.curves || opts.curves[q.key] !== false) ? ' checked' : '') + (available ? '' : ' disabled') +
@@ -3768,15 +3867,7 @@ var TuningDialog = (function () {
             if (p.frequency) p.frequency.spec = Object.assign({},p.frequency.spec,{title:(local ? 'Spectrum of selected interval, ' : 'Flight spectrum, ') + p.axis});
             html += plot(p.time,true) + plot(p.frequency,true) + '</div></section>';
         });
-        html += detail('replay','Recorded output and model replay','tuning-ft-details') + '<p>These curves use the previous filter values. Compare the recorded output with the replay.</p>';
-        pairs.forEach(function(p){
-            html += '<div class="tuning-ft-plot-pair">';
-            [p.time,p.frequency].forEach(function(it){
-                html += plot(it ? {spec:Object.assign({},it.spec,{title:'Previous filter replay, ' + p.axis + (it === p.time ? ' (time)' : ' (frequency)'),series:it.spec.series.filter(function(s){return s.ftCurve === 'old' || s.ftCurve === 'replay';})})} : null);
-            });
-            html += '</div>';
-        });
-        return {html:html + '</details></section></section>',plots:plots};
+        return {html:html + '</section></section>',plots:plots};
     }
 
     // The filter calculation as HTML. m: { state: "none" | "running" | "done" | "failed" | "canceled", fraction, text (the
@@ -3797,8 +3888,8 @@ var TuningDialog = (function () {
             html += '<div class="tuning-ft-progress"><div class="tuning-progress-track"><div class="tuning-progress-bar tuning-ft-bar" style="width: ' + (frac === null ? 100 : frac * 100).toFixed(1) + '%"></div></div>' +
                 '<span class="tuning-ft-progress-text">' + esc((m.text ? oneLine(m.text) : FT.running) + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "")) + "</span></div>" +
                 '<button type="button" class="btn btn-default btn-sm tuning-ft-cancel">Cancel</button>';
-        } else {
-            html += '<button type="button" class="btn ' + (res ? "btn-default" : "btn-primary") + ' btn-sm tuning-ft-start"' + (opts.disabled ? " disabled" : "") + ">" + esc(res && !m.stale ? FT.again : FT.start) + "</button>";
+        } else if (!res || m.stale) {
+            html += '<button type="button" class="btn btn-primary btn-sm tuning-ft-start"' + (opts.disabled ? " disabled" : "") + ">" + esc(FT.start) + "</button>";
         }
         html += "</div>";
         if (m.state === "canceled") html += '<p class="tuning-muted">' + esc(FT.canceled) + "</p>";
@@ -3842,7 +3933,7 @@ var TuningDialog = (function () {
         else if (ftDelayText(res)) html += '<p class="tuning-ft-text">' + ftDelayText(res) + "</p>";
         var rows = Array.isArray(rec.fullRows) ? rec.fullRows : Array.isArray(rec.rows) ? rec.rows.filter(function (q) { return q && q.name; }) : [];
         if ((good || res.version === 2) && rows.length && !opts.compact) {
-            html += '<h6 class="tuning-h">' + (good ? "Complete filter configuration" : "Tested filter configuration (not confirmed)") + '</h6>';
+            html += '<h6 class="tuning-h">' + (good ? "Complete filter configuration" : "Tested filter configuration (no recommendation)") + '</h6>';
             html += '<div class="tuning-table-wrap"><table class="tuning-table tuning-ft-rows"><thead><tr><th>Parameter</th><th>PID profile</th><th>From</th><th>To</th><th>Source of the value</th></tr></thead><tbody>' +
                 rows.map(function (q) {
                     return "<tr><td>" + parameterHtml(q.name) + "</td><td>" + esc(q.scope === "profile" ? profileLabel(isNum(q.profile) ? q.profile : 0) : "All PID profiles") + "</td><td><code>" + esc(q.from === null || q.from === undefined ? "?" : String(q.from)) +
@@ -3882,11 +3973,26 @@ var TuningDialog = (function () {
             }
         }
         var notes = (Array.isArray(res.notes) ? res.notes : []).concat(res.model && Array.isArray(res.model.notes) ? res.model.notes : []).filter(function (n) { return typeof n === "string" && n.trim(); });
-        if (notes.length) html += '<details class="tuning-toolkit" data-ste="quoted"><summary>Toolkit text (not STE)</summary><ul>' + notes.map(function (n) { return "<li>" + esc(n) + "</li>"; }).join("") + "</ul></details>";
+        if (notes.length) html += '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul>' + notes.map(function (n) { return "<li>" + esc(n) + "</li>"; }).join("") + "</ul></details>";
         return { html: html + "</section>", plots: plots };
     }
 
     var CONTROL_STEPS = ['governor','cyclic','tail','cycomp','tailcomp'];
+    var controlCliAuthorization = new WeakMap(), recordedConfigurationCli = new WeakSet();
+    function automaticControlChange(rec) {
+        if (!Array.isArray(rec.cli) || !rec.cli.length) return false;
+        if (CONTROL_STEPS.indexOf(rec.node || rec.area) >= 0 || rec.controlTune) return true;
+        return rec.cli.some(function (line) { return /^\s*set\s+(?:(?:roll|pitch|yaw)_[a-z_]*gain|gov_[a-z_]*gain|cyclic_cross_coupling_(?:gain|ratio))\s*=/i.test(String(line)); });
+    }
+    function acceptedControlResult(model, configuration, step) {
+        var r=model && model.result, c=r && r.controller, t=r && r.twin;
+        return !!(model && model.state==='done' && r && r.version===2 && r.status==='flight-test-required' &&
+            r.configuration===configuration && r.step===step && t && t.schema==='rotorflight-digital-twin' && t.version===1 &&
+            t.status==='validated' && t.controlEligible===true && c && c.compatibility && c.compatibility.supported===true &&
+            c.parity && c.parity.pass===true && c.sensorParity && c.sensorParity.pass===true &&
+            Array.isArray(c.closedLoopParity) && c.closedLoopParity.length>0 && c.closedLoopParity.every(function (q) {return q.pass===true;}) &&
+            r.search && r.search.holdout && r.search.holdout.pass===true);
+    }
 
     function flightPlanHtml(plan) {
         if (!plan || !plan.maneuvers || !plan.maneuvers.length) return '';
@@ -3932,7 +4038,7 @@ var TuningDialog = (function () {
         function evidenceHtml(row) {
             var f = env.findingOf(row) || row, ev = f.evidence, spans = ev && Array.isArray(ev.spans) ? ev.spans : [],
                 context = [f.id, isNum(f.log) ? 'Log ' + logLabel(f.log) : '', findingWhere(f,' · ')].filter(Boolean).join(' · '),
-                times = spans.filter(function(s){return isNum(s.t0) && isNum(s.t1);}).slice(0,3).map(function(s){return secs(s.t0) + ' to ' + secs(s.t1);}).join(', ');
+                times = spans.filter(function(s){return isNum(s.t0) && isNum(s.t1);}).slice(0,3).map(function(s){return num(s.t0) + ' s to ' + num(s.t1) + ' s';}).join(', ');
             return '<div class="tuning-ct-evidence"><p class="tuning-muted">' + esc(context) + '</p>' +
                 (f.id === 'C7' || f.module === 'report' ? '<p><strong>Model estimate, not measured</strong></p>' : '') +
                 '<p><strong>' + (valueHtml(f) || 'Not measured') + '</strong>' + (limitHtml(f) ? ' · Limit: ' + limitHtml(f) : '') + '</p>' +
@@ -3949,13 +4055,27 @@ var TuningDialog = (function () {
         var html = '<section class="tuning-ct tuning-ft-workspace" aria-label="Control loop tuning"><div class="tuning-ft-heading"><div>' +
             '<span class="tuning-ct-eyebrow">CONTROL LOOP AUTOTUNE</span><h5 class="tuning-h">' + esc(title) + '</h5>' +
             '<p class="tuning-muted">Examine the recorded problems and the changes that can help.</p></div><div class="tuning-ft-actions">' +
-            (running ? '<span role="status">The app selects a control change.</span><button type="button" class="btn btn-default btn-sm tuning-ct-cancel">Cancel</button>' :
-                '<button type="button" class="btn btn-primary btn-sm tuning-ct-start"' + (disabled ? ' disabled' : '') + '>Autotune</button>') + '</div></div>' +
-            '<p class="tuning-ct-limit"><strong>Flight test necessary.</strong> The log measures the response with the recorded values. A new flight must test the recommended values.</p>';
+            (running ? '<span role="status">The app makes and tests the helicopter model.</span><button type="button" class="btn btn-default btn-sm tuning-ct-cancel">Cancel</button>' :
+                res ? '' : '<button type="button" class="btn btn-primary btn-sm tuning-ct-start"' + (disabled ? ' disabled' : '') + '>Autotune</button>') + '</div></div>' +
+            '<p class="tuning-ct-limit"><strong>Flight test necessary.</strong> The log measures the response with the recorded values. A new flight must test the recommended values.</p>' +
+            (env.parameterEvidence ? env.parameterEvidence() : '');
         if (disabled) html += '<p class="tuning-na">' + esc(m.stale ? 'The analysis uses different inputs. Start analysis for the selected inputs before autotune.' :
             !d ? 'Select one recorded configuration before autotune.' : !d.pidProfile ? 'The PID profile is unknown. No control change is available.' : 'This configuration has no flight data in the analysis.') + '</p>';
         if (m.state === 'failed') html += notice('error','The control analysis failed. ' + quoted(esc(m.error || '')));
         if (m.state === 'canceled') html += '<p role="status">The control analysis was canceled.</p>';
+        // Keep the next action above the supporting measurements. Diagnostics
+        // are available immediately, without requiring an Autotune click.
+        if (!res && !m.stale && d) {
+            var procedures = recsOf(r, d.id).filter(function(rec) { return (rec.node || rec.area) === step && rec.procedure; });
+            var seenProcedures = [];
+            procedures.forEach(function(rec) {
+                var key = JSON.stringify(rec.procedure);
+                if (seenProcedures.indexOf(key) >= 0) return;
+                seenProcedures.push(key);
+                html += procedureHtml(rec) + (rec.evidence || []).slice(0, 2).map(evidenceHtml).join('');
+            });
+        }
+        var beforeProblems = html.length;
         html += '<section class="tuning-ct-section"><div class="tuning-ct-section-head"><h5 class="tuning-h">Recorded problems</h5>' +
             badge(bad.length ? plural(bad.length,'result') + ' to examine' : 'Recorded checks',bad.length ? 'monitor' : 'information') + '</div>';
         if (d) html += '<p class="tuning-muted">' + esc(configLabel(d.id) + ' · ' + profileLabel(d.pidProfile)) + '</p>';
@@ -3966,19 +4086,148 @@ var TuningDialog = (function () {
         if (bad.length > 4) html += '<p class="tuning-muted">' + esc('The first 4 of ' + bad.length + ' results are shown. All recorded checks are available below.') + '</p>';
         var open = view.compare && view.compare.where === step ? env.findingOf(view.compare.key) : null;
         if (open) html += '<div class="tuning-order-compare">' + env.compareHtml(open,step) + '</div>';
-        html += '</section><section class="tuning-ct-section tuning-ct-recommendations"><h5 class="tuning-h">Recommended changes</h5>';
+        html += '</section>';
+        var recordedProblems = html.slice(beforeProblems);
+        html = html.slice(0, beforeProblems);
+        html += '<section class="tuning-ct-section tuning-ct-recommendations"><h5 class="tuning-h">Tuning result</h5>';
         if (res) html += '<p role="status">' + esc(res.reason) + '</p>';
-        else if (!disabled && !running) html += '<p class="tuning-muted">Start autotune to select a change from the recorded problems.</p>';
+        else if (!disabled && !running) html += '<p class="tuning-muted">Start autotune to make a helicopter model from selected flight data. The app tests control values with this model.</p>';
+        if (res && res.twin) {
+            var twin=res.twin, validation=twin.validation && twin.validation.test, coverage=twin.coverage || {},
+                excluded=coverage.excluded || [], accepted=coverage.intervals || [];
+            html += '<section class="tuning-ct-section"><h6 class="tuning-h">Digital twin</h6>' +
+                '<p>A digital twin is a model of this helicopter. Its parameters come from recorded inputs and sensor outputs.</p>' +
+                '<p><strong>' + esc(twin.status === 'validated' ? 'Model checks satisfactory.' : 'Model checks not satisfactory.') + '</strong> ' +
+                '<span data-ste="quoted">' + esc(twin.craft && twin.craft.craft || 'Craft unknown') + '</span></p>' +
+                '<p>The model calculates angular rates. Headspeed and collective are recorded inputs. It does not calculate position or acceleration.</p>' +
+                '<p>' + esc('Selected periods: ' + accepted.length + '. Periods not used: ' + excluded.length + '.') + '</p>' +
+                '<button type="button" class="btn btn-default btn-sm tuning-ct-save-model">Save helicopter model</button>';
+            if (twin.mechanicalCohort) {
+                var cohort=twin.mechanicalCohort, files=cohort.sources || [];
+                html += '<h6>Model flight files</h6><p>Selected files supply the model data.</p><ul>' +
+                    files.map(function(file){return '<li><span data-ste="quoted">' + esc(file.fileName) + '</span>: ' +
+                        (file.selected ? 'Selected' : 'Not used') + '</li>';}).join('') + '</ul>';
+            }
+            if (twin.controlEligible === false) html += '<p><strong>Control changes are not available.</strong></p>';
+            if (twin.confidence) {
+                var confidence=twin.confidence, levels={high:'High',moderate:'Limited',low:'Low',unavailable:'Not available'};
+                html += '<h6>Model confidence: ' + esc(levels[confidence.level] || 'Not available') + '</h6>' +
+                    '<p>This result uses errors from data kept out of the model fit. A new flight must test all gain changes.</p>' +
+                    bulletList((confidence.reasons || []).map(esc),'Model confidence limits','is-caveat');
+                if (confidence.axes && confidence.axes.some(function(a){return a.rmseInterval95;})) html +=
+                    '<p>Filtered RMS error, 95% confidence interval:</p><ul>' + confidence.axes.map(function(a){
+                        return '<li>' + esc(cap(a.axis)) + ': ' + (a.rmseInterval95 ? num(a.rmseInterval95[0]) + ' to ' + num(a.rmseInterval95[1]) + ' deg/s' : 'Not available') + '</li>';
+                    }).join('') + '</ul>';
+            }
+            if (twin.pitchLimits) html += detail('pitch-limits','Pitch limits from the flight controller',function(){
+                var limits=twin.pitchLimits;
+                return '<p>These limits come from the flight controller configuration. They require correct mixer calibration.</p>' +
+                    '<div class="tuning-table-wrap"><table class="table table-condensed"><thead><tr><th>Control</th><th>Pitch limit (deg)</th></tr></thead><tbody>' +
+                    ['roll','pitch','collective','tail'].map(function(axis){var q=limits[axis];return '<tr><td>' + esc(cap(axis)) + '</td><td>' +
+                        (q && q.degrees ? num(q.degrees[0]) + ' to ' + num(q.degrees[1]) : 'Not available') + '</td></tr>';}).join('') +
+                    '<tr><td>Total main rotor pitch</td><td>' + (limits.totalMainPitch && isNum(limits.totalMainPitch.degrees) ? num(limits.totalMainPitch.degrees) : 'Not available') +
+                    '</td></tr></tbody></table></div><p>The tail angles are changes from the center trim. Servo motor dynamics are not in this model.</p>';
+            });
+            if (validation && validation.axes) {
+                html += '<p>' + (twin.validation.split && twin.validation.split.independentFlights ? 'The table uses different test flights.' : 'The table uses different test periods from the same flight logs.') +
+                    ' Raw error includes vibration that the model does not calculate.</p>' +
+                    '<div class="tuning-table-wrap"><table class="table table-condensed"><thead><tr><th>Axis</th><th>Raw RMS error (deg/s)</th><th>Filtered RMS error (deg/s)</th><th>Filtered error (%)</th><th>Mean error (deg/s)</th></tr></thead><tbody>' +
+                    validation.axes.map(function(a,i){var filtered=validation.controlledAxes && validation.controlledAxes[i];
+                        return '<tr><td>' + esc(cap(a.axis)) + '</td><td>' + num(a.rmse) + '</td><td>' + num(filtered && filtered.rmse) + '</td><td>' + num(filtered && filtered.normalizedRMSE*100) + '</td><td>' + num(a.bias) + '</td></tr>';
+                    }).join('') + '</tbody></table></div>' +
+                    '<p>The same low-pass filter applies to the two signals for the filtered error. Other checks examine the frequency range.</p>';
+            }
+            if ((twin.reasons || []).length || (twin.controlReasons || []).length || (res.controller && res.controller.reasons || []).length) html +=
+                bulletList((twin.reasons || []).concat(twin.controlReasons || [],res.controller && res.controller.reasons || []).map(esc), 'Model limits', 'is-caveat');
+            html += detail('model-inputs','Selected flight periods and periods not used',function(){
+                return '<p>The saved model includes each selected period. It also records why other periods are not used.</p><pre>' +
+                    esc(JSON.stringify({used:accepted,excluded:excluded},null,2)) + '</pre>';
+            });
+            var prediction=twin.predictions && twin.predictions[0];
+            if (prediction && prediction.predicted && prediction.measured) html += detail('model-signals','Recorded and calculated sensor outputs',function(){
+                var t=prediction.predicted[0].map(function(_,i){return prediction.fromS+i/prediction.rate;});
+                return '<p>These calculations use recorded control inputs. Only the first gyro sample sets the initial model values.</p>' +
+                    ['roll','pitch','yaw'].map(function(a,i){return plot(item({title:cap(a)+' model check',
+                        x:{label:'time',unit:'s'},y:{label:'angular rate',unit:'deg/s'},series:[
+                            line('Recorded',t,prediction.measured[i],C.blue),line('Calculated',t,prediction.predicted[i],C.orange)]}));}).join('');
+            });
+            html += '</section>';
+        }
         if (rows.length) html += parameterTable(rows,'Recommended');
         if (res && res.recommendations && res.recommendations.length) {
             html += '<h6 class="tuning-h">Effect of this change</h6><p class="tuning-muted">These are possible effects. The recorded problems stay open until a new flight tests the changes.</p>' +
                 res.recommendations.map(function(rec,i){return '<article class="tuning-ct-reason"><h6>' + parameterHtml(rec.parameter) + ' · ' + esc(profileText(rec)) + '</h6>' +
-                    ftParas(rec.text || ruleText(rec)) + staleRecHtml(rec) +
+                    recommendationBody(rec) + staleRecHtml(rec) +
                     '<div class="tuning-label">Results for this change</div>' + (rec.evidence || []).map(evidenceHtml).join('') +
                     detail('change-' + i,'Rule and limits',function(){return ftParas(ruleText(rec)) + sourcesHtml(rec) +
                         bulletList((rec.caveats || []).map(function(c){return esc(oneLine(c));}), 'Note', 'is-caveat');}) + '</article>';}).join('');
-            html += '<div class="tuning-ft-actions"><button type="button" class="btn btn-default btn-sm tuning-ct-reset">Use recorded values</button><a href="#" class="tuning-tab-link" data-tab="export">Examine CLI changes and flight maneuvers</a></div>' +
+            html += '<div class="tuning-ft-actions"><button type="button" class="btn btn-primary btn-sm tuning-ct-trial">Export only this test</button><button type="button" class="btn btn-default btn-sm tuning-ct-reset">Use recorded values</button><a href="#" class="tuning-tab-link" data-tab="export">Examine all CLI changes and flight maneuvers</a></div>' +
+                '<p class="tuning-muted">Export only this test selects this change group and its recorded configuration. Test other changes in different flights.</p>' +
                 detail('flight','Flight test necessary',flightPlanHtml(res.flightPlan));
+        }
+        if (res && res.proposals && res.proposals.length) {
+            html += '<h6 class="tuning-h">Changes that must wait</h6>' +
+                '<p>These values do not enter the CLI file. Complete the prerequisite steps first.</p>' +
+                '<p>Then record a new flight and start autotune again. The new measurements can change these values.</p>' +
+                parameterTable(res.proposals.map(function(q){return q.row;}),'Possible value');
+            html += res.proposals.map(function(rec,i){
+                var causes = (rec.causes || []).filter(function(c){return c.holds !== false;}).map(function(c){
+                    return 'Correct checks ' + (c.ids || []).join(', ') + ' first (' + c.rule + ').';
+                });
+                return '<article class="tuning-ct-reason"><h6>' + parameterHtml(rec.parameter) + ' · ' + esc(profileText(rec)) + '</h6>' +
+                    ftParas(rec.text || ruleText(rec)) + staleRecHtml(rec) +
+                    '<div class="tuning-label">Results for this change</div>' + (rec.evidence || []).map(evidenceHtml).join('') +
+                    bulletList((rec.blockedBy || []).concat(causes).map(esc), 'Complete first', 'is-blocked') +
+                    detail('proposal-' + i,'Rule and limits',function(){return ftParas(ruleText(rec)) + sourcesHtml(rec) +
+                        bulletList((rec.caveats || []).map(function(c){return esc(oneLine(c));}), 'Note', 'is-caveat');}) + '</article>';
+            }).join('');
+        }
+        if (res && res.prerequisites && res.prerequisites.length) {
+            function prerequisiteWaits(rec) {
+                return rec.severity === 'action' && (isBlocked(rec) || heldByCause(rec) || !!(rec.gate && rec.gate.held && rec.gate.held.length));
+            }
+            var prerequisiteNodes = [];
+            var prerequisites = res.prerequisites.map(function(rec, i) {
+                var node = rec.node || rec.area;
+                if (prerequisiteNodes.indexOf(node) < 0) prerequisiteNodes.push(node);
+                return { rec: rec, node: prerequisiteNodes.indexOf(node), index: i, waits: prerequisiteWaits(rec) ? 1 : 0 };
+            }).sort(function(a,b) { return a.node-b.node || a.waits-b.waits || a.index-b.index; }).map(function(q) { return q.rec; });
+            function prerequisiteHtml(rec) {
+                var waits = prerequisiteWaits(rec);
+                var causes = (rec.causes || []).filter(function(c){return c.holds !== false;}).map(function(c){return 'Correct checks ' + (c.ids || []).join(', ') + ' first (' + c.rule + ').';});
+                var related = rec.severity === 'action' ? [] : (rec.causes || []).map(function(c){return 'Examine checks ' + (c.ids || []).join(', ') + ' with this problem (' + c.rule + ').';});
+                return '<article class="tuning-ct-reason"><h6>' + mdCode(rec.title) + '</h6>' +
+                    (waits ? '<p><strong>This change must wait.</strong> Complete its prerequisite steps and record a new flight first.</p>' + bulletList((rec.blockedBy || []).concat(causes).map(esc),'Complete first','is-blocked') : '') +
+                    recommendationBody(rec) + bulletList(related.map(esc),'Related checks','') +
+                    staleRecHtml(rec) + (rec.evidence || []).map(evidenceHtml).join('') +
+                    '<a href="#" class="tuning-tab-link" data-tab="' + esc(rec.node || rec.area) + '">Open the prerequisite step</a></article>';
+            }
+            html += '<h6 class="tuning-h">Prerequisite steps</h6>' + prerequisites.slice(0,3).map(prerequisiteHtml).join('');
+            if (prerequisites.length > 3) {
+                var otherPrerequisites = prerequisites.slice(3), otherIds = Array.from(new Set(otherPrerequisites.map(function(rec) {
+                    return String(rec.id).split(':').find(function(part) { return /^[A-Z]\d+$/.test(part); });
+                }).filter(Boolean)));
+                html += detail('prerequisites', esc('More prerequisite checks (' + otherPrerequisites.length + ')' + (otherIds.length ? ': ' + otherIds.join(', ') : '')), function() {
+                    return otherPrerequisites.map(prerequisiteHtml).join('');
+                });
+            }
+        }
+        if (res && res.experiments && res.experiments.length) {
+            html += '<h6 class="tuning-h">Diagnostic tests</h6><p>These tests collect data. They do not correct the recorded problem.</p>' + res.experiments.map(function(rec){
+                return '<article class="tuning-ct-reason"><h6>' + esc(rec.title) + '</h6><p>' + esc(profileLabel(rec.profile)) + '</p>' +
+                    ftParas(rec.text) + ftParas(rec.rule) + staleRecHtml(rec) + (rec.evidence || []).map(evidenceHtml).join('') + '</article>';
+            }).join('');
+        }
+        if (res && res.guidance && res.guidance.length) {
+            var shownGuidance = [];
+            html += '<h6 class="tuning-h">Next steps and measurements</h6>' + res.guidance.map(function(rec,i){
+                var key = rec.procedure && JSON.stringify(rec.procedure), duplicate = key && shownGuidance.indexOf(key) >= 0;
+                if (key && !duplicate) shownGuidance.push(key);
+                return '<article class="tuning-ct-reason"><h6>' + mdCode(rec.title) + '</h6>' + recommendationBody(rec, duplicate) +
+                    staleRecHtml(rec) + (rec.evidence || []).map(evidenceHtml).join('') +
+                    detail('diagnosis-' + i,'Rule and limits',function(){return ftParas(ruleText(rec)) + sourcesHtml(rec) +
+                        bulletList((rec.caveats || []).map(function(c){return esc(oneLine(c));}), 'Note', 'is-caveat');}) + '</article>';
+            }).join('');
         }
         if (res && res.prediction) {
             html += detail('model','Model estimate (not measured)',function(){
@@ -3988,7 +4237,7 @@ var TuningDialog = (function () {
             });
         }
         if (res && res.deferred && res.deferred.length) html += detail('deferred','Changes that must wait','<ul>' + res.deferred.map(function(q){return '<li><strong>' + mdCode(q.title) + '</strong><p>' + esc(q.reason) + '</p></li>';}).join('') + '</ul>');
-        html += '</section><section class="tuning-ct-section"><h5 class="tuning-h">Recorded response</h5>';
+        html += '</section>' + recordedProblems + '<section class="tuning-ct-section"><h5 class="tuning-h">Recorded response</h5>';
         var curves = curvesInView(r,view);
         html += '<div class="tuning-plot-toolbar">';
         if (step === 'cyclic') html += '<div class="btn-group btn-group-xs">' + ['roll','pitch'].map(function(a){return '<button type="button" class="btn btn-default tuning-axis' + (axis === a ? ' active' : '') + '" data-axis="' + a + '">' + cap(a) + '</button>';}).join('') + '</div>';
@@ -4295,21 +4544,27 @@ var TuningDialog = (function () {
         recs.forEach(function (rec, i) {
             var sev = (REC_SEVERITY[rec.severity] || REC_SEVERITY.info).label;
             out.push("### " + (i + 1) + ". " + oneLine(rec.title) + " (" + sev + (isBlocked(rec) ? ", blocked" : "") + (causesOf(rec).length ? ", possible result" : "") + ")", "");
+            if (rec.procedure) {
+                out.push('**Do next: ' + oneLine(rec.procedure.title) + '**', '');
+                (rec.procedure.steps || []).forEach(function(s, n) { out.push((n + 1) + '. ' + oneLine(s)); });
+                out.push('', oneLine(rec.procedure.after), '', 'Result to look for: ' + oneLine(rec.procedure.success), '', '**Measurements**', '');
+            }
             if (rec.text) out.push(oneLine(rec.text), "");
             if (rec.parameter) out.push("- Parameter: `" + oneLine(rec.parameter) + "` " + paramText(rec));
             out.push("- Area: " + oneLine(REC_AREA_LABEL[rec.area] || rec.area) + "." + (confidenceText(rec.confidence) ? " Confidence: " + confidenceText(rec.confidence) + "." : ""));
             if (rec.rule) out.push("- Rule: " + oneLine(rec.rule));
             (rec.blockedBy || []).forEach(function (b) { out.push("- Blocked: " + oneLine(b)); });
-            causesOf(rec).forEach(function (c) { out.push("- Possible result of: " + oneLine([c.rule, c.name].filter(Boolean).join(" ")) + (c.first ? ". Do first: " + oneLine(Array.isArray(c.first) ? c.first.join(" ") : c.first) : "")); });
+            causesOf(rec).forEach(function (c) { out.push("- Possible result of: " + oneLine([c.rule, c.name].filter(Boolean).join(" ")) + (c.first ? (rec.severity === 'action' && c.holds !== false ? ". Do first: " : ". Examine: ") + oneLine(Array.isArray(c.first) ? c.first.join(" ") : c.first) : "")); });
             (rec.caveats || []).forEach(function (c) { out.push("- Note: " + oneLine(c)); });
             if (staleOf(rec)) out.push("- " + FRESH.badge + ": " + (oneLine(staleOf(rec).text) || FRESH.period));
-            table(["Check", "Log", "Profile and axis", "Value", "Limit", "Source", "Result", "Toolkit text (not STE)", FRESH.badge], (rec.evidence || []).map(function (e) {
+            table(["Check", "Log", "Profile and axis", "Value", "Limit", "Source", "Result", "Analysis information", FRESH.badge], (rec.evidence || []).map(function (e) {
                 return [e.id, logLabel(e.log), where(e), value(e), limitTextOf(e), e.source, summaryOf(e), e.text, staleText(e)];
             }));
             if (hasCli(rec)) out.push("```", rec.cli.join("\n"), "```", "");
+            else if (automaticControlChange(rec)) out.push(noCliText(rec), "");
         });
         var script = (r.advice && r.advice.script) || "";
-        if (script) out.push("## CLI script for all changes", "", "```", script, "```", "");
+        if (script && !automaticControlChange({cli:script.split("\n")})) out.push("## CLI script for all changes", "", "```", script, "```", "");
         if (Array.isArray(r.decisions) && r.decisions.length) {
             out.push("## Gain analysis");
             table(["Axis", "Headspeed", "Flights", "Windows", "Result", FRESH.badge], r.decisions.map(function (d) {
@@ -4318,7 +4573,7 @@ var TuningDialog = (function () {
             }));
         }
         out.push("## Results: problems, notes and analysis errors");
-        table(["Status", "Check", "Log", "Profile and axis", "Value", "Limit", "Source", "Result", "Toolkit text (not STE)", FRESH.badge], (r.findings || []).filter(function (f) {
+        table(["Status", "Check", "Log", "Profile and axis", "Value", "Limit", "Source", "Result", "Analysis information", FRESH.badge], (r.findings || []).filter(function (f) {
             return rankOf(f) <= SEVERITY_RANK.note;
         }).sort(SORTS.severity).map(function (f) {
             return [STATUS[findingStatus(f)], f.id, logLabel(f.log), where(f), value(f), limitTextOf(f), f.source, summaryOf(f), f.text, staleText(f)];
@@ -4368,7 +4623,7 @@ var TuningDialog = (function () {
         }
         var notes = notesOf(r);
         if (notes.length) out.push("## Notes", "", notes.map(function (n) { return "- " + oneLine(n); }).join("\n"), "");
-        out.push("---", "", "## Toolkit report (not STE)", "", r.reportMarkdown || "(none)", "");
+        out.push("---", "", "## Detailed analysis report", "", r.reportMarkdown || "(none)", "");
         return out.join("\n");
     }
 
@@ -4483,7 +4738,7 @@ var TuningDialog = (function () {
             details: detailHtml,
             filter: resultFilter,
             seek: function (li, t, what, segment) { seekTo(li, shown ? frameOf(shown.result, li, t, segment) : t, what); },
-            copy: function (text) { copyTexts.push(String(text)); return copyTexts.length - 1; },
+            copy: function (text, rec) { copyTexts.push({text:String(text),rec:rec}); return copyTexts.length - 1; },
             plotId: function () { return uid + "-plot-" + (++plotSeq); },
             recId: function (i) { return uid + "-rec-" + i; },
             // a finding of the result, from its key or fid, or the finding behind a recommendation's evidence row
@@ -4513,6 +4768,7 @@ var TuningDialog = (function () {
             exportOf: function (entry) { return exportModel(entry); },
             exportRecs: function (entry) { return exportRecsOf(entry); },
             controlModel: function (step) { return ctModel(step); },
+            parameterEvidence: function () { return ctEvidenceHtml(); },
             filterSource: function () { return ftSource(); },
             // the filter calculation of the open file (SPEC3 G): its HTML, and its plots with the plots of the pane
             filterSearch: function (where) {
@@ -4940,16 +5196,23 @@ var TuningDialog = (function () {
             // Filter results belong to the flight source, independently of the
             // control drafts. An edited replay cannot revive heuristic advice.
             if (ft.cache.some(function(e){return e.sourceKey===ftKey(true) && e.result.version===2;})) own=own.filter(function(r){return (r.node||r.area)!=='filters';});
+            // Heuristic gain advice never enters a control draft, including
+            // before the first model run, after reset, or after a rejected run.
+            // Recorded configuration copies are appended by compiledPlan.
+            own=own.filter(function(r){return !automaticControlChange(r);});
             CONTROL_STEPS.forEach(function(step){
                 var model=entry.control && entry.control[id+'|'+step];
-                if (!model) return;
-                own=own.filter(function(r){return (r.node||r.area)!==step;});
-                if (ctCurrent(entry) && model.state==='done' && model.result) own=own.concat(model.result.recommendations || []);
+                if (ctCurrent(entry) && acceptedControlResult(model,id,step)) own=own.concat((model.result.recommendations || []).filter(function(r){
+                    var valid=r.controlTune===true && r.dataset===id && (r.node||r.area)===step;
+                    if(valid)controlCliAuthorization.set(r,function(){return ctCurrent(entry) && entry.control[id+'|'+step]===model && acceptedControlResult(model,id,step);});
+                    return valid;
+                }));
             });
             return own.map(function(r){
                 if (!d) return r;
                 var q=Object.assign({},r,{id:id+':'+r.id,dataset:id});
                 if (r.group) q.group=id+':'+r.group;
+                if(controlCliAuthorization.has(r))controlCliAuthorization.set(q,controlCliAuthorization.get(r));
                 return q;
             });
         }
@@ -4998,7 +5261,7 @@ var TuningDialog = (function () {
                 records=records.concat(recs); Object.keys(selected).forEach(function(i){picks[+i+offset]=true;});
                 if (!d || !d.exportBase) return;
                 var own=pendingPlan(recs,selected), overwritten=new Set(own.rows.concat(filterPlan.rows).filter(function(q){return q.scope==='profile'&&q.index===d.pidProfile-1;}).map(function(q){return q.name;}));
-                (d.exportBase.records||[]).forEach(function(r){if(!overwritten.has(r.parameter)){picks[records.length]=true;records.push(r);}});
+                (d.exportBase.records||[]).forEach(function(r){if(!overwritten.has(r.parameter)){recordedConfigurationCli.add(r);picks[records.length]=true;records.push(r);}});
                 (d.exportBase.unsupported||[]).forEach(function(q){if(!overwritten.has(q.name)) missing.push({configuration:id,name:q.name,reason:q.reason});});
             });
             var offset=records.length; records=records.concat(filters); Object.keys(filterPicks).forEach(function(i){picks[+i+offset]=true;});
@@ -5007,8 +5270,26 @@ var TuningDialog = (function () {
         }
         function finalProfilesHtml(entry) {
             var list=configList(entry.result), state=tuningState(entry), profiles=Object.keys(state.finalByProfile).sort(function(a,b){return +a-+b;});
+            var fm=ftModel(), fr=fm.result && fm.result.recommended, exportRefused=fm.state==='done' && !fm.dirty && !fm.stale && filterCliUnavailable(fm.result),
+                filterStatus=fm.state==='running' ? 'Filter replay in progress' :
+                fm.dirty || fm.stale ? 'Filter replay necessary' : fm.state==='failed' ? 'Filter replay failed' : exportRefused ? 'Filter CLI not available' : fr && fr.status==='recommended' ? 'Filter result available' :
+                fr ? 'No recommended filter change' : 'Filter recommendations have no replay';
             var source=ftSource(), filterNote=source ? '<section class="tuning-final-filter"><h5 class="tuning-h">Filter tune for export</h5><p>' + esc(source.title) +
-                (filterDraftRecs(entry).length ? ' · Filter result available' : ' · No filter result for export') + '</p><a href="#" class="tuning-tab-link" data-tab="filters">Select the log or flight in Filters</a></section>' : '';
+                ' · ' + filterStatus + '</p>' + (!fr ? '<p>Filter recommendations come from the analysis checks. Click Autotune in Filters to test their effect on this flight.</p>' : '') +
+                (exportRefused ? filterCliUnavailableHtml(fm.result) : '') +
+                '<a href="#" class="tuning-tab-link" data-tab="filters">Select the log or flight in Filters</a></section>' : '';
+            var plan=compiledPlan(entry), groups=[], seen={};
+            plan.records.forEach(function(r,i){
+                if (!plan.picks[i] || !hasCli(r) || CONTROL_STEPS.indexOf(r.node || r.area)<0) return;
+                var key=r.group || r.id;
+                if (!seen[key]) {seen[key]=true;groups.push(r);}
+            });
+            var hasFilters=plan.records.some(function(r,i){return plan.picks[i] && hasCli(r) && (r.node || r.area)==='filters';});
+            if (groups.length>1 || groups.length && hasFilters) filterNote += '<section class="tuning-final-trials"><h5 class="tuning-h">Different flight tests</h5>' +
+                '<p>The selection contains different flight tests. Test one control change group in each flight.</p>' +
+                (hasFilters ? '<p>Test filter changes before control changes. Record a new flight between these steps.</p>' : '') +
+                '<ul>' + groups.map(function(r){return '<li>' + mdCode(r.title) + ' · ' + esc(profileText(r)) +
+                    ' <button type="button" class="btn btn-default btn-xs tuning-trial-only" data-trial="' + esc(r.id) + '">Select only this test</button></li>';}).join('') + '</ul></section>';
             if (!list.length) return filterNote;
             return filterNote + '<section class="tuning-final-profiles"><h5 class="tuning-h">Control configuration for each PID profile</h5><p>Select one recorded configuration for the control changes of each PID profile. The filter tune uses the log or flight above.</p><p class="tuning-muted">The export also includes recorded values that are different from the newest configuration of that PID profile. Global values apply to all PID profiles.</p>'+profiles.map(function(p){return '<label>'+esc(profileLabel(+p))+'<select class="form-control input-sm tuning-final-config" data-profile="'+p+'">'+options([['','No changes']].concat(list.filter(function(d){return d.pidProfile===+p;}).map(function(d){var rs=draftRecs(entry,d.id),ps=draftPicks(entry,d.id,rs);return [d.id,configLabel(d.id)+' — '+Object.keys(ps).length+' selected changes'];})),state.finalByProfile[p])+'</select></label>';}).join('')+(list.some(function(d){return !d.pidProfile;}) ? '<p class="tuning-muted">A configuration with an unknown PID profile is available for analysis only.</p>' : '')+'</section>';
         }
@@ -5029,7 +5310,7 @@ var TuningDialog = (function () {
                     " go into the CLI file together. Select all the changes of the group, or none of them." });
             }
             if (!ids.length) return (entry.exported = { sig: sig, state: "none" });
-            m = entry.exported = { sig: sig, state: "loading" };
+            m = entry.exported = { sig: sig, state: "loading", records:recs.filter(function(rec){return ids.indexOf(String(rec.id))>=0;}) };
             ask({ cmd: "export", withPlan:true, recs: recs, picks: ids, meta: Object.assign(exportMeta(entry),configList(entry.result).length ? {configurations:plan.configurations.map(function(id){var d=configOf(entry.result,id);return d ? configLabel(id)+" ("+profileLabel(d.pidProfile)+")" : "";}).filter(Boolean).join(", ")} : {}) }).then(function (out) {
                 var text=typeof out === 'string' ? out : out && out.text;
                 if (typeof text !== "string") throw new Error("the answer of the worker has no text");
@@ -5051,25 +5332,95 @@ var TuningDialog = (function () {
             renderTabStatus();
         }
 
+        function exportReady(entry, model) {
+            return !!(entry && model && entry.exported===model && model.state==='ready' &&
+                Array.isArray(model.records) && model.records.every(hasCli));
+        }
         function saveCli() {
-            var m = shown && shown.exported;
-            if (!m || m.state !== "ready") return;
+            var entry=shown, m = entry && entry.exported;
+            if (!exportReady(entry,m)) return;
             pickSaveFile({
                 suggestedName: baseName(shown) + (shown.scope === "log" ? "-log" + (shown.logIndex + 1) : "") + "-cli.txt",
                 description: "CLI commands", mimeType: "text/plain", extension: ".txt"
             }).then(function (target) {
-                if (target) return target.write(new Blob([m.text], { type: "text/plain" }));
+                if (target && shown===entry && exportReady(entry,m)) return target.write(new Blob([m.text], { type: "text/plain" }));
             }).catch(function (error) { reportSaveError(error); });
         }
 
         // Control proposals belong to one completed analysis and configuration.
         // Changed inputs and canceled requests cannot contribute CLI commands.
+        // Continuity is user evidence, tied to every source byte. Calendar
+        // timestamps and sampled UI cache keys cannot authorize inheritance.
+        function ctEvidence() {
+            var info=fileInfo(), log=viewerLog();
+            if (!info || !log) return null;
+            if (info.parameterEvidence) return info.parameterEvidence;
+            var e=info.parameterEvidence={state:'checking',from:1,to:log.getLogCount(),count:log.getLogCount(),confirmed:false};
+            if (typeof crypto==='undefined' || !crypto.subtle) { e.state='unavailable'; return e; }
+            crypto.subtle.digest('SHA-256',info.bytes).then(function(bytes){
+                e.sha256=Array.from(new Uint8Array(bytes)).map(function(v){return v.toString(16).padStart(2,'0');}).join('');
+                e.state='ready';
+                try {
+                    var saved=JSON.parse(localStorage.getItem('rotorflight.parameter-continuity.v1:'+e.sha256)||'null');
+                    if(saved && saved.sha256===e.sha256 && Number.isInteger(saved.from) && Number.isInteger(saved.to) &&
+                        saved.from>=1 && saved.to>=saved.from && saved.to<=e.count) {
+                        e.from=saved.from;e.to=saved.to;e.confirmed=saved.confirmed===true;
+                    }
+                } catch(error) { e.storageUnavailable=true; }
+                if (fileInfo()===info && shown) { if(e.confirmed)ctDiscardAll();else ctRefresh(); }
+            }).catch(function(){e.state='unavailable';if(fileInfo()===info && shown)ctRefresh();});
+            return e;
+        }
+        function ctEvidenceValid(e) {
+            return !!e && e.state==='ready' && Number.isInteger(e.from) && Number.isInteger(e.to) &&
+                e.from>=1 && e.to>=e.from && e.to<=e.count;
+        }
+        function ctAssertions() {
+            var e=ctEvidence();
+            if (!ctEvidenceValid(e) || !e.confirmed) return [];
+            return [{sourceSha256:e.sha256,localLogIndexes:Array.from({length:e.to-e.from+1},function(_,i){return e.from+i-1;}),
+                scope:'parameters',basis:'user-assertion',statement:'Parameters did not change in this log range.'}];
+        }
+        function ctEvidenceHtml() {
+            var e=ctEvidence();if(!e)return '';
+            var disabled=e.state!=='ready'?' disabled':'';
+            return '<section class="tuning-ct-section" aria-label="Parameter history"><h6>Parameter history</h6>' +
+                '<p>Use log numbers in file order. FBL dates can be incorrect.</p>' +
+                '<label>First log <input type="number" class="tuning-ct-evidence-from" min="1" max="'+e.count+'" value="'+e.from+'"'+disabled+'></label> ' +
+                '<label>Last log <input type="number" class="tuning-ct-evidence-to" min="1" max="'+e.count+'" value="'+e.to+'"'+disabled+'></label>' +
+                '<p><label><input type="checkbox" class="tuning-ct-evidence-confirm"'+(e.confirmed?' checked':'')+disabled+'> Parameters did not change in this log range.</label></p>' +
+                '<p>This confirmation applies separately to each PID profile. Each profile still requires recorded gains from a log header.</p>' +
+                '<p>The app saves this confirmation for this exact file only. It does not confirm that mechanical parts stayed the same.</p>' +
+                (e.state==='checking'?'<p role="status">The app checks the file contents.</p>':e.state==='unavailable'?'<p>The file check is not available. Parameter confirmation is disabled.</p>':
+                    !ctEvidenceValid(e)?'<p>Enter a valid log range.</p>':'') +
+                (e.storageUnavailable?'<p>The app cannot save the confirmation between sessions.</p>':'')+'</section>';
+        }
+        function ctDiscardAll() {
+            if(!shown)return;
+            cache.concat([shown]).forEach(function(entry){
+                if(entry.fileKey!==shown.fileKey)return;
+                var old=entry.control||{};entry.control={};entry.exported=null;
+                Object.keys(old).forEach(function(key){if(old[key].stop)old[key].stop();});
+            });
+            ctRefresh();
+        }
+        function ctChangeEvidence(field,value) {
+            var e=ctEvidence();if(!e || e.state!=='ready')return;
+            if(field==='confirmed')e.confirmed=!!value && ctEvidenceValid(e);
+            else {e[field]=Number(value);e.confirmed=false;}
+            try {
+                if(ctEvidenceValid(e))localStorage.setItem('rotorflight.parameter-continuity.v1:'+e.sha256,
+                    JSON.stringify({sha256:e.sha256,from:e.from,to:e.to,confirmed:e.confirmed}));
+                else localStorage.removeItem('rotorflight.parameter-continuity.v1:'+e.sha256);
+            } catch(error) {e.storageUnavailable=true;}
+            ctDiscardAll();
+        }
         function ctCurrent(entry) {
             return !!entry && entry === shown && (entry.key === currentKey() || sameFlights());
         }
         function ctModel(step) {
             var model=shown && shown.control && shown.control[view.dataset+'|'+step];
-            return Object.assign({state:'none'},model||{},{stale:!ctCurrent(shown)});
+            return Object.assign({state:'none'},model||{},{stale:!ctCurrent(shown) || !!(model && model.evidenceSignature && model.evidenceSignature!==JSON.stringify(ctAssertions()))});
         }
         function ctRefresh() {
             CONTROL_STEPS.concat(['export','recs']).forEach(function(k){rendered[k]=null;});
@@ -5078,24 +5429,73 @@ var TuningDialog = (function () {
         function ctStart() {
             var entry=shown, step=view.tab, d=entry && configOf(entry.result,view.dataset);
             if (!ctCurrent(entry) || CONTROL_STEPS.indexOf(step)<0 || !d || !d.pidProfile || !(configFlight(d)>0)) return;
-            var key=d.id+'|'+step, models=entry.control || (entry.control={}), model=models[key]={state:'running'};
+            var assertions=ctAssertions();
+            var key=d.id+'|'+step, models=entry.control || (entry.control={}), model=models[key]={state:'running',evidenceSignature:JSON.stringify(assertions)};
             ctRefresh();
-            // The analysis already decoded and measured the flight. Send only
-            // the configuration, advice and gain decisions, without its curves.
-            ask({cmd:'controlTune',configuration:d.id,step:step,analysis:{
-                datasets:{datasets:[d]}, advice:{byDataset:entry.result.advice && entry.result.advice.byDataset || {}},
-                decisions:entry.result.decisions || []
-            }}).then(function(result){
+            var info=fileInfo(), c=usedCli(), bytes=info && info.bytes.slice().buffer;
+            var request={cmd:'controlTune',configuration:d.id,step:step,bytes:bytes,fileName:info && info.name,
+                options:{flightRpm:entry.result.flightRpm || null,cliText:c ? c.text : null,parameterContinuity:assertions,
+                    flights:entry.result.selection && entry.result.selection.flights || null},analysis:{
+                datasets:{datasets:entry.result.datasets && entry.result.datasets.datasets || [d],labels:entry.result.datasets && entry.result.datasets.labels || []},
+                advice:{byDataset:entry.result.advice && entry.result.advice.byDataset || {}},
+                hierarchy:entry.result.hierarchy,epochs:entry.result.epochs || [],decisions:entry.result.decisions || []
+            }};
+            // Identification can occupy the worker for minutes. Its dedicated
+            // worker leaves plots responsive and allows immediate cancellation.
+            new Promise(function(resolve,reject){
+                var worker=new Worker('js/tuning_worker.js'), timer;
+                model.worker=worker;
+                function finish(error,result){
+                    clearTimeout(timer); worker.terminate(); model.worker=null;
+                    if(error)reject(error);else resolve(result);
+                }
+                model.stop=function(){finish(new Error('The control analysis was canceled.'));};
+                worker.onmessage=function(e){var message=e.data||{};
+                    if(message.type==='progress')return;
+                    if(message.type==='error')finish(new Error(message.message||'The control analysis failed.'));
+                    else finish(null,message.result);
+                };
+                worker.onerror=function(e){if(e.preventDefault)e.preventDefault();finish(new Error(e.message||'The control analysis failed.'));};
+                timer=setTimeout(function(){finish(new Error('The calculation did not finish within its time limit.'));},15*60*1000);
+                request.id=1;
+                try{worker.postMessage(request,bytes ? [bytes] : []);}catch(e){finish(e);}
+            }).then(function(result){
                 if (models[key]!==model) return;
                 if (!result || result.configuration!==d.id || result.step!==step) throw new Error('The control result does not agree with the selected configuration.');
                 model.state='done'; model.result=result;
+                if(acceptedControlResult(model,d.id,step))(result.recommendations||[]).forEach(function(r){
+                    if(r.controlTune===true && r.dataset===d.id && (r.node||r.area)===step)
+                        controlCliAuthorization.set(r,function(){return ctCurrent(entry) && entry.control===models && models[key]===model &&
+                            model.evidenceSignature===JSON.stringify(ctAssertions()) && acceptedControlResult(model,d.id,step);});
+                });
             }).catch(function(e){if(models[key]===model){model.state='failed';model.error=String(e.message||e);}}).then(function(){if(shown===entry && models[key]===model) ctRefresh();});
         }
         function ctClear(state) {
             if (!shown || CONTROL_STEPS.indexOf(view.tab)<0) return;
             var models=shown.control || (shown.control={});
-            models[view.dataset+'|'+view.tab]={state:state || 'none'};
+            var key=view.dataset+'|'+view.tab, old=models[key];
+            models[key]={state:state || 'none'};
+            if(old&&old.stop)old.stop();
             ctRefresh();
+        }
+        function ctSaveModel() {
+            var model=ctModel(view.tab), twin=model && model.result && model.result.twin;
+            if (!twin || model.stale) return;
+            pickSaveFile({suggestedName:baseName(shown)+'-helicopter-model.json',description:'Helicopter model',mimeType:'application/json',extension:'.json'}).then(function(target){
+                if (target) return target.write(new Blob([JSON.stringify(twin,function(k,v){return ArrayBuffer.isView(v)?Array.from(v):v;},2)],{type:'application/json'}));
+            }).catch(function(error){reportSaveError(error);});
+        }
+
+        function selectTrial(entry,id,configuration) {
+            var rs=configuration ? draftRecs(entry,configuration) : exportRecsOf(entry), index=rs.findIndex(function(r){return r.id===id;});
+            if (index<0 || !canPick(rs,index)) return;
+            var selected=rs[index], d=configOf(entry.result,selected.dataset), state=tuningState(entry);
+            if (d) Object.keys(state.finalByProfile).forEach(function(p){state.finalByProfile[p]=+p===d.pidProfile ? d.id : '';});
+            var mine=draftRecs(entry,d ? d.id : 'all'), picks={};
+            mine.forEach(function(r,i){if(r.id===selected.id || selected.group && r.group===selected.group)picks[i]=true;});
+            savePicks(entry,mine,picks);
+            savePicks(entry,filterDraftRecs(entry),{});
+            entry.exported=null;TABS.forEach(function(t){rendered[t.key]=null;});showTab('export');
         }
 
         // --- the filter calculation (SPEC3 G, M2): its own worker, one run at a time, for the open file
@@ -5112,11 +5512,12 @@ var TuningDialog = (function () {
         }
         function ftLimit() { var key=ftKey(true);return ft.limits[key]!==undefined ? ft.limits[key] : .5; }
         function ftRpm() { return shown && shown.key === currentKey() && shown.result.flightRpm && isNum(shown.result.flightRpm.value) ? shown.result.flightRpm.value : null; }
+        function ftNotchFit() { return shown && shown.key === currentKey() && shown.result.notchFit && shown.result.notchFit.used ? shown.result.notchFit : null; }
         function ftKey(sourceOnly) {
             var info = fileInfo(), c = usedCli(), source = ftSource();
             if (!info || !source) return null;
             var baseline = filterBaseline(shown.result,source);
-            return [info.key, 'flight:' + source.key, JSON.stringify(baseline), ftRpm() === null ? 'auto' : ftRpm(), c ? c.hash : 'no-cli'].concat(sourceOnly ? [] : ['delay:' + ftLimit()]).join('|');
+            return [info.key, 'flight:' + source.key, JSON.stringify(baseline), ftRpm() === null ? 'auto' : ftRpm(), JSON.stringify(ftNotchFit()), c ? c.hash : 'no-cli'].concat(sourceOnly ? [] : ['delay:' + ftLimit()]).join('|');
         }
 
         // The calculation of the result entry for the CLI file: the one of the settings of now, for the file of the entry
@@ -5148,7 +5549,7 @@ var TuningDialog = (function () {
             } else if (e) {
                 m.state = "done";
             }
-            m.maxAddMs = ftLimit(); m.draft = ft.drafts[ftKey(true)] || null; m.dirty = !!m.draft; m.hasAutotune = !!ft.auto[ftKey(true)];
+            m.maxAddMs = ftLimit(); m.draft = ft.drafts[ftKey(true)] || null; m.dirty = !!m.draft; m.hasAutotune = !!ft.auto[ftKey()];
             m.source = source; m.sources = ftSources(); m.baseline = shown ? filterBaseline(shown.result,source) : [];
             m.recordedChecks = shown ? (shown.result.findings || []).filter(function(f){
                 return /^(F\d+|C11)$/.test(f.id) && (!source || onLog(f,source.log)) &&
@@ -5191,6 +5592,7 @@ var TuningDialog = (function () {
             var info = fileInfo(), log = viewerLog(), rpm = null, c = usedCli(), key = ftKey();
             if (!info || !log || ftUnavailable()) return false;
             var sourceKey = ftKey(true), reuse = !ft.job && ft.worker && ft.workerKey === sourceKey;
+            if (!mode && ft.auto[key]) return false;
             if (!reuse) ftStop();
             ft.failure = ft.cancelled = null;
             var source = ftSource(), list = [{log:source.log,flight:source.flight}], w,
@@ -5203,13 +5605,19 @@ var TuningDialog = (function () {
             if (!isNum(ftLimit()) || ftLimit() < 0 || ftLimit() > 20) { ft.failure = {key:key,detail:"The maximum added time delay must be a number from 0 to 20 ms."}; ftRefresh(); return false; }
             var draft = ft.drafts[sourceKey], previous = ftModel().result;
             var values = {};
-            if (mode !== "load") { ((previous && previous.parameters) || []).filter(function(q){return q.editable;}).forEach(function(q){values[q.key]=q.to;}); Object.assign(values,draft||{}); }
+            if (mode !== "load") {
+                // A recorded replay retains each interval until a field is edited.
+                var recorded = previous && previous.recommended && previous.recommended.params && !Object.keys(previous.recommended.params).length;
+                if (!recorded || draft) ((previous && previous.parameters) || []).filter(function(q){return q.editable;}).forEach(function(q){values[q.key]=q.to;});
+                Object.assign(values,draft||{});
+            }
             var msg = { cmd: reuse ? "filterReplay" : "filterTune", workspaceKey: sourceKey, id: ++ft.seq, bytes: reuse ? undefined : info.bytes.slice().buffer, fileName: info.name, selectedLog: source.log, logCount: log.getLogCount(),
                 // reuse the threshold derived from the recorded governor configuration only for the current analysis
                 options: { flightRpm: ftRpm(),
                     cliText: c ? c.text : null, cliName: c ? c.name : null, flights: list, logs: [source.log],
                     blockedBy: gates, maxAddMs: ftLimit() } };
             var ds=shown && datasetsOf(shown.result);
+            if (ftNotchFit()) msg.options.notchFit=ftNotchFit();
             if (ds) msg.options.recordedConfigurations={datasets:ds.datasets.map(function(d){return {id:d.id,pidProfile:d.pidProfile||0,values:d.values,sources:d.sources};}),
                 labels:(ds.labels||[]).filter(function(q){return q.log===source.log;})};
             if (mode === "simulate" || mode === "load") msg.options.simulate = values;
@@ -5234,7 +5642,7 @@ var TuningDialog = (function () {
                     ft.cache = ft.cache.filter(function (x) { return x.key !== j.key; }).concat([{ key: j.key, sourceKey:sourceKey, cli:!!c, source:source, fileKey: j.fileKey, result: m.result, finishedAt: Date.now() }]);
                     ft.job = null;
                     delete ft.drafts[sourceKey];
-                    if (m.result.mode === "autotune") ft.auto[sourceKey] = m.result;
+                    if (m.result.mode === "autotune") ft.auto[j.key] = m.result;
                     if (m.result.version !== 2) ftStop();
                     ftRefresh();
                 }
@@ -5377,8 +5785,9 @@ var TuningDialog = (function () {
         }
 
         function showTab(key) {
-            if (key !== view.tab) closeLogPreview();
-            view.tab = TABS.some(function (t) { return t.key === key; }) ? key : "overview";
+            var next = TABS.some(function (t) { return t.key === key; }) ? key : "overview", changed = next !== view.tab;
+            if (changed) closeLogPreview();
+            view.tab = next;
             body.find('.tuning-configuration').toggleClass('tuning-hide',view.tab === 'filters' || !shown || !configList(shown.result).length);
             TABS.forEach(function (t) {
                 body.find('.tuning-tab[data-tab="' + t.key + '"]').toggleClass("active", t.key === view.tab).attr('aria-current', t.key === view.tab ? 'page' : 'false');
@@ -5387,6 +5796,12 @@ var TuningDialog = (function () {
             if (rendered[view.tab] !== shown) renderPane(view.tab);
             else if (visible) attachPlots(view.tab);
             renderTabStatus();
+            // A new step starts at its heading, below the sticky navigation.
+            // Same-step progress and parameter edits retain the current view.
+            var root = dialog[0], target = pane(view.tab)[0], tabs = body.find('.tuning-tabs')[0];
+            if (changed && visible && root && root.clientHeight > 0 && target && tabs && root.getBoundingClientRect && target.getBoundingClientRect) {
+                root.scrollTop = Math.max(0, root.scrollTop + target.getBoundingClientRect().top - root.getBoundingClientRect().top - tabs.offsetHeight - 12);
+            }
         }
 
         function renderTabStatus() {
@@ -5402,6 +5817,7 @@ var TuningDialog = (function () {
             });
             if (!current) ['overview'].concat(CONTROL_STEPS).forEach(function (key) { states[key].push('insufficient'); });
             var plan = compiledPlan(shown), conflicts = plan.conflicts.length + plan.unsupported.length + partGroups(plan.records, plan.picks).length;
+            var filterRefused = model.state === 'done' && !model.dirty && !model.stale && filterCliUnavailable(model.result);
             var changes = plan.records.filter(function (rec, i) { return plan.picks[i] && hasCli(rec); }).length;
             TABS.filter(function (t) { return !t.auxiliary; }).forEach(function (t) {
                 var summary = tabStatus(states[t.key] || []), scope = t.key === 'filters' ? (model.source ? model.source.title + '. ' : '') :
@@ -5409,8 +5825,8 @@ var TuningDialog = (function () {
                     view.dataset !== 'all' ? configLabel(view.dataset) + '. ' : '';
                 if (t.key === 'filters' && summary.key === 'satisfactory' && model.result && model.result.checklist) summary.label = 'Satisfactory in replay';
                 if (t.key === 'export') {
-                    summary = {key: conflicts ? 'problem' : changes ? 'monitor' : 'information',
-                        label: conflicts ? 'Cannot export' : changes ? plural(changes, 'change') + ' to examine' : 'No changes'};
+                    summary = {key: conflicts ? 'problem' : changes || filterRefused ? 'monitor' : 'information',
+                        label: conflicts ? 'Cannot export' : changes ? plural(changes, 'change') + ' to examine' : filterRefused ? 'Filter CLI not available' : 'No changes'};
                     scope = 'Selected changes from all tuning steps. ';
                 }
                 var selector = '.tuning-tab[data-tab="' + t.key + '"]', tab = body.find(selector);
@@ -6080,8 +6496,26 @@ var TuningDialog = (function () {
         dialog.on("click", ".tuning-fsel-none", function (e) { e.preventDefault(); changeSelection({ kind: "none" }); });
         dialog.on("click", ".tuning-tab", function (e) { e.preventDefault(); closeLogPreview(); showTab(this.getAttribute("data-tab")); });
         dialog.on("click", ".tuning-axis", function () { view.axis = this.getAttribute("data-axis"); renderPane(view.tab); });
-        dialog.on("change", ".tuning-segment", function () { view.segment = +this.value; renderPane(view.tab); renderChrome(); });
-        dialog.on("change", ".tuning-vib-profile", function () { view.vibProfile = this.value; renderPane(view.tab); });
+        // Chromium 99 on macOS can crash if a native select's change callback
+        // removes that select. Keep it alive until the popup callback returns.
+        function deferredSelectChange(handler) {
+            var requests = new WeakMap();
+            return function () {
+                var control=this, request=(requests.get(control)||0)+1, value=control.value,
+                    entry=shown, tab=view.tab, dataset=view.dataset, source=ftSource(), info=fileInfo();
+                requests.set(control,request);
+                setTimeout(function () {
+                    var current=fileInfo();
+                    if (requests.get(control)!==request || control.value!==value || control.isConnected===false ||
+                        shown!==entry || view.tab!==tab || view.dataset!==dataset || !info || !current || current.key!==info.key) return;
+                    var nextSource=ftSource();
+                    if ((source && source.key)!==(nextSource && nextSource.key)) return;
+                    handler.call(control);
+                },0);
+            };
+        }
+        dialog.on("change", ".tuning-segment", deferredSelectChange(function () { view.segment = +this.value; renderPane(view.tab); renderChrome(); }));
+        dialog.on("change", ".tuning-vib-profile", deferredSelectChange(function () { view.vibProfile = this.value; renderPane(view.tab); }));
         dialog.on("click", ".tuning-seek", function (e) {
             e.preventDefault();
             var li = +this.getAttribute("data-log"), t = +this.getAttribute("data-t");
@@ -6132,7 +6566,7 @@ var TuningDialog = (function () {
             }
         });
         dialog.on("click", ".tuning-node-link", function (e) { e.preventDefault(); selectNode(this.getAttribute("data-node")); });
-        dialog.on("click", ".tuning-copy", function () { copy(copyTexts[+this.getAttribute("data-copy")] || "", this); });
+        dialog.on("click", ".tuning-copy", function () { var item=copyTexts[+this.getAttribute("data-copy")]; if(item && (!item.rec || hasCli(item.rec)))copy(item.text, this); });
         // the PID profile of the diagram and the lists: the panes that show it are drawn again
         dialog.on("click", ".tuning-profile", function (e) {
             if (e && e.preventDefault) e.preventDefault();
@@ -6151,23 +6585,34 @@ var TuningDialog = (function () {
             if (was !== view.dataset) notifyConfig();
         });
         // the filter calculation (SPEC3 G): start, cancel, "Show the measurement" of its spectra, and the link to the Filters tab
+        dialog.on('change', '.tuning-ct-evidence-from', function () { ctChangeEvidence('from',this.value); });
+        dialog.on('change', '.tuning-ct-evidence-to', function () { ctChangeEvidence('to',this.value); });
+        dialog.on('change', '.tuning-ct-evidence-confirm', function () { ctChangeEvidence('confirmed',this.checked); });
         dialog.on('click', '.tuning-ct-start', function () { ctStart(); });
         dialog.on('click', '.tuning-ct-cancel', function () { ctClear('canceled'); });
         dialog.on('click', '.tuning-ct-reset', function () { ctClear(); });
-        dialog.on('change', '.tuning-ct-reference', function () {
+        dialog.on('click', '.tuning-ct-save-model', function () { ctSaveModel(); });
+        dialog.on('click', '.tuning-ct-trial', function () {
+            var m=ctModel(view.tab), rec=m.result && m.result.recommendations && m.result.recommendations[0];
+            if (shown && rec && !m.stale) selectTrial(shown,view.dataset+':'+rec.id,view.dataset);
+        });
+        dialog.on('click', '.tuning-trial-only', function () {
+            if (shown) selectTrial(shown,this.getAttribute('data-trial'));
+        });
+        dialog.on('change', '.tuning-ct-reference', deferredSelectChange(function () {
             if (!view.ctReference) view.ctReference={};
             view.ctReference[view.tab]=this.value; renderPane(view.tab);
-        });
+        }));
         dialog.on('click', '.tuning-ct-details summary[data-ct-detail]', function () {
             if (!view.ctDetails) view.ctDetails={};
             view.ctDetails[this.getAttribute('data-ct-detail')]=!this.parentNode.open;
         });
         dialog.on("click", ".tuning-ft-start", function (e) { if (e && e.preventDefault) e.preventDefault(); ftStart(); });
-        dialog.on('change', '.tuning-ft-source-select', function () {
+        dialog.on('change', '.tuning-ft-source-select', deferredSelectChange(function () {
             var info=fileInfo(), source=ftSources().find(function(s){return s.key===this.value;},this);
             if (!info || !source || ft.sources[info.key]===source.key) return;
             ftStop(); ft.sources[info.key]=source.key; view.ftTrace=0; view.segment=null; view.vibProfile=null; ftRefresh();
-        });
+        }));
         dialog.on("input change", ".tuning-ft-delay", function (e) {
             if (!ft.limits) ft.limits={};
             ft.limits[ftKey(true)]=String(this.value).trim()==='' ? NaN : Number(this.value);
@@ -6191,12 +6636,11 @@ var TuningDialog = (function () {
         dialog.on("click", ".tuning-ft-load", function () { ftStart("load"); });
         dialog.on("click", ".tuning-ft-simulate", function () { ftStart("simulate"); });
         dialog.on("click", ".tuning-ft-reset", function () {
-            var m = ftModel(), values = {};
-            ((m.result && m.result.parameters) || []).filter(function (q) { return q.editable; }).forEach(function (q) { values[q.key] = q.from; });
-            ft.drafts[ftKey(true)] = values; ftRefresh();
+            ft.drafts[ftKey(true)] = {};
+            ftStart("load");
         });
         dialog.on("click", ".tuning-ft-restore", function () {
-            var saved = ft.auto[ftKey(true)]; if (!saved) return;
+            var saved = ft.auto[ftKey()]; if (!saved) return;
             var values = {}; (saved.parameters || []).filter(function (q) { return q.editable; }).forEach(function (q) { values[q.key] = q.to; });
             ft.drafts[ftKey(true)] = values; ftRefresh();
         });
@@ -6208,9 +6652,9 @@ var TuningDialog = (function () {
         dialog.on("change", ".tuning-ft-hide-unchanged", function () {
             view.ftHideUnchanged = this.checked; rendered.filters = null; showTab("filters");
         });
-        dialog.on("change", ".tuning-ft-trace", function () {
+        dialog.on("change", ".tuning-ft-trace", deferredSelectChange(function () {
             view.ftTrace = +this.value || 0; rendered.filters = null; showTab("filters");
-        });
+        }));
         dialog.on("change", ".tuning-ft-curve", function () {
             var key = this.getAttribute("data-ft-curve");
             if (['raw','old','new'].indexOf(key) < 0) return;
@@ -6236,7 +6680,7 @@ var TuningDialog = (function () {
         });
         dialog.on("click", ".tuning-tab-link", function (e) { if (e && e.preventDefault) e.preventDefault(); showTab(this.getAttribute("data-tab")); });
         // the configuration menu (SPEC3 J), the link to the table of the parameters that are not the same, and "Show" of a row
-        dialog.on("change", ".tuning-config", function () { setConfig(this.value); });
+        dialog.on("change", ".tuning-config", deferredSelectChange(function () { setConfig(this.value); }));
         dialog.on("click", ".tuning-config-pick", function (e) { if (e && e.preventDefault) e.preventDefault(); setConfig(this.getAttribute("data-config")); });
         dialog.on("click", ".tuning-config-diff", function (e) { if (e && e.preventDefault) e.preventDefault(); showTab("configs"); });
         // a change of a group (C7) selects or removes all the changes of the group
@@ -6252,16 +6696,16 @@ var TuningDialog = (function () {
             TABS.forEach(function(t){rendered[t.key]=null;});
             showTab(view.tab); // one selection and parameter record across the step pages
         });
-        dialog.on("change", ".tuning-final-config", function () {
+        dialog.on("change", ".tuning-final-config", deferredSelectChange(function () {
             if (!shown) return;
             var p=+this.getAttribute('data-profile'), d=configOf(shown.result,this.value);
             if (this.value && (!d || d.pidProfile!==p)) return;
             tuningState(shown).finalByProfile[p]=d ? d.id : '';
             rendered.export=null;showTab('export');
-        });
+        }));
         dialog.on("click", ".tuning-export-copy", function () {
             var m = shown && shown.exported;
-            if (m && m.state === "ready") copy(m.text, this);
+            if (exportReady(shown,m)) copy(m.text, this);
         });
         dialog.on("click", ".tuning-export-save", function () { saveCli(); });
         // a flight, or a part of a log with values that are possibly different (its text in the bar over the graph): data-log, data-t0,
@@ -6471,6 +6915,7 @@ var TuningDialog = (function () {
 
     // Pure pieces, for test/tuning_dialog.test.cjs
     TuningDialog.internals = {
+        automaticControlChange: automaticControlChange, acceptedControlResult: acceptedControlResult,
         tabStatus: tabStatus, filterTabStates: filterTabStates,
         controlWorkspaceHtml: controlWorkspaceHtml, controlPairs: controlPairs, flightPlanHtml: flightPlanHtml,
         esc: esc, parameterLabel: parameterLabel, parameterHtml: parameterHtml, num: num, valueSe: valueSe, threshold: threshold, logLabel: logLabel, paramText: paramText, findingStatus: findingStatus,

@@ -55,7 +55,7 @@ var AnalysisView = (function () {
     var KEYS = 3; // the main numbers of a card at most
 
     // The status words (SPEC2 D9): the worst first, for the status of a card (js/tuning_dialog.js STATUS_ORDER)
-    var ORDER = ["error", "problem", "monitor", "satisfactory", "information", "insufficient", "notMeasured"];
+    var ORDER = ["error", "problem", "monitor", "insufficient", "notMeasured", "satisfactory", "information"];
     var LABEL = { error: "Analysis error", problem: "Problem", monitor: "Monitor", satisfactory: "Satisfactory", information: "Information",
         insufficient: "Not sufficient data", notMeasured: "Not measured" };
     var MAIN = 6; // the primary rows of a card at most; the others open with "N more items"
@@ -107,7 +107,7 @@ var AnalysisView = (function () {
         prereq: "Before the first flight",
         prereqProblem: "Items with a problem before the first flight:",
         close: "Close",
-        quoted: "Toolkit text (not STE)",
+        quoted: "Analysis information",
         limit: "Limit",
         value: "Value",
         noPlot: "The plot is not available.",

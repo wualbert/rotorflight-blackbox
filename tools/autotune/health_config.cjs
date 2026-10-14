@@ -186,7 +186,7 @@ function judge(flights, RULES = DEFAULT_RULES, extra = {}) {
             if (!q.on) { const conflict = P[p].rescues > 0;
                 add(Object.assign(base, { severity: 'flag', value: 0, conflict, text: para(`In PID profile ${p}, the rescue switch does not start a rescue, because \`rescue_mode\` is OFF.`, why,
                     `${line} The limit is a value other than OFF (CLIMB or ALT_HOLD).`, flightText(p) + (conflict ? ` But the logs show ${many(P[p].rescues, 'rescue')} in this PID profile. Thus, the CLI dump is possibly not from the time of these logs.` : '')) })); continue; }
-            add(Object.assign(base, { severity: 'ok', value: 1, text: para(`In PID profile ${p}, the rescue switch starts the rescue. ${line}`, otherText, [flightText(p), rescueText(p)].filter(Boolean).join(' ')) }));
+            add(Object.assign(base, { severity: 'ok', value: 1, text: para(`The rescue mode is on in PID profile ${p}. ${line}`, otherText, [flightText(p), rescueText(p)].filter(Boolean).join(' ')) }));
         }
         if (C.missing.length) { const fl = C.missing.filter(flown);
             add({ severity: 'note', thin: true, basis: 'cli', cliKind: C.kind, unknownProfiles: C.missing.slice(), flownUnknown: fl, unknownRescues: unknown.rescues,
@@ -203,7 +203,7 @@ function judge(flights, RULES = DEFAULT_RULES, extra = {}) {
             add(Object.assign({ profile: p, basis: 'header', mode: h.mode, log: h.log, severity: off ? 'flag' : 'ok', value: off ? 0 : 1, n: P[p].rescues }, off ? { conflict } : {}, facts(p), { text: off
                 ? para(`In PID profile ${p}, the rescue switch does not start a rescue, because \`rescue_mode\` is OFF.`, why, `In PID profile ${p}, the log header gives \`rescue_mode\` OFF. The limit is a value other than OFF (CLIMB or ALT_HOLD).`,
                     flightText(p) + (conflict ? ` But the logs show ${many(P[p].rescues, 'rescue')} in this PID profile. Thus, \`rescue_mode\` is possibly different in some logs.` : ''))
-                : para(`In PID profile ${p}, the rescue switch starts the rescue. The log header gives \`rescue_mode\` ${h.mode} for this PID profile.`, [flightText(p), rescueText(p)].filter(Boolean).join(' ')) })); continue; }
+                : para(`The rescue mode is on in PID profile ${p}. The log header gives \`rescue_mode\` ${h.mode} for this PID profile.`, [flightText(p), rescueText(p)].filter(Boolean).join(' ')) })); continue; }
         if (P[p].rescues > 0) { known.push(p);
             add(Object.assign({ profile: p, basis: 'log', mode: null, log: logsOf(P[p].rescueLogs), severity: 'ok', value: 1, n: P[p].rescues }, facts(p), {
                 text: para(`In PID profile ${p}, the logs show ${many(P[p].rescues, 'rescue')}. The firmware starts a rescue only if \`rescue_mode\` is not OFF. Thus, the rescue is on in this PID profile.`, flightText(p)) })); continue; }

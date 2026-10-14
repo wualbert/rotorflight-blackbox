@@ -293,7 +293,7 @@ test('3e a PID profile with no source: unknown values, one dataset for the logs 
     assert.deepEqual(byId(ds, 'A').sameValuesAs, [], 'B has no known PID profile value to agree with');
     // no CLI dump (an optional input, user rule 2026-10-06): the notes say what the log records, and no note asks for a dump
     assert.ok(ds.notes.includes('No log header shows the values of PID profile 3. Thus, the configurations of PID profile 3 have only the global values of the log header.'), JSON.stringify(ds.notes));
-    assert.ok(ds.notes.includes('The log header records the values of PID profile 3 only when the pilot arms the helicopter in PID profile 3.'));
+    assert.ok(ds.notes.includes('The log header records the values of PID profile 3 only when a new log starts in PID profile 3.'));
     assert.ok(!ds.notes.some(n => /CLI dump|diff all/.test(n)), JSON.stringify(ds.notes));
     assert.deepEqual(ds.diff.map(r => [r.name, r.values]), [['yaw_p_gain', { A: 65, B: null, C: 45 }], ['yaw_i_gain', { A: 120, B: null, C: 105 }], ['yaw_d_gain', { A: 12, B: null, C: 10 }]], 'pitch, roll, yaw: the settings.c order');
     const AB = ds.pairs.find(p => p.a === 'A' && p.b === 'B');

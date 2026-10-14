@@ -158,7 +158,7 @@ test('F10 flags yaw D driven by noise above 30 Hz; mixer noise in permille rms',
     const N = run(noiseW(0.02, 3)), y = N.metrics.F10.yaw.byProfile[1];
     within(y.share, 0.8, 0.03, 'yaw D share above 30 Hz (power 0.02^2 / (0.01^2 + 0.02^2))');
     const f = find(N.findings, 'F10', { axis: 'yaw' })[0]; assert.equal(f.severity, 'flag', f.text); assert.equal(f.value, y.share);
-    assert.match(f.text, /This is more than 50 % by more than 2 SE\. Most of the yaw D-term comes from gyro noise at more than 30 Hz\. Correct the filters first\. Then decrease yaw_d_gain\./);
+    assert.match(f.text, /This is more than 50 % by more than 2 SE\. This power can come from gyro noise at more than 30 Hz\. Examine the filters first\. Read the recommendation before you change yaw_d_gain\./);
     within(N.metrics.F10.roll.byProfile[1].controlPermille, 3 / Math.SQRT2, 0.05, 'roll mixer rms above 30 Hz of a 3 permille 120 Hz line');
     // roll and pitch: the mixer noise only, their D share is C11's (health_loop), the same measure
     for (const ax of ['roll', 'pitch']) { const g = find(N.findings, 'F10', { axis: ax })[0], s = N.metrics.F10[ax].byProfile[1];
@@ -313,7 +313,8 @@ test('C14 recovers the pitch-collective coupling within 2 SE and the gain that s
     within(s.gainChange, s.slope / 2, 0.06, 'pitch_collective_ff_gain change = slope / 2 (pid.c:937-942)');
     assert.ok(s.fast.slope < 85, `above 0.2 Hz the loop has not absorbed the moment: ${s.fast.slope}`);
     const f = find(findings, 'C14', { profile: 1 })[0]; assert.equal(f.severity, 'flag', f.text);
-    assert.deepEqual([f.from, f.to], [0, Math.round(s.slope / 2)]); assert.match(f.text, new RegExp(`Increase pitch_collective_ff_gain from 0 to ${f.to}\\.`));
+    assert.deepEqual([f.from, f.to], [0, Math.round(s.slope / 2)]); assert.match(f.text, /fit gives a pitch_collective_ff_gain value of \d+ ± \d+\. This is an estimate/);
+    assert.doesNotMatch(f.text, /Increase pitch_collective_ff_gain|Decrease pitch_collective_ff_gain/);
     // no coupling: no flag; the wrong sign for the parameter (it cannot go below 0): no flag
     for (const c of [0, 0.1]) { const g = find(run(pitchW(c, 900, 22)).findings, 'C14', { profile: 1 })[0]; assert.equal(g.severity, 'note', g.text); }
     // thin data
@@ -423,7 +424,8 @@ test('T14 flags ramps that push the nose with the reaction torque and reads the 
     assert.equal(m.mainRotor, 'CW'); assert.equal(m.consistency, 1); assert.equal(m.againstAcceleration, m.n); assert.equal(m.antiTorque, m.n); assert.equal(m.fitConsistency, 1);
     assert.ok(m.toward.mean > 25, `peak yaw toward the torque ${m.toward.mean}`);
     within(m.gainChange.value, truth, 0.05 * truth, 'gain whose firmware term (pid.c:893-904) cancels kd x d(rpm)/dt');
-    const f = find(findings, 'T14')[0]; assert.equal(f.severity, 'flag', f.text); assert.match(f.text, new RegExp(`\\nIncrease yaw_inertia_precomp_gain from 0 to ${f.to}\\. `));
+    const f = find(findings, 'T14')[0]; assert.equal(f.severity, 'flag', f.text); assert.match(f.text, /fit gives a yaw_inertia_precomp_gain value of \d+ ± \d+\. This is an estimate/);
+    assert.doesNotMatch(f.text, /Increase yaw_inertia_precomp_gain|Decrease yaw_inertia_precomp_gain/);
     assert.equal(f.to, Math.round(m.gainChange.value)); assert.equal(f.value, m.gainChange.value); assert.equal(f.unit, 'gain units');
     assert.equal(f.events.length, m.n);
     // a yaw stick input at one switch: that ramp is left out
@@ -450,7 +452,7 @@ test('T14 judges the regression gain change: no flag at the matching gain, raise
         within(m.gainChange.value, truth - g0, 0.1 * truth, `gain change, ${what}`);
         if (!want) { assert.equal(f.severity, 'note', `${what}: ${f.text}`); assert.ok(m.toward.mean < -20, `${what}: the peak (${m.toward.mean} deg/s) has the other sign at the matching gain`); continue; }
         assert.equal(f.severity, 'flag', `${what}: ${f.text}`); assert.equal(Math.sign(f.to - g0), want === 'raise' ? 1 : -1, what);
-        assert.match(f.text, new RegExp(`${want === 'raise' ? 'Increase' : 'Decrease'} yaw_inertia_precomp_gain from ${g0} to ${f.to}\\.`)); within(f.to, truth, 0.1 * truth, `target, ${what}`);
+        assert.match(f.text, /This is an estimate/); assert.doesNotMatch(f.text, /(?:Increase|Decrease) yaw_inertia_precomp_gain/); within(f.to, truth, 0.1 * truth, `target, ${what}`);
         if (o) assert.ok(m.toward.mean < 0, `slow ramps: the peak (${m.toward.mean} deg/s) points the wrong way, the regression does not`);
     }
 });
@@ -461,9 +463,10 @@ test('T14 on an integrator yaw plant (the Gaui identification): the matching gai
     const f1 = find(run(rampW(3e-4, null, { plant: 'int', ramps: 8, g0: 180 })).findings, 'T14')[0]; assert.equal(f1.severity, 'note', f1.text);
     const big = find(run(rampW(5.4e-4, null, { plant: 'int', ramps: 8 })).findings, 'T14')[0]; // truth 324
     assert.equal(big.severity, 'flag', big.text); assert.equal(big.to, 250);
-    assert.match(big.text, /Increase yaw_inertia_precomp_gain from 0 to 250\. The necessary value \(\d+ ± \d+\) is more than the firmware maximum of 250\. Thus, also make the headspeed changes slower \(gov_tracking_time\)\./);
+    assert.match(big.text, /The estimate is more than the firmware maximum of 250/);
+    assert.doesNotMatch(big.text, /(?:Increase|Decrease) yaw_inertia_precomp_gain|make the headspeed changes slower/);
     const top = find(run(rampW(5.4e-4, null, { plant: 'int', ramps: 8, g0: 250 })).findings, 'T14')[0];
-    assert.equal(top.severity, 'note', top.text); assert.match(top.text, /The parameter range \(0 to 250\) cannot supply this change, and the header value is 250\. Make the headspeed changes slower \(gov_tracking_time\)\./);
+    assert.equal(top.severity, 'note', top.text); assert.match(top.text, /The estimate is out of the parameter range \(0 to 250\).*This does not identify a gov_tracking_time change/);
 });
 
 // no inertia torque, a tail that wags (1-8 Hz torque noise, the peak yaw about 26 deg/s as on the Fireball), 3 ramps a log

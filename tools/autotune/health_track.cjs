@@ -409,7 +409,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     'This filter is only in the feedback, and the log records the gyro before it. Thus, the measured time delay does not include it.' : '', lag = past(s.tauMs, s.tauSe, RL.flag);
                 add(idL, lag ? 'flag' : 'note', f, p, { axis: ax, value: s.tauMs, se: s.tauSe, n: s.blocks, unit: 'ms', threshold: `delay - 2 SE > ${RL.flag} ms flag, else report only`, pidLpfMs: lpf ? tr.pidLpf.ms : null,
                     text: para(`The ${ax} gyro follows the setpoint after a time delay of ${pm(s.tauMs, s.tauSe, 1)} ms (${bl(s.blocks)}).` + (s.atMaxDelay ? ` This is the maximum time delay that the analysis examines (${fmt(RULE.track.maxS * 1000, 0)} ms).` : '') +
-                        (lag ? ` The time delay is more than ${RL.flag} ms by more than 2 SE. This is too much for a loop that operates correctly, and the cause is not the loop gains. Examine the gyro filters and the servos.` : ` ${info(RL.flag)}`), lpf) });
+                        (lag ? ` The time delay is more than ${RL.flag} ms by more than 2 SE. The time delay does not identify the cause. Examine the gyro filters, servos and output limits.` : ` ${info(RL.flag)}`), lpf) });
             }
             // R1
             if (st) { const R = rule('R1'), h = st.header, how = `The analysis uses ${bl(st.blocks)} with ${fmt(st.movingS, 0)} s of stick movement.`;
@@ -420,16 +420,17 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 else { const flag = past(st.delayMs, st.se, R.flag);
                     add('R1', flag ? 'flag' : 'note', f, null, { axis: ax, value: st.delayMs, se: st.se, n: st.blocks, unit: 'ms', threshold: `delay - 2 SE > ${R.flag} ms flag, else report only`, corr: st.corr,
                         text: para(`The ${ax} setpoint follows the stick after a time delay of ${pm(st.delayMs, st.se, 1)} ms (correlation ${fmt(st.corr, 3)}).` +
-                            (flag ? ` The time delay is more than ${R.flag} ms by more than 2 SE. The adjustments of the rate profile cause it. Decrease response_time or accel_limit. Examine rc_smoothness.` : ` ${info(R.flag)}`),
+                            (flag ? ` The time delay is more than ${R.flag} ms by more than 2 SE. Examine the response time, acceleration limit and rc_smoothness. A smaller response time decreases filter time delay. A larger acceleration limit lets the setpoint change faster.` : ` ${info(R.flag)}`),
                             `${how} ${hdr} The log does not record the rate profile. Thus, the analysis uses all of the log.`) }); } }
             // C5 / T1
             if (os) { const id = yaw ? 'T1' : 'C5', R = rule(id), lvl = R.level, O = RULE.osc;
                 if (os.skipped) { add(id, 'skipped', f, null, { axis: ax, text: os.skipped }); continue; }
-                const at = `${os.band.join('-')} Hz`, free = 'windows where the stick does not cause the error', flank = `a line through the spectrum ${O.peakFlankHz.join('-')} Hz from it on each side`;
+                const at = `${os.band.join('-')} Hz`, free = 'windows selected by the stick check', flank = `a line through the spectrum ${O.peakFlankHz.join('-')} Hz from it on each side`;
                 const filt = `The analysis applies a filter to the ${ax} error (the gyro minus the setpoint) and keeps only the ${at} band.` + (os.gain ? ` The gain of this filter is ${fmt(os.gain[0], 2)} to ${fmt(os.gain[1], 2)} in the band.` : '');
                 for (const [p, s] of Object.entries(os.byProfile)) {
                     const pk = s.peak, need = `A local maximum is a peak if it is ${O.peakMinDb} dB or more and ${O.peakZ} SE or more.`, sh = O.thresholds.map((v, k) => `${v} deg/s or more in ${fmt(pct(s.shares[v]), 1)} %${k ? '' : ' of these windows'}`);
-                    const win = `The analysis uses ${many(s.stickFree, 'window')} of ${O.windowS} s where the stick does not cause the error.` + (s.stickDriven ? ` It does not use the ${many(s.stickDriven, 'window')} where the stick causes it.` : '') +
+                    const win = `The analysis uses ${many(s.stickFree, 'window')} of ${O.windowS} s that the stick check selects.` + (s.stickDriven ? ` It does not use the ${many(s.stickDriven, 'window')} with a large setpoint amplitude.` : '') +
+                        `\nThe check does not use a window with these two conditions. The error amplitude is ${O.thresholds[0]} deg/s or more. The setpoint amplitude is more than ${O.stickDriven * 100} % of this value.\n` +
                         (s.stickFree ? ` The amplitude is ${series(sh)}. The median amplitude is ${fmt(s.median, 1)} deg/s, and 99 % of the windows have ${fmt(s.p99, 1)} deg/s or less.` : '');
                     const peak = !s.spectrumWindows ? (s.stickFree ? `The analysis cannot calculate an error spectrum for these windows. The log has no period of ${O.psdS} s with only these windows, or the FFT is not available.` : '')
                         : s.peakHz !== null ? `The error spectrum of these windows has a peak at ${pm(s.peakHz, s.peakHzSe, 1)} Hz (${many(s.spectrumWindows, 'window')}). The peak is ${fmt(pk.excessDb, 1)} dB more than ${flank} (${fmt(pk.z, 1)} SE). ${need}` + (s.peakInBand ? '' : ` This peak is not in the ${at} band.`)
@@ -437,7 +438,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     if (s.selfExcitedBursts.length) { const list = s.selfExcitedBursts, big = list[0];
                         add(id, 'flag', f, p, { axis: ax, value: list.length, n: s.bursts, unit: 'count', threshold: `any burst growing from < ${O.onset.small} to >= ${O.onset.high} deg/s over >= ${O.onset.minHalfCycles} half cycles (in ${O.cycleBand.join('-')} Hz) with the stick below ${O.stickDriven} of it`,
                             events: list.map(q => ({ t: q.onsetT === null ? q.t : q.onsetT, value: q.value })),
-                            text: para(`The number of ${ax} oscillations at ${at} that increase with no stick input is ${list.length} of ${s.bursts}. ` +
+                            text: para(`The number of ${ax} oscillations at ${at} that increase with small stick input is ${list.length} of ${s.bursts}. ` +
                                 `The largest is ${fmt(big.value, 0)} deg/s after the filter${typeof big.sine === 'number' ? ` (approximately ${fmt(big.sine, 0)} deg/s before the filter)` : ''}, at ${fmt(big.hz, 1)} Hz at ${fmt(big.onsetT === null ? big.t : big.onsetT, 1)} s. ` +
                                 'Possible causes are a loop gain that is too high at this frequency, or a mechanical problem.' +
                                 (list.length > 1 ? '' : ' A load or a low battery can also cause 1 oscillation of this type.'), filt, win, peak) }); continue; }
@@ -449,7 +450,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     const present = past(s.shares[lvl], s.sharesSe[lvl], R.share);
                     add(id, present ? 'note' : 'ok', f, p, { axis: ax, value: s.shares[lvl], se: s.sharesSe[lvl], n: s.stickFree, unit: 'fraction', threshold: `share >= ${lvl} deg/s - 2 SE > ${R.share} note`, peakHz: s.peakHz,
                         text: para((present ? `The ${ax} error has an oscillation at ${at}. ` : '') + `The amplitude is ${lvl} deg/s or more in ${pm(pct(s.shares[lvl]), pct(s.sharesSe[lvl]), 1)} % of the ${free} (${bl(s.blocks)}). ` +
-                            `This is ${present ? '' : 'not '}more than ${lv(R.share)} by more than 2 SE. ` + (s.bursts ? `The number of oscillations that increase with no stick input is 0 of ${s.bursts}.` : 'The analysis finds no oscillation in the band.'), filt, win, peak) });
+                            `This is ${present ? '' : 'not '}more than ${lv(R.share)} by more than 2 SE. ` + (s.bursts ? `The number of oscillations that increase with small stick input is 0 of ${s.bursts}.` : 'The analysis finds no oscillation in the band.'), filt, win, peak) });
                 } }
         }
     }

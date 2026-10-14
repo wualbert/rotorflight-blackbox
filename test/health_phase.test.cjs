@@ -239,7 +239,7 @@ test('G16: a change to ACTIVE after the liftoff has the phase flight and afterLi
     within(ph.flights[0].i0 / RATE, 12, 0.02, 'liftoff');
     assert.deepEqual([f.severity, f.phase, f.afterLiftoff, f.afterLiftoffN], ['flag', 'flight', true, 1], f.text);
     within(f.afterLiftoffS, act - 12, 0.03, 's from the liftoff to the change'); within(f.liftoffT, 12, 0.02, 'liftoff time');
-    assert.match(f.text, /\nThe change comes 0\.\d\d s after the liftoff at 12\.0 s\. Thus, the helicopter was airborne before the governor was ACTIVE, and the load of the rotor causes a part of the error\. A longer spool-up time does not correct this\. Keep the collective low until the governor is ACTIVE\./);
+    assert.match(f.text, /\nThe change comes 0\.\d\d s after the liftoff at 12\.0 s\. A change in rotor load can cause part of the error\. The time of this change does not identify a governor parameter change\. Compare collective, throttle and headspeed around the change to ACTIVE\./);
     assert.doesNotMatch(f.text, /Examine the spool-up/);
     // the usual order: the phase spoolup, afterLiftoff false
     const g = find(run(sim({ overshoot: 0.05, seed: 16 }).w).findings, 'G16')[0]; assert.deepEqual([g.phase, g.afterLiftoff, g.liftoffT, g.afterLiftoffN], ['spoolup', false, null, 0]);
@@ -291,10 +291,10 @@ test('C15 flags a roll oscillation on the skids before liftoff that increases, w
     const { findings } = run(w), f = find(findings, 'C15')[0];
     assert.deepEqual([f.severity, f.axis, f.unit, f.phase], ['flag', 'roll', 'deg/s', 'ground'], f.text);
     within(f.hz, 8.5, 0.2, 'frequency'); assert.ok(Math.abs(f.growth - 1.0) <= 2 * f.growthSe + 0.15, `growth ${f.growth} +- ${f.growthSe}, truth 1.0 /s`); within(f.value, Math.exp(2.9) * 0.81, 2, 'peak rms, deg/s: the last window, 0.81 = the gain of the 5-15 Hz band-pass at 8.5 Hz');
-    assert.match(f.text, /\nAt [\d.]+ s, the roll rate has an oscillation at 8\.\d ± 0\.\d Hz of [\d.]+ deg\/s rms on the skids\. The oscillation increases \([\d.]+ ± [\d.]+ \/s\)\. The collective is -2\d\d and the headspeed is 2\d\d\d rpm, with the governor in ACTIVE\.\nThis is a ground resonance\. Keep the collective low until the governor is ACTIVE\. Then increase the collective to the hover value quickly\./);
+    assert.match(f.text, /\nAt [\d.]+ s, the roll rate has an oscillation at 8\.\d ± 0\.\d Hz of [\d.]+ deg\/s rms on the skids\. The oscillation increases \([\d.]+ ± [\d.]+ \/s\)\. The collective is -2\d\d and the headspeed is 2\d\d\d rpm, with the governor in ACTIVE\.\nGround resonance is a possible cause\. This check does not identify a gain change\./);
     // the same peak that decreases (a knock on the skids): a note; nothing: ok
     const d = sim({ seed: 27 }); for (let i = at(20); i < at(23); i++) { const t = i / RATE; d.w.gyro[1][i] += Math.round(20 * Math.SQRT2 * Math.exp(-2 * (t - 20)) * Math.sin(2 * Math.PI * 9 * t)); }
-    const g = find(run(d.w).findings, 'C15')[0]; assert.deepEqual([g.severity, g.axis], ['note', 'pitch'], g.text); assert.match(g.text, /The oscillation does not increase\. Thus, it is not a ground resonance\.$/);
+    const g = find(run(d.w).findings, 'C15')[0]; assert.deepEqual([g.severity, g.axis], ['note', 'pitch'], g.text); assert.match(g.text, /The measured oscillation does not increase by more than 2 SE\. This check does not identify its cause\.$/);
     assert.equal(find(run(sim({ seed: 28 }).w).findings, 'C15')[0].severity, 'ok');
     // less than 1 s of ground running before the liftoff: not sufficient data
     const q = find(run(sim({ lift: 10.4, seed: 29 }).w).findings, 'C15')[0]; assert.ok(q.severity === 'note' && q.thin, JSON.stringify(q)); // 9.5-10.4 s at 1500 rpm or more

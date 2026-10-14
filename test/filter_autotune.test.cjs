@@ -38,6 +38,8 @@ test('missing raw samples, unknown RPM sources and unrecorded dynamic LPF inputs
 test('the same complete target is replayed across logs with different original LPF and PID cutoffs',()=>{
     const P=A.prepare([fixture(0,80),fixture(1,130)],{gear});
     const wins=P.segments.map(s=>P.windows.find(w=>w.seg===s));
+    const recorded=A.evaluate(P,A.manualChanges(P,{}),wins,true);
+    assert.notDeepEqual(recorded.results[0].trace.y,recorded.results[1].trace.y,'recorded replay retains each interval\'s different filter values');
     const original=FT.chainResponse; FT.chainResponse=()=>{throw Error('frequency-domain scoring is forbidden');};
     try {
         const ev=A.evaluate(P,{dyn_notch_q:60},wins,true);
@@ -90,6 +92,78 @@ test('complete CLI keeps all RPM arrays, restores the selected profile, rejects 
     rows.push({name:'save\nset foo',to:1,source:'header',scope:'global'}); assert.equal(A.cliFile(res),'');
     assert.equal(A.validCliRow({name:'dyn_notch_q',to:101}),false);
     assert.equal(A.validCliRow({name:'gyro_rpm_notch_source_yaw',to:Array(16).fill(19).join(',')}),false);
+});
+test('recorded baseline replay cannot export a single reference configuration as its target',()=>{
+    const rows=[{name:'gyro_lpf1_static_hz',from:140,to:140,scope:'global',source:'header'}];
+    const res={mode:'simulation',model:{passed:true},recommended:{status:'recommended',params:{},rows:[],fullRows:rows,predicted:{totalDb:0}}};
+    assert.equal(A.cliFile(res),'','empty params replays each interval independently; the reference is not a tested common target');
+    assert.deepEqual(A.cliExportStatus(res),{available:false,reasons:['Recorded filter replay. No filter values changed.']});
+    res.recommended.params={gyro_lpf1_static_hz:140};
+    assert.match(A.cliFile(res),/set gyro_lpf1_static_hz = 140/,'an explicit common target can match the newest reference while changing older intervals');
+    assert.deepEqual(A.cliExportStatus(res),{available:true,reasons:[]});
+});
+test('accepted filter replay reports the prerequisite that refuses CLI export without discarding its measured improvement',()=>{
+    const advice=require('../tools/autotune/advice.cjs'),block='The prerequisite "RPM signal and motor poles" has a problem.';
+    const row={name:'dyn_notch_count',from:6,to:2,scope:'global',source:'header'};
+    const res={version:2,mode:'autotune',model:{passed:true},recommended:{status:'recommended',params:{dyn_notch_count:2},
+        reasons:[],rows:[row],fullRows:[row],predicted:{totalDb:-10.266,se:1.12},delay:{maxAddMs:.3484}}};
+    res.recommendations=advice.filterRecommendations(res,{blockedBy:[block],texts:A.texts(res)});
+    assert.ok(res.recommendations.every(r=>r.severity==='action'&&!r.cli.length));
+    assert.deepEqual(A.cliExportStatus(res),{available:false,reasons:['CLI export must wait for the filter prerequisite checks. Examine the prerequisite checks.',block]});
+    assert.equal(A.cliFile(res),'');
+    assert.equal(res.recommended.status,'recommended');
+    assert.deepEqual(res.recommended.predicted,{totalDb:-10.266,se:1.12});
+    // A top-level worker gate remains authoritative if recommendation data is unavailable.
+    res.blockedBy=[block];res.recommendations=[];
+    assert.deepEqual(A.cliExportStatus(res).reasons,['CLI export must wait for the filter prerequisite checks. Examine the prerequisite checks.',block]);
+    assert.equal(A.cliFile(res),'');
+    delete res.blockedBy;
+    res.recommendations=[{causes:[{holds:true,text:'Examine the RPM signal before filter changes.'}]}];
+    assert.match(A.cliExportStatus(res).reasons.join(' '),/RPM signal/);
+    assert.equal(A.cliFile(res),'');
+    res.recommendations=advice.filterRecommendations(res,{texts:A.texts(res)});
+    assert.deepEqual(A.cliExportStatus(res),{available:true,reasons:[]});
+    assert.match(A.cliFile(res),/^set dyn_notch_count = 2$/m);
+});
+test('each filter export refusal identifies the exact guard while valid complete values remain exportable',()=>{
+    const row={name:'gyro_lpf1_static_hz',from:100,to:140,scope:'global',source:'header'};
+    const result=()=>({model:{passed:true},recommended:{status:'recommended',fullRows:[{...row}],predicted:{totalDb:-5}}});
+    const cases=[
+        [r=>{r.model.passed=false;r.recommended.reasons=['The selected flight periods have no complete replay.'];},/no complete replay/],
+        [r=>{delete r.model;},/no recommended configuration.*Start autotune/],
+        [r=>{r.recommended.status='not recommended';},/no recommended configuration/],
+        [r=>{r.recommended.fullRows=[];},/no parameter values/],
+        [r=>{r.recommended.fullRows=[null];},/empty parameter row/],
+        [r=>{r.recommended.fullRows[0].source='default';},/recorded value.*gyro_lpf1_static_hz.*unknown/],
+        [r=>{r.recommended.fullRows[0].from=null;},/recorded value.*unknown/],
+        [r=>{r.recommended.fullRows[0].from=-1;},/recorded value.*not correct/],
+        [r=>{r.recommended.fullRows[0].to=1001;},/new value.*firmware CLI range/],
+        [r=>{r.recommended.fullRows[0].scope='profile';},/scope.*firmware scope/],
+        [r=>{r.recommended.fullRows=[{...row,name:'roll_gyro_cutoff',scope:'profile',profile:0}];},/PID profile.*unknown/],
+        [r=>{r.recommended.fullRows=[{...row,name:'roll_gyro_cutoff',scope:'profile',profile:2}];},/profile to set again.*unknown/],
+        [r=>{r.recommended.fullRows.push({...row,to:150});},/different values.*same scope/],
+        [r=>{r.recommended.fullRows.push({...row,from:80});},/different values.*same scope/]
+    ];
+    for(const [change,reason] of cases){const r=result();change(r);const status=A.cliExportStatus(r);assert.equal(status.available,false);assert.match(status.reasons.join(' '),reason);assert.equal(A.cliFile(r),'');}
+    assert.equal(A.cliExportStatus(null).available,false);
+    const r=result();assert.deepEqual(A.cliExportStatus(r),{available:true,reasons:[]});assert.ok(A.cliFile(r));
+    r.recommended.fullRows=[{...row,name:'roll_gyro_cutoff',scope:'profile',profile:2}];
+    assert.equal(A.cliExportStatus(r,{bootProfile:1}).available,true);
+    assert.match(A.cliFile(r,{bootProfile:1}),/profile 0\nsave\n$/);
+});
+test('recorded replay text distinguishes the baseline, manual changes and failed coverage',()=>{
+    const res={mode:'simulation',model:{passed:true},recommended:{status:'recommended',params:{},rows:[],reasons:[],
+        validation:{holdout:{blocks:2}},predicted:{totalDb:0}}};
+    let text=A.texts(res);
+    assert.match(text.recommendation,/Recorded filter replay\. No filter values changed/);
+    assert.match(text.validation,/selected flight periods with their recorded values/);
+    assert.doesNotMatch(text.recommendation+text.validation,/changed values are in|before export|after manual changes/);
+    res.recommended.params={gyro_lpf1_static_hz:140};text=A.texts(res);
+    assert.match(text.recommendation,/changed values are in/);
+    assert.match(text.validation,/do not give a different test after changes that you enter/);
+    res.recommended.params={};res.recommended.status='not recommended';res.model.passed=false;
+    res.recommended.reasons=['Some selected flight periods have no complete replay.'];
+    assert.equal(A.texts(res).recommendation,res.recommended.reasons[0],'failed baseline retains the failure reason');
 });
 test('a delay increase in one profile is not concealed by another profile',()=>{
     function entry(id,profile,delay,power){
@@ -178,6 +252,7 @@ test('manual parameter schema rejects illegal settings and preserves a complete 
     assert.equal(A.delayLimit(),.5);assert.equal(A.delayLimit(0),0);assert.equal(A.delayLimit(2),2);
     for(const v of [-1,21,NaN,Infinity,'2'])assert.throws(()=>A.delayLimit(v),/delay/);
     assert.equal(table.find(r=>r.key==='gyro_lpf1_type').choices.length,10);
+    assert.deepEqual(A.manualChanges(P,{}),{},'recorded replay does not flatten intervals into the last configuration');
     const edited=A.manualChanges(P,{gyro_lpf1_type:'BESSEL','p2:roll_d_cutoff':'20',RPM_FILTER:'false'});
     assert.equal(edited.gyro_lpf1_type,8);assert.equal(edited['p2:roll_d_cutoff'],20);assert.equal(edited.RPM_FILTER,false);assert.equal(edited.dyn_notch_q,P.ref.s.dyn_notch_q);
     for(const value of [{unknown_parameter:3},{gyro_lpf1_type:'UNKNOWN'},{dyn_notch_q:101},{gyro_lpf1_static_hz:''},{gyro_rpm_notch_source_roll:'1,2'},{'p2:roll_d_cutoff':0},{filter_process_denom:2}])assert.throws(()=>A.manualChanges(P,value));
@@ -218,9 +293,186 @@ test('before/after checklist calls the original rules, clears a repaired LPF iss
     for(const q of mixed.windows)q.input=P.windows.find(p=>p.st===q.st).input;
     assert.deepEqual(check.compare(mixed,{gyro_lpf1_type:1,gyro_lpf1_static_hz:100}),out);
     assert.equal(mixed.segments.length,1);
-    assert.deepEqual(mixed.excluded.map(x=>x.log),[1,2]);
+    assert.deepEqual(mixed.excluded,[],'valid short periods do not invalidate the measured replay');
+    assert.deepEqual(mixed.unmeasured.map(x=>x.log),[1]);
+    assert.equal(mixed.unmeasured[0].eligibleS,.5);
+    const broken=fixture(3);broken.w.n=500;broken.w.extra['gyroRAW[0]'][20]=NaN;
+    assert.equal(A.prepare([broken],{gear}).excluded.length,1,'missing input remains a blocking failure even in a short period');
+    assert.match(mixed.notes.join(' '),/Log 3: a period has no flight samples/);
     const empty=A.tune([short,masked],{gear});
     assert.equal(empty.recommended.status,'no flight log');
     assert.deepEqual(empty.recommended.cli,[]);
     assert.match(empty.recommended.reasons.join(' '),/no complete flight windows/);
+});
+
+test('correction of recorded filter problems ranks before larger noise reductions and cannot trade for a new failure',()=>{
+    const C=require('../tools/autotune/filter_checklist.cjs');
+    const f=(id,severity)=>({id,severity,log:0,segment:0,profile:2,text:'Filter check.',replayable:true});
+    const before=[f('F1','flag'),f('F2','ok'),f('F5','flag')];
+    const candidate=(db,after)=>({score:{db},checks:C.assess(C.compareFindings(before,after,{baseline:before}))});
+    const unchanged=candidate(-15,before),corrected=candidate(-5,[f('F1','ok'),f('F2','ok'),f('F5','ok')]);
+    const regression=candidate(-20,[f('F1','ok'),f('F2','flag'),f('F5','ok')]);
+    assert.equal(unchanged.checks.passed,false);assert.equal(corrected.checks.passed,true);assert.equal(regression.checks.passed,false);
+    assert.equal([unchanged,corrected,regression].sort(A.rankCandidates)[0],corrected);
+    assert.equal(corrected.checks.corrected,2);
+    assert.match(unchanged.checks.reasons.join(' '),/parameter problems are not corrected: F1/);
+    assert.match(regression.checks.reasons.join(' '),/new filter problems: F2/);
+});
+
+test('final selection preserves delay margin when training noise differences are within one SE',()=>{
+    const checks={passed:true,newIssues:0,worsened:0,configurationIssues:0,remaining:3,unverified:0,improved:3,corrected:5};
+    const q=(hz,db,se,delay)=>({changes:{gyro_lpf1_static_hz:hz},checks,score:{db,se,delay:{maxAddMs:delay}}});
+    const best=q(100,-6.6,.2,.48),lowerDelay=q(200,-6.5,.1,.32),weak=q(300,-5.8,.1,.1);
+    const missing={...q(400,-7,.2,.2),checks:{...checks,passed:false,unverified:1,remaining:2}};
+    for(const list of [[best,lowerDelay,weak,missing],[missing,weak,lowerDelay,best]]) {
+        const selected=A.selectFinalist(list);
+        assert.equal(selected.candidate,lowerDelay);assert.equal(selected.allowanceDb,.2);assert.equal(selected.candidates,2);
+    }
+    assert.equal(A.selectFinalist([{...best,score:{...best.score,se:null}},lowerDelay]).candidate.changes.gyro_lpf1_static_hz,100,'unknown uncertainty gives no noise allowance');
+    const noCorrection={...checks,corrected:0};
+    const enough={...q(100,-3.1,.3,.48),checks:noCorrection},insufficient={...q(200,-2.9,.1,.32),checks:noCorrection};
+    assert.equal(A.selectFinalist([insufficient,enough]).candidate,enough,'the delay preference cannot remove the minimum noise benefit');
+});
+
+test('baseline mismatch, lost measurements and removed RPM banks cannot count as corrections',()=>{
+    const C=require('../tools/autotune/filter_checklist.cjs');
+    const f=(id,severity,extra={})=>({id,severity,log:0,segment:0,profile:2,axis:'pitch',text:'Filter check.',replayable:true,...extra});
+    const before=[f('F1','flag'),f('F6','flag',{notchSource:14}),f('C11','flag')];
+    const after=[f('F1','ok'),f('F6','ok',{notchSource:12}),f('C11','skipped')];
+    const baseline=[f('F1','ok'),before[1],before[2]],check=C.compareFindings(before,after,{baseline});
+    assert.equal(check.summary.cleared,0);
+    assert.equal(C.assess(check).unverified,3);
+    assert.match(check.rows.find(r=>r.id==='F1').detail,/does not show/);
+    assert.equal(check.rows.find(r=>r.notchSource===14).outcome,'Not evaluated');
+    assert.equal(C.assess(C.compareFindings(before,after,{unchanged:true})).passed,false);
+    assert.equal(C.summary([f('F6','ok'),f('F6','skipped')]).status,'Not evaluated','a measured bank cannot hide an unavailable bank');
+    const unavailable=C.compareFindings([f('C11','flag',{replayable:false})],[f('C11','skipped',{replayable:false})]);
+    assert.equal(C.assess(unavailable).unavailable,1);
+    assert.equal(unavailable.rows[0].outcome,'Not evaluated','an unknown PID path remains an open recorded problem');
+});
+
+test('both export paths reject a noise-only recommendation with unresolved filter checks',()=>{
+    const C=require('../tools/autotune/filter_checklist.cjs'),advice=require('../tools/autotune/advice.cjs');
+    const failed={id:'F1',severity:'flag',log:0,profile:2,text:'No gyro low-pass filter is on.',replayable:true};
+    const res={version:2,model:{passed:true},recommended:{status:'recommended',rows:[{name:'gyro_lpf1_static_hz',from:100,to:140,scope:'global',source:'header'}],
+        predicted:{totalDb:-12,se:.1},validation:{}},checklist:C.compareFindings([failed],[failed])};
+    assert.equal(A.cliExportStatus(res).available,false);
+    assert.match(A.cliExportStatus(res).reasons.join(' '),/filter parameter problems are not corrected.*F1/);
+    assert.equal(A.cliFile(res),'');
+    const recs=advice.filterRecommendations(res,{texts:A.texts(res)});
+    assert.ok(recs.every(r=>r.severity==='check'&&!r.cli.length));
+    assert.doesNotMatch(advice.exportScript(recs,null,{}),/^set /m);
+});
+
+test('a validated partial correction is useful without hiding remaining problems or regressions',()=>{
+    const C=require('../tools/autotune/filter_checklist.cjs');
+    const f=(id,severity,value,se)=>({id,severity,value,se,log:13,segment:1,profile:2,axis:id==='C11'?'pitch':null,replayable:true});
+    const before=[f('F1','flag',0),f('C11','flag',.85,.01),f('F5','flag',3.78)];
+    const after=[f('F1','ok',1),f('C11','flag',.65,.01),before[2]];
+    const check=C.compareFindings(before,after,{baseline:before}),partial=C.assess(check);
+    assert.equal(partial.passed,true);assert.equal(partial.complete,false);
+    assert.equal(partial.corrected,1);assert.equal(partial.improved,1);assert.equal(partial.remaining,2);
+    const lost=C.assess(C.compareFindings(before,[after[0],{...after[1],severity:'skipped'},before[2]],{baseline:before}));
+    assert.equal(lost.passed,false);
+    const verified={score:{db:-5},checks:partial},unverified={score:{db:-15},checks:lost};
+    assert.equal([unverified,verified].sort(A.rankCandidates)[0],verified,'a missing measurement cannot displace an accepted partial correction');
+    assert.equal(C.assess(C.compareFindings(before,[after[0],f('C11','flag',.95,.01),before[2]],{baseline:before})).passed,false);
+    const noProgress=C.compareFindings([before[2]],[before[2]]);
+    assert.equal(C.assess(noProgress).passed,false,'unaffected coverage and noise reduction alone do not claim a correction');
+    assert.equal(C.assess(noProgress,{requireProgress:false}).passed,true,'reserved periods check regressions without selecting the candidate again');
+    C.verify(check,{passed:false,supported:true,parity:[{log:13,passed:false,axes:{pitch:{passed:false}}}]});
+    const config=check.rows.find(r=>r.id==='F1'),signal=check.rows.find(r=>r.id==='C11');
+    assert.equal(config.confirmed,true);assert.equal(config.outcome,'Cleared in replay');
+    assert.equal(signal.confirmed,false);assert.equal(signal.outcome,'Not evaluated');
+    assert.match(config.confirmationReason,/signal replay is not necessary/);
+});
+
+test('partial correction can pass real search and export while short transitions remain explicitly unmeasured',()=>{
+    const it=correctionFixture(187),short=fixture(1);short.w.n=200;
+    const P=A.prepare([it,short],{gear}),raw=[0,1,2].map(a=>it.w.extra['gyroRAW['+a+']']);
+    for(const w of P.windows)w.input={start:w.st-w.lead,end:w.st+w.N,factor:1,raw:raw.map(x=>x.slice(w.st-w.lead,w.st+w.N)),native:raw.map(x=>x.slice(w.st-w.lead,w.st+w.N))};
+    P.reconstructed=true;
+    const result=A.tune([],{gear,prepared:P,maxCandidates:36,budgetMs:30000,curves:false});
+    assert.equal(result.model.passed,true);
+    assert.equal(result.recommended.status,'recommended',JSON.stringify(result.recommended.reasons));
+    assert.ok(result.recommended.validation.checks.corrected>0);
+    assert.ok(result.recommended.validation.checks.remaining>0);
+    assert.equal(result.unmeasuredPeriods.length,1);
+    assert.equal(result.unmeasuredPeriods[0].eligibleS,.2);
+    assert.match(result.cliFile,/Filter problems not corrected: F5/);
+    assert.match(result.cliFile,/Signal change not measured: log 2/);
+    assert.match(A.texts(result).recommendation,/Some filter problems are not corrected/);
+    const advice=require('../tools/autotune/advice.cjs'),recs=advice.filterRecommendations(result,{texts:A.texts(result)});
+    assert.ok(recs.some(r=>r.severity==='action'&&r.cli.length),'the combined export accepts the same validated partial correction');
+    const script=advice.exportScript(recs,null,{});
+    assert.match(script,/These filter problems are not corrected: F5/);
+    assert.match(script,/Log 2, 0 s to 0.2 s/);
+    assert.match(script,/signal change is not measured/);
+    const excessive=A.tune([],{gear,prepared:P,simulate:{gyro_lpf1_type:1,gyro_lpf1_static_hz:170},maxAddMs:.1,curves:false});
+    assert.equal(excessive.recommended.status,'not recommended');
+    assert.ok(excessive.recommended.validation.holdout.delay.maxAddMs>.1);
+    assert.match(excessive.recommended.reasons.join(' '),/flight periods for the last test, added filter time delay is .* ms\. The limit is 0\.1 ms/);
+});
+
+test('repair proposals combine the missing LPF and missing rotor harmonics without assigning resonances to RPM sources',()=>{
+    const C=require('../tools/autotune/filter_checklist.cjs'),it=fixture(),h=it.w.flight.header;
+    h.gyro_soft_type=0;h.features=1<<30;h.gyro_rpm_notch_preset=0;
+    const P=A.prepare([it],{gear});
+    const line=order=>({order,rotorLocked:true,axes:['roll','pitch','yaw'].map(axis=>({axis,amplitude:10}))});
+    P.trainingChecklistBefore=[{id:'F5',severity:'flag',segment:0,lines:[line(4),line(3.74)]}];
+    const repaired=A.repairCandidate(P,{dyn_notch_q:60});
+    assert.equal(repaired.gyro_lpf1_type,1);assert.equal(repaired.dyn_notch_q,60);
+    assert.equal(repaired.gyro_rpm_notch_preset,0);
+    for(const ax of ['roll','pitch','yaw'])assert.deepEqual(repaired['gyro_rpm_notch_source_'+ax].filter(Boolean),[14]);
+    assert.deepEqual(C.configurationIssues(P,repaired),[]);
+    assert.deepEqual(A.invalid(P,repaired),[]);
+    for(const ax of ['roll','pitch','yaw']) {
+        h['gyro_rpm_notch_source_'+ax]=[14,...Array(15).fill(0)];
+        h['gyro_rpm_notch_q_'+ax]=[60,...Array(15).fill(0)];
+    }
+    h.features=0;
+    const disabled=A.prepare([it],{gear});disabled.trainingChecklistBefore=P.trainingChecklistBefore;
+    const enabled=A.repairCandidate(disabled,{});
+    assert.equal(enabled.RPM_FILTER,true,'an existing but disabled bank does not provide RPM coverage');
+    assert.equal(enabled.gyro_lpf1_type,1);
+    for(const ax of ['roll','pitch','yaw'])assert.equal(enabled['gyro_rpm_notch_source_'+ax],undefined,'reuse the recorded bank without adding a duplicate');
+});
+
+function correctionFixture(frequency=200) {
+    const it=fixture(),w=it.w,h=w.flight.header,n=w.n,lib=require('../tools/autotune/lib.cjs');
+    h.features=1<<30;h.gyro_rpm_notch_preset=0;h.gyro_soft_type=0;h.gyro_lowpass_hz=0;
+    const raw=[0,1,2].map(a=>Float64Array.from({length:n},(_,i)=>10*Math.sin(2*Math.PI*13*i/1000+a)+8*Math.sin(2*Math.PI*frequency*i/1000+a)));
+    w.extra=Object.fromEntries(raw.map((x,a)=>['gyroRAW['+a+']',x]));
+    w.airborneAt=new Uint8Array(n).fill(1);w.govStateAt=new Uint8Array(n).fill(4);w.rescueAt=new Uint8Array(n);
+    w.u=[0,1,2].map(()=>new Float64Array(n));w.sp=w.u;w.coll=new Float64Array(n);w.P=w.u;w.I=w.u;w.F=w.u;w.B=w.u;
+    const cfg=FT.config(h,{gear}),pid=['roll','pitch','yaw'].map((ax,a)=>({known:true,gyro_cutoff:h[ax+'BW'][0],d_cutoff:h[ax+'BW'][1],Kp:50*lib.SCALE.P[a],Kd:15*lib.SCALE.D[a]}));
+    const output=R.run(cfg,{n,raw,hs:w.hs},pid);w.gyro=output.y;w.D=output.d;
+    return it;
+}
+
+test('autotune corrects an unfiltered rotor line and missing LPF under the same checks on training and reserved periods',()=>{
+    const it=correctionFixture(),P=A.prepare([it],{gear}),raw=[0,1,2].map(a=>it.w.extra['gyroRAW['+a+']']);
+    // This fixture tests the search and its judges with complete native input.
+    // Reconstruction accuracy has separate native-C regression tests.
+    for(const w of P.windows)w.input={start:w.st-w.lead,end:w.st+w.N,factor:1,raw:raw.map(x=>x.slice(w.st-w.lead,w.st+w.N)),native:raw.map(x=>x.slice(w.st-w.lead,w.st+w.N))};
+    P.reconstructed=true;
+    const result=A.tune([],{gear,prepared:P,maxCandidates:36,budgetMs:30000,curves:false});
+    assert.equal(result.recommended.status,'recommended',JSON.stringify(result.recommended.reasons));
+    assert.ok(result.recommended.validation.checks.corrected>=2);
+    assert.equal(result.recommended.validation.checks.remaining,0);
+    assert.equal(result.recommended.validation.checks.training.passed,true);
+    assert.equal(result.recommended.validation.checks.heldout.passed,true);
+    for(const id of ['F1','F5'])assert.ok(result.checklist.rows.some(r=>r.id===id&&r.outcome==='Cleared in replay'),id);
+    assert.ok(result.cliFile);
+    assert.match(result.cliFile,/does not predict a new closed-loop flight/);
+    const baseline=A.tune([],{gear,prepared:P,simulate:{},curves:false});
+    assert.equal(baseline.checklist.summary.cleared,0);
+    assert.ok(baseline.checklist.summary.remaining>=2);
+    assert.equal(baseline.cliFile,'');
+    const noiseOnly=A.tune([],{gear,prepared:P,simulate:{gyro_notch1_hz:200,gyro_notch1_cutoff:190},curves:false});
+    assert.equal(noiseOnly.model.passed,true);
+    assert.ok(noiseOnly.recommended.predicted.totalDb<-3,'a large noise reduction is insufficient while the original checks fail');
+    assert.equal(noiseOnly.recommended.status,'not recommended');
+    assert.match(noiseOnly.recommended.reasons.join(' '),/filter parameter problems are not corrected.*F1/);
+    assert.equal(noiseOnly.cliFile,'');
 });

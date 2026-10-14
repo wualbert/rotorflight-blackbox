@@ -56,7 +56,7 @@ function pair(v, se, unit, d) {
     return withUnit(num(se) !== null ? `${fmt(v, dd)} ± ${fmt(Math.abs(se), dd)}` : fmt(v, dd), unit);
 }
 const many = (k, word) => `${fmt(num(k) === null ? 0 : k)} ${word}${k === 1 ? '' : 's'}`;
-const isThin = (f) => !!f && f.severity === 'note' && (f.thin === true || /^no finding/i.test(String(f.text || '')));
+const isThin = (f) => !!f && f.severity === 'note' && (f.thin === true || /^no (?:finding|result)/i.test(String(f.text || '')));
 const logLabel = (l) => typeof l === 'number' ? `log ${l + 1}` : null;           // the viewer counts logs from 1
 // the PID profile of a finding: the worker's pidProfile (1-6, its resolved profile) first, as hierarchy.cjs profileKey and
 // js/tuning_dialog.js profileNo; else the log profile 1-6, 0 when it is not known (0, 'arm', 'unknown'), null when the
@@ -239,7 +239,7 @@ X('G0', { noun: 'governor mode', unit: '', scale: 1, tab: 'governor', module: 'g
     evidence: ev('flight', [['govSum', 'govI'], ['headspeed', 'govTarget'], ['motor[0]']], { kind: 'governor', curve: 'more.gov' }, { expected: () => null }) });
 X('G1', { noun: 'RPM signal', unit: '', scale: 1, tab: 'governor', module: 'gov',
     say: (f, v) => f.severity === 'flag' ? `The governor changes to FALLBACK ${v.val} ${f.value === 1 ? 'time' : 'times'}.` : num(f.value) > 0 ? `The headspeed signal shows ${many(f.value, 'possible error')} in flight.`
-        : f.severity === 'note' ? 'The headspeed signal shows no errors in flight. The log has no log events for the governor. Thus, the check cannot find a FALLBACK.' : 'The governor does not change to FALLBACK, and the headspeed signal shows no errors in flight.',
+        : f.severity === 'note' ? 'The headspeed signal shows no possible errors in flight. The log has no log events for the governor. Thus, the check cannot find a FALLBACK.' : 'The log shows no FALLBACK or possible RPM error in flight.',
     limit: (f) => f.severity === 'flag' ? 'The limit is 0.' : null,
     value: (f, v) => v.val === null ? null : f.severity === 'flag' ? `${v.val} ${f.value === 1 ? 'change' : 'changes'} to FALLBACK` : many(f.value, 'possible error'),
     evidence: ev('events', [['headspeed', 'govTarget'], ['motor[0]']], { kind: 'governor', curve: 'more.gov' }, { pads: [1, 2], expected: () => 'The headspeed signal is smooth, and the governor stays in ACTIVE.' }) });
@@ -256,7 +256,9 @@ X('G4', { noun: 'headspeed overshoot', unit: '%', scale: 100, tab: 'governor', m
     limit: (f, v, R) => T.sigma(pc(R.flag), '%'),
     evidence: ev('events', [['headspeed', 'govTarget'], ['setpoint[3]'], ['govF', 'govSum', 'motor[0]']], { kind: 'governor', curve: 'more.gov' }, { pads: [0.3, 1.3], expected: () => 'The headspeed does not go more than the target after a collective change.' }) });
 X('G5', { noun: 'time to target', unit: 's', scale: 1, tab: 'governor', module: 'gov',
-    say: (f, v) => `${v.In}after a collective increase, the headspeed error decreases to 1 % or less in ${v.value}.`,
+    say: (f, v) => f.governorResponse && f.governorResponse.censored > 0
+        ? `${v.In}the mean time to the target is a minimum of ${v.value}. Some responses did not get to the target in the recorded period.`
+        : `${v.In}after a collective increase, the headspeed error decreases to 1 % or less in ${v.value}.`,
     limit: (f, v, R) => T.sigma(num(f.threshold) !== null ? f.threshold : R.flag, 's'),
     evidence: ev('events', [['headspeed', 'govTarget'], ['setpoint[3]'], ['govSum', 'motor[0]']], { kind: 'governor', curve: 'more.gov' }, { pads: [0.3, 0.5], expected: () => 'The headspeed is at the target again in 0.5 s or less.' }) });
 X('G6', { noun: 'throttle reserve', unit: '%', scale: 1, tab: 'governor', module: 'gov',
@@ -376,14 +378,14 @@ for (const [id, yaw] of [['C13', false], ['T12', true]]) X(id, { noun: yaw ? 'ya
 X('R1', { noun: 'stick time delay', unit: 'ms', scale: 1, tab: 'curves', module: 'track', note: 'information', nOf: (f) => `periods with ${f.axis || 'stick'} stick movement`, min: (R) => R.minBlocks,
     say: (f, v) => `The ${ax(v)} setpoint follows the stick with a time delay of ${v.value}.`, limit: (f, v, R) => T.sigma(R.flag, 'ms'),
     evidence: ev('blocks', [['rcCommand[{a}]', G.sp]], { kind: 'time', snippet: { fields: ['rcCommand[{a}]', G.sp] } }, { expected: () => 'The setpoint follows the stick with a short time delay.' }) });
-for (const [id, yaw] of [['C5', false], ['T1', true]]) X(id, { noun: yaw ? 'fast tail oscillation' : 'fast oscillation', unit: '%', scale: 100, tab: 'curves', module: 'track', note: 'monitor', nOf: 'periods of 0.5 s with no stick input', min: (R) => R.minWindows,
-    say: (f, v) => f.severity === 'flag' ? `${v.In}the ${ax(v)} rate has ${f.value === 1 ? '1 oscillation that increases' : `${fmt(f.value)} oscillations that increase`} with no stick input.`
-        : `${v.In}the ${ax(v)} oscillation is ${fmt(rulesOf(f, CHECKS[id]).level) || 20} deg/s or more for ${v.value} of the time with no stick input.`,
+for (const [id, yaw] of [['C5', false], ['T1', true]]) X(id, { noun: yaw ? 'fast tail oscillation' : 'fast oscillation', unit: '%', scale: 100, tab: 'curves', module: 'track', note: 'monitor', nOf: 'selected periods of 0.5 s', min: (R) => R.minWindows,
+    say: (f, v) => f.severity === 'flag' ? `${v.In}the ${ax(v)} rate has ${f.value === 1 ? '1 oscillation that increases' : `${fmt(f.value)} oscillations that increase`} with small stick input.`
+        : `${v.In}the ${ax(v)} oscillation is ${fmt(rulesOf(f, CHECKS[id]).level) || 20} deg/s or more for ${v.value} of the time in selected windows.`,
     limit: (f, v, R) => f.severity === 'flag' ? 'Each oscillation of this type is a problem.' : num(R.share) === null ? null : `At more than ${pc(R.share)} %, the result is "Monitor". ${SE_NOTE}`,
     bound: (f, v, R) => f.severity === 'flag' ? '0 oscillations that increase' : num(R.share) === null ? null : `${pc(R.share)} % of the time`,
     value: (f, v) => f.severity !== 'flag' || num(f.value) === null ? (v.value === null ? null : `${v.value} of the time`) : f.value === 1 ? '1 oscillation that increases' : `${fmt(f.value)} oscillations that increase`,
     unitOf: (f) => f.severity === 'flag' ? '' : '%', scaleOf: (f) => f.severity === 'flag' ? 1 : 100,
-    evidence: ev('events', [[G.sp, G.gy], [G.P, G.D], [G.mix]], { kind: 'time', curve: 'track.{axis}.time' }, { pads: [0.3, 0.5], analyser: 'gyroRAW[{a}]', expected: () => 'The error has no oscillation that increases with no stick input.' }) });
+    evidence: ev('events', [[G.sp, G.gy], [G.P, G.D], [G.mix]], { kind: 'time', curve: 'track.{axis}.time' }, { pads: [0.3, 0.5], analyser: 'gyroRAW[{a}]', expected: () => 'The error has no oscillation that increases with small stick input.' }) });
 
 // --- health_more.cjs ---
 X('D6', { noun: 'time not used', unit: 's', scale: 1, tab: 'checks', module: 'more', note: 'information',
@@ -408,13 +410,13 @@ X('T13', { noun: 'hover tail trim', unit: '%', scale: 100, tab: 'tail', module: 
 // per 1000 units / 1000 is the degrees of cyclic pitch for each degree of collective (SPEC3 F: no I-term units in the text)
 const perDeg = (f) => num(f.value) === null ? null : `${pair(f.value / 1000, num(f.se) === null ? null : f.se / 1000)} deg of cyclic pitch for each 1 deg of collective`;
 X('C14', { noun: 'pitch collective feedforward', unit: '', scale: 1, tab: 'checks', module: 'more', note: 'information', nOf: 'periods of 30 s', min: (R) => R.minBlocks,
-    say: (f, v) => `${v.In}the pitch I-term adds ${perDeg(f)}.` + (num(f.gainChange) !== null ? ` A change of ${fmt(f.gainChange)} in pitch_collective_ff_gain supplies this.` : ''),
+    say: (f, v) => `${v.In}the pitch I-term and offset change by ${perDeg(f)}.` + (num(f.gainChange) !== null ? ` The fit estimates a change of ${pair(f.gainChange, f.gainChangeSE)} in pitch_collective_ff_gain.` : ''),
     limit: (f, v, R) => num(R.flag) === null ? null : `The limit is ${fmt(R.flag / 1000)} deg for each 1 deg of collective, with a gain change of ${R.minGainChange} or more. ${SE_NOTE}`,
     bound: (f, v, R) => num(R.flag) === null ? null : `${fmt(R.flag / 1000)} deg for each 1 deg of collective`,
     value: (f) => perDeg(f),
     evidence: ev('events', [['axisI[1]', 'axisO[1]'], ['mixer[3]'], ['setpoint[1]', 'gyroADC[1]']], { kind: 'scatter', snippet: { fields: ['axisI[1]', 'axisO[1]', 'mixer[3]'], derive: { kind: 'bandpass' } } }, { pads: [0.3, 1.3], expected: () => 'The pitch I-term does not change with the collective.' }) });
 X('T14', { noun: 'inertia precompensation', unit: '', scale: 1, tab: 'tail', module: 'more', note: 'information', nOf: 'headspeed changes that the check can use', min: (R) => R.minEvents,
-    say: (f, v) => `At headspeed changes, the tail feedback follows the rotor acceleration. A change of ${v.value} in yaw_inertia_precomp_gain supplies this feedback.`,
+    say: (f, v) => `At headspeed changes, the tail feedback follows the rotor acceleration. The fit estimates a change of ${v.value} in yaw_inertia_precomp_gain.`,
     limit: (f, v, R) => num(R.minGainChange) === null ? null : `The limit is a gain change of ±${fmt(Math.max(R.minGainChange, (R.relGainChange || 0) * (num(f.from) || 0)))}. ${SE_NOTE}`,
     value: (f, v) => v.value === null ? null : `gain change ${v.value}`,
     evidence: ev('events', [['headspeed', 'govTarget'], ['gyroADC[2]', 'setpoint[2]'], ['mixer[2]', 'axisF[2]']], { kind: 'time', snippet: { fields: ['mixer[2]', 'axisF[2]', 'headspeed'], derive: { kind: 'lowpass' } } }, { pads: [1, 1.3], expected: () => 'The yaw rate stays stable when the headspeed changes.' }) });
@@ -468,7 +470,7 @@ X('G16', PH({ noun: 'change to ACTIVE', unit: '%', scale: 100, tab: 'governor', 
         rpm: (f, v) => `at the change from SPOOLUP to ACTIVE, the headspeed is ${morePct(f, v)} ${refOf(f)}` }),
     limit: (f, v, R) => phaseUnit(f) === '%' && num(R.flag) !== null ? `The limits are ${pc(R.flag)} %${num(R.settleS) !== null ? ` and ${fmt(R.settleS)} s to become stable` : ''}.`
         : phaseUnit(f) === 's' && num(f.threshold) === null && num(R.settleS) !== null ? T.plain(R.settleS, 's') : phaseLimit(f, v, R),
-    after: (f) => f.afterLiftoff === true ? `A longer spool-up time does not correct this error, because the change comes ${num(f.afterLiftoffS) !== null ? `${pair(f.afterLiftoffS, null, 's')} after the liftoff` : 'in flight'}.`
+    after: (f) => f.afterLiftoff === true ? `The change comes ${num(f.afterLiftoffS) !== null ? `${pair(f.afterLiftoffS, null, 's')} after the liftoff` : 'in flight'}. A change in rotor load can cause part of the error. The time of this change does not identify a governor parameter change.`
         : phaseUnit(f) !== '%' ? null : f.censored || (f.severity === 'flag' && f.settleS === null) ? 'The headspeed does not become stable.' : num(f.settleS) > 0 ? `The headspeed becomes stable in ${pair(f.settleS, null, 's')}.`
         : num(f.settleS) === 0 ? 'The headspeed stays stable after the change.' : null,
     evidence: ev('events', [['headspeed', 'govTarget'], ['motor[0]', 'govSum'], ['mixer[3]']], { kind: 'governor', snippet: { fields: ['headspeed', 'govTarget', 'motor[0]'] } },
@@ -517,8 +519,8 @@ X('G19', { noun: 'rescue headspeed', unit: '%', scale: 100, tab: 'governor', mod
 // G20: the cause of each FALLBACK (health_rescue fallbacksOf): value the overloads, n the FALLBACK entries, events kind overload |
 // signal | none. Information: an overload is a possible result of the throttle limit (rule K22), the others are check G1
 X('G20', { noun: 'FALLBACK cause', unit: '', scale: 1, tab: 'governor', module: 'rescue', note: 'information', statusOf: (f) => (f.severity === 'note' || f.severity === 'flag') && !isThin(f) ? 'information' : null,
-    info: 'This check finds the cause of each change of the governor to FALLBACK.',
-    why: (f) => num(f.value) > 0 && f.value === f.n ? 'At the throttle limit, the motor cannot hold the headspeed. Then the governor changes to FALLBACK, and the RPM signal is possibly correct.' : 'A FALLBACK at a usual load is possibly an error of the RPM signal (check G1).',
+    info: 'This check compares each change to FALLBACK with the headspeed and throttle.',
+    why: (f) => num(f.value) > 0 && f.value === f.n ? 'The FALLBACK occurs with a headspeed decrease at the throttle limit. This does not show that the RPM signal is correct.' : 'A FALLBACK at a usual load is possibly an error of the RPM signal (check G1).',
     say: (f) => `${cap(many(f.value, 'FALLBACK'))} of ${fmt(f.n)} ${num(f.value) === 1 ? 'comes' : 'come'} at a headspeed decrease with the throttle at 95 % or more.`
         + (num(f.signals) > 0 ? ` ${cap(many(f.signals, 'FALLBACK'))} ${f.signals === 1 ? 'comes' : 'come'} at an error of the headspeed signal.` : ''),
     limit: () => 'This check gives information only. It has no limit.', value: (f) => num(f.value) === null ? null : `${fmt(f.value)} of ${fmt(f.n)} at the throttle limit`,
@@ -535,7 +537,9 @@ X('T15', { noun: 'rescue yaw error', unit: 'deg/s', scale: 1, tab: 'tail', modul
         { pads: [0.5, 0.5], expected: () => 'At the rescue, the yaw rate follows the setpoint, and the tail output does not get to its limits.' }) });
 X('D8', { noun: 'rescue PID profile', unit: '', scale: 1, tab: 'checks', module: 'rescue', nOf: 'rescues',
     say: (f, v) => num(f.value) > 0 ? `At ${many(f.value, 'rescue')}, the PID profile changes` + (num(f.fromProfile) !== null && num(f.toProfile) !== null ? ` from ${profileLabel(f.fromProfile)} to ${profileLabel(f.toProfile)}` : '') + '.'
-        + (num(f.fromTarget) !== null && num(f.toTarget) !== null ? ` The governor headspeed changes from ${fmt(f.fromTarget)} rpm to ${fmt(f.toTarget)} rpm.` : '') : 'The PID profile does not change at the rescue.',
+        + (num(f.fromTarget) !== null && num(f.toTarget) !== null ? f.fromTarget === f.toTarget
+            ? ` The governor headspeed target stays at ${fmt(f.toTarget)} rpm.`
+            : ` The governor headspeed target changes from ${fmt(f.fromTarget)} rpm to ${fmt(f.toTarget)} rpm.` : '') : 'The PID profile does not change at the rescue.',
     limit: () => 'Each PID profile change at a rescue is a problem.', bound: () => '0 changes',
     value: (f) => num(f.value) === null ? null : many(f.value, 'PID profile change'),
     skipped: (f) => num(f.n) === 0 ? 'The log has no rescue. Thus, this check did not operate.' : 'This check did not operate on this log. The toolkit text gives the cause.',
@@ -548,7 +552,7 @@ const profList = (l) => l.length > 1 ? `PID profiles ${andList(l.map(String))}` 
 X('D9', { noun: 'rescue mode', unit: '', scale: 1, tab: 'checks', module: 'config',
     sym: (f) => f.severity === 'flag' ? 'In this PID profile, the rescue switch does not start a rescue.' : null,
     why: (f) => f.severity === 'flag' ? 'If you fly in this PID profile, the rescue cannot move the helicopter back to a level attitude.' : null,
-    good: 'In this PID profile, the rescue switch starts a rescue.',
+    good: 'The rescue mode is on in this PID profile.',
     say: (f, v) => f.severity === 'flag' ? `${v.In}\`rescue_mode\` is OFF${f.basis === 'cli' ? ' in the CLI dump' : f.basis === 'header' ? ' in the log header' : ''}.`
         : `${v.In}the rescue is on${f.mode ? ` (\`rescue_mode\` is ${f.mode})` : ''}.` + (f.basis === 'log' && num(f.n) > 0 ? ` The log shows ${many(f.n, 'rescue')} in this PID profile.` : f.basis === 'cli' ? ' The CLI dump shows this.' : ''),
     thinSay: (f) => Array.isArray(f.unknownProfiles) && f.unknownProfiles.length ? `The analysis cannot find if the rescue is on in ${profList(f.unknownProfiles)}. The log header does not record \`rescue_mode\`. `
@@ -579,11 +583,11 @@ X('P1', { noun: 'voltage at load', unit: 'V', scale: 1, tab: 'governor', module:
     skipped: noVolt,
     evidence: ev('events', [['Vbat'], ['Ibat'], ['motor[0]'], ['headspeed', 'govTarget']], { kind: 'time', snippet: { fields: ['Vbat', 'Ibat', 'motor[0]'] } },
         { pads: [0.5, 0.5], maxSpans: 10, expected: () => 'At each load step, the battery voltage decreases by a small quantity and stays more than the warning level.' }) });
-X('P2', { noun: 'battery voltage decrease', unit: 'mΩ', scale: 1, tab: 'governor', module: 'power', note: 'information', nOf: 'load steps with a large output increase', min: (R) => R.minSteps,
+X('P2', { noun: 'battery resistance estimate', unit: 'mΩ', scale: 1, tab: 'governor', module: 'power', note: 'information', nOf: 'load steps with a large output increase', min: (R) => R.minSteps,
     noteStatus: (f) => f.higher ? 'monitor' : 'information',
     info: 'This check measures the battery voltage decrease for each 1 A of battery output.', sym: 'The battery voltage decreases more for each 1 A than with the other batteries.',
     why: (f) => f.higher ? 'A battery with a larger decrease is possibly weak. It gives less power at the load steps.' : null,
-    say: (f) => `For each 1 A of battery output, the voltage decreases by ${pair(f.value, f.se, 'mΩ')} (V for each 1000 A)` + (num(f.perCell) !== null ? `, or ${pair(f.perCell, f.perCellSe, 'mΩ')} for each cell` : '') + '.'
+    say: (f) => `The voltage/current slope gives a resistance estimate of ${pair(f.value, f.se, 'mΩ')}` + (num(f.perCell) !== null ? `, or ${pair(f.perCell, f.perCellSe, 'mΩ')} for each cell` : '') + '.'
         + (f.higher && num(f.othersMedian) !== null ? ` The median of the other batteries is ${pair(f.othersMedian, null, 'mΩ')}.` : ''),
     limit: (f, v, R) => num(R.relHigh) === null ? T.report() : `A battery with more than ${fmt(R.relHigh)} x the median of the other batteries is a value to monitor. ${SE_NOTE}`,
     bound: (f, v, R) => num(R.relHigh) === null ? null : `${fmt(R.relHigh)} x the median of the other batteries`,
@@ -636,35 +640,35 @@ const LEAD = {
     D3: { sym: 'The log does not record some fields that the checks use.', why: 'Thus, some checks did not operate. The blackbox tab of the Configurator turns on these fields.', good: null },
     D4: { sym: 'The CLI dump and the log header have different values.', why: 'The analysis uses the CLI dump for the values that the header does not have. A dump from a different time can give incorrect values.', good: null },
     H: { info: 'A value of the configuration changes between two logs.', why: 'The analysis does not use the results of different values together.' },
-    F1: { sym: (f) => f.severity === 'flag' ? 'No gyro low-pass filter is on, but the RPM filters are on.' : 'No gyro low-pass filter is on.', why: 'The RPM filters remove only the rotor lines. One low-pass filter at approximately 100 Hz removes the other vibration.' },
-    F2: { sym: 'A gyro low-pass filter has a low cutoff.', why: 'A low cutoff adds a time delay. Then the gains must be lower, and the response of the helicopter is slower.' },
+    F1: { sym: (f) => f.severity === 'flag' ? 'No gyro low-pass filter is on, but the RPM filters are on.' : 'No gyro low-pass filter is on.', why: 'The RPM filters remove only the rotor lines. A low-pass filter can decrease vibration between those lines.' },
+    F2: { sym: 'A gyro low-pass filter has a low cutoff.', why: 'A low cutoff adds a time delay. This can limit the gains and slow the response.' },
     F3: { sym: (f) => f.severity === 'note' && !(num(f.value) > 0) ? null : 'An RPM notch filter has a low Q.', why: (f) => f.severity === 'note' && !(num(f.value) > 0) ? null : 'A notch filter with a low Q has a large bandwidth. Then it adds a large time delay.' },
     F4: { sym: (f, v) => `The ${axIs(v)} D-term cutoff is not near the recommended value.`, why: 'A high cutoff lets vibration into the D-term. A low cutoff adds a time delay to the D-term.', good: (f, v) => `The ${axIs(v)} D-term cutoff is near the recommended value.` },
     F5: { sym: 'The raw gyro has a strong vibration line with no notch filter near it.', why: 'Vibration that the filters do not remove gets into the PID controller, the servos and the motor.' },
     F6: { sym: 'The vibration line stays large after its RPM notch filter.', why: 'The vibration that stays gets into the PID controller and the servos.' },
     F9: { sym: (f) => num(f.value) > 0 ? 'Some notch filter frequencies are more than the Nyquist frequency or the firmware limit.' : null, why: (f) => num(f.value) > 0 ? 'A notch filter at this frequency does not operate.' : null },
-    C1: { sym: (f, v) => `The ${axIs(v)} I-term stays at its limit.`, why: 'At its limit, the I-term cannot correct a constant error. Then the helicopter moves slowly away from the attitude that the pilot sets.' },
-    C2: { sym: 'The cyclic output stays at its limit.', why: 'At the limit, the swash plate cannot move more. Gain changes cannot correct the errors at that time.' },
-    C3: { sym: (f, v) => `During fast ${axIs(v)} turns, the I-term must supply a part of the command.`, why: 'The F gain sets the stick response. If the I-term must help, the response is slow, and it changes after the stop.' },
-    C4: { sym: (f, v) => `After ${axIs(v)} stops, the helicopter turns more than the stop position and then turns back.`, why: 'An overshoot at the stops shows a gain or a feedforward that is too high.' },
+    C1: { sym: (f, v) => `The ${axIs(v)} I-term stays at its limit.`, why: 'At its limit, the I-term cannot increase its output. Examine the output limits and the constant error.' },
+    C2: { sym: 'The cyclic output stays at its limit.', why: 'Gains cannot increase the output range. Examine the start times of the error and the output limit.' },
+    C3: { sym: (f, v) => Math.abs(f.value) > rulesOf(f, CHECKS.C3).iShare ? `During fast ${axIs(v)} turns, the I-term supplies a large part of the command.` : `During fast ${axIs(v)} turns, the gyro rate does not agree with the setpoint.`, why: 'The F gain sets the stick response. A large I-term output can show an error in the feedforward.' },
+    C4: { sym: (f, v) => `After ${axIs(v)} stops, the helicopter turns more than the stop position and then turns back.`, why: 'An overshoot at the stops can come from the gains or the feedforward.' },
     C5: { sym: (f, v) => f.severity === 'flag' ? `The ${axIs(v)} axis has an oscillation that increases when the sticks do not move.` : `The ${axIs(v)} axis has a small fast oscillation when the sticks do not move.`,
-        why: (f) => f.severity === 'flag' ? 'An oscillation of this type shows a gain that is too high. It can increase until the helicopter is not stable.' : 'A fast oscillation can show a gain near its limit, or vibration in the gyro signal.' },
-    C6: { sym: (f, v) => `When the sticks do not move, the ${axIs(v)} axis has a slow oscillation.`, why: 'A slow oscillation shows an I gain that is too high or a P gain that is too low.' },
+        why: (f) => f.severity === 'flag' ? 'An oscillation of this type can show a loop gain that is too high or a mechanical response. It can increase until the helicopter is not stable.' : 'A fast oscillation can show a gain near its limit, or vibration in the gyro signal.' },
+    C6: { sym: (f, v) => `When the sticks do not move, the ${axIs(v)} axis has a slow oscillation.`, why: 'A slow oscillation can come from the control loop, the load or the governor.' },
     C8: { info: 'This check measures the roll movement when the pitch stick moves.', why: 'The cross-coupling compensation decreases this roll movement.' },
     C9: { info: 'This check compares the pitch error at positive and at negative collective.', why: 'The high speed integral (O gain) corrects this difference in fast flight.' },
     C10: { sym: (f, v) => !f.axis ? null : `In flight, the ${axIs(v)} I-term decreases fast, as on the ground.`, why: (f) => !f.axis ? null : 'Then the firmware possibly does not know that the helicopter is airborne.' },
     C11: { sym: (f, v) => `Much of the ${axIs(v)} D-term signal is vibration, not movement of the helicopter.`, why: 'This vibration goes to the servos. It can cause damage to the servos, and it limits the D gain.' },
-    T2: { sym: 'When the sticks do not move, the tail moves slowly from side to side.', why: 'A slow oscillation shows an I gain that is too high or a P gain that is too low.' },
+    T2: { sym: 'When the sticks do not move, the tail moves slowly from side to side.', why: 'A slow oscillation can come from the control loop, the load or the governor.' },
     T4: { sym: 'The tail oscillation stays at the same frequency when the gains change.', why: 'A frequency that does not change with the gains shows a possible mechanical cause, for example a loose linkage.' },
-    T5: { sym: 'The tail stops are not the same on the two sides.', why: 'The stop gains set the yaw stop on each side. A larger overshoot on one side shows a stop gain to adjust.' },
+    T5: { sym: 'The tail stops are not the same on the two sides.', why: 'The stop gains set the yaw stop on each side. A larger overshoot on one side can show a stop-gain difference.' },
     T6: { sym: 'The tail moves when the collective changes.', why: 'The collective changes the torque of the main rotor. The yaw precompensation must supply the tail thrust for this torque.' },
-    T7: { sym: 'During collective movements, the yaw I-term must correct the torque change.', why: 'Then the precompensation does not supply all of the tail thrust for the torque change.' },
-    T8: { sym: 'The tail output stays at its limit.', why: 'At its limit, the tail does not have sufficient authority. Gain changes cannot correct this.' },
-    T9: { sym: 'During fast pirouettes, the yaw I-term must supply a part of the tail command.', why: 'The yaw F gain sets the pirouette response. If the I-term must help, the response is slow.' },
-    C12: { sym: (f, v) => `The gyro does not follow the ${axIs(v)} stick command accurately.`, why: 'The tracking error is the difference between the stick command and the gyro rate. A large error shows that the gains or the feedforward are not sufficient.' },
-    T11: { sym: 'The gyro does not follow the yaw stick command accurately.', why: 'The tracking error is the difference between the stick command and the gyro rate. A large error shows that the gains or the feedforward are not sufficient.' },
-    C13: { info: (f, v) => `This check measures the time delay from the stick to the ${axIs(v)} rate.`, sym: (f, v) => `The ${axIs(v)} axis has a slow response to the stick.`, why: 'A long time delay makes the response slow. The filters, the servos and the B gain change it.' },
-    T12: { info: 'This check measures the time delay from the stick to the yaw rate.', sym: 'The tail has a slow response to the stick.', why: 'A long time delay makes the response slow. The filters, the servo and the B gain change it.' },
+    T7: { sym: 'During collective movements, the yaw I-term must correct the torque change.', why: 'The I-term can help or operate against the precompensation. Its direction is necessary to identify a change.' },
+    T8: { sym: 'The tail output stays at its limit.', why: 'Gains cannot increase the output range. The limit does not identify the cause.' },
+    T9: { sym: (f) => Math.abs(f.value) > rulesOf(f, CHECKS.T9).iShare ? 'During fast pirouettes, the yaw I-term supplies a large part of the tail command.' : 'During fast pirouettes, the gyro rate does not agree with the setpoint.', why: 'The yaw F gain sets the pirouette response. A large I-term output can show an error in the feedforward.' },
+    C12: { sym: (f, v) => `The gyro does not follow the ${axIs(v)} stick command accurately.`, why: 'The tracking error is the difference between the stick command and the gyro rate. The error does not identify a gain change.' },
+    T11: { sym: 'The gyro does not follow the yaw stick command accurately.', why: 'The tracking error is the difference between the stick command and the gyro rate. The error does not identify a gain change.' },
+    C13: { info: (f, v) => `This check measures the time delay from the setpoint to the ${axIs(v)} rate.`, sym: (f, v) => `The ${axIs(v)} axis has a slow response to the stick.`, why: 'A long time delay makes the response slow. The filters, the servos and the B gain change it.' },
+    T12: { info: 'This check measures the time delay from the setpoint to the yaw rate.', sym: 'The tail has a slow response to the stick.', why: 'A long time delay makes the response slow. The filters, the servo and the B gain change it.' },
     R1: { info: (f, v) => `This check measures the time delay from the stick to the ${axIs(v)} setpoint.`, sym: (f, v) => `The ${axIs(v)} setpoint follows the stick with a long time delay.`, why: 'The response time and the acceleration limit of the rates set this time delay.' },
     D6: { sym: (f) => f.severity === 'flag' ? 'Failsafe is on while the helicopter is airborne.' : null, why: (f) => f.severity === 'flag' ? 'Failsafe in flight shows that the receiver did not get the signal of the transmitter.' : null },
     F10: { sym: (f, v) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'Much of the yaw D-term signal is vibration, not movement of the helicopter.', why: (f) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'This vibration goes to the tail servo or the tail motor, and it limits the yaw D gain.' },
@@ -681,25 +685,25 @@ const LEAD = {
     C15: { sym: 'Before the liftoff, the helicopter has an oscillation on its skids.', why: 'A ground resonance can increase fast and cause damage. Keep the collective low until the governor is ACTIVE.' },
     G19: { sym: 'At the rescue, the headspeed decreases.', why: 'The rescue pulls up with a large collective. A low headspeed decreases the lift and the tail authority.' },
     T15: { sym: 'At the rescue, the tail moves more than before the rescue.', why: 'The rescue changes the collective fast, and the tail must hold the torque change.' },
-    D8: { sym: 'The PID profile changes when the rescue starts.', why: 'Then the rescue pulls up with different gains and a different headspeed.' },
+    D8: { sym: 'The PID profile changes near the rescue start.', why: 'This can change gains or headspeed during the rescue. The time of a PID profile change does not identify its source.' },
     D5: { sym: (f, v, x) => d5Low(f, x) ? 'The battery voltage becomes very low in flight.' : 'The battery voltage changes suddenly.',
         why: (f, v, x) => d5Low(f, x) ? 'A low voltage decreases the motor power. Then the governor cannot hold the headspeed.' : 'A sudden step can show a loose connector or a problem of the voltage sensor.' },
     G13: { sym: 'In flight, the cell voltage becomes low.', why: 'At a low cell voltage, the motor has less power, and the battery can become damaged.', good: 'The cell voltage stays sufficient in flight.' },
-    G1: { sym: (f) => f.severity === 'flag' ? 'The governor changes to FALLBACK.' : 'The headspeed signal shows errors.',
-        why: (f) => f.severity === 'flag' ? 'In FALLBACK, the governor does not use the RPM signal. Then it does not control the headspeed.' : 'The governor and the RPM notch filters use this signal.' },
+    G1: { sym: (f) => f.severity === 'flag' ? 'The governor changes to FALLBACK.' : 'The headspeed signal shows possible errors.',
+        why: (f) => f.severity === 'flag' ? 'In FALLBACK, the governor does not control the headspeed. Low RPM, sudden RPM changes or a FALLBACK mode switch that is on can cause this condition. This condition does not show that the RPM source is incorrect.' : 'The governor and the RPM notch filters use this signal. This check does not identify an RPM source problem.' },
     G2: { sym: 'In stable flight, the headspeed is not at the target.', why: 'A headspeed error changes the lift and the tail authority. The governor I gain corrects a constant error.' },
     G3: { sym: 'When the collective increases, the headspeed decreases.', why: 'The governor F gain supplies throttle before the headspeed decreases. A large decrease changes the torque and moves the tail.' },
-    G4: { sym: 'After a collective change, the headspeed goes more than the target.', why: 'An overshoot shows a governor F gain or P gain that is too high.' },
-    G5: { sym: 'After a collective increase, the headspeed comes back to the target slowly.', why: 'The governor P and I gains set this time.' },
-    G6: { sym: 'The throttle is near its limit in flight.', why: 'Without a reserve, the governor cannot hold the headspeed when the load increases. Gain changes cannot increase the reserve.' },
+    G4: { sym: 'After a collective change, the headspeed goes more than the target.', why: 'The governor F and P gains can change the overshoot. The collective movement and output limits must also be examined.' },
+    G5: { sym: (f) => f.governorResponse && f.governorResponse.censored > 0 ? 'After a collective increase, some responses did not get to the target in the recorded period.' : 'After a collective increase, the headspeed comes back to the target slowly.', why: 'The governor gains, available power and load change this time.' },
+    G6: { sym: f => f.throttleLimit && f.throttleLimit.estimated ? 'The throttle limit is an estimate from the highest recorded output.' : 'The throttle is near its limit in flight.', why: 'Without a reserve, the governor cannot hold the headspeed when the load increases. Gain changes cannot increase the maximum throttle.' },
     G7: { info: 'At the throttle limit, the governor commands more throttle than the motor can get.' },
-    G9: { sym: 'The headspeed has an oscillation in stable flight.', why: 'An oscillation shows a governor P gain or I gain that is too high.' },
-    G10: { sym: 'The headspeed and the yaw rate have the same oscillation.', why: 'The governor can cause the tail oscillation. Then decrease the governor gain before you change the tail gains.' },
-    G11: { sym: 'At equal collective, the throttle increases during the flight.', why: 'The battery voltage decreases during the flight. The governor then must supply more throttle, and the reserve becomes smaller.' },
+    G9: { sym: 'The headspeed has an oscillation in stable flight.', why: 'A governor P or I gain that is too high can cause this oscillation.' },
+    G10: { sym: 'The headspeed and the yaw rate have the same oscillation.', why: 'The signals are related. This does not show which loop causes the oscillation.' },
+    G11: { sym: 'At equal collective, the throttle increases during the flight.', why: 'A decrease in battery voltage can make more throttle necessary at equal load. Compare the voltage and load before you identify the cause.' },
     G12: { sym: 'The main rotor vibration line is not at the rotor frequency that the log records.', why: 'The RPM notch filters and the governor use this headspeed.' },
 };
-const LIMIT_WHY = { L1: 'At the throttle limit, the governor cannot hold the headspeed.', L2: 'At the collective limit, the pilot or the rescue cannot get more collective.', L3: 'At the cyclic limit, the swash plate cannot move more.',
-    L4: 'At its limit, the tail does not have sufficient authority. Gain changes cannot correct this.', L5: 'At its limit, the servo cannot move more.', L6: 'At its limit, the I-term cannot correct a constant error.',
+const LIMIT_WHY = { L1: 'At the throttle limit, the governor cannot command more throttle. The headspeed signal shows if the governor holds its target.', L2: 'At the collective limit, the pilot or the rescue cannot get more collective.', L3: 'At the cyclic limit, the swash plate cannot move more.',
+    L4: 'Gains cannot increase the output range. The limit does not identify the cause.', L5: 'At its limit, the servo cannot move more.', L6: 'At its limit, the I-term cannot increase its output.',
     L7: 'At the end of the stick, the pilot cannot command more collective.' };
 // L7, the collective stick at its end, is a command of the pilot: a value to monitor at most, never a problem of the flight controller
 CHECKS.L7.statusOf = (f) => f.severity === 'flag' && !f.explained ? 'monitor' : null;
@@ -708,6 +712,8 @@ CHECKS.L7.statusOf = (f) => f.severity === 'flag' && !f.explained ? 'monitor' : 
 // issue). A weak battery is P1: a load step that takes a cell from the warning level to less than the minimum voltage
 CHECKS.G11.statusOf = (f) => f.severity === 'flag' && !f.explained ? 'monitor' : null;
 for (const id of Object.keys(LIMIT_WHY)) LEAD[id] = { sym: (f) => num(f.n) > 0 ? `${cap(chanOf(f))} gets to its limit.` : null, why: (f) => num(f.n) > 0 ? LIMIT_WHY[id] : null };
+LEAD.L1 = { sym: f => f.throttleLimit && f.throttleLimit.estimated ? 'The throttle limit is an estimate from recorded output.' : num(f.n) > 0 ? 'The throttle gets to its limit.' : null,
+    why: f => f.throttleLimit && f.throttleLimit.estimated ? 'These periods do not show full throttle. Compare the governor maximum throttle value with the recorded output.' : num(f.n) > 0 ? LIMIT_WHY.L1 : null };
 
 // the reference lines and bands of the plot against the limit: (f, R the rules, x the facts) -> [{ kind, value | from, to, label, unit }]
 const pctOf = (x) => num(x) === null ? null : x * 100;
@@ -777,6 +783,7 @@ function gapCounts(events) {
 }
 // the key and values of an H finding (health_setup: "key: from -> to (since log n, scope)"); value is the new value
 function headerChange(f) {
+    if (typeof f.headerKey === 'string') return { key: f.headerKey, from: String(f.from), to: String(f.value), since: f.since };
     const m = /^([^:]+): (.*) -> (.*?) \(since log (\d+)/.exec(String(f.text || ''));
     return m ? { key: m[1].trim(), from: m[2].trim(), to: m[3].trim(), since: +m[4] } : null;
 }

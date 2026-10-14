@@ -124,8 +124,8 @@ test('forFinding: spans in frame seconds, worst first, pads around the event, vi
     assert.deepEqual([ev.view.t0, ev.view.t1, ev.view.analyser], [a.t0, a.t1, null]); within(ev.view.at, (a.t0 + a.t1) / 2, 1e-3, 'view centre');
     assert.deepEqual([ev.plot.kind, ev.plot.tab, ev.plot.curve], ['time', 'tail', 'more.tail']);
     assert.deepEqual(ev.context.map(q => [q.id, q.label]), [['D6', 'Rescue']], 'the rescue span overlaps the worst span');
-    assert.equal(ev.summary, 'The tail output stays at its limit. At its limit, the tail does not have sufficient authority. Gain changes cannot correct this.\nIn PID profile 1, the tail output is at a limit for 2.5 s in 3 periods. Each period at a limit counts as a problem.');
-    assert.equal(ev.plot.caption, 'The curve is the tail output, and the lines are the tail output limits: at a line, the tail does not have sufficient authority.', 'SPEC3 H: what the curves are and where the limit is');
+    assert.equal(ev.summary, 'The tail output stays at its limit. Gains cannot increase the output range. The limit does not identify the cause.\nIn PID profile 1, the tail output is at a limit for 2.5 s in 3 periods. Each period at a limit counts as a problem.');
+    assert.equal(ev.plot.caption, 'The curve is the tail output, and the lines are its limits: the limit does not identify its cause.', 'SPEC3 H: what the curves are and where the limit is');
     assert.equal(ev.expected, 'The tail output does not touch its limits.');
     // D2 at the stall: the span is the frame time of the first frame after the stall, ± 0.25 s
     const D2 = { fid: 'setup|D2|4|0|||0', id: 'D2', severity: 'flag', log: 4, profile: null, value: 0, n: w.n, text: '', events: rec.metrics.setup.D2.events };

@@ -71,10 +71,14 @@ help: ## Show available commands
 
 NODE ?= node
 NOTATION_CHECKER ?= $(HOME)/.codex/tools/check_notation.py
-.PHONY: notation test-filter
+.PHONY: notation test-filter test-control
 
-notation: ## Check mathematical notation in the filter and development documentation
+notation: ## Check mathematical notation in filter, model and development documentation
 	python3 "$(NOTATION_CHECKER)" --registry docs/filter-notation.json
+	python3 "$(NOTATION_CHECKER)" --registry docs/HELICOPTER_SYSID_NOTATION.json
 
 test-filter: notation ## Test firmware replay, autotune, UI, worker and CLI export
-	$(NODE) --test test/filter_replay.test.cjs test/filter_reconstruct.test.cjs test/filter_autotune.test.cjs test/filter_validate.test.cjs test/filter_tune.test.cjs test/tuning_dialog.test.cjs test/tuning_worker.test.cjs test/advice.test.cjs
+	$(NODE) --test test/filter_math.test.cjs test/filter_replay.test.cjs test/filter_reconstruct.test.cjs test/filter_solve.test.cjs test/filter_reconstruct_fast.test.cjs test/filter_observer.test.cjs test/filter_autotune.test.cjs test/filter_validate.test.cjs test/filter_tune.test.cjs test/tuning_dialog.test.cjs test/tuning_worker.test.cjs test/advice.test.cjs
+
+test-control: notation ## Test aircraft identification, native firmware, closed-loop search and integration
+	$(NODE) --test test/system_id.test.cjs test/firmware_controller.test.cjs test/control_pipeline.test.cjs test/control_tune.test.cjs test/tuning_dialog.test.cjs test/tuning_worker.test.cjs

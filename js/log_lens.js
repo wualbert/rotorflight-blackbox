@@ -113,7 +113,7 @@ var LogLens = (function () {
         compare: "Show the measurement",
         show: "Show",
         close: "Close",
-        quoted: "Toolkit text (not STE)",
+        quoted: "Analysis information",
         window: "Time window",
         quantity: "Quantity", value: "Value", limit: "Limit", check: "Check",
         notMeasured: "Not measured", insufficient: "Not sufficient data",
@@ -324,7 +324,7 @@ var LogLens = (function () {
             case "skipped": return "notMeasured";
             case "flag": return f.explained ? "information" : "problem";
             case "ok": return "satisfactory";
-            case "note": return f.thin === true || /^no finding/i.test(String(f.text || "")) ? "insufficient" : "monitor";
+            case "note": return f.thin === true || /^no (?:finding|result)/i.test(String(f.text || "")) ? "insufficient" : "monitor";
             default: return "information";
         }
     }

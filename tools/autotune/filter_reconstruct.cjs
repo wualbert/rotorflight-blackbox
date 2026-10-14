@@ -1,4 +1,5 @@
 'use strict';
+const Math = require('./filter_math.cjs');
 
 // Multichannel, multirate reconstruction from the firmware's observations.
 // gyroRAW observes gyroADCd on the Blackbox tick; gyroADC observes the most
@@ -6,6 +7,7 @@
 // quantized, not exact floating-point states. See docs/FILTER_AUTOTUNE.md.
 const FT = require('./filter_tune.cjs');
 const R = require('./filter_replay.cjs');
+const Solver = require('./filter_solve.cjs');
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
 
@@ -203,6 +205,102 @@ function pidObserver(seg, windows, axis) {
     return {gyro_cutoff:best.cut,d_cutoff:d.cut,Kp:best.gain,Kd:d.gain,known:true,observer:true,fit:{P:best,D:d}};
 }
 
+// Inherited profile values can be stale. Check them against training signals
+// before turning their P/D outputs into high-weight inverse constraints.
+// All reserved outputs are removed from calibration input, including the gyro
+// history used by the PID filters. Interpolation here is calibration only.
+function pidTraining(seg, windows) {
+    const skip=new Uint8Array(seg.n).fill(1), available=windows.filter(w=>!w.held),reserved=windows.filter(w=>w.held);
+    // Sinc interpolation has 24 taps on each side; cubic gap repair uses up
+    // to four further frames. A fixed 32-frame margin covers both supports.
+    // A calibration window also needs its complete two-second filter history.
+    const margin=32,eligible=available.filter(w=>!reserved.some(h=>h.st<w.st+w.N+margin&&h.st+h.N>w.st-w.lead-margin));
+    for(const w of available)skip.fill(0,Math.max(0,w.st-w.lead-margin),Math.min(seg.n,w.st+w.N+margin));
+    for(const block of reconstructionBlocks(windows)) {
+        const start=block[0].st-block[0].lead,end=block[block.length-1].st+block[block.length-1].N;
+        for(let i=start;i<end;i++)if((i-start)%5===2)skip[i]=1;
+    }
+    for(const w of windows)if(w.held)skip.fill(1,w.st,w.st+w.N);
+    const before=new Int32Array(seg.n),after=new Int32Array(seg.n);
+    let at=-1;for(let i=0;i<seg.n;i++){before[i]=at;if(!skip[i])at=i;}
+    at=-1;for(let i=seg.n-1;i>=0;i--){after[i]=at;if(!skip[i])at=i;}
+    const gyro=seg.filt.map(x=>{
+        const y=new Float64Array(seg.n);
+        for(let j=0;j<seg.n;j++) {
+            if(!skip[j]){y[j]=x[j];continue;}
+            const lo=before[j],hi=after[j],ll=lo<0?-1:before[lo],hh=hi<0?-1:after[hi];
+            if(ll>=0&&hh>=0&&hh-ll<=8) {
+                const indices=[ll,lo,hi,hh];let value=0;
+                for(const i of indices){let weight=1;for(const k of indices)if(k!==i)weight*=(j-k)/(i-k);value+=weight*x[i];}
+                y[j]=value;
+            } else y[j]=lo<0?(hi<0?0:x[hi]):hi<0?x[lo]:x[lo]+(x[hi]-x[lo])*(j-lo)/(hi-lo);
+        }
+        return y;
+    });
+    const pick=eligible.length<=6?eligible:Array.from({length:6},(_,i)=>eligible[Math.floor((i+.5)*eligible.length/6)]);
+    const data=pick.map(w=>({w,indices:Array.from({length:w.N},(_,i)=>w.lead+i).filter(i=>!skip[w.st-w.lead+i])}));
+    return {skip,gyro,data};
+}
+
+function validatePidObserver(seg, windows, axis, declared, training=pidTraining(seg,windows)) {
+    const rate=seg.cfg.rates.pidHz,factor=rate/seg.cfg.rates.logHz,{data}=training;
+    const hasP=seg.w.P&&seg.w.sp&&seg.w.P[axis]&&seg.w.sp[axis]&&(axis!==2||declared.stopGain);
+    const hasD=seg.w.D&&seg.w.D[axis];
+    const quantized=data.every(({w,indices})=>indices.every(i=>Number.isInteger(seg.filt[axis][w.st-w.lead+i])));
+    const quantizedSetpoint=hasP&&data.every(({w,indices})=>indices.every(i=>Number.isInteger(seg.w.sp[axis][w.st-w.lead+i])));
+    const sections=[FT.firstOrderLpf(declared.gyro_cutoff,rate)],derivative=FT.difSection(declared.d_cutoff,rate).map((v,i)=>i<3?-v:v);
+    const impulse=new Float64Array(1024);impulse[512]=1;
+    const pg=filter(R.resample(impulse,factor,0,0,impulse.length),sections),dg=filter(pg,[derivative]);
+    let pVariance=quantizedSetpoint?1/12:0,dVariance=0;
+    if(quantized)for(let i=0;i<impulse.length;i++){pVariance+=pg[Math.floor(i*factor)]**2/12;dVariance+=dg[Math.floor(i*factor)]**2/12;}
+    let aa=0,ab=0,bb=0,az=0,bz=0,pz=0,daa=0,dab=0,dbb=0,dx=0,dy=0,dz=0,pError=0,dError=0,n=0;
+    const gains=axis===2&&declared.stopGain?declared.stopGain.map(v=>v*declared.Kp):[declared.Kp,declared.Kp];
+    for(const {w,indices} of data) {
+        const start=w.st-w.lead,gyro=R.resample(training.gyro[axis],factor,0,start,w.st+w.N);
+        const p=filter(gyro,sections),d=hasD?filter(p,[derivative]):null;
+        for(const i of indices) {
+            const j=start+i,k=Math.floor(i*factor);n++;
+            if(hasP) {
+                const e=seg.w.sp[axis][j]-p[k],t=axis===2?clamp((e+10)/20,0,1):0,a=e*(1-t),b=e*t,z=seg.w.P[axis][j];
+                aa+=a*a;ab+=a*b;bb+=b*b;az+=a*z;bz+=b*z;pz+=z*z;
+                const da=axis!==2||e<=-10?1:e>=10?0:.5-e/10,db=1-da;
+                daa+=da*da;dab+=da*db;dbb+=db*db;
+                pError+=(z-gains[0]*a-gains[1]*b)**2;
+            }
+            if(hasD){const x=d[k],z=seg.w.D[axis][j];dx+=x*x;dy+=x*z;dz+=z*z;dError+=(z-declared.Kd*x)**2;}
+        }
+    }
+    const channels={},identified={};
+    function assess(name,error,power,variance,scale,fit) {
+        // Four rounding-noise standard deviations and 5% of observed RMS
+        // make this a conservative contradiction test, not a new replay limit.
+        const rms=Math.sqrt(error/Math.max(n,1)),limit=Math.max(.001,4*Math.sqrt(1e-6/12+scale*scale*variance),.05*Math.sqrt(power/Math.max(n,1)));
+        const contradicted=n>=128&&rms>limit;
+        channels[name]={samples:n,rms,limit,contradicted,fit,action:contradicted?(fit&&fit.accepted?'identified':'omitted'):'retained'};
+        return contradicted;
+    }
+    let badP=false,badD=false;
+    if(hasP) {
+        const caa=aa-pVariance*daa,cab=ab-pVariance*dab,cbb=bb-pVariance*dbb,det=caa*cbb-cab*cab;
+        const left=axis===2?(az*cbb-bz*cab)/det:az/caa,right=axis===2?(bz*caa-az*cab)/det:left;
+        const error=Math.max(0,pz-2*left*az-2*right*bz+left*left*aa+2*left*right*ab+right*right*bb),rms=Math.sqrt(error/Math.max(n,1)),r2=pz?1-error/pz:0;
+        const accepted=n>=3000&&left>0&&right>0&&Math.max(left,right)<3*Math.min(left,right)&&r2>.995&&rms<(axis===2?Math.sqrt(1e-6+Math.max(left,right)**2)/Math.sqrt(3):.001);
+        const fit={left,right,rms,r2,accepted};
+        badP=assess('P',pError,pz,pVariance,Math.max(...gains),fit);
+        if(badP&&accepted){identified.Kp=(left+right)/2;if(axis===2)identified.stopGain=[left/identified.Kp,right/identified.Kp];}
+    }
+    if(hasD) {
+        const gain=dx>n*dVariance?dy/(dx-n*dVariance):0,error=Math.max(0,dz-2*gain*dy+gain*gain*dx),rms=Math.sqrt(error/Math.max(n,1)),r2=dz?1-error/dz:0;
+        const accepted=n>=3000&&gain>0&&r2>.99&&rms<.001,fit={gain,rms,r2,accepted};
+        badD=assess('D',dError,dz,dVariance,declared.Kd,fit);
+        if(badD&&accepted)identified.Kd=gain;
+    }
+    const contradicted=badP||badD;
+    const observer=contradicted?{...declared,...identified,Kp:badP?(identified.Kp||0):declared.Kp,Kd:badD?(identified.Kd||0):declared.Kd,observer:true}:declared;
+    return {observer,validation:{axis:['roll','pitch','yaw'][axis],contradicted,declared:{...declared},identified,channels,
+        reason:contradicted?'The PID configuration does not agree with the recorded PID signals.':null}};
+}
+
 function pObservation(pid,axis,p,setpoint) {
     if(!(pid.known&&pid.Kp>0))return null;
     let error=p/pid.Kp,slope=pid.Kp;
@@ -286,7 +384,10 @@ function stage(x, c, transpose = false, initial = null) {
             x2 = x1; x1 = x[i]; y2 = y1; y1 = v;
         }
     } else {
-        const g = Float64Array.from(x, (v, i) => v * c[i * 6 + 5]);
+        // Indexed loops avoid typed-array iterator/callback overhead in the
+        // repeated inverse solves, preserving the arithmetic order.
+        const g = new Float64Array(n);
+        for (let i = 0; i < n; i++) g[i] = x[i] * c[i * 6 + 5];
         for (let i = n - 1; i >= 0; i--) {
             const k = i * 6, v = g[i];
             y[i] += (1 - c[k + 5]) * x[i] + c[k] * v;
@@ -308,7 +409,9 @@ function constant(c, n) {
     return tape;
 }
 function cg(A, b, seed, iterations = 80) {
-    const x = Float64Array.from(seed), Ax = A(x), r = Float64Array.from(b, (v, i) => v - Ax[i]), p = Float64Array.from(r);
+    const x = new Float64Array(seed), Ax = A(x), r = new Float64Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = b[i] - Ax[i];
+    const p = new Float64Array(r);
     let rr = dot(r, r), initial = rr, used = 0;
     for (; used < iterations && rr > Math.max(1e-16, initial * 1e-10); used++) {
         const q = A(p), den = dot(p, q); if (!(den > 0)) break;
@@ -379,7 +482,13 @@ function linearizeDynamic(C,tape,input,initial,record,axis,count) {
     const allpole=tape.slice(split).map(c=>{const v=c.slice();for(let i=0;i<n;i++){v[i*6]=1;v[i*6+1]=v[i*6+2]=0;}return v;});
     function forward(x) {
         let y=C.chain(x,tape.slice(0,split));
-        const means=Float64Array.from(record.avg,r=>{let s=0;for(let i=r.start;i<r.end;i++)s+=y[i];return s*record.rcp;});
+        const means = new Float64Array(record.avg.length);
+        for (let k = 0; k < record.avg.length; k++) {
+            const r = record.avg[k];
+            let s = 0;
+            for (let i = r.start; i < r.end; i++) s += y[i];
+            means[k] = s * record.rcp;
+        }
         for(let j=0;j<count;j++) {
             const list=events[j],g=new Float64Array(n);
             for(let z=0;z<list.length;z++) {
@@ -407,14 +516,17 @@ function linearizeDynamic(C,tape,input,initial,record,axis,count) {
         for(let i=0;i<n;i++)y[i]+=extra[i];
         return C.chain(y,tape.slice(0,split),true);
     }
-    return {forward,transpose,output:values[values.length-1]};
+    return {forward,transpose,output:values[values.length-1],kernel:{count,split,record,events,drives,allpole}};
 }
 
-function forward(cfg, seg, start, native, pid, capture = false) {
-    const step = cfg.rates.filtDenom, n = Math.floor(native[0].length / step), E = R.engine(cfg, pid, { capture: capture ? n : 0, derivatives:capture?recordDynamicJacobian:null, centers: seg.dynamicSeeds && seg.dynamicSeeds.get(start), state:stateAt(seg,start) });
+function forward(cfg, seg, start, native, pid, capture = false, cache = null) {
+    const step = cfg.rates.filtDenom, n = Math.floor(native[0].length / step), E = R.engine(cfg, pid, { capture: capture ? n : 0, derivatives:capture?recordDynamicJacobian:null, centers: seg.dynamicSeeds && seg.dynamicSeeds.get(start), state:stateAt(seg,start), rpmCoefficients:cache&&cache.rpm });
     const y = native.map(() => new Float64Array(n)), pg = native.map(() => new Float64Array(n)), d = native.map(() => new Float64Array(n));
+    const raw=new Float64Array(3);
     for (let k = 0; k < n; k++) {
-        E.tick(native.map(x => x[k * step]), ...drivers(cfg, seg, start, k));
+        for(let a=0;a<3;a++)raw[a]=native[a][k*step];
+        const drive=cache?cache.drivers[k]:drivers(cfg,seg,start,k);
+        E.tick(raw,drive[0],drive[1],drive[2]);
         for (let a = 0; a < 3; a++) { y[a][k] = E.gyro[a]; pg[a][k] = E.pidGyro[a]; d[a][k] = E.dterm[a]; }
     }
     return { tape: E.tape, y, pg, d, derivative: E.dynamic&&E.dynamic.derivative };
@@ -475,18 +587,34 @@ function solveAxis(cfg, seg, axis, start, end, seed, tape, pid, options, prior =
         const dif = FT.difSection(pid.d_cutoff, r.pidHz).map((v, i) => i < 3 ? -v * pid.Kd : v);
         obs.push({ weight, data, tape: [constant(FT.firstOrderLpf(pid.gyro_cutoff, r.pidHz), np), constant(dif, np)] });
     }
-    const down = x => Float64Array.from({ length: nf }, (_, i) => x[i * step]);
+    const down = x => {
+        const y = new Float64Array(nf);
+        for (let i = 0; i < nf; i++) y[i] = x[i * step];
+        return y;
+    };
     // Nonzero filter states contribute an affine output independent of the
     // unknown input. Remove it from the data term, not from the forward path.
     let bias=new Float64Array(nf);
     if(options.initialStages)for(let j=0;j<tape.length;j++)bias=stage(bias,tape[j],false,options.initialStages[j]);
-    if(options.jac){const linear=options.jac.forward(down(seed));bias=Float64Array.from(linear,(v,i)=>options.jac.output[i]-v);}
-    for(const ob of obs)ob.bias=chain(Float64Array.from({length:ob.weight.length},(_,i)=>bias[i*pp]),ob.tape);
+    if (options.jac) {
+        const linear = options.jac.forward(down(seed));
+        bias = new Float64Array(linear.length);
+        for (let i = 0; i < linear.length; i++) bias[i] = options.jac.output[i] - linear[i];
+    }
+    for (const ob of obs) {
+        const x = new Float64Array(ob.weight.length);
+        for (let i = 0; i < x.length; i++) x[i] = bias[i * pp];
+        ob.bias = chain(x, ob.tape);
+    }
     function feedback(x, data) {
-        const filtered = options.jac?options.jac.forward(down(x)):chain(down(x), tape), g = Float64Array.from(filtered, (v, i) => gyroWeight[i] * (data ? gyroData[i]-bias[i] : v));
+        const filtered = options.jac ? options.jac.forward(down(x)) : chain(down(x), tape);
+        const g = new Float64Array(filtered.length);
+        for (let i = 0; i < g.length; i++) g[i] = gyroWeight[i] * (data ? gyroData[i] - bias[i] : filtered[i]);
         for (const ob of obs) {
-            const p = Float64Array.from({ length: ob.weight.length }, (_, i) => filtered[i * pp]);
-            const y = chain(p, ob.tape), q = Float64Array.from(y, (v, i) => ob.weight[i] * (data ? ob.data[i]-ob.bias[i] : v));
+            const p = new Float64Array(ob.weight.length);
+            for (let i = 0; i < p.length; i++) p[i] = filtered[i * pp];
+            const y = chain(p, ob.tape), q = new Float64Array(y.length);
+            for (let i = 0; i < q.length; i++) q[i] = ob.weight[i] * (data ? ob.data[i] - ob.bias[i] : y[i]);
             const z = chain(q, ob.tape, true);
             for (let i = 0; i < z.length; i++) g[i * pp] += z[i];
         }
@@ -505,19 +633,11 @@ function solveAxis(cfg, seg, axis, start, end, seed, tape, pid, options, prior =
     }
     const damping=options.jac ? 0.1 : 0;
     const rhs = penalty(prior, feedback(seed, true));for(let i=0;i<n;i++)rhs[i]+=damping*seed[i];
-    const operator = x => {const y=penalty(x, feedback(x, false));for(let i=0;i<n;i++)y[i]+=damping*x[i];return y;};
     const prefix = Math.min(n, options.fixedPrefix || 0);
-    let solved;
-    if(prefix) {
-        // Earlier committed samples are constants, not new unknowns. Solve
-        // for the remaining samples after subtracting the fixed contribution.
-        const fixed=new Float64Array(n);fixed.set(seed.subarray(0,prefix));
-        const fixedEffect=operator(fixed), target=Float64Array.from(rhs,(v,i)=>i<prefix?0:v-fixedEffect[i]);
-        const freeSeed=Float64Array.from(seed,(v,i)=>i<prefix?0:v);
-        solved=cg(x=>{const y=operator(x);y.fill(0,0,prefix);return y;},target,freeSeed,options.iterations||80);
-        solved.x.set(fixed.subarray(0,prefix));
-    } else solved = cg(operator, rhs, seed, options.iterations || 80);
-    return { ...solved, burn, holdout: hold };
+    const solved = Solver.solve({n,nf,step,pp,tape,gyroWeight,rawWeight,obs,
+        jac:options.jac&&options.jac.kernel,rhs,seed,damping,regularization,
+        iterations:Math.ceil(options.iterations||80),prefix});
+    return {...solved,burn,holdout:hold};
 }
 
 function reconstruct(cfg, seg, start, end, pid, options = {}) {
@@ -544,6 +664,50 @@ function reconstruct(cfg, seg, start, end, pid, options = {}) {
     let reference = null;
     const axes = [], rounds = options.rounds || (FT.compile(cfg).dyn.on ? 16 : 1);
     let completedRounds = 0;
+    const ticks=Math.floor(native[0].length/r.filtDenom),cache={drivers:Array.from({length:ticks},(_,k)=>drivers(cfg,seg,start,k)),rpm:[]};
+    const aligned=Number.isInteger(factor)&&Number.isInteger(nativeFactor);
+    const burn=Math.ceil(Math.min(1,(end-start)/r.logHz/3)*r.logHz);
+    // A trial changes gyro samples only. Preserve the exact nonlinear filter
+    // and observer state before its changed interval, then replay its suffix.
+    // Each axis is independent; the shared SDFT scheduler still advances for
+    // all axes. No measurement or candidate is omitted by this reuse.
+    function trialEngine(prefix,active) {
+        return R.engine(cfg,pid,{state:prefix?prefix.state:stateAt(seg,start),
+            centers:seg.dynamicSeeds&&seg.dynamicSeeds.get(start),axes:active,
+            rpmCoefficients:cache.rpm,coefficientOffset:prefix?prefix.tick:0});
+    }
+    function scoreFrames(x,E,lo,hi,score,active) {
+        const raw=new Float64Array(3);
+        for(let k=lo;k<hi;k++) {
+            for(const a of active)raw[a]=x[a][k*r.filtDenom];
+            const drive=cache.drivers[k];E.tick(raw,drive[0],drive[1],drive[2]);
+            if(k%factor!==0||k/factor<burn)continue;
+            const i=k/factor,j=i*nativeFactor+r.offsetTicks;
+            for(const a of active) {
+                if(options.holdout===false||i%5!==2) {
+                    score[a]+=(E.gyro[a]-seg.filt[a][start+i])**2;
+                    if(pid[a].known&&pid[a].Kd>0&&seg.w&&seg.w.D)score[a]+=1e6*(E.dterm[a]-seg.w.D[a][start+i])**2;
+                }
+                if(pid[a].known&&pid[a].Kp>0&&seg.w&&seg.w.P&&seg.w.sp) {
+                    const observation=pObservation(pid[a],a,seg.w.P[a][start+i],seg.w.sp[a][start+i]);
+                    if(observation)score[a]+=(E.pidGyro[a]-observation.value)**2*observation.weight;
+                }
+                score[a]+=(x[a][j]-seg.raw[a][start+i])**2;
+            }
+        }
+    }
+    function trialScore(x,prefix=null,active=[0,1,2]) {
+        // Fractional observation ticks retain the existing full-replay path.
+        // Suffix reuse requires every logging frame to start on a filter tick.
+        if(!aligned)return merit(x,forward(cfg,seg,start,x,pid,false,cache));
+        const score=prefix?prefix.score.slice():[0,0,0],E=trialEngine(prefix,active);
+        scoreFrames(x,E,prefix?prefix.tick:0,ticks,score,active);
+        for(const a of active) {
+            const v=x[a],reg=regularizationFor(a);
+            for(let i=1;i<v.length-1;i++)score[a]+=reg*((v[i-1]-prior[a][i-1])-2*(v[i]-prior[a][i])+(v[i+1]-prior[a][i+1]))**2;
+        }
+        return score;
+    }
     function merit(x, out) {
         return x.map((v, a) => {
             let score = 0;
@@ -566,7 +730,7 @@ function reconstruct(cfg, seg, start, end, pid, options = {}) {
         });
     }
     for (let iteration = 0; iteration < rounds; iteration++) {
-        const base = forward(cfg, seg, start, native, pid, true), tape = base.tape, bestScore = merit(native, base);
+        const base = forward(cfg, seg, start, native, pid, true, cache), tape = base.tape, bestScore = merit(native, base);
         if (!reference) reference = base;
         const proposal = native.map((x, a) => {
             const regularization = regularizationFor(a);
@@ -579,7 +743,7 @@ function reconstruct(cfg, seg, start, end, pid, options = {}) {
         const best = native.slice();
         for (const alpha of rounds === 1 ? [1] : Array.from({length:iteration<8?6:12},(_,j)=>2**-j)) {
             const trial = native.map((x, a) => Float64Array.from(x, (v, i) => v + alpha * (proposal[a][i] - v)));
-            const score = merit(trial, forward(cfg, seg, start, trial, pid));
+            const score = trialScore(trial);
             for (let a = 0; a < 3; a++) if (score[a] < bestScore[a]) { best[a] = trial[a]; bestScore[a] = score[a]; }
         }
         // Peak selection is discontinuous. A single step length over several
@@ -591,8 +755,18 @@ function reconstruct(cfg, seg, start, end, pid, options = {}) {
         const stalled=best.map((x,a)=>x===native[a]);
         if(iteration>=8&&stalled.some(Boolean)) {
             const chunk=Math.round(.25*r.gyroHz);
+            const active=[0,1,2].filter(a=>stalled[a]),prefixEngine=aligned?trialEngine(null,active):null,prefixScore=[0,0,0];
+            let prefixTick=0;
             for(let lo=options.fixedPrefix||0;lo<native[0].length;lo+=chunk) {
                 const hi=Math.min(lo+chunk,native[0].length),anchor=best.slice();
+                // A raw observation can occur after its filter observation
+                // within one logging frame. Recompute that entire frame.
+                let prefix=null;
+                if(aligned) {
+                    const next=Math.floor(lo/nativeFactor)*factor;
+                    scoreFrames(anchor,prefixEngine,prefixTick,next,prefixScore,active);prefixTick=next;
+                    prefix={state:prefixEngine.snapshot(true),tick:prefixTick,score:prefixScore};
+                }
                 for(const alpha of [1,.5,.25,.125,.0625,.03125]) {
                     const trial=best.map((x,a)=>{
                         if(!stalled[a])return x;
@@ -600,7 +774,7 @@ function reconstruct(cfg, seg, start, end, pid, options = {}) {
                         for(let i=lo;i<hi;i++)y[i]+=alpha*(proposal[a][i]-native[a][i]);
                         return y;
                     });
-                    const score=merit(trial,forward(cfg,seg,start,trial,pid));
+                    const score=trialScore(trial,prefix,active);
                     for(let a=0;a<3;a++)if(stalled[a]&&score[a]<bestScore[a]){best[a]=trial[a];bestScore[a]=score[a];}
                 }
             }
@@ -630,7 +804,7 @@ function reconstruct(cfg, seg, start, end, pid, options = {}) {
         const recover = (x, index) => x ? invert(R.resample(x, rpmFactor, 0, start, end), FT.lowpassSections(8, cfg.s.motor_rpm_lpf[index], r.pidHz)) : null;
         rpm = { hs: recover(seg.hs, 0), tail: cfg.gear && cfg.gear.motorisedTail ? recover(seg.tail, 1) : null, original: cfg.s.motor_rpm_lpf.slice() };
     }
-    const check = forward(cfg, seg, start, native, pid);
+    const check = forward(cfg, seg, start, native, pid, false, cache);
     const validation = native.map((_,a)=>{
         let error=0, priorError=0, samples=0, rawError=0;
         for(let i=Math.min(Math.ceil(2*r.logHz),end-start-1);i<end-start;i++) if(i%5===2) {
@@ -749,4 +923,4 @@ function join(seg, windows) {
     return {start:0,end,raw,sensor,rpm,state:seg.initialState,nativeHz:r.gyroHz,factor:r.filterHz/r.logHz,offset:r.offsetTicks/nativeFactor,originalDecimationHz:cfg.s.gyro_decimation_hz,reconstruction:true};
 }
 
-module.exports = { reconstruct, reconstructWindows, candidateInput, join, seedHistory, schedulerScale, governorRatio, pidObserver, pObservation, calibrateTiming, phaseState, reconstructionBlocks, decimation, filter, invert, drivers, stage, chain, constant, cg, record, forward, solveAxis, recordDynamicJacobian, linearizeDynamic };
+module.exports = { reconstruct, reconstructWindows, candidateInput, join, seedHistory, schedulerScale, governorRatio, pidObserver, pidTraining, validatePidObserver, pObservation, calibrateTiming, phaseState, reconstructionBlocks, decimation, filter, invert, drivers, stage, chain, constant, cg, record, forward, solveAxis, recordDynamicJacobian, linearizeDynamic };

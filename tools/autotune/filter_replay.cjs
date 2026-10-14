@@ -1,4 +1,5 @@
 'use strict';
+const Math = require('./filter_math.cjs');
 
 // Rotorflight release/4.6.0 (118e912): gyro_filter_impl.c, core.c, rpm_filter.c,
 // dyn_notch_filter.c, sdft.c, filter.c and pid.c. GPL-3.0, like the firmware.
@@ -24,7 +25,7 @@ function dynamicPeriod(sampleCount) {
     return sampleCount>=FT.FW.dynTicks?sampleCount:sampleCount*FT.FW.dynTicks/gcd(sampleCount,FT.FW.dynTicks);
 }
 
-function dynamic(M, derivatives=false, updates=0) {
+function dynamic(M, derivatives=false, updates=0, axes=[0,1,2]) {
     if (!M.dyn.on) return null;
     const D = M.dyn, NS = FT.FW.sdftN, NB = NS / 2, count = D.count;
     const X = { MC: count, count, res: D.res, minHz: D.minHz, maxHz: D.maxHz,
@@ -49,12 +50,12 @@ function dynamic(M, derivatives=false, updates=0) {
         const I = X.ints;
         if (I[3] === X.sampleCount) {
             I[3] = 0; if(derivative)derivative.average(localTick);
-            for (let a = 0; a < 3; a++) { X.avg[a] = X.acc[a] * X.rcp; X.acc[a] = 0; }
+            for (const a of axes) { X.avg[a] = X.acc[a] * X.rcp; X.acc[a] = 0; }
             I[0] = FT.FW.dynTicks;
         }
         const bi = I[3], first = X.start + X.batchSize * bi, last = bi === X.sampleCount - 1;
         const end = last ? X.end + 1 : first + X.batchSize;
-        for (let a = 0; a < 3; a++) {
+        for (const a of axes) {
             const o = a * NB, xo = a * NS, delta = X.avg[a] - X.rN * X.sx[xo + X.sidx[a]];
             if (last) { X.sx[xo + X.sidx[a]] = X.avg[a]; X.sidx[a] = (X.sidx[a] + 1) % NS; }
             const bin = k => { if(derivative)derivative.bin(k); const re = X.sre[o + k] + delta, im = X.sim[o + k];
@@ -65,7 +66,11 @@ function dynamic(M, derivatives=false, updates=0) {
             if (last && X.end < NB - 1) bin(X.end + 1);
         }
         I[3]++;
-        if (I[0] > 0) { if(derivative&&I[1]===0)derivative.window(I[2]); FT._t.dynStep(X, tick); I[0]--; }
+        if (I[0] > 0) {
+            if (axes.includes(I[2])) { if(derivative&&I[1]===0)derivative.window(I[2]); FT._t.dynStep(X, tick); }
+            else { if(I[1]===3)I[2]=(I[2]+1)%3; I[1]=(I[1]+1)%4; }
+            I[0]--;
+        }
         // Tracks are diagnostic only. Bound their memory during long replay.
         for (const tr of X.out) if (tr.at.length > 1) { tr.at.splice(0, tr.at.length - 1); tr.c.splice(0, tr.c.length - count); }
     }
@@ -80,6 +85,7 @@ function dynamic(M, derivatives=false, updates=0) {
 
 function engine(cfg, pid, options = {}) {
     const M = FT.compile(cfg), fs = M.rates.filterHz, R = M.rates;
+    const axes=options.axes || [0,1,2];
     const configKey=JSON.stringify(cfg.s), saved=options.state&&options.state.configKey===configKey?options.state:null;
     const phase=options.state?options.state.tick:options.phase||0;
     if (!(fs > 0 && R.pidHz > 0 && fs >= R.pidHz)) throw new Error('The filter and PID rates are not valid.');
@@ -88,7 +94,7 @@ function engine(cfg, pid, options = {}) {
     const lpf = [0, 1, 2].map(() => M.statics.map(st => ({ st, sections: M.sectionsOf(st, fs).map(section) })));
     const rpm = M.rpm.map(list => list.map(b => ({ b, filter: section(FT.biquad('notch', M.rpmMinHz, fs, b.q)), fade: 0 })));
     let dynamicUpdates=options.state&&Number.isFinite(options.state.dynamicUpdates)?options.state.dynamicUpdates:options.dynamicUpdates||0;
-    const flat = rpm.flat(), D = dynamic(M,options.derivatives,saved?0:dynamicUpdates), gyro = new Float64Array(3), pidGyro = new Float64Array(3), out = new Float64Array(3), dterm = new Float64Array(3);
+    const flat = rpm.flat(), D = dynamic(M,options.derivatives,saved?0:dynamicUpdates,axes), gyro = new Float64Array(3), pidGyro = new Float64Array(3), out = new Float64Array(3), dterm = new Float64Array(3);
     if (D && options.centers && options.centers.length === D.X.cen.length) {
         D.X.cen.set(options.centers);
         for (let a = 0; a < 3; a++) for (let p = 0; p < D.X.count; p++) D.banks[a][p].c = FT.biquad('notch', D.X.cen[a * D.X.count + p], fs, M.dyn.q + p * FT.FW.dynQAdvance);
@@ -114,13 +120,19 @@ function engine(cfg, pid, options = {}) {
             if(dst.bank)dst.bank.fade=src.fade;
         }
         if(D&&saved.dynamic)for(const k of dynamicStateKeys)D.X[k].set(saved.dynamic[k]);
+        if(saved.pid)for(let a=0;a<3;a++) {
+            for(const field of ['gyro','d'])for(const k of ['x1','x2','y1','y2'])paths[a][field][k]=saved.pid[a][field][k];
+            pidGyro[a]=saved.pid[a].pidGyro;dterm[a]=saved.pid[a].dterm;out[a]=saved.pid[a].out;
+        }
     }
-    return { model: M, gyro, pidGyro, out, dterm, dynamic: D, tape, snapshot() {
+    return { model: M, gyro, pidGyro, out, dterm, dynamic: D, tape, snapshot(includePid=false) {
         // The complete gyro pipeline and SDFT machine, before the next tick.
         // PID observers warm up locally; final PID replay remains continuous.
-        return {configKey,tick:phase+tick,cursor,lastLpf,dynamicUpdates,
+        const state={configKey,tick:phase+tick,cursor,lastLpf,dynamicUpdates,
             stages:stages.map(list=>list.map(s=>({c:s.filter.c.slice(),x1:s.filter.x1,x2:s.filter.x2,y1:s.filter.y1,y2:s.filter.y2,fade:s.bank?s.bank.fade:1}))),
             dynamic:D?Object.fromEntries(dynamicStateKeys.map(k=>[k,D.X[k].slice()])):null};
+        if(includePid)state.pid=paths.map((p,a)=>({gyro:{...p.gyro},d:{...p.d},pidGyro:pidGyro[a],dterm:dterm[a],out:out[a]}));
+        return state;
     }, setPid(next) {
         for (let a=0;a<3;a++) {
             paths[a].p=next[a];
@@ -133,7 +145,7 @@ function engine(cfg, pid, options = {}) {
             const s = stages[a][j], t = tape[a][j], at = tick * 6;
             t.set(s.filter.c, at); t[at + 5] = s.bank ? s.bank.fade : 1;
         }
-        for (let a = 0; a < 3; a++) {
+        for (const a of axes) {
             let x = raw[a];
             // Keep the state even while faded out (rpmFilterGyro always applies).
             for (const b of rpm[a]) x += (apply(b.filter, x) - x) * b.fade;
@@ -141,7 +153,7 @@ function engine(cfg, pid, options = {}) {
             if (D) { D.X.acc[a] += x; for (const s of D.banks[a]) x = apply(s, x); }
             gyro[a] = x;
         }
-        if (clock % fpl === pidAt) for (let a = 0; a < 3; a++) {
+        if (clock % fpl === pidAt) for (const a of axes) {
             const p = paths[a], g = apply(p.gyro, gyro[a]);
             pidGyro[a] = g;
             dterm[a] = apply(p.d, -g) * p.p.Kd;
@@ -159,10 +171,18 @@ function engine(cfg, pid, options = {}) {
             // Retain the subtask clock even when dynamic notches are OFF;
             // a candidate that enables them must use the same time origin.
             dynamicUpdates++;
+            // Reconstruction trials share the same configuration, RPM inputs,
+            // clock and bank schedule. Only their gyro samples can change.
+            const key=(options.coefficientOffset||0)+tick;
+            const cached=options.rpmCoefficients && (options.rpmCoefficients[key] || (options.rpmCoefficients[key]=[]));
             for (let j = 0; j < Math.min(3, flat.length); j++) {
                 const b = flat[cursor], freq = (b.b.ref === 'tail' ? tail : hs) * b.b.mult;
-                b.fade = clamp((freq - M.rpmMinHz) / (M.rpmFadeHz - M.rpmMinHz), 0, 1);
-                b.filter.c = FT.biquad('notch', clamp(freq, M.rpmMinHz, M.rpmMaxHz), fs * scale, b.b.q);
+                if(cached&&cached[j]) { b.fade=cached[j].fade;b.filter.c=cached[j].c; }
+                else {
+                    b.fade = clamp((freq - M.rpmMinHz) / (M.rpmFadeHz - M.rpmMinHz), 0, 1);
+                    b.filter.c = FT.biquad('notch', clamp(freq, M.rpmMinHz, M.rpmMaxHz), fs * scale, b.b.q);
+                    if(cached)cached[j]={fade:b.fade,c:b.filter.c};
+                }
                 cursor = (cursor + 1) % flat.length;
             }
         }

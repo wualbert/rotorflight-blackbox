@@ -75,7 +75,7 @@ const DEFAULT_RULES = {
         note: 'flag: the largest decrease of the median headspeed from the target, by 2 x the variation of the headspeed signal (one event has no SE); or a governor change from ACTIVE to FALLBACK, RECOVERY or BAILOUT' },
     T15: { kick: T6_KICK, source: `${P}; the yaw kick limit of check T6 (${T6_KICK} deg/s), for the increase from the largest yaw error before the rescue; and the tail output limit of check T8`,
         note: 'flag: (largest |yaw error| in the first 1.5 s) - (largest |yaw error| from 2 s to 0.2 s before) more than kick; or a sample at 0.5 % of a tail output limit or nearer in the first 1.5 s' },
-    D8: { source: `${P}; a PID profile change at a rescue start changes the gains, the governor headspeed and the precompensation while the rescue pulls up`,
+    D8: { source: `${P}; a PID profile change at a rescue start can change the gains, the governor headspeed and the precompensation while the rescue pulls up`,
         note: 'flag: a PID profile change from 1 s before to 0.1 s after a rescue start' },
 };
 const UNITS = { G19: 'fraction', T15: 'deg/s', D8: 'count', G20: 'count' };
@@ -276,8 +276,8 @@ function judge(flights, RULES = DEFAULT_RULES) {
             add('G20', 'note', f, null, { value: ov.length, n: L.length, unit: UNITS.G20, overloads: ov.length, signals: sg.length, threshold: { throttleHigh: RULE.throttleHigh, fall: RULE.overload.fall, lateS: RULE.overload.lateS }, phase: null,
                 events: L.map(x => ({ t: x.overload ? Math.min(x.overload.t, x.t) : Math.max(f.metrics.fromS, x.t - RULE.fallback.signalS), t1: x.t + RULE.fallback.afterS, start: x.t, tS: x.tS, kind: x.kind, value: x.overload ? x.overload.fall : null,
                     seconds: x.overload ? x.overload.seconds : null, signal: x.signal, signalAfter: x.signalAfter, throttleHighS: x.throttleHighS, throttleMax: x.throttleMax, profile: x.profile, bad: x.kind !== 'overload' })),
-                text: para(...L.slice(0, 4).map(one), ov.length === L.length ? `Thus, ${L.length === 1 ? 'the FALLBACK is' : 'each FALLBACK is'} possibly a result of the load at the throttle limit. The RPM signal is possibly correct.`
-                    : `${L.length - ov.length} of ${many(L.length, 'FALLBACK')} ${L.length - ov.length === 1 ? 'comes' : 'come'} at a usual load. ${L.length - ov.length === 1 ? 'It is' : 'They are'} possibly an error of the RPM signal (check G1).`) }); }
+                text: para(...L.slice(0, 4).map(one), ov.length === L.length ? `Thus, ${L.length === 1 ? 'the FALLBACK is' : 'each FALLBACK is'} possibly a result of the load at the throttle limit. This does not show that the RPM signal is correct. Examine the RPM signal and power response at the same time.`
+                    : `${L.length - ov.length} of ${many(L.length, 'FALLBACK')} ${L.length - ov.length === 1 ? 'has' : 'have'} no measured headspeed decrease at the throttle limit. Examine the RPM signal (check G1).`) }); }
         if (M.skipped) { for (const id of ['G19', 'T15', 'D8']) add(id, 'skipped', f, null, { text: M.skipped }); continue; }
         if (!M.rescues.length) { for (const id of ['G19', 'T15', 'D8']) add(id, 'skipped', f, null, { n: 0, text: `The log has no rescue (${M.source === 'RESCUE_STATE' ? 'RESCUE_STATE' : M.source || 'no rescue data'}).` }); continue; }
         const groups = new Map(); for (const ev of M.rescues) { const k = ev.profile === null ? 'null' : String(ev.profile); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(ev); }
@@ -292,7 +292,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     const dec = `At the rescue ${at(worst)}, the headspeed decreases to ${pc(-g.value)} % less than the target. This is ${fmt(g.headspeed, 0)} rpm against ${fmt(g.ref, 0)} rpm, ${rel(g.worstDtS)}.`;
                     const thr = g.throttleHighS === null ? 'The log does not have motor[0].' : (g.belowS > 0 ? `The headspeed is more than ${RULE.below * 100} % less than the target for ${fmt(g.belowS, 2)} s.` : `The headspeed does not decrease to ${RULE.below * 100} % less than the target.`)
                         + (g.throttleHighS > 0 ? ` The throttle is at ${RULE.throttleHigh / 10} % or more for ${fmt(g.throttleHighS, 2)} s.` : ` The throttle stays less than ${RULE.throttleHigh / 10} %.`);
-                    const ov = g.overload ? `From ${rel(g.overload.dtS)}, the headspeed decreases by ${pc(g.overload.fall)} % while the throttle is at ${RULE.throttleHigh / 10} % or more${g.overload.until ? `. Then the governor changes to ${g.overload.until}` : ''}. The motor cannot hold the headspeed at this load.` : '';
+                    const ov = g.overload ? `From ${rel(g.overload.dtS)}, the headspeed decreases by ${pc(g.overload.fall)} % while the throttle is at ${RULE.throttleHigh / 10} % or more${g.overload.until ? `. Then the governor changes to ${g.overload.until}` : ''}. These signals do not identify the cause. Examine the RPM signal, governor response and power measurements.` : '';
                     const chg = (list) => `The governor changes are: ${list.slice(0, 5).map(c => `${c.from} to ${c.to} ${rel(c.dtS)}`).join(', ')}.`;
                     const lv = g.leave ? `The governor changes from ACTIVE to ${g.leave.to} ${rel(g.leave.dtS)}.` + (g.minThrottleAfter !== null && g.leave.throttleBefore !== null && g.minThrottleAfter < g.leave.throttleBefore ? ` Then the throttle decreases from ${fmt(g.leave.throttleBefore / 10, 1)} % to ${fmt(g.minThrottleAfter / 10, 1)} %.` : '')
                         + (g.states.length > 1 ? ` ${chg(g.states)}` : '') : g.states.length ? chg(g.states) : 'The governor stays in ACTIVE.';
@@ -306,7 +306,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                         events: ok.map(ev => ({ t: Math.max(f.metrics.fromS, ev.t - RULE.window.preS), t1: ev.t1, start: ev.t, tS: ev.tS, t1S: ev.t1S, value: ev.G19.value, worstS: ev.G19.worstS, belowS: ev.G19.belowS, throttleHighS: ev.G19.throttleHighS,
                             onsetS: ev.G19.onsetS, leave: ev.G19.leave ? ev.G19.leave.to : null, leaveT: ev.G19.leave ? ev.G19.leave.t : null, leaveS: ev.G19.leave ? ev.G19.leave.tS : null, states: ev.G19.states.map(c => ({ tS: c.tS, from: c.from, to: c.to })),
                             overload: ev.G19.overload, phase: ev.phase, profile: ev.profile, bad: bad(ev.G19) })),
-                        text: para(`${dec} ${thr}`, `${ov} ${lv}`.trim(), `${verdict} ${unc}`, pool, n > 1 ? `The log has ${many(n, 'rescue')} in ${prof(p)}, and this is the largest decrease.` : '') });
+                        text: para(`${dec} ${thr}`, ov, lv, `${verdict} ${unc}`, pool, n > 1 ? `The log has ${many(n, 'rescue')} in ${prof(p)}, and this is the largest decrease.` : '') });
                 } }
             // T15
             { const R = rule('T15'), ok = list.filter(ev => ev.T15 && typeof ev.T15.value === 'number'), bad = (q) => q.value > R.kick || q.atLimitS > 0;
@@ -323,10 +323,12 @@ function judge(flights, RULES = DEFAULT_RULES) {
             // D8
             { const withCh = list.filter(ev => ev.D8 && ev.D8.changes.length), flag = withCh.length > 0, ev0 = withCh[0] || list[0], c = withCh.length ? ev0.D8.changes[ev0.D8.changes.length - 1] : null;
                 const one = (ev) => { const x = ev.D8.changes[ev.D8.changes.length - 1];
-                    return `At the rescue ${at(ev)}, ${rel(x.dtS, 3)}, the PID profile changes from ${prof(x.from)} to ${prof(x.to)}.` + (x.fromTarget !== null && x.toTarget !== null ? ` The governor headspeed changes from ${fmt(x.fromTarget, 0)} rpm to ${fmt(x.toTarget, 0)} rpm.` : ''); };
+                    return `At the rescue ${at(ev)}, ${rel(x.dtS, 3)}, the PID profile changes from ${prof(x.from)} to ${prof(x.to)}.` + (x.fromTarget !== null && x.toTarget !== null
+                        ? x.fromTarget === x.toTarget ? ` The governor headspeed target stays at ${fmt(x.toTarget, 0)} rpm.`
+                            : ` The governor headspeed target changes from ${fmt(x.fromTarget, 0)} rpm to ${fmt(x.toTarget, 0)} rpm.` : ''); };
                 add('D8', flag ? 'flag' : 'ok', f, p, { value: withCh.length, n, threshold: { flag: 1 }, phase: ev0.phase, fromProfile: c ? c.from : null, toProfile: c ? c.to : null, fromTarget: c ? c.fromTarget : null, toTarget: c ? c.toTarget : null,
                     events: list.map(ev => ({ t: Math.max(f.metrics.fromS, ev.t - RULE.profile.beforeS), t1: ev.t + RULE.profile.afterS, start: ev.t, tS: ev.tS, value: ev.D8.changes.length, changes: ev.D8.changes, phase: ev.phase, profile: ev.profile })),
-                    text: flag ? para(...withCh.slice(0, 4).map(one), 'The rescue pulls up with the gains, the governor headspeed and the precompensation of a different PID profile. Thus, the transmitter changes the PID profile with the rescue switch.')
+                    text: flag ? para(...withCh.slice(0, 4).map(one), 'A PID profile change can change gains, governor headspeed and precompensation. The time of the change does not identify its source. Examine the transmitter, Modes tab and Adjustments tab to find the command that changed the PID profile.')
                         : `At ${many(n, 'rescue')}, the PID profile does not change from ${RULE.profile.beforeS} s before to ${RULE.profile.afterS} s after the start.` }); }
         }
     }

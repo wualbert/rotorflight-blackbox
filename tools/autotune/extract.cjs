@@ -13,7 +13,10 @@
 const fs = require('node:fs'), path = require('node:path');
 const lib = require('./lib.cjs');
 
-const [OUT, ...FILES] = process.argv.slice(2);
+const [OUT, ...args] = process.argv.slice(2);
+const flags = args.filter(x => x.startsWith('--logs=')), FILES = args.filter(x => !x.startsWith('--logs='));
+if (flags.length > 1 || flags.length && !/^--logs=\d+(,\d+)*$/.test(flags[0])) throw new Error('Invalid --logs selection.');
+const logs = flags.length ? flags[0].slice(7).split(',').map(Number) : undefined;
 if (!OUT || !FILES.length) { console.error('usage: node extract.cjs <out dir> <log file> [more log files...]'); process.exit(2); }
 
 const app = lib.loadApp();
@@ -24,7 +27,7 @@ const tidy = (o) => JSON.parse(JSON.stringify(o, (k, v) => typeof v === 'number'
 
 for (const file of FILES) {
     const started = Date.now();
-    for (const item of lib.segments(app, file)) {
+    for (const item of lib.segments(app, file, { logs })) {
         const fl = item.flight;
         if (seen.has(fl.id) && seen.get(fl.id) !== file) { if (!skipped.some(s => s.id === fl.id && s.file === fl.file)) skipped.push({ file: fl.file, log: fl.log, id: fl.id, reason: `same flight as one in ${path.basename(seen.get(fl.id))}` }); continue; }
         seen.set(fl.id, file);

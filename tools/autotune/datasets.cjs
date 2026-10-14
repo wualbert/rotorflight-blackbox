@@ -332,7 +332,7 @@ const HEADER = {
     vbatmaxcellvoltage: 'vbat_max_cell_voltage', currentMeterOffset: 'ibata_offset', currentMeterScale: 'ibata_scale',
 };
 for (const ax of AX) for (const k of ['source', 'center', 'q']) HEADER[`gyro_rpm_notch_${k}_${ax}`] = { base: `gyro_rpm_notch_${k}_${ax}` };
-const SKIP_KEYS = new Set(['frameDefs', 'unknownHeaders', 'features']); // containers; features: the bits (FEATURES)
+const SKIP_KEYS = new Set(['frameDefs', 'unknownHeaders', 'features', 'loggedHeaderFields']); // containers; features: the bits (FEATURES)
 
 // CLI lookup values of the names that the header records as numbers (settings.c lookup tables, 4.6.0)
 const OFF_ON = ['OFF', 'ON'], LPF = ['NONE', 'FIRST_ORDER', 'SECOND_ORDER', 'PT1', 'PT2', 'PT3', 'ORDER1', 'BUTTER', 'BESSEL', 'DAMPED'];
@@ -739,7 +739,7 @@ function datasets(logs, cli, options = {}) {
             else { stretches.push(s); infoItems.push({ stretch: s, values, sources }); } // info: every interval, also one that a merge joins
             if (P.assumed && p > 0) {
                 if (P.from === null) { note(`${it.cliUsed ? 'No log header and no CLI dump show' : 'No log header shows'} the values of PID profile ${p}. Thus, the configurations of PID profile ${p} have only the global values of the log header.`);
-                    note(`The log header records the values of PID profile ${p} only when the pilot arms the helicopter in PID profile ${p}.`); }
+                    note(`The log header records the values of PID profile ${p} only when a new log starts in PID profile ${p}.`); }
                 else if (P.from === 'cli') note(`The CLI dump does not agree with the log header of log ${N(it.log)}. Thus, the values of PID profile ${p} in log ${N(it.log)} come from a CLI dump of a different time.`);
             }
             if (R.assumed && rateNow !== null && R.from === null) note(`The log header of log ${N(it.log)} does not show the values of rate profile ${rateNow}. Thus, the rates after the switch to rate profile ${rateNow} are unknown.`);

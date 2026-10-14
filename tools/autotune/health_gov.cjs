@@ -239,14 +239,14 @@ function analyse(w, ctx) {
             minCellInFlight: inFlight.length ? r(inFlight[0] / cells, 3) : null, minCellT: minAt >= 0 ? T(minAt) : null, n: inFlight.length, rate: r(rate, 2),
             cellHistogram: { from: h0, step: hd, counts: hist } };
         out.G13 = inFlight.length ? { cells, cellsSource, cellsAmbiguous, p1Cell: r(quantile(inFlight, 0.01) / cells, 3), p5Cell: r(quantile(inFlight, 0.05) / cells, 3), medianCell: r(quantile(inFlight, 0.5) / cells, 3), minCell: r(inFlight[0] / cells, 3),
-            startV: r(V(Math.max(0, flying.indexOf(1))), 2), endV: r(V(n - 1 - Array.from(flying).reverse().indexOf(1)), 2), n: inFlight.length, seconds: r(inFlight.length / rate, 1) } : { skipped: 'not flown' };
-    } else { out.D5 = { skipped: 'no Vbat field' }; out.G13 = { skipped: 'no Vbat field' }; }
+            startV: r(V(Math.max(0, flying.indexOf(1))), 2), endV: r(V(n - 1 - Array.from(flying).reverse().indexOf(1)), 2), n: inFlight.length, seconds: r(inFlight.length / rate, 1) } : { skipped: 'The log has no flight.' };
+    } else { out.D5 = { skipped: 'The log does not record `Vbat`.' }; out.G13 = { skipped: 'The log does not record `Vbat`.' }; }
 
     // --- G0: is the PID governor running?
     if (sum && x.govI) {
         let nz = 0, nzI = 0; for (let i = 0; i < n; i++) if (flying[i]) { if (sum[i] !== 0) nz++; if (x.govI[i] !== 0) nzI++; }
         out.G0 = { flyingSamples: flyingN, govSumNonZero: nz, govINonZero: nzI, mode: !flyingN ? null : (nz === 0 && nzI === 0 ? 'DIRECT/LIMIT' : 'PID (ELECTRIC/NITRO)') };
-    } else out.G0 = { skipped: 'no govSum or govI field' };
+    } else out.G0 = { skipped: 'The log does not record govSum or govI.' };
     const governed = out.G0.mode === 'PID (ELECTRIC/NITRO)';
 
     // --- G1: fallback and glitch proxies
@@ -310,14 +310,21 @@ function analyse(w, ctx) {
                 const peakAt = dir > 0 ? droopAt : overAt, peak = dir > 0 ? droop : over;
                 let rec = null, censored = false;
                 if (peak <= RULE.step.band) rec = 0;
-                else { let j = peakAt; while (j < Math.min(n, peakAt + recMax) && act[j] && Math.abs(err[j]) > RULE.step.band) j++;
-                    if (Math.abs(err[j]) <= RULE.step.band) rec = (j - peakAt) / rate; else { rec = (j - peakAt) / rate; censored = true; } }
-                let sat = false; for (let j = on - pre; j < on + post; j++) if (atCeil(j)) { sat = true; break; }
+                else { let j = peakAt; while (j < Math.min(n, peakAt + recMax) && act[j] && prof[j] === prof[on] && Math.abs(err[j]) > RULE.step.band) j++;
+                    if (j < n && act[j] && prof[j] === prof[on] && Math.abs(err[j]) <= RULE.step.band) rec = (j - peakAt) / rate;
+                    else { rec = (j - peakAt) / rate; censored = true; } }
+                let ceilingAt = null; for (let j = on - pre; j < on + post; j++) if (atCeil(j)) { ceilingAt = j; break; }
+                const sat = ceilingAt !== null;
+                let beforeCeiling = null;
+                if (sat && ceilingAt > on) { beforeCeiling = 0; for (let j = on; j < ceilingAt; j++) beforeCeiling = Math.max(beforeCeiling, -err[j]); }
                 const delta = {}; for (const k in terms) if (terms[k]) delta[k] = (avg(terms[k], on, on + post) - avg(terms[k], on - pre, on)) / 1000;
-                const share = delta.sum && Math.abs(delta.sum) > 1e-3 ? Object.fromEntries(['F', 'P', 'I', 'D'].filter(k => delta[k] !== undefined).map(k => [k, r(delta[k] / delta.sum, 3)])) : null;
+                // A term's fraction of an added output is defined only for a positive output change.
+                // A negative or nearly zero denominator cannot diagnose deficient feedforward.
+                const share = delta.sum > 1e-3 ? Object.fromEntries(['F', 'P', 'I', 'D'].filter(k => delta[k] !== undefined).map(k => [k, r(delta[k] / delta.sum, 3)])) : null;
                 let bin = -1; for (let b = 0; b < RULE.step.bins.length; b++) if (size >= RULE.step.bins[b]) bin = b;
                 events.push({ t: T(on), dir: dir > 0 ? 'rise' : 'drop', profile: prof[on], size: r(size, 3), bin, from: r(a[o], 3), to: r(a[e], 3), target: r(ref(on), 0), preError: r(avg(err, on - pre, on), 4),
                     droop: r(droop, 4), droopT: T(droopAt), overshoot: r(over, 4), overshootT: T(overAt), value: r(peak, 4), recoveryS: r(rec, 3), censored, saturated: sat,
+                    firstCeilingT: sat ? T(ceilingAt) : null, droopBeforeCeiling: r(beforeCeiling, 4),
                     delta: Object.fromEntries(Object.entries(delta).map(([k, v]) => [k, r(v, 4)])), share });
             }
         }
@@ -333,7 +340,7 @@ function analyse(w, ctx) {
         const G345 = { unit: `|collective| / one-sided travel ${travel}`, bins, events: events.slice(0, 500), eventsTotal: events.length, byProfile: byP(p => ({ rise: bins.map((_, b) => agg(events.filter(e => e.profile === p && e.dir === 'rise' && e.bin === b))), drop: bins.map((_, b) => agg(events.filter(e => e.profile === p && e.dir === 'drop' && e.bin === b))) })) };
         out.G3 = out.G4 = out.G5 = G345; // one measurement serves the three checks
         out.authority = { byProfile: byP(p => { const ev = events.filter(e => e.profile === p && e.dir === 'rise'); return agg(ev).share; }), note: 'share of the change of govSum over the first second of a collective rise carried by each term' };
-    } else { const why = { skipped: coll ? 'no govTarget field' : 'no collective field' }; out.G3 = out.G4 = out.G5 = why; out.authority = why; }
+    } else { const why = { skipped: coll ? 'The log does not record govTarget.' : 'The log does not record collective.' }; out.G3 = out.G4 = out.G5 = why; out.authority = why; }
 
     let vcomp = null; // G8 finds it, G7 uses it
     // --- G8: voltage compensation, motor[0]/govSum where nothing clamps
@@ -361,7 +368,7 @@ function analyse(w, ctx) {
         else { const med = quantile(sorted, 0.5); vcomp = () => med; out.G8.vcompUsed = `on: constant ${r(med, 4)} (median unsaturated ratio, no Vbat)`; }
         // unit check: govSum = P + I + D + F (C is below one count)
         if (x.govP && x.govI && x.govD && x.govF) { let s = 0, m = 0; for (let i = 0; i < n; i += 5) if (act[i]) { s += (sum[i] - x.govP[i] - x.govI[i] - x.govD[i] - x.govF[i]) ** 2; m++; } out.units = { sumResidualRms: r(m ? Math.sqrt(s / m) : null, 2), n: m }; }
-    } else out.G8 = { skipped: 'no motor[0] or govSum field' };
+    } else out.G8 = { skipped: 'The log does not record motor[0] or govSum.' };
 
     // --- G6, G7: throttle headroom and the sum beyond the ceiling
     if (mot) {
@@ -375,9 +382,9 @@ function analyse(w, ctx) {
             return { ceiling: ceiling[p], ceilingSource: ceilingSource[p], medianPct: r(quantile(v, 0.5) / 10, 1), p95Pct: r(quantile(v, 0.95) / 10, 1), atCeilingShare: r(top / v.length, 4), n: v.length, seconds: r(v.length / rate, 1), runs: list.slice(0, 200), runsTotal: list.length };
         }) };
         // demand after voltage compensation (govSum x vcomp) beyond the output; govSum is logged before vcomp, motor[0] after
-        out.G7 = !sum ? { skipped: 'no govSum field' } : !vcomp ? { skipped: 'voltage compensation unknown (G8 has no unsaturated sample)' } : { vcomp: out.G8.vcompUsed, byProfile: byP(p => { const d = []; for (let i = 0; i < n; i++) if (flying[i] && prof[i] === p && atCeil(i) && (!gs || gs[i] === ACTIVE)) d.push((sum[i] * vcomp(i) - mot[i]) / 1000);
+        out.G7 = !sum ? { skipped: 'The log does not record govSum.' } : !vcomp ? { skipped: 'The voltage compensation is unknown. Check G8 has no sample with the throttle less than its limit.' } : { vcomp: out.G8.vcompUsed, byProfile: byP(p => { const d = []; for (let i = 0; i < n; i++) if (flying[i] && prof[i] === p && atCeil(i) && (!gs || gs[i] === ACTIVE)) d.push((sum[i] * vcomp(i) - mot[i]) / 1000);
             d.sort((a, b) => a - b); return d.length ? { mean: r(meanOf(d), 4), p95: r(quantile(d, 0.95), 4), max: r(d[d.length - 1], 4), n: d.length } : { n: 0 }; }) };
-    } else { out.G6 = { skipped: 'no motor[0] field' }; out.G7 = out.G6; }
+    } else { out.G6 = { skipped: 'The log does not record motor[0].' }; out.G7 = out.G6; }
 
     // gains in effect: govP against the firmware error, govF against |collective|^2
     if (x.govP && tgt && governed) {
@@ -471,7 +478,7 @@ function analyse(w, ctx) {
             perSecond: pooled ? r(pooled.slope, 5) : null, perSecondSe: pooled ? r(pooled.se, 5) : null, perPack: pooled ? r(pooled.slope * pack, 2) : null, perPackSe: pooled ? r(pooled.se * pack, 2) : null,
             perVolt: pooledV ? r(pooledV.slope, 3) : null, perVoltSe: pooledV ? r(pooledV.se, 3) : null, r2: pooled ? r(pooled.r2, 3) : null,
             byProfile: byP(p => { const f = fit(blocks.filter(o => o.p === p), 't', [p]); return f ? { perSecond: r(f.slope, 5), perSecondSe: r(f.se, 5), perPack: r(f.slope * pack, 2), perPackSe: r(f.se * pack, 2), n: f.n } : { n: blocks.filter(o => o.p === p).length }; }) };
-    } else out.G11 = { skipped: 'no motor[0] field' };
+    } else out.G11 = { skipped: 'The log does not record motor[0].' };
 
     // --- G12: main-rotor lines of the raw gyro against the logged headspeed
     const raw = [0, 1, 2].map(k => x[`gyroRAW[${k}]`]);
@@ -495,9 +502,9 @@ function analyse(w, ctx) {
             peaks.sort((p, q) => total[q] - total[p]);
             const lines = peaks.slice(0, O.lines).map(b => { const o = (lib.spectralPeak(total, b, b).bin + kf) * d / m1.order; return { order: r(o, 4), harmonic: Math.abs(o - Math.round(o)) < O.harmonic ? Math.round(o) : null, amplitude: r(Math.sqrt(total[b] / wins.length / 3) / (ON / 4), 2) }; });
             out.G12 = { windows: wins.length, revolutions: O.revolutions, orderPerBin: d, mainOrder: r(m1.order, 5), mainOrderSe: jk ? r(jackSe(jk), 5) : null, mainProminence: r(m1.prominence, 1), harmonics: harm, lines,
-                note: 'mainOrder = the strongest line between orders 0.6 and 1.6 of the logged headspeed; 1 when poles and gear ratio are right. lines are in multiples of mainOrder' };
-        } else out.G12 = { windows: 0, skipped: `no window of ${O.revolutions} revolutions in flight above ${O.headspeed} rpm` };
-    } else out.G12 = { skipped: 'no gyroRAW fields' };
+                note: 'mainOrder = the strongest line between orders 0.6 and 1.6 of the logged headspeed. The configured gear ratios are correct. A different order can indicate incorrect motor_poles or an RPM sensor problem. lines are in multiples of mainOrder' };
+        } else out.G12 = { windows: 0, skipped: `The log has no flight window of ${O.revolutions} rotor turns at more than ${O.headspeed} rpm.` };
+    } else out.G12 = { skipped: 'The log does not record gyroRAW.' };
 
     return out;
 }
@@ -508,7 +515,10 @@ function analyse(w, ctx) {
 
 function judge(flights, RULES = DEFAULT_RULES) {
     const R = RULES, sig = R.sig === undefined ? 2 : R.sig, out = [], pct = (v, d = 1) => v === null || v === undefined ? '-' : (100 * v).toFixed(d) + ' %';
-    const add = (id, severity, log, profile, value, se, n, threshold, text) => out.push({ id, severity, log, profile, value: value === undefined ? null : value, se: se === undefined ? null : se, n: n === undefined ? null : n, threshold, source: (R[id] || {}).source || null, text });
+    const add = (id, severity, log, profile, value, se, n, threshold, text) => {
+        const finding = { id, severity, log, profile, value: value === undefined ? null : value, se: se === undefined ? null : se, n: n === undefined ? null : n, threshold, source: (R[id] || {}).source || null, text };
+        out.push(finding); return finding;
+    };
     const above = (v, se, thr) => v > thr && (se === null || se === undefined || v - sig * se > thr); // significantly above
     const direct = new Set();
 
@@ -522,110 +532,125 @@ function judge(flights, RULES = DEFAULT_RULES) {
             const H = d.cellHistogram, belowN = H ? H.counts.reduce((a, c, k) => a + (H.from + (k + 1) * H.step <= R.D5.minCell + 1e-9 ? c : 0), 0) : null;
             const belowS = belowN !== null && d.rate ? belowN / d.rate : null, low = !d.cellsAmbiguous && belowS !== null && belowS >= (R.D5.minS || 0);
             if (big.length) add('D5', 'flag', L, null, d.maxStep, null, big.length, R.D5,
-                `${big.length} Vbat steps above ${R.D5.step} V in ${d.stepWindowS * 1000} ms (largest ${d.maxStep} V at ${d.maxStepT} s, first at ${big.slice(0, 5).map(s => s.t + ' s').join(', ')}); min in flight ${d.minCellInFlight} V/cell at ${d.minCellT} s (${cellText}). Sag or telemetry glitch: do not interpret power here`);
+                `The voltage has ${big.length} steps of more than ${R.D5.step} V in ${d.stepWindowS * 1000} ms. The largest step is ${d.maxStep} V at ${d.maxStepT} s. The first steps are at ${big.slice(0, 5).map(s => s.t + ' s').join(', ')}.\nThe minimum voltage in flight is ${d.minCellInFlight} V/cell at ${d.minCellT} s. Cell count source: "${cellText}". Examine the voltage measurement before the power analysis.`);
             if (low) add('D5', 'flag', L, null, r(belowS, 2), null, belowN, R.D5,
-                `${r(belowS, 2)} s in flight below ${R.D5.minCell} V/cell (${belowN} samples, >= ${R.D5.minS} s; min ${d.minCellInFlight} V/cell at ${d.minCellT} s; ${cellText}). Deep sag: do not interpret power here`);
-            if (!big.length && !low) add('D5', d.cellsAmbiguous ? 'note' : 'ok', L, null, d.maxStep, null, d.n, R.D5, `largest Vbat step ${d.maxStep} V per ${d.stepWindowS * 1000} ms` + (d.cellsAmbiguous ? `; per-cell voltage not judged: ${cellText}` : `, min ${d.minCellInFlight} V/cell in flight, ${r(belowS, 2)} s below ${R.D5.minCell} V/cell (${cellText})`));
+                `The voltage is "below ${R.D5.minCell} V/cell" for ${r(belowS, 2)} s in flight (${belowN} samples). The time limit is ${R.D5.minS} s. The minimum is ${d.minCellInFlight} V/cell at ${d.minCellT} s. Cell count source: "${cellText}". Examine this voltage decrease before the power analysis.`);
+            if (!big.length && !low) add('D5', d.cellsAmbiguous ? 'note' : 'ok', L, null, d.maxStep, null, d.n, R.D5, `The largest voltage step is ${d.maxStep} V in ${d.stepWindowS * 1000} ms.` + (d.cellsAmbiguous ? ` The cell count is not clear. The check cannot examine the voltage of each cell. Cell count source: "${cellText}".` : ` The minimum voltage in flight is ${d.minCellInFlight} V/cell. The voltage is less than ${R.D5.minCell} V/cell for ${r(belowS, 2)} s. Cell count source: "${cellText}".`));
         }
         // G13
         if (m.G13.skipped) add('G13', 'skipped', L, null, null, null, 0, R.G13, m.G13.skipped);
-        else if (m.G13.cellsAmbiguous) add('G13', 'note', L, null, null, null, m.G13.n, R.G13.minCell, `no finding: cell count ambiguous (${m.G13.cellsSource}); Vbat in flight ${m.G13.startV} -> ${m.G13.endV} V. The log does not record the cell count`);
+        // The quoted legacy labels retain classification in advice.cjs.
+        else if (m.G13.cellsAmbiguous) add('G13', 'note', L, null, null, null, m.G13.n, R.G13.minCell, `No result: "cell count ambiguous". Cell count source: "${m.G13.cellsSource}". Voltage data: "Vbat in flight ${m.G13.startV} -> ${m.G13.endV}" V. The log does not record the cell count.`);
         else add('G13', m.G13.p1Cell < R.G13.minCell ? 'flag' : 'ok', L, null, m.G13.p1Cell, null, m.G13.n, R.G13.minCell,
-            `p1 of Vbat in flight ${m.G13.p1Cell} V/cell (min ${m.G13.minCell}, median ${m.G13.medianCell}; ${m.G13.cells} cells, ${m.G13.cellsSource || ''}; ${m.G13.startV} -> ${m.G13.endV} V)`);
+            `One percent of the voltage samples in flight are ${m.G13.p1Cell} V/cell or less. The minimum is ${m.G13.minCell}, and the median is ${m.G13.medianCell} V/cell. The voltage changes from ${m.G13.startV} to ${m.G13.endV} V. Cell count source (${m.G13.cells} cells): "${m.G13.cellsSource || ''}".`);
         // G0
         if (m.G0.skipped) add('G0', 'skipped', L, null, null, null, 0, null, m.G0.skipped);
-        else if (m.G0.mode === 'DIRECT/LIMIT') { direct.add(L); add('G0', 'note', L, null, 0, null, m.G0.flyingSamples, null, 'govSum and govI are 0 in flight: DIRECT or LIMIT, no PID governor. G2-G6 and G9 skipped; headspeed judged against its per-profile median'); }
-        else add('G0', 'ok', L, null, m.G0.govSumNonZero, null, m.G0.flyingSamples, null, `PID governor running (govSum non-zero in ${m.G0.govSumNonZero} of ${m.G0.flyingSamples} in-flight samples)`);
+        else if (m.G0.mode === 'DIRECT/LIMIT') { direct.add(L); add('G0', 'note', L, null, 0, null, m.G0.flyingSamples, null, 'govSum and govI are 0 in flight: DIRECT or LIMIT, with no PID governor. Checks G2-G6 and G9 do not operate. The headspeed reference is the median of each PID profile.'); }
+        else add('G0', 'ok', L, null, m.G0.govSumNonZero, null, m.G0.flyingSamples, null, `The PID governor operates. govSum is not 0 in ${m.G0.govSumNonZero} of ${m.G0.flyingSamples} flight samples.`);
         // G1
         const fb = m.G1.fallbackEntries;
         if (fb.length >= R.G1.fallback) add('G1', 'flag', L, null, fb.length, null, fb.length, R.G1.fallback,
-            `${fb.length} FALLBACK entr${fb.length > 1 ? 'ies' : 'y'} at ${fb.map(e => `${e.t} s (${e.value} s long, headspeed ${e.headspeedAt}, max ${e.headspeedMax}, ${e.glitchSamplesNear} glitch-proxy samples within 0.5 s)`).join('; ')}. RPM signal lost or glitching`);
+            `${fb.length} FALLBACK entr${fb.length > 1 ? 'ies' : 'y'}. ${fb.map(e => `The entry is at ${e.t} s (${e.value} s long). The headspeed is ${e.headspeedAt} rpm, with a maximum of ${e.headspeedMax} rpm. The "glitch-proxy" has ${e.glitchSamplesNear} samples in 0.5 s.`).join('\n')}\nFALLBACK does not show that the RPM source is incorrect. Possible causes are low RPM, sudden RPM changes, or a FALLBACK mode switch that is on. Examine the mode switch and the RPM signal at each entry.`);
         if (m.G1.glitchInFlight > 0) add('G1', 'note', L, null, m.G1.glitchInFlight, null, m.G1.glitchSamples, null,
-            `${m.G1.glitchInFlight} glitch-proxy events in flight (${m.G1.criterion}; the logged headspeed is filtered differently from the governor's, so this is a proxy), first at ${m.G1.events.filter(e => e.flying).slice(0, 5).map(e => `${e.t} s (${pct(e.value)})`).join(', ')}; max logged headspeed ${m.G1.headspeedMax}`);
-        if (!fb.length && !m.G1.glitchInFlight) add('G1', m.G1.fallbackKnown ? 'ok' : 'note', L, null, 0, null, null, R.G1.fallback, m.G1.fallbackKnown ? 'no FALLBACK, no glitch proxy in flight' : 'no glitch proxy in flight; FALLBACK unknown (no GOVSTATE events)');
+            `The "glitch-proxy" has ${m.G1.glitchInFlight} possible errors in flight. The rule is "${m.G1.criterion}". The recorded headspeed and governor headspeed use different filters. Thus, this check gives an indication only.\nThe first times are ${m.G1.events.filter(e => e.flying).slice(0, 5).map(e => `${e.t} s (${pct(e.value)})`).join(', ')}. The maximum recorded headspeed is ${m.G1.headspeedMax} rpm.`);
+        if (!fb.length && !m.G1.glitchInFlight) add('G1', m.G1.fallbackKnown ? 'ok' : 'note', L, null, 0, null, null, R.G1.fallback, m.G1.fallbackKnown ? 'The log has no FALLBACK and no possible RPM errors in flight.' : 'The log has no possible RPM errors in flight. FALLBACK is unknown because the log has no GOVSTATE log events.');
 
-        const skipDirect = (id) => { if (direct.has(L)) { add(id, 'skipped', L, null, null, null, 0, R[id], 'DIRECT/LIMIT (G0)'); return true; } return false; };
+        const skipDirect = (id) => { if (direct.has(L)) { add(id, 'skipped', L, null, null, null, 0, R[id], 'The governor is in DIRECT or LIMIT (G0).'); return true; } return false; };
         // G2
         if (!skipDirect('G2')) for (const [p, g] of Object.entries(m.G2.byProfile)) {
-            if (!g.n || g.seconds < R.G2.minS) { add('G2', 'note', L, +p, g.median, g.se, g.n, R.G2, `no finding: ${g.seconds || 0} s of steady ACTIVE flight < ${R.G2.minS} s`); continue; }
+            if (!g.n || g.seconds < R.G2.minS) { add('G2', 'note', L, +p, g.median, g.se, g.n, R.G2, `No result: ${g.seconds || 0} s of stable ACTIVE flight. A minimum of ${R.G2.minS} s is necessary.`); continue; }
             const bad = above(Math.abs(g.median), g.se, R.G2.median) || g.p5 < -R.G2.band || g.p95 > R.G2.band;
-            add('G2', bad ? 'flag' : 'ok', L, +p, g.median, g.se, g.n, R.G2, `steady headspeed error median ${pct(g.median, 2)} +- ${pct(g.se, 2)}, p5..p95 ${pct(g.p5, 2)}..${pct(g.p95, 2)} over ${g.seconds} s (vs ${g.reference})`);
+            add('G2', bad ? 'flag' : 'ok', L, +p, g.median, g.se, g.n, R.G2, `The median headspeed error in stable flight is ${pct(g.median, 2)} ± ${pct(g.se, 2)}. The range from 5 % to 95 % of the error is ${pct(g.p5, 2)} to ${pct(g.p95, 2)}. The check uses ${g.seconds} s. Reference: "${g.reference}".`);
         }
         // G6, G7
         if (m.G6.skipped) add('G6', 'skipped', L, null, null, null, 0, R.G6, m.G6.skipped);
         else if (!skipDirect('G6')) for (const [p, g] of Object.entries(m.G6.byProfile)) {
             if (!g.n) continue;
             const sat = g.runs.filter(q => q.value >= R.G6.runS && q.deficit !== null && q.deficit > R.G6.deficit), high = g.medianPct > R.G6.median;
-            add('G6', sat.length || high ? 'flag' : 'ok', L, +p, g.medianPct, null, g.n, R.G6,
-                `median throttle ${g.medianPct} % (p95 ${g.p95Pct} %), ${pct(g.atCeilingShare, 2)} of ACTIVE time at the ceiling ${g.ceiling} (${g.ceilingSource}); ${sat.length} runs >= ${R.G6.runS * 1000} ms at the ceiling with headspeed > ${pct(R.G6.deficit, 0)} below target${sat.length ? ' at ' + sat.slice(0, 5).map(q => `${q.t} s (${q.value} s, ${pct(q.deficit)})`).join(', ') : ''}${sat.length ? '. Saturation, not a gain problem' : ''}${high ? '. Throttle above the 75-85 % guideline: little headroom' : ''}`);
+            const estimated = g.ceiling < 1000 && /^guessed/.test(g.ceilingSource || '');
+            const finding = add('G6', sat.length || high ? 'flag' : 'ok', L, +p, g.medianPct, null, g.n, R.G6,
+                `The median throttle is ${g.medianPct} %. 95 % of throttle samples are ${g.p95Pct} % or less. The throttle is at ${estimated ? 'a limit from the recorded output' : 'its limit'} ${g.ceiling} for ${pct(g.atCeilingShare, 2)} of ACTIVE time. Limit source: "${g.ceilingSource}".\nPeriod data: "${sat.length} runs >= ${R.G6.runS * 1000} ms at the ceiling with headspeed > ${pct(R.G6.deficit, 0)} below target${sat.length ? ' at ' + sat.slice(0, 5).map(q => `${q.t} s (${q.value} s, ${pct(q.deficit)})`).join(', ') : ''}".${sat.length ? estimated ? ' The throttle limit is an estimate from the largest recorded output. These periods do not show that the throttle was at its maximum.' : ' The output has no reserve during these periods. These measurements do not show the cause before the limit.' : ''}${high ? ' The throttle is more than the range of 75-85 % in the documentation, with a small reserve.' : ''}`);
+            finding.throttleLimit = { value: g.ceiling, source: g.ceilingSource, estimated };
             const g7 = m.G7.byProfile && m.G7.byProfile[p];
-            if (g7 && g7.n) add('G7', g7.mean > 0 ? 'note' : 'ok', L, +p, g7.mean, null, g7.n, 0, `at the ceiling the governor asks ${pct(g7.mean)} more than the output (govSum x vcomp - motor[0]; p95 ${pct(g7.p95)}, max ${pct(g7.max)}) over ${g7.n} samples; vcomp ${m.G7.vcomp}`);
+            if (g7 && g7.n) add('G7', g7.mean > 0 ? 'note' : 'ok', L, +p, g7.mean, null, g7.n, 0, `At the throttle limit, the governor command is ${pct(g7.mean)} more than the output in ${g7.n} samples. 95 % of the differences are ${pct(g7.p95)} or less, and the maximum is ${pct(g7.max)}. Formula: "govSum x vcomp - motor[0]". Voltage compensation: "${m.G7.vcomp}".`);
         }
         // G8
         if (m.G8.skipped) add('G8', 'skipped', L, null, null, null, 0, R.G8, m.G8.skipped);
-        else if (m.G8.n < R.G8.minN) add('G8', 'note', L, null, m.G8.median, null, m.G8.n, R.G8, `no finding: ${m.G8.n} unsaturated samples < ${R.G8.minN}`);
+        else if (m.G8.n < R.G8.minN) add('G8', 'note', L, null, m.G8.median, null, m.G8.n, R.G8, `No result: ${m.G8.n} samples with the throttle less than its limit. A minimum of ${R.G8.minN} samples is necessary.`);
         else {
             const off = m.G8.unityShare >= R.G8.unityShare, outOf = m.G8.p5 < R.G8.bounds[0] - 0.01 || m.G8.p95 > R.G8.bounds[1] + 0.01;
-            add('G8', outOf ? 'flag' : 'note', L, null, m.G8.median, null, m.G8.n, R.G8, off ? `voltage compensation off: motor[0]/govSum = 1 within ${RULE.unsat.unity} in ${pct(m.G8.unityShare)} of ${m.G8.n} unsaturated samples`
-                : `voltage compensation on: motor[0]/govSum median ${m.G8.median} (p5 ${m.G8.p5}, p95 ${m.G8.p95}), correlation with the gain predicted from Vbat ${m.G8.corrWithPredicted} (predicted median ${m.G8.predictedMedian})${outOf ? '; outside the firmware bounds 0.80-1.20: the ratio is not vcomp alone' : ''}`);
+            add('G8', outOf ? 'flag' : 'note', L, null, m.G8.median, null, m.G8.n, R.G8, off ? `The voltage compensation is off. The motor[0]/govSum ratio is 1 ± ${RULE.unsat.unity} in ${pct(m.G8.unityShare)} of ${m.G8.n} samples with no throttle limit.`
+                : `The voltage compensation is on. The median motor[0]/govSum ratio is ${m.G8.median}. The range from 5 % to 95 % of the ratios is ${m.G8.p5} to ${m.G8.p95}. The correlation with the gain calculated from voltage is ${m.G8.corrWithPredicted}. The calculated median is ${m.G8.predictedMedian}.${outOf ? '\nThe ratio is outside the firmware limits of 0.80-1.20. Thus, it does not measure only voltage compensation.' : ''}`);
         }
         // G9
         if (!skipDirect('G9')) for (const [p, g] of Object.entries(m.G9.byProfile)) for (const band of Object.keys(RULE.g9.bands)) {
             const b = g[band];
-            if (!b || g.windows < R.G9.minWindows) { add('G9', 'note', L, +p, b ? b.prominence : null, null, g.windows, R.G9.prominence, `no finding (${band}-type band): ${g.windows} windows of ${m.G9.windowS} s < ${R.G9.minWindows}`); continue; }
+            if (!b || g.windows < R.G9.minWindows) { add('G9', 'note', L, +p, b ? b.prominence : null, null, g.windows, R.G9.prominence, `No result (${band}-type band): ${g.windows} windows of ${m.G9.windowS} s. A minimum of ${R.G9.minWindows} windows is necessary.`); continue; }
             const big = b.amplitude >= (R.G9.minAmplitude || 0), forced = b.collectiveCoherence !== null && b.collectiveCoherence >= R.G9.maxCollectiveCoherence;
             const flag = big && !forced && above(b.prominence, b.prominenceSe, R.G9.prominence), edge = !flag && b.prominence >= R.G9.prominence;
             add('G9', flag ? 'flag' : edge ? 'note' : 'ok', L, +p, b.prominence, b.prominenceSe, b.n, R.G9.prominence,
-                `headspeed error peak at ${b.hz} +- ${b.hzSe} Hz in ${b.band[0]}-${b.band[1]} Hz (${band}-type), prominence ${b.prominence} +- ${b.prominenceSe}, amplitude ${pct(b.amplitude, 2)} of target, coherence with collective ${b.collectiveCoherence}, ${b.n} windows${flag ? (band === 'P' ? ': governor P or gain too high' : ': governor I too high') : edge ? (forced ? ': follows the collective, a forced response' : big ? ': above the threshold but not by ' + sig + ' SE' : `: prominent but under ${pct(R.G9.minAmplitude, 2)} of target`) : ''}`);
+                `The headspeed error has a peak at ${b.hz} ± ${b.hzSe} Hz in the ${b.band[0]}-${b.band[1]} Hz band (${band}-type). The prominence is ${b.prominence} ± ${b.prominenceSe}, and the amplitude is ${pct(b.amplitude, 2)} of the target. The coherence with collective is ${b.collectiveCoherence} in ${b.n} windows.\n${flag ? `A lower governor ${band} gain is a possible test after its prerequisite checks. The peak does not identify the cause.` : edge ? (forced ? 'The response is related to the collective. The collective can cause this response.' : big ? `The prominence is more than the threshold, but not by ${sig} SE.` : `The amplitude is less than ${pct(R.G9.minAmplitude, 2)} of the target.`) : ''}`);
         }
         // G10
         for (const [p, g] of Object.entries(m.G10.byProfile)) {
-            if (g.windows < R.G10.minWindows) { add('G10', 'note', L, +p, g.coherence === undefined ? null : g.coherence, null, g.windows, R.G10, `no finding: ${g.windows} windows < ${R.G10.minWindows}`); continue; }
+            if (g.windows < R.G10.minWindows) { add('G10', 'note', L, +p, g.coherence === undefined ? null : g.coherence, null, g.windows, R.G10, `No result: ${g.windows} windows. A minimum of ${R.G10.minWindows} windows is necessary.`); continue; }
             const impl = above(g.coherence, g.coherenceSe, R.G10.implicated), out0 = g.coherence <= R.G10.ruledOut && g.headspeedAmplitude <= R.G10.flatRpm;
             add('G10', impl ? 'flag' : out0 ? 'ok' : 'note', L, +p, g.coherence, g.coherenceSe, g.windows, R.G10,
-                `coherence of headspeed (frame rotation removed, sign ${g.frameSign}; ${g.coherenceRaw} before) and yaw gyro at the yaw peak ${g.wagHz} Hz: ${g.coherence} +- ${g.coherenceSe} (max ${g.maxCoherence} at ${g.maxCoherenceHz} Hz); headspeed ${g.headspeedAmplitude} rpm, yaw ${g.yawAmplitude} deg/s there${impl ? ': governor implicated' : out0 ? ': governor ruled out' : ''}`);
+                `The coherence of headspeed and yaw gyro at ${g.wagHz} Hz is ${g.coherence} ± ${g.coherenceSe}. The analysis removes the effect of frame movement with sign ${g.frameSign}. Before this, the coherence is ${g.coherenceRaw}. The maximum coherence is ${g.maxCoherence} at ${g.maxCoherenceHz} Hz.\nAt the yaw peak, the headspeed amplitude is ${g.headspeedAmplitude} rpm, and the yaw amplitude is ${g.yawAmplitude} deg/s.${impl ? ' The signals are related. This does not show which loop causes the oscillation.' : out0 ? ' Coherence and headspeed changes are small in these windows.' : ''}`);
         }
         // G11
         if (m.G11.skipped) add('G11', 'skipped', L, null, null, null, 0, R.G11, m.G11.skipped);
-        else if (m.G11.blocks < R.G11.minBlocks || m.G11.perPack === null) add('G11', 'note', L, null, m.G11.perPack, m.G11.perPackSe, m.G11.blocks, R.G11.perPack, `no finding: ${m.G11.blocks} steady blocks of ${m.G11.blockS} s`);
+        else if (m.G11.blocks < R.G11.minBlocks || m.G11.perPack === null) add('G11', 'note', L, null, m.G11.perPack, m.G11.perPackSe, m.G11.blocks, R.G11.perPack, `No result: ${m.G11.blocks} stable periods of ${m.G11.blockS} s.`);
         else add('G11', above(m.G11.perPack, m.G11.perPackSe, R.G11.perPack) ? 'flag' : 'ok', L, null, m.G11.perPack, m.G11.perPackSe, m.G11.blocks, R.G11.perPack,
-            `steady throttle trend ${m.G11.perPack} +- ${m.G11.perPackSe} % points over ${m.G11.packS} s in flight (${m.G11.perVolt === null ? '-' : m.G11.perVolt + ' +- ' + m.G11.perVoltSe} % per V), at equal collective, ${m.G11.blocks} blocks`);
+            `At equal collective, the throttle changes by ${m.G11.perPack} ± ${m.G11.perPackSe} percentage points in ${m.G11.packS} s of flight. The change for each V is ${m.G11.perVolt === null ? 'unknown' : m.G11.perVolt + ' ± ' + m.G11.perVoltSe + ' %'}. The check uses ${m.G11.blocks} stable periods.`);
         // G12
         if (m.G12.skipped) add('G12', 'skipped', L, null, null, null, 0, R.G12, m.G12.skipped);
-        else if (m.G12.mainProminence < R.G12.minProminence) add('G12', 'note', L, null, m.G12.mainOrder, m.G12.mainOrderSe, m.G12.windows, R.G12, `no finding: strongest line near 1P at order ${m.G12.mainOrder}, prominence ${m.G12.mainProminence} < ${R.G12.minProminence}`);
+        else if (m.G12.mainProminence < R.G12.minProminence) add('G12', 'note', L, null, m.G12.mainOrder, m.G12.mainOrderSe, m.G12.windows, R.G12, `No result: the strongest line near 1P is ${m.G12.mainOrder} times the rotor frequency. Its prominence is ${m.G12.mainProminence}, less than ${R.G12.minProminence}.`);
         else { const dev = Math.abs(m.G12.mainOrder - 1), bad = dev > R.G12.tolerance && (m.G12.mainOrderSe === null || dev - sig * m.G12.mainOrderSe > R.G12.tolerance);
             add('G12', bad ? 'flag' : 'ok', L, null, m.G12.mainOrder, m.G12.mainOrderSe, m.G12.windows, R.G12.tolerance,
-                `main rotor line at ${m.G12.mainOrder} +- ${m.G12.mainOrderSe} x logged headspeed/60 (prominence ${m.G12.mainProminence}; harmonics ${m.G12.harmonics.map(q => q.k + 'P ' + q.order).join(', ')})${bad ? `: headspeed reads ${(1 / m.G12.mainOrder).toFixed(3)} x the rotor, check motor_poles and gear ratio` : ''}`); }
+                `The main rotor line is at ${m.G12.mainOrder} ± ${m.G12.mainOrderSe === null ? 'unknown' : m.G12.mainOrderSe} times the recorded headspeed divided by 60. Its prominence is ${m.G12.mainProminence}. Harmonics: ${m.G12.harmonics.map(q => q.k + 'P ' + q.order).join(', ')}.${bad ? '\nThe line does not agree with the recorded headspeed. Check motor_poles and the RPM sensor. The gear ratios in the configuration are correct.' : ''}`); }
     }
 
     // G3, G4, G5 and the authority split: events pooled over flights, per profile and step size
     const ev = [];
     for (const f of flights) if (!direct.has(f.log) && f.metrics.G3 && f.metrics.G3.events) for (const e of f.metrics.G3.events) ev.push(Object.assign({ log: f.log }, e));
     const skippedAll = flights.every(f => !f.metrics.G3 || f.metrics.G3.skipped);
-    if (skippedAll) for (const id of ['G3', 'G4', 'G5']) add(id, 'skipped', null, null, null, null, 0, R[id], flights.length ? flights[0].metrics.G3.skipped || 'DIRECT' : 'no flights');
+    if (skippedAll) for (const id of ['G3', 'G4', 'G5']) add(id, 'skipped', null, null, null, null, 0, R[id], flights.length ? flights[0].metrics.G3.skipped || 'The governor is in DIRECT.' : 'The analysis has no flights.');
     const profiles = [...new Set(ev.map(e => e.profile))].sort((a, b) => a - b), logsOf = (l) => [...new Set(l.map(e => e.log))];
-    const stat = (l, k) => { const v = l.map(e => e[k]).filter(q => q !== null); return { mean: meanOf(v), se: seOf(v), n: v.length }; };
+    const stat = (l, k) => { const v = l.map(e => e[k]).filter(Number.isFinite); return { mean: meanOf(v), se: seOf(v), n: v.length }; };
     for (const p of profiles) {
         const rise = ev.filter(e => e.profile === p && e.dir === 'rise' && e.size >= R.G3.minStep), drop = ev.filter(e => e.profile === p && e.dir === 'drop' && e.size >= R.G4.minStep);
         // G3
-        if (rise.length < R.G3.minEvents) add('G3', 'note', logsOf(rise), p, null, null, rise.length, R.G3, `no finding: ${rise.length} collective rises >= ${pct(R.G3.minStep, 0)} of one-sided collective travel < ${R.G3.minEvents}`);
+        if (rise.length < R.G3.minEvents) add('G3', 'note', logsOf(rise), p, null, null, rise.length, R.G3, `No result: ${rise.length} collective increases of ${pct(R.G3.minStep, 0)} or more of travel from center to maximum. A minimum of ${R.G3.minEvents} increases is necessary.`);
         else {
-            const d = stat(rise, 'droop'), sat = rise.filter(e => e.saturated).length, fs = rise.map(e => e.share && e.share.F).filter(v => typeof v === 'number');
-            const sev = above(d.mean, d.se, R.G3.flag) ? 'flag' : d.mean > R.G3.good ? 'note' : 'ok', satd = sat / rise.length >= R.G3.saturatedShare;
-            add('G3', sev, logsOf(rise), p, r(d.mean, 4), r(d.se, 4), d.n, R.G3,
-                `droop ${pct(d.mean, 2)} +- ${pct(d.se, 2)} over ${d.n} rises >= ${pct(R.G3.minStep, 0)} of one-sided collective travel (worst ${pct(Math.max(...rise.map(e => e.droop)), 2)} at log ${rise.reduce((a, b) => b.droop > a.droop ? b : a).log} ${rise.reduce((a, b) => b.droop > a.droop ? b : a).t} s); ${sat} at the throttle ceiling; F carries ${pct(meanOf(fs), 0)} +- ${pct(seOf(fs), 0)} of the added govSum`
-                + (sev !== 'ok' ? (satd ? '. Most events saturate: headroom (G6), not F' : meanOf(fs) < 0.5 ? '. F carries less than half: F too low (GOVT)' : '') : ''));
+            const free = rise.filter(e => !e.saturated), limited = rise.filter(e => e.saturated), d = stat(rise, 'droop'), u = stat(free, 'droop'), s = stat(limited, 'droop');
+            // Ratios outside 0..1 are not a partition of added throttle. Keep them in the event
+            // details, but do not use them as evidence that feedforward supplies too little.
+            const fs = free.filter(e => e.delta && e.delta.sum > 1e-3 && e.share && Number.isFinite(e.share.F) && e.share.F >= 0 && e.share.F <= 1).map(e => e.share.F);
+            const fm = meanOf(fs), fse = seOf(fs), lowF = u.n >= R.G3.minEvents && above(u.mean, u.se, R.G3.flag)
+                && fs.length >= R.G3.minEvents && Number.isFinite(fse) && fm + sig * fse < 0.5;
+            const sev = lowF || above(d.mean, d.se, R.G3.flag) ? 'flag' : d.mean > R.G3.good ? 'note' : 'ok';
+            const finding = add('G3', sev, logsOf(rise), p, r(d.mean, 4), r(d.se, 4), d.n, R.G3,
+                `The headspeed decrease is ${pct(d.mean, 2)} ± ${pct(d.se, 2)} in ${d.n} collective increases. Each increase is ${pct(R.G3.minStep, 0)} or more of travel from center to maximum. The largest decrease is ${pct(Math.max(...rise.map(e => e.droop)), 2)} at log ${rise.reduce((a, b) => b.droop > a.droop ? b : a).log}, ${rise.reduce((a, b) => b.droop > a.droop ? b : a).t} s.\n${limited.length} increases get to the throttle limit. F supplies ${pct(meanOf(fs), 0)} ± ${pct(seOf(fs), 0)} of the increase in govSum with no throttle limit.`
+                + ` With throttle less than its limit, ${u.n} increases give a headspeed decrease of ${pct(u.mean, 2)} ± ${pct(u.se, 2)}. At the throttle limit, ${s.n} increases give a decrease of ${pct(s.mean, 2)} ± ${pct(s.se, 2)}.\n`
+                + (lowF ? 'With no throttle limit, the F percentage is less than half by 2 SE. A higher F gain is a possible test after its prerequisite checks (GOVT).' : 'This check does not identify an F gain change.'));
+            finding.governorResponse = { all: d, unsaturated: u, saturated: s, feedforward: { mean: fm, se: fse, n: fs.length }, lowF,
+                events: rise.map(e => ({ log: e.log, t: e.t, droop: e.droop, droopT: e.droopT, saturated: e.saturated, firstCeilingT: e.firstCeilingT, droopBeforeCeiling: e.droopBeforeCeiling })) };
             // overshoot on rise: the "headspeed temporarily too high" signature of F too high
             const o = stat(rise, 'overshoot');
-            if (above(o.mean, o.se, R.G4.flag)) add('G4', 'flag', logsOf(rise), p, r(o.mean, 4), r(o.se, 4), o.n, R.G4, `headspeed overshoots ${pct(o.mean, 2)} +- ${pct(o.se, 2)} on collective rises (load onset), F carries ${pct(meanOf(fs), 0)} of the added govSum: F too high (GOVT)`);
+            if (o.n >= R.G4.minEvents && above(o.mean, o.se, R.G4.flag)) add('G4', 'flag', logsOf(rise), p, r(o.mean, 4), r(o.se, 4), o.n, R.G4, `The headspeed overshoots by ${pct(o.mean, 2)} ± ${pct(o.se, 2)} when collective increases ("load onset"). A lower F gain is a possible test (GOVT).`);
             // G5
-            const rc = rise.map(e => e.recoveryS === null ? null : e.recoveryS).filter(v => v !== null), cen = rise.filter(e => e.censored).length, rm = meanOf(rc), rs = seOf(rc);
-            add('G5', above(rm, rs, R.G5.flag) ? 'flag' : 'ok', logsOf(rise), p, r(rm, 3), r(rs, 3), rc.length, R.G5.flag, `recovery to within ${pct(RULE.step.band, 0)} of target ${r(rm, 3)} +- ${r(rs, 3)} s after the droop peak over ${rc.length} rises (${cen} not recovered within ${RULE.step.recoverMaxS} s, counted at that time)`);
+            const rc = free.map(e => e.recoveryS).filter(Number.isFinite), cen = free.filter(e => e.censored).length, rm = meanOf(rc), rs = seOf(rc);
+            const g5 = add('G5', rc.length < R.G5.minEvents ? 'note' : above(rm, rs, R.G5.flag) ? 'flag' : cen ? 'note' : 'ok', logsOf(free), p, r(rm, 3), r(rs, 3), rc.length, R.G5.flag,
+                rc.length < R.G5.minEvents ? `No result: ${rc.length} collective increases with no throttle limit. A minimum of ${R.G5.minEvents} increases is necessary.`
+                    : cen ? `The mean time to the target band is a minimum of ${r(rm, 3)} s after the largest headspeed decrease. The band is ${pct(RULE.step.band, 0)} from the target. The check uses ${rc.length} collective increases with no throttle limit.\n${cen} responses did not get to the band before the end of the recorded period. These minimum times have an SE of ${r(rs, 3)} s.`
+                        : `The mean time to the target band is ${r(rm, 3)} ± ${r(rs, 3)} s after the largest headspeed decrease. The band is ${pct(RULE.step.band, 0)} from the target. The check uses ${rc.length} collective increases with no throttle limit.`);
+            g5.governorResponse = { unsaturated: { mean: rm, se: rs, n: rc.length }, censored: cen, saturatedExcluded: limited.length };
         }
         // G4 on unload
-        if (drop.length < R.G4.minEvents) add('G4', 'note', logsOf(drop), p, null, null, drop.length, R.G4, `no finding: ${drop.length} collective drops >= ${pct(R.G4.minStep, 0)} of one-sided collective travel < ${R.G4.minEvents}`);
+        if (drop.length < R.G4.minEvents) add('G4', 'note', logsOf(drop), p, null, null, drop.length, R.G4, `No result: ${drop.length} collective decreases of ${pct(R.G4.minStep, 0)} or more of travel from center to maximum. A minimum of ${R.G4.minEvents} decreases is necessary.`);
         else { const o = stat(drop, 'overshoot');
-            add('G4', above(o.mean, o.se, R.G4.flag) ? 'flag' : 'ok', logsOf(drop), p, r(o.mean, 4), r(o.se, 4), o.n, R.G4, `overshoot after collective drops ${pct(o.mean, 2)} +- ${pct(o.se, 2)} over ${o.n} events (max ${pct(Math.max(...drop.map(e => e.overshoot)), 2)})`); }
+            add('G4', above(o.mean, o.se, R.G4.flag) ? 'flag' : 'ok', logsOf(drop), p, r(o.mean, 4), r(o.se, 4), o.n, R.G4, `The headspeed overshoot after ${o.n} collective decreases is ${pct(o.mean, 2)} ± ${pct(o.se, 2)}. The maximum is ${pct(Math.max(...drop.map(e => e.overshoot)), 2)}.`); }
     }
     return out;
 }

@@ -266,8 +266,8 @@ test('T0: the worker is Chromium 99 syntax as written (esbuild chrome99 output e
 
 test('T0: the toolkit files the worker runs in Chromium 99 are Chromium 99 syntax and use no newer API', (t) => {
     const { dir, names, optional } = fetchedToolkit();
-    assert.equal(names.length, 27);
-    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_autotune', 'filter_checklist', 'control_tune']);
+    assert.equal(names.length, 35);
+    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'control_tune', 'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline']);
     let esbuild = null; try { esbuild = require(path.join(REPO, 'node_modules/esbuild')); } catch (e) { /* the API check still runs */ }
     for (const n of names) {
         const file = path.join(JS, `${dir}${n}.cjs`);
@@ -286,7 +286,7 @@ test('T0: every file the worker loads is a relative URL to a file that exists an
     const list = /(?:var distSources|APP_ASSET_SOURCES) = \[([\s\S]*?)\];/.exec(gulp)[1], quoted = (s) => [...s.matchAll(/'([^']+)'/g)].map(m => m[1]);
     const scripts = quoted(/importScripts\(([^)]*)\)/.exec(src)[1]).map(u => path.posix.join('js', u));
     const toolkit = names.map(n => path.posix.normalize(path.posix.join('js', `${dir}${n}.cjs`)));
-    assert.equal(scripts.length, 12); assert.equal(names.length, 27);
+    assert.equal(scripts.length, 12); assert.equal(names.length, 35);
     toolkit.forEach((f, i) => { if (optional.includes(names[i]) && !fs.existsSync(path.join(REPO, f))) { t.diagnostic(`${f} is not in the repo yet: an optional module`); toolkit[i] = null; } });
     for (const f of scripts.concat(toolkit.filter(Boolean))) {
         assert.ok(!/^\/|^[a-z]+:/i.test(f) && !f.startsWith('..'), `${f} relative to the app root`);
@@ -323,9 +323,9 @@ test('T1: whole file, excludeAbnormal and phases off: records equal health.cjs, 
     assert.ok(C.health.logs.find(l => l.log === 5).flown && /lacks .*headspeed/.test(C.health.logs.find(l => l.log === 6).skipped), 'a flight with the required fields only, a log without headspeed');
     // log numbers in finding texts count from 1 as the viewer does; "log 1000 Hz" is a logging rate
     const H = R.findings.filter(f => f.id === 'H' && f.log === 3), cliH = C.results.findings.filter(f => f.id === 'H' && f.log === 3);
-    assert.ok(cliH.length && cliH.length === H.length && cliH.every((f, i) => /\(since log \d+, /.test(f.text) && H[i].text === f.text.replace(/since log (\d+)/, (m, n) => `since log ${+n + 1}`)),
+    assert.ok(cliH.length && cliH.length === H.length && cliH.every((f, i) => /since log \d+/.test(f.text) && H[i].since === f.since && H[i].text === f.text.replace(/since log (\d+)/, (m, n) => `since log ${+n + 1}`)),
         `H texts: ${J(H.map(f => f.text))} against the CLI's ${J(cliH.map(f => f.text))}`);
-    assert.ok(R.findings.some(f => f.id === 'SETUP' && /; log 1000 Hz \(PID /.test(f.text)), 'SETUP logging rate unchanged');
+    assert.ok(R.findings.some(f => f.id === 'SETUP' && f.setup.logRateHz === 1000 && /The log rate is 1000 Hz/.test(f.text)), 'SETUP logging rate unchanged');
 
     // the log on screen does not change what is analysed: the bench run (log 0) on screen gives the same rpm, records and findings
     const B = await W.result({ cmd: 'analyseFile', fileName: 'sim.bbl', selectedLog: 0,
@@ -379,7 +379,7 @@ test('T1: gains: extract.cjs + report.cjs in the worker give the CLI decisions, 
     assert.ok(R.timing.gainsS > 0);
     const f = W.progress.filter(p => p.id === 1).map(p => p.fraction);
     assert.ok(f.every((v, i) => v >= 0 && v <= 1 && (!i || v >= f[i - 1])), `progress fractions rise from 0 to 1: ${f.join(' ')}`);
-    assert.ok(W.progress.some(p => p.stage === 'gains' && /^"extract\.cjs": "sim\.bbl #4/.test(p.text)), 'extract.cjs progress lines reach the dialog, as quoted text');
+    assert.ok(W.progress.some(p => p.stage === 'gains' && p.text === 'The app calculates gain segments for log 5.'), 'gain progress uses the viewer log number');
 });
 
 test('T1: auto flight rpm: lowest per-profile governor target, else airborne headspeed, else the toolkit default', async () => {
@@ -693,11 +693,11 @@ test('excludeAbnormal: with under 5 s of normal flight left, loop checks do not 
     });
     const of = (R, module) => R.findings.filter(f => f.module === module);
     assert.equal(of(on, 'loop').filter(f => logsOf(f).includes(1)).length, 0, 'no loop findings of the log');
-    assert.ok(of(on, 'loop').every(f => f.log === null && /^no finding: /.test(f.text)), J(of(on, 'loop'))); // health_loop judging no flight (T4)
+    assert.ok(of(on, 'loop').every(f => f.log === null && f.status === 'insufficient' && /^No result: /.test(f.text)), J(of(on, 'loop'))); // health_loop judging no flight (T4)
     const core = (list) => list.map(f => { const o = Object.assign({}, f); for (const k of APP_FIELDS) delete o[k]; return o; });
     const perLog = (R) => core(of(R, 'gov').filter(f => ['D5', 'G0', 'G1', 'G12', 'G13'].includes(f.id))); // the checks of no PID profile: the labels do not matter
     assert.equal(J(perLog(on)), J(perLog(off)), 'the governor findings of the whole flight');
-    assert.ok(of(on, 'gov').some(f => f.id === 'G0' && /PID governor running \(govSum non-zero in [1-9]\d* of /.test(f.text)), 'G0 counts in-flight samples');
+    assert.ok(of(on, 'gov').some(f => f.id === 'G0' && f.value > 0 && /govSum is not 0 in [1-9]\d* of /.test(f.text)), 'G0 counts in-flight samples');
     assert.ok(on.notes.includes('After the app removes rescue, level modes, failsafe and ground contact, the log has 0 s of usual flight at 0 deg/s rms. A flight is a minimum of 5 s at 10 deg/s rms (health.cjs RULE.flight). ' +
         'Thus, the app does not do the loop checks, and the governor checks use all of the flight (log 2).'), on.notes.join('\n'));
 
@@ -844,10 +844,12 @@ test('finding texts count logs from 1 as the viewer does; a logging rate is not 
         assert.equal(TW.viewerText(text), want === null ? text : want);
 });
 
-test('control autotune runs in the browser worker and exports only the selected maneuver plan', async () => {
+test('control autotune requires real samples and cannot export legacy proposals as simulated gains', async () => {
     const W = worker(), advice = require('../tools/autotune/advice.cjs');
     const findings = [{ id:'G3',fid:'droop',module:'gov',severity:'flag',log:0,profile:1,
-        value:.07,se:.005,n:10,text:'droop 7 %: F too low (GOVT)',source:'test' }];
+        value:.07,se:.005,n:10,text:'droop 7 %: F too low (GOVT)',source:'test',
+        governorResponse:{all:{mean:.07,se:.005,n:10},unsaturated:{mean:.07,se:.005,n:10},
+            saturated:{mean:null,se:null,n:0},feedforward:{mean:.3,se:.02,n:10},lowF:true} }];
     const recs = advice.advise({findings,header:{govPID:[40,50,0,10,40]},headerLog:0,headerProfile:1,
         logs:[{log:0,flown:true,profileSeconds:{1:100},targetOf:{1:2300}}]}).recommendations
         .filter(r=>r.parameter === 'gov_f_gain').map(r=>Object.assign({},r,{dataset:'A'}));
@@ -856,18 +858,93 @@ test('control autotune runs in the browser worker and exports only the selected 
         advice:{byDataset:{A:recs}}};
     const reply = await W.post({cmd:'controlTune',analysis,configuration:'A',step:'governor'});
     assert.equal(reply.type,'controlTuned',reply.message);
-    assert.equal(reply.result.rows.length,1,JSON.stringify(reply.result.deferred));
-    assert.equal(reply.result.rows[0].to,20);
+    assert.equal(reply.result.rows.length,0);
+    assert.equal(reply.result.status,'model-required');
     assert.equal(reply.result.verifiedInFlight,false);
     const exp = await W.post({cmd:'export',recs:reply.result.recommendations,withPlan:true});
     assert.equal(exp.type,'exported',exp.message);
-    assert.match(exp.result.text,/set gov_f_gain = 20/);
-    assert.match(exp.result.flightPlan.maneuvers[0].instructions.join(' '),/full positive collective/);
+    assert.doesNotMatch(exp.result.text,/set gov_f_gain/);
+    assert.deepEqual(exp.result.flightPlan.maneuvers,[]);
     const none = await W.post({cmd:'export',recs:reply.result.recommendations,picks:[],withPlan:true});
     assert.deepEqual(none.result.flightPlan.maneuvers,[]);
     const absent = await worker({'control_tune.cjs':null}).post({cmd:'controlTune',analysis,configuration:'A',step:'governor'});
     assert.equal(absent.type,'error');
     assert.match(absent.message,/control_tune/);
+});
+
+test('digital twin input selection preserves native fields and rejects rescue before configuration cuts', async () => {
+    const echo=`module.exports={identify(input){return {seed:input.options.sysid.seed,excluded:input.excluded,files:input.source.files,
+        boundContinuity:input.options.parameterContinuity,request:input.options.parameterContinuityRequest,
+        limits:input.source.limitCoverage,items:input.items.map(item=>({configuration:item.configuration,
+            profile:item.profile,n:item.w.n,rate:item.ctx.rate,mask:Array.from(item.ctx.eligible),
+            rescue:Array.from(item.w.rescueAt||[]),profileAt:Array.from(item.w.profileAt||[]),
+            raw:!!item.w.extra['gyroRAW[0]'],rc:!!item.w.extra['rcCommand[0]'],
+            originalHeader:!!item.w.originalHeader,originalPID:item.w.originalHeader&&item.w.originalHeader.rollPID,
+            rawFields:item.w.originalHeader&&item.w.originalHeader.loggedHeaderFields,
+            interval:item.w.recordedConfiguration.interval,epochs:item.epochs,source:item.source,
+            saturation:item.saturation.length,airborneEvents:item.ctx.airborneEvents}))};}};`;
+    const W=worker({'control_pipeline.cjs':echo}), flight=bbl.simulateFlight({seconds:35,seed:72,airborne:[5,31],rescue:[14,17],
+        profiles:[{from:0,profile:1,target:2500},{from:22,profile:2,target:2700}]});
+    const bytes=bbl.encode([flight]).bytes;
+    W.ctx.crypto=require('node:crypto').webcrypto;
+    const analysis=await W.result({cmd:'analyseFile',fileName:'fireball-fixture.bbl',selectedLog:0,
+        options:{curves:false,gains:false,cliText:CLI}},bytes);
+    const config=analysis.datasets.datasets.find(d=>d.analysedFlightSeconds>0);
+    assert.ok(config,'the fixture has analyzed flight data');
+    const answer=await W.send({cmd:'systemIdentify',fileName:'fireball-fixture.bbl',configuration:config.id,analysis,
+        options:{cliText:CLI,sysid:{seed:42},parameterContinuityRequest:{confirmed:true,statement:'No parameters changed in the selected logs.',logIndexes:[0]}}},bytes);
+    assert.equal(answer.type,'systemIdentified',answer.message);
+    assert.equal(answer.result.seed,42);
+    assert.equal(answer.result.files.length,1);
+    assert.equal(answer.result.files[0].sha256,require('node:crypto').createHash('sha256').update(bytes).digest('hex'));
+    assert.deepEqual(answer.result.parameterContinuity,[{sourceSha256:answer.result.files[0].sha256,localLogIndexes:[0],
+        scope:'parameters',basis:'user-assertion',statement:'No parameters changed in the selected logs.'}]);
+    assert.deepEqual(answer.result.boundContinuity,answer.result.parameterContinuity,'the pipeline receives only the SHA-bound statement');
+    assert.equal(answer.result.request,undefined,'unbound global indexes do not survive into a model');
+    assert.deepEqual(answer.result.sourceFiles,answer.result.files);
+    assert.ok(answer.result.items.length>=2,'profile changes create distinct intervals');
+    assert.ok(answer.result.limits.length>0,'known limits and unknown coverage are retained');
+    let usable=0,rescue=0;
+    for(const item of answer.result.items){
+        assert.equal(item.raw,true);assert.equal(item.rc,true);assert.equal(item.saturation,item.n);
+        assert.equal(item.originalHeader,true);assert.ok(item.originalPID.length>=3);
+        assert.equal(item.source.file.sha256,answer.result.files[0].sha256);assert.equal(item.source.logIndex,0);assert.equal(item.source.localLogIndex,0);
+        assert.ok(item.rawFields.includes('rollPID'),'raw parser journal survives configuration materialization');
+        assert.ok(item.interval.source.profile,'source belongs to the original configuration interval');
+        assert.ok(item.epochs.length>0,'parameter epochs remain available at native rate');
+        assert.ok(item.profileAt.every(p=>p===item.profile));
+        for(let i=0;i<item.n;i++){usable+=item.mask[i];if(item.rescue[i]){rescue++;assert.equal(item.mask[i],0);}}
+    }
+    assert.ok(usable>0);assert.ok(rescue>0);
+    const corrupt=await W.send({cmd:'systemIdentify',fileName:'fireball-fixture.bbl',configuration:config.id,analysis,
+        options:{cliText:CLI,sourceFiles:[{fileName:'wrong.bbl',sha256:'bad-hash',byteOffset:0,bytes:bytes.length}]}},bytes);
+    assert.equal(corrupt.type,'error');assert.match(corrupt.message,/source file data/);
+    const replaced=Uint8Array.from(bytes);replaced[replaced.length-1]^=1;
+    const stale=await W.send({cmd:'systemIdentify',fileName:'fireball-fixture.bbl',configuration:config.id,analysis,
+        options:{cliText:CLI,parameterContinuity:answer.result.parameterContinuity}},replaced);
+    assert.equal(stale.type,'error');assert.match(stale.message,/does not refer to this flight file/,'same name and byte length cannot transfer the statement');
+});
+
+test('parameter continuity binds explicit groups to verified source bytes and rejects incomplete statements', () => {
+    const bind=worker().ctx.TuningWorker.bindParameterContinuity, first='a'.repeat(64),second='b'.repeat(64),
+        files=[{sha256:first,verifiedBytes:true,logOffset:0,logs:2},{sha256:second,verifiedBytes:true,logOffset:2,logs:3}],
+        request={confirmed:true,statement:'No parameter changes.',logIndexes:[4,1,2,4]},
+        canonical=(hash,logs)=>({sourceSha256:hash,localLogIndexes:logs,scope:'parameters',basis:'user-assertion',statement:request.statement}),
+        json=v=>JSON.parse(JSON.stringify(v));
+    assert.deepEqual(json(bind({},files)),[],'no user statement is inferred');
+    const bound=bind({parameterContinuityRequest:request},files);
+    assert.deepEqual(json(bound),[canonical(second,[0,2]),canonical(first,[1])]);
+    assert.deepEqual(json(bind({parameterContinuity:bound},files)),json(bound),'saved assertions preserve their exact source and scope');
+    assert.deepEqual(json(bind({parameterContinuity:bound,parameterContinuityRequest:{...request,logIndexes:[0]}},files)),
+        [canonical(second,[0,2]),canonical(first,[0])],'a new group never implicitly joins previously different groups');
+    for(const bad of [{...request,confirmed:false},{...request,statement:' '},{...request,logIndexes:[]},
+        {...request,logIndexes:[5]},{...request,logIndexes:[-1]},{...request,logIndexes:[0.5]},
+        {...request,sourceSha256:first}]) assert.throws(()=>bind({parameterContinuityRequest:bad},files));
+    assert.throws(()=>bind({parameterContinuity:bound},files.map(f=>({...f,verifiedBytes:false}))),/does not refer/);
+    assert.throws(()=>bind({parameterContinuity:[canonical('c'.repeat(64),[0])]},files),/does not refer/);
+    assert.throws(()=>bind({parameterContinuity:[canonical(first,[2])]},files),/out of/);
+    assert.throws(()=>bind({parameterContinuity:[{...canonical(first,[0]),basis:'assumed'}]},files),/constant parameter values/);
+    assert.throws(()=>bind({parameterContinuityRequest:request},files.map(f=>({...f,sha256:null,verifiedBytes:false}))),/cannot identify/);
 });
 
 test('advice gets the selected log, its arming profile, viewer log numbering and the log dates; its CLI script comes back', async () => {
@@ -1057,11 +1134,11 @@ test('derive: init loads the toolkit once; derive never decodes, makes no fs cal
     assert.deepEqual(Object.keys(ready.result.modules), ['track', 'more', 'gov', 'catalog']);
     assert.ok(ready.result.modules.track && ready.result.modules.more && ready.result.modules.gov, J(ready.result));
     assert.equal(ready.result.modules.catalog, has('catalog.cjs'));
-    assert.equal(W.fetches.length, 27, 'each toolkit file fetched once');
+    assert.equal(W.fetches.length, 35, 'each toolkit file fetched once');
     const x = Float32Array.from(noise(4000, 1, 10));
     await W.derive('bandpass', { x }, 1000, { lo: 5, hi: 50 });
     await W.derive('window', { 'setpoint[0]': x, 'gyroADC[0]': x }, 1000, {});
-    assert.equal(W.fetches.length, 27, 'no fetch after init');
+    assert.equal(W.fetches.length, 35, 'no fetch after init');
     assert.equal((await TW.deriveKit()).calls.n, 0, 'no fs call');
     const bad = async (msg, text) => { const m = await W.post(Object.assign({ cmd: 'derive' }, msg)); assert.deepEqual([m.type, m.message], ['error', text]); };
     await bad({ kind: 'nope', rate: 1000, cols: { x } }, 'The function "nope" is unknown.');
@@ -1583,11 +1660,11 @@ test('D12 headspeed: the PID profile changes of the file give three headspeeds; 
     assert.ok(L.findings.filter(f => logsOf(f).length === 1 && logsOf(f)[0] === 0 && f.pidProfile !== null && !['D4', 'F4', 'H'].includes(f.id)).every(f => f.pidProfile === 2));
     // PID profile 3 flies in log 1, and no flight log of the selection starts in it: the log header has its values only when the pilot arms the
     // helicopter in it, and the app can then find it (2700 rpm is PID profile 3 only). No instruction for a PID profile with a CLI section
-    const p3 = 'No flight log in the analysis starts in PID profile 3. The log header records the values of the PID profile that is active when you arm the helicopter. ' +
-        'Thus, the log header has the values of PID profile 3 only when you arm the helicopter in PID profile 3.';
+    const p3 = 'No flight log in the analysis starts in PID profile 3. The log header records the values of the PID profile that is active when a new log starts. ' +
+        'Thus, the log header has the values of PID profile 3 only when a new log starts in PID profile 3.';
     const S = await run({ flights: [{ log: 0, flight: null }, { log: 1, flight: null }] });
     assert.ok(S.notes.includes(p3), S.notes.join('\n'));
-    assert.ok(!S.notes.some(n => /arm the helicopter in PID profile [12]\b/.test(n)), S.notes.join('\n'));
+    assert.ok(!S.notes.some(n => /new log starts in PID profile [12]\b/.test(n)), S.notes.join('\n'));
     const C = await run({ flights: [{ log: 0, flight: null }, { log: 1, flight: null }], cliText: '# diff all\nprofile 2\nset gov_headspeed = 2700\nprofile 0\n' });
     assert.ok(!C.notes.includes(p3), C.notes.join('\n'));
 });
@@ -1609,9 +1686,9 @@ test('D12 headspeed: not confirmed when two PID profiles have the headspeed, whe
     assert.ok(B.notes.includes('At the start of the log, "govRequest" is 2500 rpm. In the PID profile changes of this file, PID profiles 1 and 2 have this value. ' +
         'Thus, the app cannot find the PID profile at the start of the log. The results of that part show "PID profile unknown" (logs 1 and 2).'), B.notes.join('\n'));
     assert.ok(B.findings.filter(f => f.profile === 0 && !['D4', 'F4', 'H'].includes(f.id)).every(f => f.pidProfile === null));
-    assert.ok(B.notes.includes('No flight log in the analysis starts in PID profile 3. The log header records the values of the PID profile that is active when you arm the helicopter. ' +
-        'Thus, the log header has the values of PID profile 3 only when you arm the helicopter in PID profile 3.'), B.notes.join('\n'));
-    assert.ok(!B.notes.some(n => /arm the helicopter in PID profile [12]\b/.test(n)), 'no instruction for a PID profile that the app cannot find');
+    assert.ok(B.notes.includes('No flight log in the analysis starts in PID profile 3. The log header records the values of the PID profile that is active when a new log starts. ' +
+        'Thus, the log header has the values of PID profile 3 only when a new log starts in PID profile 3.'), B.notes.join('\n'));
+    assert.ok(!B.notes.some(n => /new log starts in PID profile [12]\b/.test(n)), 'no instruction for a PID profile that the app cannot find');
     // (d) log 1 starts in PID profile 3 at 2500 rpm (no change shows PID profile 3), and its first change goes to PID profile 2 (2500 rpm): a log
     // records only a change, so the start is not PID profile 2. (c) log 2 records no change, but govRequest goes from 2300 to 2500 rpm at 15 s
     const R = await run(F.rules), arm = (l) => R.profiles.arming.find(q => q.log === l);
@@ -1886,8 +1963,9 @@ test('round 2: Fireball 2026-10-05 in file scope: P1 at the load steps of each f
     const g20 = R.findings.filter(f => f.id === 'G20');
     assert.deepEqual(g20.map(f => [f.log, f.value, f.n]), [[11, 2, 2], [14, 1, 1]], 'log 12: 2 FALLBACKs at the throttle limit; log 15: 1 at the rescue');
     const g1 = R.findings.filter(f => f.id === 'G1' && f.severity === 'flag');
-    assert.ok(g1.length === 2 && g1.every(f => f.status === 'monitor' && Array.isArray(f.resultOf)), J(g1.map(f => [f.log, f.status])));
-    assert.notEqual(R.hierarchy.nodes.rpm.status, 'problem', 'a FALLBACK at the throttle limit is no problem of the RPM signal');
+    assert.ok(g1.length === 2 && g1.every(f => f.status === 'problem'), J(g1.map(f => [f.log, f.status])));
+    assert.equal(R.hierarchy.nodes.rpm.status, 'problem', 'FALLBACK still needs diagnosis when throttle reaches its limit');
+    assert.ok(R.hierarchy.nodes.filters.blockedBy.includes('rpm'), 'RPM-dependent filter changes must wait for the unresolved cause');
     assert.ok(!R.hierarchy.startHere.some(id => R.hierarchy.nodes[id].status !== 'startHere'));
     // SPEC3 F on the real results: a problem or a value to monitor says first what the helicopter does and why (catalog.cjs lead), then the number
     const C = require('../tools/autotune/catalog.cjs'); let n = 0;
@@ -1954,6 +2032,24 @@ module.exports = { EXTRA: [], RULE: {}, DEFAULT_RULES: {},
     judge: (flights) => [].concat(...flights.map(f => f.metrics.labels.map(L => ({ id: 'C12', severity: 'note', thin: true, log: f.log, profile: L, axis: 'roll', value: L, se: null, n: 1, threshold: null, source: 'test', unit: 'samples',
         text: 'label ' + L + ': PID profile ' + L + ' and profile ' + L + '.' })))),
     curves: () => null };`;
+test('rescue transition text retains actual PID profile numbers when configurations have different labels', async () => {
+    const rescue = `'use strict'; module.exports = {EXTRA: [], RULE: {}, DEFAULT_RULES: {},
+        analyse: (w,ctx) => ({label: Array.from(ctx.profile).find(x=>x>0)}),
+        judge: flights => flights.map(f=>({id:'D8',severity:'flag',log:f.log,profile:f.metrics.label,
+            value:1,n:1,fromProfile:3,toProfile:2,
+            text:'The PID profile changes from PID profile 3 to PID profile 2.',
+            events:[{t:5,profile:f.metrics.label,changes:[{from:3,to:2}]}]})), curves:()=>null};`;
+    const S=sim(), W=worker({'health_phase.cjs':STUB_PHASE,'health_rescue.cjs':rescue});
+    const R=await W.result({cmd:'analyseFile',fileName:'sim.bbl',selectedLog:3,
+        options:{flightRpm:TRUTH.rpm,cliText:CLI,curves:false,gains:false,flights:[{log:3,flight:null}]}},S.bytes);
+    const rows=R.findings.filter(f=>f.id==='D8');assert.ok(rows.length);
+    for(const f of rows){
+        assert.equal(f.text,'The PID profile changes from PID profile 3 to PID profile 2.');
+        assert.deepEqual([f.fromProfile,f.toProfile],[3,2]);
+        assert.deepEqual(f.events[0].changes,[{from:3,to:2}]);
+        assert.equal(f.dataset,'C');assert.equal(f.profile,1,'configuration C belongs to PID profile 1');
+    }
+});
 test('round 3 M1: every sample has the label of its configuration, the modules pool by configuration; f.dataset, the fid and result.datasets', async () => {
     const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE, 'health_track.cjs': STUB_LABELS });
     const run = (o, sel = 1) => W.result({ cmd: 'analyseFile', fileName: 'sim.bbl', selectedLog: sel, options: Object.assign({ flightRpm: TRUTH.rpm, cliText: CLI, curves: false, keepMetrics: true }, o) }, S.bytes);
@@ -2010,6 +2106,10 @@ test('round 3 M2: filterTune runs the filter search of filter_tune.cjs on the fl
     const R = await go({ blockedBy: ['rpm', 'filters', 'The step "Governor" has a problem.', 'x'] });
     // options.blockedBy: the ids of the diagram (the titles of hierarchy.cjs graph) or STE texts
     assert.deepEqual(R.blockedBy, ['The prerequisite "RPM signal and motor poles" has a problem.', 'The step "Filters" has a problem.', 'The step "Governor" has a problem.']);
+    assert.deepEqual(R.cliExport, require('../tools/autotune/filter_autotune.cjs').cliExportStatus(R, {recommendations:R.recommendations}),
+        'the worker recalculates export eligibility after it attaches the current prerequisite gates');
+    assert.equal(R.cliExport.available, false);
+    assert.equal(R.cliFile, '');
     // the flight logs with the raw gyro (log 5 has no extra field), not the bench run (log 0) or the logs with no data (2, 6)
     assert.deepEqual(R.logs, [1, 3, 4, 5]);
     assert.ok(R.model && Array.isArray(R.model.parity) && R.recommended && typeof R.recommended.status === 'string' && R.current && R.units, Object.keys(R).join());
@@ -2090,7 +2190,8 @@ test('notch orders of the log: without a CLI dump, the tail rotor notch order of
     assert.ok(flown.length === 3 && flown.every(l => l.metrics.setup.F5.gear === 'log notch' && l.metrics.setup.setup.rpm.banks.yaw.find(b => b.code === 21).order === N.tail.order), J(flown.map(l => l.metrics.setup.F5.gear)));
     const f6 = R.findings.filter(f => f.id === 'F6');
     assert.ok(f6.length && !f6.some(f => f.severity === 'skipped' || f.status === 'notMeasured'), J(f6.filter(f => f.severity === 'skipped').map(f => f.text)));
-    assert.ok(f6.some(f => f.text.startsWith(`yaw notch 21 (tail rotor 1, ${N.tail.order} x rotor`) && f.status === 'satisfactory'), J(f6.map(f => f.text)));
+    assert.ok(f6.some(f => f.text.includes('The yaw notch filter source 21 is `tail rotor` harmonic 1')
+        && f.text.includes(`The rotor order is ${N.tail.order},`) && f.status === 'satisfactory'), J(f6.map(f => f.text)));
     assert.ok(R.findings.filter(f => f.id === 'F9').every(f => f.status === 'satisfactory' && !/unknown frequency/.test(f.text)), 'F9');
     assert.ok(R.findings.filter(f => f.id === 'F5').every(f => f.severity !== 'flag'), J(R.findings.filter(f => f.id === 'F5').map(f => f.text)));
     assert.ok(!R.advice.recommendations.some(r => /^F[5689]/.test(r.id)), J(R.advice.recommendations.map(r => r.id)));
@@ -2102,7 +2203,8 @@ test('notch orders of the log: without a CLI dump, the tail rotor notch order of
     // logGear false: today's results, the order unknown
     const O = await run({ logGear: false });
     assert.equal(O.notchFit, null);
-    assert.ok(O.findings.some(f => f.id === 'F6' && f.severity === 'skipped' && /^yaw source 21 \(tail rotor\): order unknown/.test(f.text)), 'F6 not measured');
+    assert.ok(O.findings.some(f => f.id === 'F6' && f.severity === 'skipped'
+        && /yaw.*21.*tail rotor/.test(f.text) && /unknown/.test(f.text)), 'F6 not measured');
     assert.ok(O.findings.some(f => f.id === 'F9' && f.status === 'monitor') && O.records.filter(l => l.logClass === 'flight').every(l => l.metrics.setup.F5.gear === null), 'F9, no gear');
     assert.ok(!O.notes.some(t => /notch filter is at|not sufficient to find/.test(t)), O.notes.join('\n'));
     // a CLI dump gives the gear ratios (a diff: its absent keys are the default 1,1): no fit, the dump's order
@@ -2124,11 +2226,12 @@ test('notch orders of the log: a line at a tail rotor harmonic gets an RPM notch
     const R = await run({});
     assert.ok(R.notchFit.used, J(R.notchFit));
     const f5 = R.findings.filter(f => f.id === 'F5' && f.severity === 'flag');
-    assert.ok(f5.length === 3 && f5.every(f => /^line at 8\.13\d* x rotor/.test(f.text)), J(f5.map(f => f.text)));
+    assert.ok(f5.length === 3 && f5.every(f => f.lines && f.lines.some(line => Math.abs(line.order - 8.1334) < 0.001)), J(f5.map(f => f.text)));
     const r = R.advice.recommendations.find(x => x.id === 'F5');
     assert.deepEqual([r.severity, r.title], ['action', 'RPM notch filter at tail rotor harmonic 2']);
     assert.match(r.text, /is at `8\.13\d* × rotor` \([\d.]+ Hz, prominence [\d.]+, log \d, PID profile unknown\), tail rotor harmonic 2\. The gear ratios in the configuration are correct\./);
-    assert.match(r.text, /\nAdd an RPM notch filter with source 22 and Q 4\.0 \(FILT\) on the roll, pitch and yaw axes\.$/);
+    assert.match(r.text, /\nAn RPM notch filter with source 22 and Q 4\.0 \(FILT\) on the roll, pitch and yaw axes can remove tail rotor harmonic 2\.$/);
+    assert.deepEqual(r.cli, [], 'unknown recorded notch banks retain a descriptive target without an apply command');
     assert.match(r.rule, /RPM notch filters follow the main rotor harmonics 1 to 8 and the tail rotor harmonics 1 to 8\./);
     assert.ok(!/resonance/i.test(`${r.title} ${r.text} ${r.caveats.join(' ')}`), r.text);
     assert.ok(r.caveats.includes('The gyro filters let 100 % to 100 % of tail rotor harmonic 2 through.'), J(r.caveats));
@@ -2374,18 +2477,21 @@ test('values that are possibly not current (review): the time that a result meas
 test('filter configuration selection clips to its recorded periods, uses LUA values, and reuses the prepared input', async () => {
     const capture=`module.exports={EXTRA:['gyroRAW[0]','gyroRAW[1]','gyroRAW[2]'],tune(items,opts){
         const reused=!!opts.prepared;if(opts.onPrepared)opts.onPrepared({ready:true});
-        return {version:1,model:{passed:false},recommended:{status:'not recommended',rows:[],validation:{}},
+        return {version:1,notes:['The PID configuration does not agree with the recorded PID signals.'],model:{passed:false},recommended:{status:'not recommended',rows:[],validation:{}},
           capture:{reused,simulate:opts.simulate===undefined?null:opts.simulate,maxAddMs:opts.maxAddMs,items:items.map(x=>({log:x.w.flight.log,from:x.w.fromS,n:x.w.n,rate:x.w.rate,profile:x.armingProfile,profiles:[...new Set(x.w.profileAt)],gain:x.w.flight.header.rollPID[0],cutoff:x.w.flight.header.rollBW[0]}))}};
     }};`;
-    const W=worker({'filter_tune.cjs':capture,'health_phase.cjs':STUB_PHASE}), S=sim();
+    const W=worker({'filter_tune.cjs':capture,'health_phase.cjs':STUB_PHASE,'health_rescue.cjs':null}), S=sim();
     const config={id:'LUA-B',pidProfile:2,values:{roll_p_gain:97,roll_gyro_cutoff:123},labels:[{dataset:'LUA-B',log:3,t0:15,t1:35}]};
     const first=await W.send({cmd:'filterTune',workspaceKey:'B',fileName:'sim.bbl',options:{logs:[3],flightRpm:TRUTH.rpm,configuration:config,maxAddMs:.5}},S.bytes);
     assert.equal(first.type,'filterTuned',first.stack);
+    assert.ok(first.result.notes.includes('The PID configuration does not agree with the recorded PID signals.'),'reconstruction diagnostics survive the worker result metadata');
+    assert.ok(first.result.notes.some(n=>n.includes('health_rescue.cjs')),'worker diagnostics are retained with reconstruction diagnostics');
     const c=first.result.capture;
     assert.equal(c.reused,false);assert.equal(c.items.length,1);assert.equal(c.items[0].gain,97);assert.equal(c.items[0].cutoff,123);
     assert.deepEqual(c.items[0].profiles,[2]);assert.equal(c.items[0].profile,2);assert.ok(Math.abs(c.items[0].from-15)<.01);assert.ok(Math.abs(c.items[0].n/c.items[0].rate-20)<.02);
     const next=await W.post({cmd:'filterReplay',workspaceKey:'B',options:{simulate:{gyro_lpf1_static_hz:120},maxAddMs:1.5}});
     assert.equal(next.type,'filterTuned',next.stack);assert.equal(next.result.capture.reused,true);assert.equal(next.result.capture.maxAddMs,1.5);
+    assert.equal(next.result.notes.filter(n=>n==='The PID configuration does not agree with the recorded PID signals.').length,1,'replaying retains one copy of the reconstruction diagnostic');
     assert.deepEqual(next.result.capture.items,c.items);assert.deepEqual(next.result.capture.simulate,{gyro_lpf1_static_hz:120});
     const auto=await W.post({cmd:'filterReplay',workspaceKey:'B',options:{maxAddMs:.5}});assert.equal(auto.result.capture.simulate,null,'autotune does not retain the last manual mode');
     const bad=await W.post({cmd:'filterReplay',workspaceKey:'A',options:{}});assert.equal(bad.type,'error');assert.match(bad.message,/filter inputs changed/);
@@ -2414,6 +2520,59 @@ test('filter flight replay uses all recorded configuration intervals and preserv
     const next=await W.post({cmd:'filterReplay',workspaceKey:'flight3',options:{simulate:{gyro_lpf1_static_hz:120}}});
     assert.equal(next.type,'filterTuned',next.stack);assert.equal(next.result.capture.reused,true);
     assert.deepEqual(next.result.capture.items,items,'manual playback retains each original baseline');
+});
+
+test('single-flight filter replay retains accepted file notch evidence with its source logs', async () => {
+    const capture=`module.exports={EXTRA:['gyroRAW[0]','gyroRAW[1]','gyroRAW[2]'],tune(items,opts){
+        return {version:1,model:{passed:false},recommended:{status:'not recommended',rows:[],validation:{}},capture:opts.tailFit||null};
+    }};`;
+    const W=worker({'filter_tune.cjs':capture,'health_phase.cjs':STUB_PHASE}),S=sim();
+    const fit={used:true,logs:[1,3,4],tail:{passed:true,order:4.07,se:.005,n:3,unit:'flight',reasons:[]},motor:null};
+    const run=async(notchFit,extra={})=>{
+        const m=await W.send({cmd:'filterTune',fileName:'sim.bbl',options:{logs:[3],flightRpm:TRUTH.rpm,notchFit,...extra}},S.bytes);
+        assert.equal(m.type,'filterTuned',m.stack);return m.result;
+    };
+    const accepted=await run(fit);
+    assert.deepEqual(accepted.capture.gear,{main:null,tail:[1,4.07],tailOrder:4.07,motorOrder:null,motorisedTail:false,source:'log notch'});
+    assert.deepEqual(accepted.capture.sourceLogs,[1,3,4]);
+    assert.ok(accepted.notes.includes('The replay uses the RPM notch filter frequencies from the analysis of this file.'));
+    for(const bad of [{...fit,used:false},{...fit,logs:[1,4]},{...fit,tail:{...fit.tail,passed:false}},
+        {...fit,tail:{...fit.tail,order:NaN}},{...fit,tail:{...fit.tail,reasons:[{code:'alias'}]}}])assert.equal((await run(bad)).capture,null);
+    assert.equal((await run(fit,{cliText:CLI})).capture,null,'the CLI configuration keeps precedence');
+    assert.equal((await run(fit,{logGear:false})).capture,null,'disabled log estimation is respected');
+});
+
+test('filter masks retain flight and excluded-mode context across short configuration intervals', async () => {
+    const capture=`module.exports={EXTRA:['gyroRAW[0]','gyroRAW[1]','gyroRAW[2]'],tune(items){
+        return {version:1,model:{passed:false},recommended:{status:'not recommended',rows:[],validation:{}},
+          capture:items.map(x=>({from:x.w.fromS,mask:Array.from(x.mask)}))};}};`;
+    const flight=bbl.simulateFlight({seconds:50,seed:17,airborne:[6,46],rescue:[30,33],
+        profiles:[{from:0,profile:1,target:2300},{from:18,profile:2,target:2500},{from:22,profile:1,target:2300},{from:34,profile:2,target:2500}]});
+    const bytes=bbl.encode([flight]).bytes, W=worker({'filter_tune.cjs':capture});
+    const options={logs:[0],flightRpm:1900};
+    const whole=await W.send({cmd:'filterTune',workspaceKey:'whole',fileName:'phase-context.bbl',options},bytes);
+    const split=await W.send({cmd:'filterTune',workspaceKey:'split',fileName:'phase-context.bbl',options:{...options,
+        recordedConfigurations:{datasets:[{id:'A',pidProfile:1,values:{}},{id:'B',pidProfile:2,values:{}}],
+            labels:[[0,18,'A'],[18,22,'B'],[22,34,'A'],[34,50,'B']].map(([t0,t1,dataset])=>({log:0,t0,t1,dataset}))}}},bytes);
+    assert.equal(whole.type,'filterTuned',whole.stack);assert.equal(split.type,'filterTuned',split.stack);
+    const before=whole.result.capture.flatMap(x=>x.mask),after=split.result.capture.flatMap(x=>x.mask);
+    assert.equal(split.result.capture.length,4);
+    assert.deepEqual(after,before,'profile changes cannot invent ground time or change excluded flight modes');
+    assert.ok(split.result.capture[1].mask.every(Boolean),'the 4-second midflight profile remains airborne');
+    assert.ok(before.some(Boolean) && before.some(x=>!x),'the fixture includes both flight and excluded samples');
+});
+
+test('selected log decoding matches full decoding without opening other logs', () => {
+    const lib=require('../tools/autotune/lib.cjs'), S=sim();
+    for (const whole of [true,false]) {
+        const app=lib.loadApp(), options={whole,extra:['time'],minHeadspeed:1900};
+        const full=[...lib.segments(app,S.file,options)].filter(w=>[3,4].includes(w.flight.log));
+        vm.runInContext('var openedForSelection=[]; var OriginalFlightLog=FlightLog; FlightLog=function(bytes){var log=new OriginalFlightLog(bytes),open=log.openLog;log.openLog=function(i){openedForSelection.push(i);return open.call(log,i);};return log;};',app);
+        const selected=[...lib.segments(app,S.file,{...options,logs:[3,4]})];
+        sameJson(selected,full,'selected extraction preserves the segments used by gain calculations');
+        sameJson(vm.runInContext('openedForSelection',app),[3,4],'unselected logs are not opened');
+        assert.throws(()=>[...lib.segments(app,S.file,{logs:[-1]})],/log selection/);
+    }
 });
 
 test('configuration-specific curves and advice use each LUA interval and its recorded values', async () => {

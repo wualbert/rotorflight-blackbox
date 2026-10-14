@@ -746,6 +746,9 @@ markup, PR #84) stays byte-identical to upstream and is not used. Only its toolb
 | `tools/autotune/datasets.cjs` | The configurations (SPEC3 J): one PID profile with one exact set of the values that change the flight. `datasets(logs, cli)`, the classification table of every 4.6 name, `labelArray`, `profileMap`, `compare` (A/B, slopes, 2 SE), `predict` |
 | `tools/autotune/filter_tune.cjs` | Filter configuration, legacy analysis helpers and the v2 entry point. `filter_autotune.cjs` performs constrained search; `filter_reconstruct.cjs` recovers native inputs from firmware observations; `filter_replay.cjs` runs the native-rate compute path |
 | `tools/autotune/control_tune.cjs` | Offline control proposals from configuration-specific advice, atomic gain groups, exact model estimates and parameter-specific flight maneuvers for Export |
+| `tools/autotune/system_id.cjs`, `helicopter_model.cjs` | Automatic interval selection, pilot-instrumented plant identification, physical priors, independent validation and serializable aircraft dynamics |
+| `tools/autotune/control_pipeline.cjs`, `firmware_controller.cjs`, `firmware/` | Native Rotorflight replay and artifact verification, digital-twin lifecycle, controller parity, closed-loop candidate search and refusal gates |
+| `tools/autotune/control_validate.cjs`, `twin_replay.cjs` | Production-worker real-log validation with resource hashes, and frozen saved-model replay |
 | `docs/STE_GLOSSARY.md`, `test/ste/vocabulary.json`, `test/ste_text.test.cjs` | The STE rules, words and lint |
 
 Tests: one file for each part (`test/catalog.test.cjs`, `hierarchy`, `evidence`, `health_track`, `health_more`,
@@ -821,6 +824,9 @@ with a `sourceURL` so that stack traces name the file:
   modules (`filter_tune`, `filter_replay`, `filter_reconstruct`, `filter_autotune`, `filter_checklist`) are fetched with the
   others and loaded on demand by `filterTune` and `filterReplay` (`K.require`). `control_tune` is fetched with them
   and loaded on demand by `controlTune` or by `advice.exportScript` when it builds the flight maneuver list.
+  `system_id`, `helicopter_model`, `control_pipeline`, `firmware_controller` and `firmware/schema` are also registered for
+  lazy loading by the control pipeline. The compiled `firmware/controller.wasm` is fetched as bytes and hash-checked by
+  the firmware adapter before instantiation. All firmware resources are included in the production distribution.
 - Rules for anyone editing `tools/autotune`:
   - no Node API calls when a module loads (the `require('node:*')` lines are fine);
   - keep `module.exports` followed by `if (require.main !== module) return`;
@@ -955,6 +961,9 @@ Status of a block (`status(findings, recommendations, { logs, coverage })`, for 
   first). When a prerequisite problem gates the blocks, `startHere` is empty.
 - **Satisfactory**, **Not measured** (the reason comes from the coverage), **Not applicable** (the governor in DIRECT or LIMIT),
   **Not accurate** (all findings from logs at less than 1 kHz, check D1).
+- For a block without a measured problem, use the tab precedence: analysis error, monitor, insufficient data,
+  not measured, satisfactory, information. Passing checks cannot hide a missing measurement. Prerequisite items keep
+  their separate rule: only a measurable problem marks them as incorrect.
 
 `advice.cjs` takes `blockedBy` and `gate` from the same gate table, so the diagram and the list agree: a recommendation is
 blocked if and only if its node is Blocked (`test/hierarchy.test.cjs`, `test/advice.test.cjs`). A gate with a scope holds only the
@@ -1210,7 +1219,7 @@ validated in flight. Flags that have a standard error must pass a 2-SE test.
 | D9 | `rescue_mode` of each PID profile (`health_config.cjs`): the CLI dump (`profile` sections; a `diff` without the line is the default OFF, firmware 4.6.0 pg_pid.c), else a rescue state in the log (the firmware runs the rescue only when `rescue_mode` is not OFF, rescue.c), else a header value (not in 4.6). The PID profiles that the analysis cannot read are listed | flag: a PID profile with `rescue_mode` OFF |
 | P1 | at each load step (motor[0] up by 10 points or more in 0.5 s with the governor ACTIVE): the voltage before the step (0.3 s median) against the lowest 0.1 s median in the step (Vbat lags motor[0] by 68 ms), for each cell; the lowest cell voltage at a step; cells from the CLI or the firmware rule (battery.c) | flag ("possibly a weak battery"): a step from the warning level (`vbat_warning_cell_voltage`) or more to less than the minimum (`vbat_min_cell_voltage`), the levels of the log header; monitor: the lowest cell voltage at a step under the warning level |
 | P2 | with `Ibat`: the voltage decrease for each 1 A at the steps with 10 A or more, for each battery (a new battery when the start voltage is 0.15 V for each cell or more over the end of the previous flight log) | information; monitor when 1.3 x the median of the other batteries by 2 SE |
-| G20 | at each change to FALLBACK (LOST_HEADSPEED before 4.6), with or without a rescue: overload (the G19 overload test: the throttle at 95 % or more, a headspeed fall of 2 % or more, 0.3 s or less before the change), signal (the glitch rule of governor.c with the throttle under 95 %, before the change) or none | information. A G1 flag whose FALLBACK entries are all overload is `G1:overload`, a watch with rule K22: no problem of the RPM signal |
+| G20 | at each change to FALLBACK (LOST_HEADSPEED before 4.6), with or without a rescue: overload (the G19 overload test: the throttle at 95 % or more, a headspeed fall of 2 % or more, 0.3 s or less before the change), signal (the glitch rule of governor.c with the throttle under 95 %, before the change) or none | information. `G1:overload` describes coincident output limits; G1 remains an unresolved RPM prerequisite because timing does not establish a correct RPM signal |
 | L1-L7 | each sample at 0.5 % of its limit or nearer, gaps of less than 50 ms joined; for each period the frame times, the phase, the PID profile, the rescue state, the other outputs at their limits (a servo that follows its mixer input, correlation 0.9 or more, is the same output), the headspeed error, the rate error and the tracking ratio at the best time delay (C12) | Monitor for a period; flag for a period of 100 ms or more, an error more than G3, T6 or C12, or two outputs at their limits at the same time. Limits: L1 gov_max_throttle (CLI) or the firmware 100 %; L2 collectiveRange of the header (else `mixer input SC`); L3 the clamp in the flight data (the C2 rule, else `mixer input SR, SP`); L4 the T8 limits (else the clamp in the flight data, else `mixer input SY`); L5 the `servo` lines of the CLI dump only (the extreme of a servo in the data is the servo at the stick end, Gaui X4 #50); L6 SCALE.I x I gain x error_limit (CLI section, else the header for the PID profile at the start); L7 rcCommand[3] at ±500 (rc.c), in flight and in a rescue. Else "limit unknown" (skipped). The firmware has no PID sum limit: the mixer input limits are the output limits of the axes |
 
 ### The rescue checks and the control limits
@@ -1218,14 +1227,14 @@ validated in flight. Flags that have a standard error must pass a 2-SE test.
 - The worker runs `health_rescue.cjs` and `health_limits.cjs` after `health_loop.cjs` (they read its T8 limits) on all phases of a
   flight log (`allCtx`), with no guard time: the rescue and the time before it are where these checks matter. Their findings have
   `phases` = all phases, and `phase` = the phase at the rescue start or of the longest period. They give no curves.
-- G1 and G19 (rule K22): a FALLBACK whose time lies at the large load of a G19 rescue (the governor change that ends it, 0.05 s or
-  less) gets the recommendation `G1:overload`, a watch with the cause. The worker sets `f.resultOf` on such a flag, the catalog
-  summary says "This is possibly a result of the problem of check G19 (rule K22).", and its status is "Monitor". Thus the RPM step
-  does not gate the governor step. The other G1 flags stay a repair of the RPM source.
+- G1 and G19 (rule K22): a FALLBACK at the large load of a G19 rescue also gets `G1:overload` context.
+  G1 requires diagnosis of the RPM signal and the FALLBACK cause. The firmware also permits a mode-switch command,
+  low RPM or a rapid RPM change to cause FALLBACK. The state alone proves neither a defective nor a correct RPM source.
+  Repair is conditional on a confirmed defect. The prerequisite remains open for governor and RPM-filter changes.
 - Homes: G19 and L1 the Governor block, T15 and L4 "Tail compensation and authority" (the tail authority of SPEC3 B), D8 the Rescue
   prerequisite, L2, L3 and the cyclic servos (L5) "Cyclic gains", the tail servo (L5 with axis yaw) with L4, L6 the cyclic or tail
   gains by axis, L7 the Flight controller prerequisite (a command of the pilot). K22-K27 link them to the checks that their errors
-  can cause. G20 (every FALLBACK) is evidence of the RPM signal: an overload makes G1 a watch with rule K22.
+  can cause. G20 (every FALLBACK) provides RPM and output-limit context without clearing G1.
 - The verdict has a card "Control limits" for L1-L7; the lens shows their periods (up to 10 spans each, `evidence.maxSpans`).
 
 ### Flight selection
@@ -1310,30 +1319,152 @@ flight. A value that does not change the flight (rescue, blackbox, OSD, ...) nev
   stop gains 120/80 (E, log 51) against 140/100 (F, log 59): L4 25.5 ± 6.0 against 41.1 ± 7.9 periods for each minute, T8 120 ± 16
   against 105 ± 16 for each minute of flight, neither by 2 SE; T11 and T12 have no SE.
 
-### Control autotune and the next flight
+### Aircraft identification, control autotune and the next flight
 
 The Governor, Cyclic gains, Tail gains, Cyclic compensation and Tail compensation tabs start with the recorded problems.
 Each problem shows its explanation, measured value and limit, configuration, PID profile, log, available time spans and
 evidence links. The first four results stay visible; the complete checks load when their disclosure opens.
 
-Recommended changes follow the problems, before the recorded signal plots. They show the recorded and recommended
-parameter values, their sources and differences, and the advice engine's explanation of how each change can help.
-Each explanation retains its quantitative evidence and links; rules, caveats and flight maneuvers are supporting details.
-There are no new-response measurement columns or replay outcome cards. A proposal never clears a recorded problem.
-Recorded A/B comparisons have their own disclosure, retain uncertainty and the different-flight caveat, and do not
-replace the proposed changes or the selected configuration's primary signal plot.
+Control autotune builds an aircraft-specific, serializable rotational digital twin before searching controller values.
+The result shows independent prediction errors, recorded/predicted traces, usable intervals and exclusion reasons.
+The saved JSON contains the model, physical prior, model ensemble, configuration provenance, validation and replay inputs.
+A failed model remains downloadable as a diagnostic artifact but cannot produce a gain recommendation.
+This is a conditional rate-response model: headspeed and collective are recorded external inputs. Translation, position,
+motor/rotor-speed dynamics and flight outside the measured input envelope remain unsupported. See the
+[research survey](HELICOPTER_SYSID_SURVEY.md), [model specification](HELICOPTER_SYSID_MODEL.md) and
+[compiled firmware boundary](../tools/autotune/firmware/README.md).
 
-`{ cmd: 'controlTune', id, configuration, step, analysis }` returns `{ id, type: 'controlTuned', result }`.
-It uses the completed analysis, with `datasets`, `advice.byDataset` and `decisions`, rather than decoding the log again.
-`control_tune.tune` selects the first eligible atomic recommendation group in the existing tuning order. It preserves
-the advice engine's prerequisite gates, numeric evidence, uncertainty, parameter source and current-value caveats.
-It checks the recorded value, PID profile, configuration, legal integer range, step size and exact CLI text again.
-Repeated requests start from the recorded values. Cancellation, reset and changed inputs remove the old proposal from Export.
+`{ cmd: 'controlTune', id, bytes, fileName, configuration, step, analysis, options }` returns
+`{ id, type: 'controlTuned', result }`. The dedicated worker decodes the selected file again at native sampling rate.
+It detects flight phases and unsafe/unsupported modes before configuration cuts, carries the resulting masks through
+those cuts, and retains the actual configuration of every interval. `systemIdentify` uses the same path without gain
+search and returns `systemIdentified`. Missing bytes, masks or inputs cannot fall back to the legacy proposal engine.
+The pipeline randomly reserves approximately 20% of flight groups for testing and another 20% for model selection.
+The file SHA-256 seeds a repeatable allocation; the artifact records its seed, group assignments and actual fractions.
+Whole flights stay together when sufficient flights exist. Smaller datasets use contiguous intervals with boundary
+guard time. Interval-only validation remains diagnostic and cannot authorize control tuning. Selection depends on input excitation,
+data quality and flight conditions; prediction error does not determine which test intervals are retained.
+Mechanical source selection precedes duplicate removal, the fitting budget and partitioning. One supplied file is
+selected automatically. Multiple files require an explicit SHA-256 capture order or a declared mechanical cohort.
+Firmware calendar timestamps cannot select the newest source; uptime resets do not establish elapsed time between
+boots. Repeated and overlapping captures are grouped before splitting. Exclusion records preserve source identity
+so duplicate files cannot increase the apparent validation sample size.
 
-This is a bounded flight-test proposal, not a closed-loop replay or a new plant-identification algorithm. The actuator
-does not respond to changed gains during analysis. Only an exact, complete C7 gain set with passing model gates can
-show the existing model's tracking-error estimate in a disclosure labeled as unmeasured. Rounded or partial sets cannot reuse that estimate. No synthetic
-after-curve is drawn, and a proposal never clears a recorded problem. A new flight is necessary to measure its response.
+The control workspace's **Parameter history** panel accepts an explicit, one-based log range and a confirmation that
+parameters did not change. The confirmation applies separately to each PID profile and requires an original-header
+donor for that profile. It does not supply missing gains or certify unchanged mechanics. The browser persists this
+evidence under the full file SHA-256, and the worker independently verifies the hash and zero-based local log indexes.
+Changing the range removes confirmation and invalidates all control results and exports for that file. Current CLI
+values remain hypotheses; they cannot overwrite historical header gains. API callers can supply canonical
+`options.parameterContinuity` assertions or an explicit `parameterContinuityRequest`; results return the verified
+assertions and source files even when model validation fails.
+
+`system_id.cjs` fits the coupled rotor/body plant in `helicopter_model.cjs`. It uses recorded mixer inputs, RPM and
+actual collective mixer output, with pilot commands as instruments to reduce closed-loop disturbance bias. A missing
+collective mixer channel permits diagnostic fitting from its setpoint but cannot qualify control tuning. Geometry supplies broad inertia
+regularization, not measured inertia. The same initial measured rate starts each rollout; subsequent measured gyro
+samples never correct the predicted trajectory. Raw errors and identically low-pass-filtered errors are both reported.
+The low-pass cutoff is an evaluation choice, not proof of an identified frequency range.
+
+The visible model-confidence level uses held-out prediction accuracy, supported excitation frequencies and independence
+of the validation data. Per-axis filtered RMS error includes an empirical 95% interval, resampling flights when enough
+held-out flights exist, otherwise intervals with an explicit dependence limitation. This is uncertainty in observed
+prediction error, not a posterior probability that the model is correct or flight-safe. Failed prediction checks produce
+low confidence, and missing validation produces unavailable confidence.
+
+Detailed servo motor dynamics are deliberately outside the requested model. The firmware mixer still enforces recorded
+collective, cyclic, total-pitch and tail limits. The digital twin stores their angular values and sources. In Rotorflight
+4.6, one normalized main-rotor command corresponds to 12 degrees, and one variable-pitch tail command to 24 degrees.
+Blackbox's `collectiveRange` records collective limits; the CLI dump supplies additional mixer bounds and geometry.
+These are configured angles conditional on correct calibration, not independent blade-angle measurements. Tail command
+excursion is reported relative to trim. Unknown limits remain unknown rather than being replaced by observed extrema.
+
+`control_pipeline.cjs` requires plant validation, native firmware replay, sensor-chain replay and unchanged closed-loop
+agreement before candidate search. The pinned Rotorflight 4.6 source implements PID, mixer and governor in WebAssembly;
+the capability manifest identifies hardware adapters and external paths. A separate WebAssembly artifact executes
+the pinned gyro, RPM-notch and dynamic-notch source with its own parity gate. Scheduler phase distinguishes the
+recorded raw sample from the filtered value held at the PID tick. Autonomous simulation advances at the gyro rate;
+offline recorded-sample interpolation is never used to insert future measured gyro into a prediction.
+Unknown active settings, unsupported modes and unsupported firmware
+prevent control recommendations. Governor source execution alone does not identify motor dynamics, so this rate twin
+cannot tune governor gains.
+
+Changed controller outputs drive the predicted plant, whose sensors feed the controller. Recorded actuator outputs
+are used only for plant identification, controller parity and initialization. Candidate gains are bounded and tested
+against the model ensemble; a candidate is frozen before independent flight scenarios are evaluated. Prerequisites,
+saturation, extrapolation, cross-axis regression and insufficient independent evidence can each reject a candidate.
+The result is a simulated prediction pending a new flight. It never clears a measured problem.
+
+`control_tune.cjs` remains the diagnostic and flight-plan library. Its all-log numeric targets cannot determine the
+candidate set because they include reserved-flight observations. Control candidates come from a fixed bounded gain
+grid. Export, direct copy and saved reports require a fresh successful digital-twin result for automatic control
+commands. Blocked proposals retain their prerequisites and quantitative evidence. Cancellation terminates the
+dedicated worker immediately. Reset and changed analysis inputs remove old accepted commands; repeated runs start
+from recorded values.
+
+The diagnostic advice engine supplies bounded proposals when the measurements identify a direction:
+
+- C4 decreases cyclic F by 10% when the stop I-term opposes the turn. It retains the existing increase when I follows
+  the turn. Conflicting flagged stop directions give no F trial. Overshoot or settling time must pass the existing
+  two-standard-error check. The 10% step is a design choice, not an identified optimum or a predicted error decrease.
+- C6 and T2 decrease I by 10% only when the recorded diagnostic identifies I as at least half of the control at the
+  slow oscillation peak. Frequency alone does not identify a gain. Missing spectral uncertainty remains explicit.
+- G5 proposes the documented 10-unit governor P trial after significant slow recovery. G10 proposes a 10% governor
+  master-gain decrease after significant headspeed/yaw coherence. Both retain the two-standard-error check. Governor
+  increases wait for throttle reserve (G6/L1), tail authority and the existing RPM and power prerequisites.
+- C14 can start pitch collective feedforward from zero. The first integer step is the smaller of 10 units and the
+  measured positive gain correction minus twice its standard error, rounded down. Unknown uncertainty, an unresolved
+  direction or a result below one unit cannot start the gain. Nonzero values keep the existing 20% bound. This is a
+  collection step for a new flight, not an estimate of the best final gain.
+
+The legacy `control_tune.tune` API separates `recommendations` from display-only `proposals` and `prerequisites`.
+The production `control_pipeline.tune` clears those legacy recommendations before identification and only repopulates
+them after the new validation and closed-loop search gates pass.
+Guard prerequisites (`holds`) remain visible even without a direct hierarchy gate or an identified control-gain target.
+Output limits retain a diagnosis in `guidance`; `experiments` is empty. There is no invented input-reduction
+trial. The result distinguishes selected changes, changes that must wait, prerequisite steps and further measurements.
+A blocked target is not an instruction: new flight data can change it after the prerequisite is resolved.
+Every numeric decision requires valid uncertainty, including pooled logs and derived compensation estimates.
+
+Diagnostic checks remain available while numeric changes wait. Related causal checks do not tell the user to postpone
+diagnosis. K22 is context only: RPM and power evidence are examined together, without a circular G1/G19 prerequisite.
+An action without a known base or legal CLI values uses a descriptive title. This rule also covers missing `sets`.
+Raw toolkit details and saved reports follow the same decision boundary: fitted C14/T14 values are estimates, not
+commands, and measured associations do not establish a unique component or gain cause. D8 transition text retains
+actual PID profile numbers rather than substituting pooled configuration labels.
+
+Setup findings carry structured frame counts, unavailable checks, CLI differences, vibration lines, filter state,
+header changes and yaw configuration values. Advice and the worker use these fields before legacy text parsing.
+Header-change history follows the numeric log sequence, because an unset or reset RTC cannot order the recordings.
+For the toolkit's multiple-file labels, it follows input-file order and then the log sequence within each file.
+A wording change cannot suppress an RPM notch target, a missing-data diagnosis or a stale-configuration guard.
+All health modules are included in the STE text harvest, including the older setup, governor and loop reports.
+The legacy `No finding` and current `No result` forms both retain insufficient-data status in all views.
+
+G3 splits collective increases into saturated and unsaturated events. An F increase requires significant droop in at
+least three unsaturated events and a significant F contribution below 50% from valid positive-output changes.
+G5 uses unsaturated events, stops measuring at a PID-profile transition and identifies incomplete recoveries as lower
+bounds. Any incomplete contributing recovery prevents a P increase. Output-limit guidance compares the response before
+full throttle with the response during it, then examines measured voltage, ESC limits and available telemetry.
+
+Throttle-limit recommendations carry a structured `procedure` with a primary action, numbered steps, a subsequent
+flight test and a success condition. Control workspaces show this procedure before Autotune and before recorded
+problems. After Autotune, it remains above the supporting measurements, which use a closed details element.
+Shared procedures appear once in each control workspace's guidance; each finding retains its own measurements and links.
+Recommendation cards and saved reports use the same procedure. A high median throttle alone does not claim a
+measured period at full throttle. Lower headspeed remains a conditional flight test after the power and response
+checks, with a hover test because tail authority can decrease. The procedure does not authorize a numeric gain change.
+G6 preserves the throttle-ceiling value and source in `throttleLimit`. A ceiling inferred below 100% is an estimate,
+not confirmed full throttle. Its primary action is to compare the governor maximum setting with the recorded output.
+The conservative gain-increase hold remains; the text cannot claim that the measured period proves exhausted reserve.
+L1 carries the same distinction for a throttle plateau inferred below the firmware maximum. A CLI limit is confirmed
+only for the PID profile whose section supplies it; an unrecorded profile's fallback plateau remains inferred.
+
+
+The diagnostic proposals above are bounded flight-test hypotheses. Their earlier C7 tracking estimate is not evidence
+for the aircraft digital twin and is not reused as a changed-loop simulation. The production result reports a gain
+change only after the simulated actuator and plant respond to those exact values. A new flight must measure the result
+before any recorded problem can close.
 
 `control_tune.flightPlan` maps accepted control changes to stick maneuvers. Governor gains and collective compensation
 use collective steps, including full positive collective only after a smaller step gives stable headspeed and tail control.
@@ -1351,8 +1482,15 @@ The Export page and the saved CLI comments use this same list, labeled by PID pr
 The instructions use the project's ASD-STE100 vocabulary and sentence rules. The automated lint checks the text from
 every maneuver family, UI states and exported comments; a manual review checks meaning and one action per sentence.
 
-Run `node --test test/control_tune.test.cjs test/advice.test.cjs test/tuning_dialog.test.cjs test/tuning_worker.test.cjs`
-and `node --test test/ste_text.test.cjs`, then build, install and launch with the normal desktop workflow.
+Run `make test-control` and `node --test test/ste_text.test.cjs`, then build, install and launch with the normal desktop
+workflow. `tools/autotune/control_validate.cjs` runs the production worker on real logs and records resource hashes,
+selection/fit results and errors. Develop the procedure on Fireball, freeze it, then identify and test a separate Gaui X4
+model as an external aircraft evaluation. Do not transfer fitted Fireball coefficients to Gaui.
+
+`node tools/autotune/twin_replay.cjs model.json replay.json` executes a saved model against its embedded reserved inputs
+without refitting. An optional third argument supplies a JSON array of new native-rate segments with `u`, `y`, `hs`,
+`coll`, `rate` and `n`. New observations are for scoring and first-sample initialization only. A replay does not change
+the artifact's validation status or authorize gain export.
 
 ### The filter search
 
@@ -1366,6 +1504,7 @@ steps when discrete peak changes stall an interval-wide step. It uses the asymme
 retain committed samples and complete gyro-filter/SDFT state. Finalists preserve state through each log, and noise is
 scored before downsampling to the Blackbox rate. Original-decimator inversion also
 permits testing new decimation cutoffs. Known motor-RPM and governor settings enable the corresponding upstream paths.
+For equally ranked filter checks, final selection prefers lower training delay among noise scores within one SE of the best training score. Reserved periods only accept or reject the frozen choice.
 It checks replay against recorded gyroADC before permitting export. See [Filter autotune](FILTER_AUTOTUNE.md)
 for the firmware path, literature, parameter coverage, assumptions, thresholds and tests.
 
@@ -1378,21 +1517,36 @@ PID identity and value sources; unlabelled intervals remain explicitly unknown. 
 filter settings across the selected intervals, with cutoffs for each known PID profile. The result lists the intervals
 actually used by replay, including freshness flags, and each trace identifies its recorded configuration and carries the spectrum of that same window. The legacy
 single-`configuration` request remains supported. Coverage records which firmware inputs and settings support each filter family.
-Validated v2 recommendations use firmware legality and measured replay constraints instead of the legacy documentation
-floors. Legacy advice keeps its existing rules. Both exports preserve prerequisite gates and current-value caveats.
+Validated v2 recommendations require firmware legality, measured replay constraints and progress on replayable filter
+problems. The original F1–F3 judges guide screening. Finalists rank original-check corrections before noise reduction.
+Combined proposals can repair a missing LPF and missing known rotor harmonics together. A partial correction or significant
+improvement can qualify while other failures remain visible. F1–F3 setting failures, new or worsening problems, and lost
+measurements prevent recommendation. Training and combined checks require progress; reserved checks test regressions without
+requiring the same original failure to occur there. Legacy advice keeps its existing rules. Both exports preserve prerequisite gates and current-value caveats.
 The direct filter CLI writes the complete evaluated setup, all custom bank arrays and profile restoration before `save`.
+`filter_autotune.cliExportStatus` supplies a shared eligibility result and refusal reasons. The worker recalculates it
+after attaching current prerequisite gates. Replay acceptance does not imply export eligibility: Filters and Export
+show the refusal, and the combined export removes all commands from an explicitly refused filter result. Recorded-only
+replay remains a no-change result.
 
 The worker retains decoded inputs and reconstruction under `workspaceKey`. `{ cmd: 'filterReplay', id, workspaceKey,
 options: { simulate, maxAddMs } }` evaluates manual edits without decoding or reconstructing again. An empty `simulate`
 object replays the recorded setup. A mismatched key is rejected; changing file, flight source, recorded interval values,
 RPM or CLI input invalidates the retained workspace. Selecting a control configuration does not change the filter
 workspace. The maximum added delay defaults to 0.5 ms and accepts 0–20 ms. Manual candidates
-still need baseline and delay/gain/axis checks, but do not need the autotuner's 3 dB improvement threshold.
+still need baseline, filter-problem progress and delay/gain/axis checks. They do not need the autotuner's noise-improvement
+test. Autotune requires 3 dB improvement when it corrects no recorded problem, and significant noise reduction in either case.
 
 `filter_checklist.cjs` invokes the existing filter judges from `health_setup`, `health_more` and `health_loop` on both
 recorded and replayed signals, with identical masks and scored intervals. Rows keep check id, log, configuration, profile,
-axis and time range. They classify cleared, remaining and new issues, or an unavailable counterfactual. Physical raw-input
-checks retain their measured result. Mixer/servo output and unknown PID paths are not fabricated from gyro-only replay.
+axis and time range, plus the RPM source for F6. They classify cleared, remaining and new issues, or an unavailable counterfactual.
+A correction must reproduce the original failure in the unchanged replay first. Missing measurements and removed failing
+RPM banks cannot count as corrections. Physical raw-input checks retain their measured result. Mixer/servo output and
+unknown PID paths are not fabricated from gyro-only replay. These limitations stay visible separately from correction targets.
+Settings checks F1–F4 and recorded-input checks F5/F8/F9 do not depend on modeled output. Signal results use baseline
+validation for the matching log and axis; a failed model cannot turn their calculated result into a confirmed pass.
+Valid periods shorter than warmup plus a spectral window are `unmeasuredPeriods`, distinct from blocking `bench` exclusions.
+Their ranges remain visible in the checklist and CLI comments. They do not invalidate the measured long intervals.
 
 ### The notch orders of the log (no CLI dump)
 
@@ -1448,11 +1602,20 @@ The fit adds 1-2.5 s.
   confirmed replay, retaining physical-input problems and recorded problems that replay cannot evaluate. Manual edits
   and stale results cannot retain a replay clearance. Overview combines those filter results with the selected control
   configuration. Export flags conflicts and unsupported changes in red and selected changes to examine in amber.
-- **Filter workspace** starts with a log/flight source selector. Each source has its own filter draft. The recorded
-  configuration table lists time ranges, PID profiles, value sources and freshness flags. It opens automatically for
+- **Native tuning selectors** that replace their own controls defer the change until the native popup callback returns.
+  Synchronous replacement crashes the Chromium 99 macOS renderer, reproduced with the filter source and flight interval.
+  The same guard covers configuration, control-reference, segment, vibration-profile and final-configuration selectors.
+  Obsolete callbacks cannot change a newer selection, file, analysis, tab, configuration or filter source.
+- **Filter workspace** starts with a log/flight source selector. Each source has its own filter draft.
+  The recorded configuration table lists time ranges, PID profiles, value sources and freshness flags. It opens automatically for
   multiple or unknown configurations. One editable **Filter parameters** table contains recorded and proposed values.
-  Autotune fills this table and becomes a secondary action after calculation. There is no separate parameter-difference
-  table or Before/After overview. **Show changed values only** compares against every recorded configuration, normalizes
+  Autotune fills this table once for each source, input set and delay limit. Afterward, **Simulate again** evaluates the current draft.
+  Changing the delay limit permits a new search. **Use recorded values** immediately replays each interval's own values,
+  including mixed configurations, without converting the first interval into a common target. This baseline replay
+  does not propose a change or enable a CLI download. Filters, Overview and replay diagnostics identify it as an
+  unchanged recorded replay. Loading recorded values alone still leaves the initial Autotune
+  action available. There is no separate
+  parameter-difference table or Before/After overview. **Show changed values only** compares against every recorded configuration, normalizes
   enum and array representations, retains unknown values, and preserves edits across replay and tab changes.
   The maximum added delay defaults to 0.5 ms. Manual edits, recorded-value reset and autotune-value restore use this table.
   Accepted changes enter the shared draft automatically; Export controls which changes enter the CLI file.
@@ -1460,9 +1623,13 @@ The fit adds 1-2.5 s.
 
   One **Filter checks** shows the recorded results before replay and the original judges' paired results afterward.
   Previously violated checks stay marked and appear first, including those cleared in replay. New issues and unavailable
-  results remain explicit. A failed model validation cannot display a confirmed clearance. Recorded physical vibration
-  findings remain unchanged inputs. Model validation and filter input coverage are supporting details inside the checklist,
-  rather than a second checklist. The separate recorded-flight checks table is removed.
+  results remain explicit. A failed model validation cannot display a confirmed signal clearance; independently checked
+  parameters can show **Parameter problem corrected**. Recorded physical vibration
+  findings remain unchanged inputs. Failed results show the next action, excluded intervals and precise time ranges above
+  the table. Missing replay coverage is distinct from disagreement with the recorded output. Detailed model validation
+  and filter input coverage remain inside the checklist. Accepted results identify remaining problem checks beside the
+  next action, distinguishing replay limits from the original flight checks. Checklist intervals use log seconds so short
+  periods retain distinct endpoints. The separate recorded-flight checks table is removed.
 
   **Gyro signals** shows roll, pitch and yaw together. Each axis pairs a time plot with a frequency plot, stacking at narrow
   widths. One selector identifies the log, configuration, PID profile and full interval for both domains on all axes.
@@ -1471,14 +1638,22 @@ The fit adds 1-2.5 s.
   identify their spectra as averages over all evaluated windows. Raw data means recorded gyroRAW, Previous filter means
   recorded gyroADC, and New filter means the calculated output from the same flight input. Shared checkboxes control all
   six plots without replacing inputs or rerunning analysis; the selection persists across interval and result changes.
-  Missing curves are unavailable. A recorded-only replay disables the new-filter curve. Recorded-versus-model replay plots
-  remain available in a collapsed disclosure. P+D previews are omitted because they represented only the modeled gyro
+  Missing curves are unavailable. A recorded-only replay disables the new-filter curve. The redundant recorded-versus-model
+  replay disclosure is removed. P+D previews are omitted because they represented only the modeled gyro
   contribution, not the full PID output or the helicopter response. Autotune still evaluates P+D noise and per-path delay.
 
   Results remain cached by file, flight source, recorded interval values, derived RPM and CLI input. Analysis derives
   its RPM threshold from the recorded governor data. Filter tuning reuses that threshold only for current inputs.
-  Flight intervals with no complete filter window are excluded before reconstruction and checklist replay. Their
-  coverage limits are reported, and they cannot produce a confirmed recommendation.
+  Flight and abnormal-mode masks are computed on complete decoded segments before flight and configuration cuts.
+  The masks are sliced with the samples, so profile changes cannot restart flight detection. Periods with no eligible
+  flight samples remain outside the analysis. Eligible flight intervals with no complete filter window are excluded
+  before reconstruction and checklist replay. Their coverage limits block a confirmed recommendation.
+
+  **Export only this test** selects one control change group and its recorded configuration, preserving atomic groups.
+  Other control and filter changes are deselected. Export explains when several independent trials are selected and
+  labels restoration of an older configuration as **Recorded configuration values**. Prerequisite cards state when an upstream
+  change is itself blocked, so the user can follow the required flight-test sequence.
+  Gain extraction decodes only selected logs. Configuration provenance can still use headers from the complete file.
 - **Items of the overview** (M3). The Analysis view shows `result.issues` (one item for each check and axis) in their rank, the three
   of `result.top` at the top in plain words, and the cards ranked by their items; `result.areas[area].status` gives the condition of a
   card (a card of small items is "Monitor"). Without `result.issues` the view makes the items from the findings.

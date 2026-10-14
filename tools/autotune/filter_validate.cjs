@@ -36,7 +36,8 @@ function reuseReconstruction(reportFile,file) {
     const crypto=require('node:crypto'),v8=require('node:v8'),root=path.resolve(__dirname,'../..');
     const sha=file=>crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
     const report=JSON.parse(fs.readFileSync(reportFile,'utf8'));
-    for(const file of ['tools/autotune/filter_replay.cjs','tools/autotune/filter_reconstruct.cjs','tools/autotune/filter_tune.cjs'])
+    for(const file of ['tools/autotune/filter_replay.cjs','tools/autotune/filter_reconstruct.cjs','tools/autotune/filter_tune.cjs',
+        'tools/autotune/filter_math.cjs','tools/autotune/filter_solve.cjs'])
         if(sha(path.join(root,file))!==report.sourceSha256[file])throw Error('Reconstruction source differs from the cached run: '+file);
     const record=report.recordings.find(r=>r.inputSha256===sha(file));
     if(!record)throw Error('The recorded input differs from the cached run.');

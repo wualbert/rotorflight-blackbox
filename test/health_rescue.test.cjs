@@ -45,6 +45,8 @@ test('G19: a headspeed decrease at full throttle with FALLBACK and RECOVERY befo
     const { m, F } = run(bog());
     assert.equal(m.rescues.length, 1); within(m.rescues[0].tS, 30, 0.002, 'rescue start (frame s)'); within(m.rescues[0].t1S, 32.5, 0.002, 'rescue end: RESCUE_STATE with EXIT');
     const g = only(F, 'G19');
+    assert.doesNotMatch(g.text,/The motor cannot hold/);
+    assert.match(g.text,/These signals do not identify the cause/);
     assert.equal(g.severity, 'flag');
     // the 0.2 s running median of a V-shaped dip to 1500 rpm (-40 %): the median of the window at the bottom is 1559 rpm
     within(g.value, -0.376, 0.005, 'largest decrease under govRequest in RECOVERY (0.2 s median)');
@@ -69,6 +71,9 @@ test('G19: a commanded target change (a PID profile change) is not a decrease; D
     const { F } = run(log), g = only(F, 'G19', 2), d = only(F, 'D8', 2), q = only(F, 'T15', 2);
     // against the old target the headspeed would be 20 % low; against the commanded target it is not more than 5 % low (the
     // simulated governor droops by 60 rpm x |collective| / 1000 and follows its target with a 0.5 Hz lag)
+    assert.doesNotMatch(d.text,/Thus, the transmitter changes/);
+    assert.match(d.text,/Examine the transmitter, Modes tab and Adjustments tab/);
+    assert.match(d.text,/governor headspeed target changes from 2500 rpm to 2000 rpm/);
     assert.equal(g.severity, 'ok', `G19 ${g.value}`); assert.ok(g.value > -0.05, `the headspeed follows the new target: ${g.value}`);
     // the PID profile before the first change is the arming profile, which the log does not name: label 0 ("an unknown PID profile")
     assert.equal(d.severity, 'flag'); assert.deepEqual([d.fromProfile, d.toProfile, d.fromTarget, d.toTarget], [0, 2, 2500, 2000]);
@@ -86,6 +91,11 @@ test('D8 uses the PID profile labels (ctx.pidLabels) when ctx.profile holds the 
     assert.equal(only(run(log, { profile: labels, pidLabels: pid }).F, 'D8').severity, 'ok', 'a change of configuration only');
     const both = only(run(log, { profile: new Uint8Array(n).fill(3), pidLabels: Uint8Array.from({ length: n }, (_, i) => i < k ? 1 : 2) }).F, 'D8');
     assert.deepEqual([both.severity, both.fromProfile, both.toProfile], ['flag', 1, 2], 'a PID profile change in one configuration label');
+    assert.deepEqual([both.fromTarget, both.toTarget], [2500, 2500]);
+    assert.match(both.text, /governor headspeed target stays at 2500 rpm/);
+    assert.match(both.text, /PID profile change can change gains/);
+    assert.match(both.text, /time of the change does not identify its source/);
+    assert.doesNotMatch(both.text, /headspeed(?: target)? changes from|different gains|This changes the gains/);
 });
 
 test('a rescue with no problem, a log with no rescue, and the tail limits of check T8', () => {
@@ -141,12 +151,12 @@ test('G20: an overload before the FALLBACK, an error of the RPM signal, and no o
     assert.equal(m.fallbacks[0].kind, 'overload'); within(m.fallbacks[0].overload.seconds, 0.35, 0.01, 'throttle at 95 % or more'); assert.ok(m.fallbacks[0].overload.fall >= 0.02, JSON.stringify(m.fallbacks[0].overload));
     assert.deepEqual([g.severity, g.value, g.n, g.unit], ['note', 1, 1, 'count']); assert.equal(g.events[0].bad, false);
     assert.match(g.text, /^At the change to FALLBACK at 29\.75 s, the throttle is at 95 % or more for 0\.35 s, and the headspeed decreases by [\d.]+ % before the change\.\n/);
-    assert.match(g.text, /possibly a result of the load at the throttle limit\. The RPM signal is possibly correct\.$/);
+    assert.match(g.text, /possibly a result of the load at the throttle limit\. This does not show that the RPM signal is correct\. Examine the RPM signal and power response at the same time\.$/);
     // the throttle under its high value, and a headspeed that reads 0 for 20 ms before the change: the RPM signal
     const sig = bog(); for (let i = at(29.0); i < at(29.75); i++) sig.w.extra['motor[0]'][i] = 700; for (let i = at(29.70); i < at(29.72); i++) sig.w.hs[i] = 0;
     ({ m, g } = g20(sig));
     assert.deepEqual([m.fallbacks[0].kind, m.fallbacks[0].signal.kind, g.value, g.signals], ['signal', 'zero', 0, 1]);
-    assert.match(g.text, /the headspeed signal reads 0 while the throttle is less than 95 %\.\n1 of 1 FALLBACK comes at a usual load\. It is possibly an error of the RPM signal \(check G1\)\.$/);
+    assert.match(g.text, /the headspeed signal reads 0 while the throttle is less than 95 %\.\n1 of 1 FALLBACK has no measured headspeed decrease at the throttle limit\. Examine the RPM signal \(check G1\)\.$/);
     // no overload sign
     const none = bog(); for (let i = at(29.0); i < at(29.75); i++) { none.w.extra['motor[0]'][i] = 700; none.w.hs[i] = 2500; }
     ({ m } = g20(none)); assert.equal(m.fallbacks[0].kind, 'none');

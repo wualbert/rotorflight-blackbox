@@ -69,7 +69,7 @@ const PREREQ = [
     { id: 'rpm', title: 'RPM signal and motor poles', about: 'The RPM notch filters and the governor use the RPM signal. The gear ratios in the configuration are correct.',
         note: 'The gear ratios in the configuration are correct.', checks: ['G1', 'G12', 'G20'], gates: ['filters', 'governor'],
         params: ['motor_poles', 'feature FREQ_SENSOR', 'dshot_bidir', 'motor_pwm_protocol', 'freq_input_minhz'], docs: [P.rpmMeasure, P.motors] },
-    { id: 'power', title: 'Battery and power', about: 'The battery must supply the power of the flight with a small voltage decrease. A weak battery keeps the throttle at its limit.',
+    { id: 'power', title: 'Battery and power', about: 'The battery must supply the power of the flight with a small voltage decrease. A weak battery can cause a throttle limit.',
         checks: ['D5', 'G13', 'G11', 'P1', 'P2'], gates: ['governor'],
         params: ['battery_cell_count', 'vbat_min_cell_voltage', 'vbat_warning_cell_voltage', 'vbat_max_cell_voltage', 'battery_meter', 'current_meter'], docs: [P.power] },
     { id: 'mechanics', title: 'Mechanical parts', about: 'Balance the rotor, set the blade tracking, calibrate the servos and make sure that no part is loose. Gains cannot correct a mechanical problem.',
@@ -122,7 +122,7 @@ const BLOCKS = [
         params: ['pitch_collective_ff_gain', 'cyclic_cross_coupling_gain', 'cyclic_cross_coupling_ratio', 'cyclic_cross_coupling_cutoff', 'iterm_relax_type', 'iterm_relax_cutoff', 'iterm_relax_level',
             'error_decay_time_cyclic', 'error_decay_limit_cyclic', 'error_decay_time_ground', 'offset_limit', 'swash_phase'], docs: [P.crossCoupling, P.profiles, P.process22] },
     { id: 'tailcomp', order: 4, lane: 'tail', title: 'Tail compensation and authority',
-        about: 'Set the yaw precompensation, the stop gains, the tail output limits and the tail torque assist. A higher headspeed also gives the tail more authority.',
+        about: 'Examine the yaw precompensation, stop gains and output limits. Compare the yaw error, headspeed and tail output before you select a change.',
         checks: ['T5', 'T6', 'T7', 'T8', 'T13', 'T14', 'T15', 'L4', 'L5:yaw'],
         chips: [{ label: 'Precompensation', checks: ['T6', 'T7', 'T14', 'T15'] }, { label: 'Stop gains', checks: ['T5'] }, { label: 'Tail authority', checks: ['T8', 'L4', 'T13'] }, { label: 'Tail torque assist', checks: [] }],
         params: ['yaw_collective_ff_gain', 'yaw_cyclic_ff_gain', 'yaw_precomp_cutoff', 'yaw_inertia_precomp_gain', 'yaw_inertia_precomp_cutoff', 'yaw_cw_stop_gain', 'yaw_ccw_stop_gain',
@@ -155,7 +155,7 @@ const EDGES = [
     e('logging', 'tail', 'validity', 'If the log rate is less than 1 kHz, the results of the tail oscillation are not accurate.', 'INF Nyquist', ['D1']),
     Object.assign(e('rpm', 'filters', 'gate', 'The RPM notch filters operate correctly only with a fast RPM signal and the correct motor pole count.', 'DOC RPMM, RPMF, MOTORS'), { scope: ['F3', 'F5', 'F6', 'F9'] }),
     e('rpm', 'governor', 'gate', 'The governor modes ELECTRIC and NITRO use the RPM signal. The gear ratios in the configuration are correct.', 'DOC GOVTAB, GOVT note, MOTORS'),
-    e('power', 'governor', 'gate', 'If the battery voltage is too low, the throttle stays at its limit. Governor gains cannot correct this.', 'DOC FLYR, GOVTAB, INF'),
+    e('power', 'governor', 'gate', 'Low battery voltage can cause a throttle limit. Governor gains cannot increase the maximum throttle.', 'DOC FLYR, GOVTAB, INF'),
     e('mechanics', 'filters', 'order', 'Correct the blade tracking and the balance before you set the notch filters.', 'DOC FILT'),
     // fromChecks: the gate holds only for a problem of these checks of the prerequisite (a ground resonance does not hold the tail gains)
     Object.assign(e('mechanics', 'cyclic', 'gate', 'Gains cannot correct a loose part, a ground resonance or a servo that is not calibrated.', 'DOC-old PROC45, DOC MIXS, DOC FILT'), { fromChecks: ['F7', 'C15', 'SETUP'] }),
@@ -171,7 +171,7 @@ const EDGES = [
     e('governor', 'tailcomp', 'cause', 'The precompensation operates on the torque changes that the governor makes.', 'INF, DOC GOVT'),
     e('cyclic', 'cycomp', 'order', 'Set the I-term relax after the I gain. It removes the I-term oscillation at stops.', 'DOC TUNE guidelines, DOC PROF I-term relax'),
     e('tail', 'tailcomp', 'order', 'Set the precompensation and the stop gains after the tail D, P, I and F gains.', 'INF, COM-AI RCFP-JW'),
-    e('tailcomp', 'tail', 'cause', 'If the tail does not have sufficient authority, the tail output stays at its limit. Then gain changes cannot correct the yaw error.', 'DOC MIXS, CLAUDE.md Control limits, INF', null, true),
+    e('tailcomp', 'tail', 'cause', 'A tail output limit can cause yaw error. Gains cannot increase the output range. The limit does not identify its cause.', 'DOC MIXS, CLAUDE.md Control limits, INF', null, true),
 ];
 
 // K1-K27 (rules.json, tested on five real results by evalrules.py): a symptom flag with an upstream flag in the same log,
@@ -190,15 +190,15 @@ const RULES = [
             'Then decrease the gain that you increased last.'],
         ['PROF Derivative', 'FILT', 'OLDWIKI Tail-tuning', 'PROC45 yaw', 'TUNE'], ['DOC', 'DOC-old', 'INF']),
     k('K3', 'Slow oscillation', ['C6', 'T2'], ['T4', 'C9', 'G9', 'G10', 'C1'], ['D1'],
-        ['For the tail, examine the linkage, the slider and the bearings first.', 'For the cyclic, examine the high speed integral (C9).', 'Then decrease the I gain or increase the P gain.',
-            'Then try the I-term relax.'],
+        ['For the tail, examine the linkage, the slider and the bearings first.', 'For the cyclic, examine the high speed integral (C9).', 'Then examine the P and I gain recommendations (C6, T2).',
+            'For oscillation at stops, examine the I-term relax (C4, T5).'],
         ['TUNE', 'HSI', 'PROC45 yaw', 'OLDWIKI Tail-tuning'], ['DOC', 'COM RCG-140']),
     k('K4', 'Time delay from setpoint to gyro', ['C13', 'T12'], ['F11', 'F2', 'F3', 'F4', 'C2', 'T8'], [],
-        ['Measure the time delay of the filters (F11).', 'Remove the filters that are not necessary.', 'Examine the servo speed.', 'Then increase the B gain, not the F gain.'],
+        ['Measure the time delay and vibration decrease of the filters (F11).', 'Examine the filter autotune results before you remove a filter.', 'Examine the servo speed.', 'The time delay does not identify a B or F gain change.'],
         ['RPMF', 'FILT', 'MSG gyroDynamicNotchQHelp', 'MSG gyroRpmFilterPresetHelp', 'FF', 'SERVO speed'], ['DOC', 'INF']),
     k('K5', 'Tracking error', ['C12', 'T11'], ['C2', 'T8', 'C1', 'C5', 'T1', 'C6', 'T2', 'C13', 'T12', 'C3', 'T9', 'C8', 'C9', 'C14', 'G3'], ['D1', 'D2', 'D6'],
-        ['Read the error in each frequency band first.', 'Examine the output limits first (C2, T8). At the limit, the axis does not have sufficient authority.', 'Then correct the I-term limit (C1).',
-            'Then correct the fast oscillation (C5, T1).', 'Then examine the time delay (C13, T12).', 'Then adjust the F gain.'],
+        ['Read the error in each frequency band first.', 'Examine the output limits and the error before each limit (C2, T8).', 'Then examine the I-term limit (C1).',
+            'Then correct the fast oscillation (C5, T1).', 'Then examine the time delay (C13, T12).', 'Use the gain recommendations only after these prerequisite checks.'],
         ['TUNE step 4', 'RATES', 'FF', 'XC', 'HSI', 'advice.cjs'], ['INF']),
     k('K6', 'Overshoot at stops', ['C4', 'T5'], ['C3', 'T9', 'C1', 'C2', 'T8', 'R1', 'G10', 'T4'], [],
         ['Tune the D, P and I gains first.', 'Then adjust the F gain.', 'Then adjust the I-term relax.', 'For the tail, examine if the yaw stick moves back after a stop (yaw_deadband).'],
@@ -206,30 +206,30 @@ const RULES = [
     k('K7', 'Feedforward', ['C3', 'T9'], ['C2', 'T8', 'C1', 'C5', 'C6', 'T1', 'T2'], [],
         ['Examine the output limits first (C2, T8).', 'Tune the D, P and I gains.', 'Then adjust the F gain.'], ['FF', 'TUNE step 4'], ['DOC']),
     k('K8', 'Yaw error at collective changes', ['T6', 'T7', 'T14'], ['T8', 'T13', 'G3', 'G4', 'G9', 'G10'], [],
-        ['Make sure that the tail has sufficient authority first (T8).', 'Examine the tail center trim (T13).', 'Tune the governor F gain (G3, G4).', 'Then adjust the precompensation.'],
+        ['Examine the tail output limits first (T8).', 'Examine the tail center trim (T13).', 'Examine the governor response before and during output limits (G3, G4, G6).', 'Then examine the precompensation recommendations (T7, T14).'],
         ['MIXS center trim', 'GOVT torque', 'PROF collective FF'], ['DOC', 'INF']),
     k('K9', 'Yaw I-term in hover', ['T13'], ['T8', 'T7'], [],
-        ['Set the tail center trim to keep the yaw I-term near zero in hover.', 'Make sure that the tail is not near its output limit.'], ['MIXS', 'health_more DEFAULT_RULES.T13'], ['DOC']),
+        ['For a constant yaw I-term in stable hover, examine the tail center trim and mechanical center.', 'For a yaw I-term that changes with collective, examine T7 before you change the trim.', 'Make sure that the tail is not near its output limit.'], ['MIXS', 'health_more DEFAULT_RULES.T13'], ['DOC']),
     k('K10', 'Cyclic I-term at its limit', ['C1'], ['C2', 'C10', 'C14', 'C9', 'SETUP'], [],
         ['Examine the output limits first (C2).', 'Then examine the swash trim, the mixer calibration and the center of gravity.'], ['MSG profilesIntegralHelp', 'MIXS', 'MIXT'], ['DOC', 'INF']),
     k('K11', 'Headspeed control', ['G2', 'G3', 'G4', 'G5', 'G9'], ['G1', 'G12', 'G6', 'G7', 'G11', 'G13', 'D5', 'G0', 'G14', 'G8', 'P1'], ['D1'],
-        ['Repair the RPM signal first (G1).', 'Make sure that the motor pole count and the RPM sensor are correct (G12).', 'Make sure that the throttle has a reserve (G6).',
+        ['Examine the RPM signal and the cause of FALLBACK first (G1).', 'If the RPM signal has a problem, repair it.', 'Make sure that the motor pole count and the RPM sensor are correct (G12).', 'Make sure that the throttle has a reserve (G6).',
             'Make sure that the battery voltage is sufficient (G11, G13, D5, P1).', 'Then tune the governor F, I and P gains, in that sequence.'],
         ['GOVT', 'GOVTAB', 'FLYR', 'MOTORS', 'MSG govFlagHelp_VOLTAGE_COMP'], ['DOC']),
     k('K12', 'Throttle reserve', ['G6', 'G7'], ['G11', 'G13', 'D5', 'P1'], [],
-        ['Examine the battery voltage during the flight (G13, D5, P1).', 'If the throttle reserve stays low, decrease the governor headspeed.', 'Gain changes cannot increase the throttle reserve.'],
-        ['FLYR', 'GOVTAB'], ['DOC', 'advice.cjs REFUTED.G6']),
-    k('K13', 'Tail oscillation from the governor', ['T1', 'T2'], ['G10', 'G9'], [],
-        ['Decrease the governor gain (gov_gain) before you change the tail gains.'], ['OLDWIKI Tail-tuning', 'GOVT'], ['DOC-old', 'COM RCG-141', 'COM RCG-107']),
+        ['Compare the headspeed and throttle before each output limit (G3, G6).', 'Examine the battery voltage and ESC output limits during each period (G13, D5, P1).', 'Gain changes cannot increase the maximum throttle.', 'A lower headspeed is a possible flight limit. It is not a measured governor change.'],
+        ['FLYR', 'GOVTAB'], ['DOC', 'INF']),
+    k('K13', 'Related tail and governor oscillations', ['T1', 'T2'], ['G10', 'G9'], [],
+        ['Compare the governor terms, headspeed and yaw error at the same times.', 'Coherence does not show which loop causes the oscillation.', 'Use a governor gain recommendation only if its measurements agree with the rule (G9).'], ['OLDWIKI Tail-tuning', 'GOVT'], ['DOC-old', 'COM RCG-141', 'COM RCG-107']),
     k('K14', 'Tail authority', ['T8'], ['G3', 'G6'], [],
-        ['At its output limit, the tail does not have sufficient authority.', 'Increase the tail pitch range if the mechanical parts let you.', 'Install larger tail blades or increase the headspeed.',
-            'On a tail with a motor, use the tail torque assist.', 'Decrease the governor torque changes.'], ['MIXS', 'GOVT', 'TTA'], ['DOC', 'INF']),
+        ['Compare the yaw error and tail output before each limit.', 'If oscillation comes first, examine the gains and filters before the mechanical range.', 'For yaw error at an output limit that stays, examine the tail pitch range and linkage.',
+            'If the throttle also gets to its limit, correct that problem before you increase the headspeed.', 'The log does not identify a blade or tail torque assist change.'], ['MIXS', 'GOVT', 'TTA'], ['DOC', 'INF']),
     k('K15', 'Tail oscillation that stays with gain changes', ['T4'], [], [],
         ['Examine the tail linkage, the tail slider and the bearings. Gains cannot correct a loose part.'], ['PROC45 yaw'], ['DOC-old', 'advice.cjs REFUTED.T4']),
     k('K16', 'Pitch movement with the collective', ['C14'], ['C2', 'C9'], [],
-        ['Adjust pitch_collective_ff_gain first, before you change the other gains.'], ['PROC45', 'PROF'], ['DOC-old']),
+        ['Examine the C14 estimate and its uncertainty before you change pitch_collective_ff_gain.', 'Complete the output limit and high speed integral checks first.'], ['PROC45', 'PROF'], ['DOC-old']),
     k('K17', 'I-term decrease in flight', ['C10'], [], [], ['Examine the airborne condition of the firmware (rc_threshold).'], ['firmware pid.c:1170-1188'], ['SRC', 'advice.cjs REFUTED.C10']),
-    k('K18', 'Time delay from stick to setpoint', ['R1'], [], [], ['Decrease the response time, the acceleration limit or rc_smoothness in the rate profile.'], ['RATES'], ['DOC']),
+    k('K18', 'Time delay from stick to setpoint', ['R1'], [], [], ['A smaller response time decreases the filter time delay.', 'A larger acceleration limit lets the setpoint change faster.', 'Examine the rate profile and rc_smoothness before you change a value.'], ['RATES'], ['DOC']),
     k('K19', 'Log rate', ['F5', 'F6', 'F9', 'F10', 'F11', 'C11', 'C5', 'T1', 'C6', 'T2', 'G9', 'G10', 'C13', 'T12'], ['D1'], ['D1'],
         ['Record the log at 1 kHz or more.', 'At a lower log rate, the frequency results are not accurate.'], ['GOVT preparation', 'BB logging rate'], ['INF', 'DOC']),
     k('K20', 'Header values', ['C1', 'C3', 'C4', 'C6', 'C7', 'C12', 'T5', 'T9', 'T11'], ['SETUP'], ['H'],
@@ -239,17 +239,17 @@ const RULES = [
         ['Do the filter, output limit and motor pole items first.', 'Then fly the same gains again before you change a gain.'], ['TUNE caution', 'advice.cjs guards 1-3'], ['DOC', 'INF']),
     // K22-K27: the rescue checks and the control limits (health_rescue.cjs, health_limits.cjs)
     k('K22', 'FALLBACK at a large load', ['G1'], ['G19', 'L1', 'G20'], [],
-        ['Examine the headspeed decrease at full throttle before the FALLBACK (G19, G20, L1).', 'If the FALLBACK comes only at a decrease of this type, the RPM signal is possibly correct.', 'Decrease the load at that time first.'],
+        ['Examine the headspeed decrease at full throttle before the FALLBACK (G19, G20, L1).', 'The same time does not show that the RPM signal is correct.', 'Examine the RPM signal and power response at that time.'],
         ['firmware governor.c motorRPMGood', 'health_rescue G19 and G20 overload'], ['SRC', 'INF']),
     k('K23', 'Tail kick at a rescue', ['T15'], ['G19', 'T8', 'D8'], [],
         ['Examine the headspeed decrease at the rescue (G19): a torque change pushes the tail.', 'Examine the tail authority (T8, and L4 with rule K24).', 'Make sure that the PID profile does not change with the rescue (D8).', 'Then adjust the precompensation.'],
         ['GOVT torque', 'PROF collective FF', 'RESCUE'], ['DOC', 'INF']),
     k('K24', 'Tail output at its limit', ['T1', 'T6', 'T11', 'T15'], ['L4'], [],
-        ['Examine the periods with the tail output at its limit first (L4).', 'At its limit, the tail does not have sufficient authority. Gains cannot correct this.'], ['MIXS', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
+        ['Compare the yaw error and tail output before and during each limit (L4).', 'Gains cannot increase the output range. The limit does not identify its cause.'], ['MIXS', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
     k('K25', 'Throttle at its limit', ['G2', 'G3', 'G5', 'G19'], ['L1'], [],
-        ['Examine the periods with the throttle at its limit first (L1).', 'At the throttle limit, the governor cannot hold the headspeed. Gain changes cannot correct this.'], ['FLYR', 'GOVTAB', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
+        ['Compare the headspeed and throttle before and during each limit (L1).', 'Gain changes cannot increase the maximum throttle. The limit does not identify the cause of a headspeed decrease before it.'], ['FLYR', 'GOVTAB', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
     k('K26', 'Cyclic or collective at its limit', ['C2', 'C12'], ['L2', 'L3', 'L5', 'L7'], [],
-        ['Examine the periods with the cyclic, the collective or a servo at its limit first (L2, L3, L5, L7).', 'Gains cannot correct an output at its limit.'], ['MIXT', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
+        ['Examine each output limit and the error before it (L2, L3, L5, L7).', 'Gains cannot increase the output range. The limit does not identify its cause.'], ['MIXT', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
     k('K27', 'Load at a rescue', ['G19'], ['L7', 'D8'], [],
         ['Examine the collective command at the rescue (L7): a large collective is a large load.', 'Make sure that the PID profile does not change with the rescue (D8).'], ['RESCUE', 'CLAUDE.md Control limits'], ['DOC', 'INF'], true),
 ];
@@ -414,6 +414,7 @@ const REASON = {
     monitor: () => 'Some results of this tuning block are near or more than their limits. Examine them again after the next flight.',
     information: () => 'The results of this tuning block give information only.',
     insufficient: () => 'The logs do not have sufficient data for the checks of this tuning block.',
+    error: () => 'An analysis error prevented a check of this tuning block. Examine the check information before you use the results.',
     notAccurate: () => 'All results of this tuning block come from logs that record at less than 1 kHz (D1). These results are not accurate.',
 };
 // the reasons of the advice coverage statuses. 'not-in-log': the log does not record the values (user rule 2026-10-06: the log
@@ -495,7 +496,7 @@ function statusOne(findings, recs, opts, want) {
         if (problemFinding(f)) return 'problem';
         if (f.severity === 'flag') { const s = sevOf(f); return f.explained || (s.length && s.every(x => x === 'info')) ? 'information' : 'monitor'; }
         if (C) return C.status(f);
-        return f.severity === 'ok' ? 'satisfactory' : f.severity === 'skipped' ? 'notMeasured' : f.severity === 'error' ? 'error' : /^no finding/i.test(String(f.text || '')) || f.thin ? 'insufficient' : 'monitor';
+        return f.severity === 'ok' ? 'satisfactory' : f.severity === 'skipped' ? 'notMeasured' : f.severity === 'error' ? 'error' : /^no (?:finding|result)/i.test(String(f.text || '')) || f.thin ? 'insufficient' : 'monitor';
     };
     const d1 = new Set(); for (const f of F) if (f.id === 'D1' && f.severity === 'flag') for (const l of logsOf(f)) d1.add(l);
     const nodes = {};
@@ -527,7 +528,9 @@ function statusOne(findings, recs, opts, want) {
         }
         if (probs.length || direct.length) { N.problem = true; problemFids.set(n.id, probs.map(f => f.fid).filter(Boolean)); N.problemFids = problemFids.get(n.id); N.problemRecs = direct.map(r => r.id); continue; }
         if (list.length && !valid.length) { N.status = 'notAccurate'; continue; }
-        N.status = ['monitor', 'satisfactory', 'information', 'insufficient'].find(s => classes.includes(s)) || 'notMeasured';
+        // A passing check cannot hide a missing measurement or a failed check.
+        // Keep the evidence status consistent with the procedure tabs.
+        N.status = ['error', 'monitor', 'insufficient', 'notMeasured', 'satisfactory', 'information'].find(s => classes.includes(s)) || 'notMeasured';
     }
 
     // not applicable: the governor in DIRECT or LIMIT (G0)
@@ -589,7 +592,7 @@ function statusOne(findings, recs, opts, want) {
         else if (N.status === 'possible') { const from = [...new Set([].concat(...N.possible.map(q => q.from)))].filter(id => BY_ID.has(id) && id !== n.id).sort(bySequence);
             N.reason = from.length ? `This problem can be a result of a problem in ${titlesOf(from)}.` : 'This problem can be a result of the problems before it.'; }
         else if (N.status === 'notMeasured') { const runs = n.checks.some(c => !(C && C.CHECKS[c.split(':')[0]] && C.CHECKS[c.split(':')[0]].run === false));
-            N.reason = coverageWhy(n) || (!runs ? 'No check of the app measures this tuning block.' : byNode.get(n.id).length ? 'The checks of this tuning block did not operate on these logs.' : 'The checks of this tuning block have no result.'); }
+            N.reason = coverageWhy(n) || (!runs ? 'No check of the app measures this tuning block.' : byNode.get(n.id).length ? 'One or more checks of this tuning block did not operate on these logs.' : 'The checks of this tuning block have no result.'); }
         else N.reason = REASON[N.status] ? REASON[N.status]() : '';
     }
     return { nodes, startHere, prereqProblems, profile: want, bench: [...bench].sort((a, b) => a - b) };

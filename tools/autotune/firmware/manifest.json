@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/rotorflight/rotorflight-firmware",
+  "commit": "118e9120260bb33f46df4f92052fb0e9fd4e9ebc",
+  "release": "4.6.0",
+  "license": "GPL-3.0-or-later",
+  "files": {
+    "common/axis.h": "8f290c36256c4e4559a564abf06005cebfee74c3df22424094b4be71c2a3d8bf",
+    "common/filter.h": "9269b369159fa0f32431140e4c9a56f994456a526457b15beea673d4c2d61767",
+    "common/filter.c": "b38f94879fe69bd58c7b37a95300c901aa785ffc06ca9ee47125a1d502efe374",
+    "common/maths.h": "1e8bc518b64de7a56a3fa677b458fe68f106d0d7352f7150d1086768a2fc666a",
+    "common/maths.c": "72c65185c125aecd70ce9c7e53dafa26b93a437a1a2ca9c141e0d59e89ebf15d",
+    "pg/pid.h": "0a77a2027e0462419b759c36b183cd04a9f3d3aa9ff629b4f1cf350a1f7e54fa",
+    "pg/pid.c": "bb17a93e9a2129a8055778a9be024be08e588aa0e7561b6368d4f7cb61cd6a0f",
+    "pg/governor.h": "b2257520f2c7cd25760e6712c47349538c7f0e97788bb96af690e01eb6688970",
+    "pg/mixer.h": "6608b39621bb7e20411dd1758b510589987b84c02a1c062de7b7e05b0329ba61",
+    "flight/pid.h": "da947ce8fdba29498c99d6e1ad1ab23bd121574bfda1a24cea66135e7d60cb88",
+    "flight/pid.c": "5a72bbd3fb47728a8573a48c8498618058b96b538bc3aa19d083c97f209ddc30",
+    "flight/mixer.h": "4a1cba0ec8ae50c360bda82b1d5c85c1a0677c01c490bbfe70a6e17c768213d8",
+    "flight/mixer.c": "c554eb529b21b6614e6587533b2fce00f8f693fa40c3e567fe3ae9183e948de5",
+    "pg/mixer.c": "493541330f92b7b2461918ff4472703e69e1829b20a9845237508c34bcf37d87",
+    "flight/governor.c": "2834ebbce1a95fed538e6105624e64b7972d1bf4f10d1ae13a782aeed949df5e",
+    "flight/governor.h": "3e2ae9fa01151e4c5e8d12c4e52d8837d8eebb9cb00602956737b44cc8248c28",
+    "pg/governor.c": "a14ae8b43cb603674cbc35d9a1d153f014cdeb616401cfc887e4e961718fc208",
+    "flight/servos.c": "eb4da76a35bcdc7e26787bb2df7f2f866a62f62ae01a0edd220b762caa30b376",
+    "flight/servos.h": "beac521b9de101bb3a883c07fb66a0616eaae98eae88a6888ee3222e682fa2de",
+    "pg/servos.h": "b7de17cd2bc866e3012099cdf216657e48a809b87727dd846f40265a58f73390",
+    "common/sdft.h": "c3015a21405d14dc265b59a2277408676296feb4dfb903417c3d199b7637c071",
+    "common/sdft.c": "7bc7c7feaa30388cbb6706d72e935f846e9639c6d457bb48e8a657ff196c1312",
+    "flight/dyn_notch_filter.c": "97d0811f2c7d35ad193647cf03e09bd4db191f7481e5aa4f2519d5e63daf76c1",
+    "flight/rpm_filter.c": "6d7ccb1588e5e59ef85d6643d6a5dfdb232730d52e1957d5f6be5a286a13e906",
+    "sensors/gyro_filter_impl.c": "8b3e6ae69e25a0050cde26511e370ff44de9a74a1ea694d9e171d2347a9535ce"
+  }
+}

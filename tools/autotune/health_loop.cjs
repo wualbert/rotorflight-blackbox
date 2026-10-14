@@ -136,8 +136,8 @@ function dNoise(w, rate, prof, ok) {
     const n = w.n;
     const R = RULE.dNoise, N = Math.max(1, Math.round(R.windowS * rate)), res = {};
     for (const a of [0, 1, 2]) {
-        const D = w.D && w.D[a]; if (!D || !D.some(v => v !== 0)) { res[AXES[a]] = { skipped: 'axisD is zero (D gain 0) or not logged' }; continue; }
-        if (R.hz >= 0.45 * rate) { res[AXES[a]] = { skipped: `logging rate ${r(rate, 0)} Hz too low for ${R.hz} Hz` }; continue; }
+        const D = w.D && w.D[a]; if (!D || !D.some(v => v !== 0)) { res[AXES[a]] = { skipped: 'axisD is 0, or the log does not record it.' }; continue; }
+        if (R.hz >= 0.45 * rate) { res[AXES[a]] = { skipped: `The log rate of ${r(rate, 0)} Hz is too low for the check at ${R.hz} Hz.` }; continue; }
         const hp = lib.bandpass(D, R.hz, 0.45 * rate, rate), acc = {};
         for (let s = 0; s + N <= n; s += N) {
             if (!all(ok, s, s + N) || !same(prof, s, s + N)) continue;
@@ -260,13 +260,13 @@ function analyse(w, ctx) {
     // --- C1: integrator pinned at Ki x error_limit
     {
         const el = Array.isArray(H.error_limit) ? H.error_limit : null;
-        if (!el) out.C1 = { skipped: 'error_limit not in the header' };
+        if (!el) out.C1 = { skipped: 'The header does not record error_limit.' };
         else {
             out.C1 = { errorLimit: el, note: 'limit = SCALE.I x I gain x error_limit (pid.c:1156-1166); I gain from the header for the profile at log start, else regressed; error_limit from the header for every profile' };
             for (const a of [0, 1]) {
                 const byP = {}, ev = [];
                 for (const p of Object.keys(gains)) {
-                    const Ig = gainOf(p, a, 'I', true); if (!Ig) { byP[p] = { skipped: 'I gain unknown' }; continue; }
+                    const Ig = gainOf(p, a, 'I', true); if (!Ig) { byP[p] = { skipped: 'The I gain is unknown.' }; continue; }
                     const L = SCALE.I[a] * Ig * el[a], lvl = RULE.pinnedLevels, low = Math.min(...lvl);
                     const longest = lvl.map(() => 0); let seconds = 0, peak = 0, count = 0;
                     for (const [s, e] of runs(n, i => ok[i] && +prof[i] === +p && Math.abs(w.I[a][i]) >= low * L)) {
@@ -402,7 +402,7 @@ function analyse(w, ctx) {
     }
 
     // --- C9: HSI, pitch error by sign of collective at |collective| >= 5 deg
-    if (!w.coll) out.C9 = { skipped: 'collective setpoint not logged' };
+    if (!w.coll) out.C9 = { skipped: 'The log does not record the collective setpoint.' };
     else {
         const R = RULE.hsi, B = S(R.blockS), byProfile = {}, O = [X['axisO[0]'], X['axisO[1]']];
         const blocks = {};
@@ -425,7 +425,7 @@ function analyse(w, ctx) {
     }
 
     // --- C10: I decay rate in flight at low collective; spooled up and moving while the firmware says landed
-    if (!w.coll) out.C10 = { skipped: 'collective setpoint not logged' };
+    if (!w.coll) out.C10 = { skipped: 'The log does not record the collective setpoint.' };
     else {
         const R = RULE.decay, span = S(R.spanS), ed = Array.isArray(H.error_decay) ? H.error_decay : null, groundTau = typeof H.error_decay_ground === 'number' && H.error_decay_ground > 0 ? H.error_decay_ground / 10 : null;
         const res = {};
@@ -467,13 +467,13 @@ function analyse(w, ctx) {
         }
         out.C10 = Object.assign(res, { headerErrorDecay: ed, headerErrorDecayGround: H.error_decay_ground === undefined ? null : H.error_decay_ground,
             method: 'dI = Ki sum(relax x error) dt - lambda sum(I) dt over 0.1 s spans with the stick quiet, per collective bin (relax level assumed RULE.decay.relaxLevel, cutoff from the header); SE by leave-one-group-out over 10 groups. Offset flood (> 2 deg) moves I into O and also shows as decay',
-            airborneStateLogged: hasAirborne, landedWhileMoving: hasAirborne ? { seconds: r(ev.length * R.windowS, 1), events: cap(ev) } : { skipped: 'no AIRBORNE_STATE events in the log' } });
+            airborneStateLogged: hasAirborne, landedWhileMoving: hasAirborne ? { seconds: r(ev.length * R.windowS, 1), events: cap(ev) } : { skipped: 'The log has no AIRBORNE_STATE log events.' } });
     }
 
     out.C11 = dNoise(w, rate, prof, ok);
 
     // --- T6: yaw kick after collective steps; T7: precomp against I in collective pumps
-    if (!w.coll) { out.T6 = { skipped: 'collective setpoint not logged' }; out.T7 = { skipped: 'collective setpoint not logged' }; }
+    if (!w.coll) { out.T6 = { skipped: 'The log does not record the collective setpoint.' }; out.T7 = { skipped: 'The log does not record the collective setpoint.' }; }
     else {
         let range = cr ? cr[1] - cr[0] : null;
         if (!range) { const v = []; for (let i = 0; i < n; i += 10) if (ok[i]) v.push(w.coll[i]); v.sort((p, q) => p - q); range = v.length ? v[Math.floor(v.length * 0.995)] - v[Math.floor(v.length * 0.005)] : 0; }
@@ -547,7 +547,7 @@ const DEFAULT_RULES = {
 function judge(flights, RULES = DEFAULT_RULES) {
     const F = [], fmt = (v, d = 2) => v === null || v === undefined ? 'n/a' : (+v).toFixed(d);
     const add = (id, severity, f, profile, o) => F.push(Object.assign({ id, severity, log: f.log, profile: profile === undefined || profile === null ? null : +profile, value: null, se: null, n: null, threshold: null, source: (RULES[id] || {}).source || null }, o));
-    const thin = (n, min, what) => `no finding: ${n} ${what}, fewer than ${min}`;
+    const thin = (n, min, what) => `No result: ${n} ${what}. A minimum of ${min} is necessary.`;
 
     for (const f of flights) {
         const M = f.metrics || {};
@@ -560,96 +560,96 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 const lv = Object.keys(m.longestAtLevel).map(Number).filter(v => v >= R.level).sort((a, b) => a - b)[0], longest = lv === undefined ? null : m.longestAtLevel[lv];
                 const flag = longest !== null && longest > R.minS;
                 add('C1', flag ? 'flag' : 'ok', f, p, { axis: ax, value: longest, n: m.runs, threshold: `> ${R.minS} s at >= ${lv} of the limit`,
-                    text: `${ax} I: longest run at >= ${Math.round(lv * 100)} % of the limit ${fmt(m.limit, 3)} (I ${m.iGain} x error_limit) ${fmt(longest, 2)} s; max |I| ${fmt(m.maxRatio, 2)} of the limit` + (flag ? ': integrator pinned, it cannot hold the trim or the manoeuvre' : '') });
+                    text: `The ${ax} I-term stays at ${Math.round(lv * 100)} % or more of its limit for a maximum of ${fmt(longest, 2)} s. The limit is ${fmt(m.limit, 3)} ("I ${m.iGain} x error_limit"). The largest I-term value without its sign is ${fmt(m.maxRatio, 2)} of the limit.` + (flag ? '\nThe I-term has a small reserve. This does not show the cause of the load or if the gyro follows the setpoint.' : '') });
             } }
         // C2, T8
         for (const id of ['C2', 'T8']) { const m = M[id]; if (!m) continue; const R = RULES[id];
             const lims = m.limits;
             const profs = Object.keys(m.byProfile);
-            if (!profs.length) add(id, 'ok', f, null, { value: 0, n: 0, threshold: `>= ${R.minEpisodes} episode`, text: `no output limit reached repeatedly (${id === 'C2' ? `roll ${fmt(lims.roll && lims.roll.min, 3)}..${fmt(lims.roll && lims.roll.max, 3)}, pitch ${fmt(lims.pitch && lims.pitch.min, 3)}..${fmt(lims.pitch && lims.pitch.max, 3)}` : `yaw ${fmt(lims.yaw && lims.yaw.min, 3)}..${fmt(lims.yaw && lims.yaw.max, 3)}`}); limits not in the header` + (m.missing.length ? `; not logged: ${m.missing.join(', ')}` : '') });
+            if (!profs.length) add(id, 'ok', f, null, { value: 0, n: 0, threshold: `>= ${R.minEpisodes} episode`, text: `The check finds no periods at an output limit. Recorded ranges: ${id === 'C2' ? `roll ${fmt(lims.roll && lims.roll.min, 3)} to ${fmt(lims.roll && lims.roll.max, 3)}, pitch ${fmt(lims.pitch && lims.pitch.min, 3)} to ${fmt(lims.pitch && lims.pitch.max, 3)}` : `yaw ${fmt(lims.yaw && lims.yaw.min, 3)} to ${fmt(lims.yaw && lims.yaw.max, 3)}`}. The header does not record these limits.` + (m.missing.length ? ` The log does not record ${m.missing.join(', ')}.` : '') });
             for (const p of profs) { const s = m.byProfile[p], flag = s.episodes >= R.minEpisodes;
                 const what = [...new Set(m.events.filter(e => +e.profile === +p).map(e => e.what))].join(', ');
-                add(id, flag ? 'flag' : 'ok', f, p, { value: s.seconds, n: s.episodes, threshold: `>= ${R.minEpisodes} episode`, text: `${s.episodes} episodes, ${fmt(s.seconds, 2)} s at an output limit (${what}), longest ${fmt(s.longestS, 3)} s; limits detected from the data. ${id === 'T8' ? 'Gain changes cannot fix authority' : 'Excluded from gain analysis'}` }); } }
+                add(id, flag ? 'flag' : 'ok', f, p, { value: s.seconds, n: s.episodes, threshold: `>= ${R.minEpisodes} episode`, text: `There are ${s.episodes} periods at an output limit (${what}), for a total of ${fmt(s.seconds, 2)} s. The longest period is ${fmt(s.longestS, 3)} s. The analysis finds these limits from the data. The output limit does not identify its cause.` }); } }
         // C3, T9
         for (const [id, list] of [['C3', M.C3 ? [['roll', M.C3.roll], ['pitch', M.C3.pitch]] : []], ['T9', M.T9 ? [['yaw', M.T9]] : []]]) { const R = RULES[id];
             for (const [ax, m] of list) { const profs = Object.keys(m.byProfile);
-                if (!profs.length) add(id, 'note', f, null, { axis: ax, n: 0, text: `no finding: no steady full-stick ${ax} manoeuvre (>= ${fmt(m.level, 0)} deg/s for ${RULE.steady.minS} s, unsaturated)` });
+                if (!profs.length) add(id, 'note', f, null, { axis: ax, n: 0, text: `No result: no stable ${ax} maneuver at ${fmt(m.level, 0)} deg/s or more for ${RULE.steady.minS} s with no output limit.` });
                 for (const p of profs) { const s = m.byProfile[p], n = s.iShare.n;
-                    if (n < R.minEvents) { add(id, 'note', f, p, { axis: ax, value: s.iShare.mean, se: s.iShare.se, n, text: thin(n, R.minEvents, 'steady manoeuvres') + `; I share ${fmt(s.iShare.mean)}, gyro/setpoint ${fmt(s.gyroRatio.mean)}` }); continue; }
+                    if (n < R.minEvents) { add(id, 'note', f, p, { axis: ax, value: s.iShare.mean, se: s.iShare.se, n, text: thin(n, R.minEvents, 'stable maneuvers') + ` The I-term ratio is ${fmt(s.iShare.mean)}. The gyro/setpoint ratio is ${fmt(s.gyroRatio.mean)}.` }); continue; }
                     const badI = Math.abs(s.iShare.mean) > R.iShare, badG = s.gyroRatio.mean < R.gyroRatio[0] || s.gyroRatio.mean > R.gyroRatio[1];
                     add(id, badI || badG ? 'flag' : 'ok', f, p, { axis: ax, value: s.iShare.mean, se: s.iShare.se, n, threshold: `|I share| <= ${R.iShare}, gyro/setpoint ${R.gyroRatio.join('-')}`,
-                        gyroRatio: s.gyroRatio, text: `${ax}: I share ${fmt(s.iShare.mean)} +- ${fmt(s.iShare.se)}, gyro/setpoint ${fmt(s.gyroRatio.mean, 3)} +- ${fmt(s.gyroRatio.se, 3)} over ${n} manoeuvres` +
-                        (badI ? (s.iShare.mean > 0 ? ': I carries the rate, FF too low (raise F)' : ': I works against FF, FF too high (lower F)') : '') + (badG && !badI ? ': rate off the setpoint' : '') }); } } }
+                        gyroRatio: s.gyroRatio, text: `The ${ax} I-term ratio is ${fmt(s.iShare.mean)} ± ${fmt(s.iShare.se)} in ${n} maneuvers. The gyro/setpoint ratio is ${fmt(s.gyroRatio.mean, 3)} ± ${fmt(s.gyroRatio.se, 3)}.` +
+                        (badI ? (s.iShare.mean > 0 ? ' I supplies part of the rate. "FF too low" is one possible cause.' : ' I operates against FF. "FF too high" is one possible cause.') : '') + (badG && !badI ? ' The rate is not equal to the setpoint.' : '') }); } } }
         // C4, T5
         if (M.C4) { const R = RULES.C4; for (const ax of ['roll', 'pitch']) { const m = M.C4[ax], profs = Object.keys(m.byProfile);
-            if (!profs.length) add('C4', 'note', f, null, { axis: ax, n: 0, text: `no finding: no ${ax} stops from >= ${RULE.stop.from} deg/s` });
+            if (!profs.length) add('C4', 'note', f, null, { axis: ax, n: 0, text: `No result: no ${ax} stops from ${RULE.stop.from} deg/s or more.` });
             for (const p of profs) { const s = m.byProfile[p], n = s.overshootPct.n;
-                if (n < R.minEvents) { add('C4', 'note', f, p, { axis: ax, value: s.overshootPct.mean, se: s.overshootPct.se, n, text: thin(n, R.minEvents, 'stops') + `; overshoot ${fmt(s.overshootPct.mean, 1)} %, settling ${fmt(s.settleS.mean)} s` }); continue; }
-                const flag = s.overshootPct.mean > R.overshootPct || s.settleS.mean > R.settleS, ff = s.iWithRotationShare >= 0.5 ? 'I charged with the rotation at the stop: FF too low (raise F)' : 'I charged against the rotation at the stop: FF too high (lower F), or relax/B';
+                if (n < R.minEvents) { add('C4', 'note', f, p, { axis: ax, value: s.overshootPct.mean, se: s.overshootPct.se, n, text: thin(n, R.minEvents, 'stops') + ` The overshoot is ${fmt(s.overshootPct.mean, 1)} %. The gyro becomes stable after ${fmt(s.settleS.mean)} s.` }); continue; }
+                const flag = s.overshootPct.mean > R.overshootPct || s.settleS.mean > R.settleS, ff = s.iWithRotationShare >= 0.5 ? 'I has the same sign as the turn at the stop. "FF too low" is one possible cause.' : 'I has the opposite sign to the turn at the stop. "FF too high", I-term relax or B gain are possible causes.';
                 add('C4', flag ? 'flag' : 'ok', f, p, { axis: ax, value: s.overshootPct.mean, se: s.overshootPct.se, n, threshold: `overshoot <= ${R.overshootPct} %, settling <= ${R.settleS} s`, settleS: s.settleS,
-                    text: `${ax} stops: overshoot ${fmt(s.overshootPct.mean, 1)} +- ${fmt(s.overshootPct.se, 1)} %, settling ${fmt(s.settleS.mean)} +- ${fmt(s.settleS.se)} s, I with the rotation in ${Math.round(s.iWithRotationShare * 100)} % of ${n} stops` + (flag ? ': ' + ff : '') }); } } }
+                    text: `The ${ax} stop overshoot is ${fmt(s.overshootPct.mean, 1)} ± ${fmt(s.overshootPct.se, 1)} %. The gyro becomes stable after ${fmt(s.settleS.mean)} ± ${fmt(s.settleS.se)} s. I has the same sign as the turn in ${Math.round(s.iWithRotationShare * 100)} % of ${n} stops.` + (flag ? '\n' + ff : '') }); } } }
         if (M.T5) { const R = RULES.T5, sg = M.T5.stopGain || {};
-            const check = sg.measuredCW !== null && sg.measuredCW !== undefined ? ` Stop gains regressed ${fmt(sg.measuredCW, 0)} (error > 0) / ${fmt(sg.measuredCCW, 0)} (error < 0) vs header ${JSON.stringify(sg.header)} [cw, ccw].` : '';
-            const profs = Object.keys(M.T5.byProfile); if (!profs.length) add('T5', 'note', f, null, { n: 0, text: 'no finding: no yaw stops from >= 150 deg/s' });
+            const check = sg.measuredCW !== null && sg.measuredCW !== undefined ? `\nThe calculated stop gains are ${fmt(sg.measuredCW, 0)} for positive error and ${fmt(sg.measuredCCW, 0)} for negative error. The header values are "${JSON.stringify(sg.header)} [cw, ccw]".` : '';
+            const profs = Object.keys(M.T5.byProfile); if (!profs.length) add('T5', 'note', f, null, { n: 0, text: 'No result: no yaw stops from 150 deg/s or more.' });
             for (const p of profs) { const s = M.T5.byProfile[p], c = s.cw, w = s.ccw, nc = c ? c.overshootPct.n : 0, nw = w ? w.overshootPct.n : 0;
-                if (nc < R.minEvents || nw < R.minEvents) { add('T5', 'note', f, p, { n: Math.min(nc, nw), text: thin(Math.min(nc, nw), R.minEvents, 'stops on one side') + `; CW-gain stops ${nc} (overshoot ${fmt(c && c.overshootPct.mean, 1)} %), CCW-gain stops ${nw} (${fmt(w && w.overshootPct.mean, 1)} %).` + check }); continue; }
+                if (nc < R.minEvents || nw < R.minEvents) { add('T5', 'note', f, p, { n: Math.min(nc, nw), text: thin(Math.min(nc, nw), R.minEvents, 'stops on one side') + ` The "CW-gain" side has ${nc} stops with an overshoot of ${fmt(c && c.overshootPct.mean, 1)} %. The "CCW-gain" side has ${nw} stops with an overshoot of ${fmt(w && w.overshootPct.mean, 1)} %.` + check }); continue; }
                 const oc = Math.max(c.overshootPct.mean, 1), ow = Math.max(w.overshootPct.mean, 1), ratio = Math.max(oc, ow) / Math.min(oc, ow), big = oc > ow ? 'cw' : 'ccw';
                 const se = ratio * Math.hypot((c.overshootPct.se || 0) / oc, (w.overshootPct.se || 0) / ow), flag = ratio >= R.ratio;
                 add('T5', flag ? 'flag' : 'ok', f, p, { value: r(ratio, 2), se: r(se, 2), n: nc + nw, threshold: `ratio >= ${R.ratio}`, larger: big,
-                    text: `yaw stop overshoot CW-gain side ${fmt(c.overshootPct.mean, 1)} +- ${fmt(c.overshootPct.se, 1)} % (n ${nc}), CCW-gain side ${fmt(w.overshootPct.mean, 1)} +- ${fmt(w.overshootPct.se, 1)} % (n ${nw}), ratio ${fmt(ratio)} +- ${fmt(se)}` + (flag ? `: lower yaw_${big}_stop_gain (or raise the other)` : '') + '.' + check }); } }
+                    text: `The yaw stop overshoot on the "CW-gain" side is ${fmt(c.overshootPct.mean, 1)} ± ${fmt(c.overshootPct.se, 1)} % in ${nc} stops. On the "CCW-gain" side, it is ${fmt(w.overshootPct.mean, 1)} ± ${fmt(w.overshootPct.se, 1)} % in ${nw} stops. The ratio is ${fmt(ratio)} ± ${fmt(se)}.` + (flag ? ` The yaw_${big}_stop_gain side has more overshoot. This does not identify a new gain.` : '') + check }); } }
         // C6, T2
         for (const [id, list] of [['C6', M.C6 ? [['roll', M.C6.roll], ['pitch', M.C6.pitch]] : []], ['T2', M.T2 ? [['yaw', M.T2]] : []]]) { const R = RULES[id];
-            for (const [ax, m] of list) { const profs = Object.keys(m.byProfile); if (!profs.length) add(id, 'note', f, null, { axis: ax, n: 0, text: `no finding: no stick-quiet ${RULE.slow.windowS} s windows` });
+            for (const [ax, m] of list) { const profs = Object.keys(m.byProfile); if (!profs.length) add(id, 'note', f, null, { axis: ax, n: 0, text: `No result: no ${RULE.slow.windowS} s windows with stable stick input.` });
                 for (const p of profs) { const s = m.byProfile[p];
-                    if (s.windows < R.minWindows || s.prominence === null) { add(id, 'note', f, p, { axis: ax, value: s.prominence, n: s.windows, text: thin(s.windows, R.minWindows, 'quiet windows') + `; peak ${fmt(s.hz)} Hz, prominence ${fmt(s.prominence)}` }); continue; }
+                    if (s.windows < R.minWindows || s.prominence === null) { add(id, 'note', f, p, { axis: ax, value: s.prominence, n: s.windows, text: thin(s.windows, R.minWindows, 'windows with stable input') + ` The peak is at ${fmt(s.hz)} Hz, with a prominence of ${fmt(s.prominence)}.` }); continue; }
                     const flag = s.prominence >= R.prominence;
                     add(id, flag ? 'flag' : 'ok', f, p, { axis: ax, value: s.prominence, n: s.windows, threshold: `prominence >= ${R.prominence}`, hz: s.hz,
-                        text: `${ax} 0.5-3 Hz: peak ${fmt(s.hz)} Hz, ${fmt(s.amplitude, 1)} deg/s, prominence ${fmt(s.prominence)} over ${s.windows} windows; I term is ${fmt(s.iShareOfControl * 100, 0)} % of the control there` +
-                        (flag ? (s.iShareOfControl >= 0.5 ? ': slow oscillation driven by I: I too high or P too low' : ': slow oscillation not driven by I (check mechanics, governor)') : '') }); } } }
+                        text: `In the ${ax} band of 0.5-3 Hz, the peak is at ${fmt(s.hz)} Hz with an amplitude of ${fmt(s.amplitude, 1)} deg/s. Its prominence is ${fmt(s.prominence)} in ${s.windows} windows. The I-term supplies ${fmt(s.iShareOfControl * 100, 0)} % of the control at this frequency.` +
+                        (flag ? (s.iShareOfControl >= 0.5 ? '\nThe label is "driven by I" because I supplies half or more of the control. This does not identify which gain is incorrect.' : '\nThe label is "not driven by I" because I supplies less than half of the control. This does not show that the I-loop is correct.') : '') }); } } }
         // C8, C9
         if (M.C8) { const R = RULES.C8; for (const [p, s] of Object.entries(M.C8.byProfile))
-            add('C8', 'note', f, p, { value: s.gainSigned, n: s.windows, text: s.windows < R.minWindows ? thin(s.windows, R.minWindows, 'windows') : `roll response to pitch stick rate: ${fmt(s.gain, 4)} deg/s per deg/s^2 (signed ${fmt(s.gainSigned, 4)}), coherence ${fmt(s.coherence)}, header cyclic_coupling ${JSON.stringify(M.C8.headerCyclicCoupling)}; report only` }); }
+            add('C8', 'note', f, p, { axis: 'roll', value: s.gainSigned, n: s.windows, text: s.windows < R.minWindows ? thin(s.windows, R.minWindows, 'windows') : `The roll response to pitch stick acceleration is ${fmt(s.gain, 4)} deg/s for each deg/s^2. The value with its sign is ${fmt(s.gainSigned, 4)}. The coherence is ${fmt(s.coherence)}. The header cyclic_coupling is "${JSON.stringify(M.C8.headerCyclicCoupling)}". This is information only.` }); }
         if (M.C9) { const R = RULES.C9; if (M.C9.skipped) add('C9', 'skipped', f, null, { text: M.C9.skipped });
             else for (const [p, s] of Object.entries(M.C9.byProfile)) { const n = Math.min(s.pitchErrorPositive.n, s.pitchErrorNegative.n);
-                add('C9', 'note', f, p, { value: s.difference, se: s.differenceSe, n, text: (n < R.minBlocks ? thin(n, R.minBlocks, 'blocks on one side') + '; ' : '') + `pitch error at positive collective ${fmt(s.pitchErrorPositive.mean)} (n ${s.pitchErrorPositive.n}), negative ${fmt(s.pitchErrorNegative.mean)} (n ${s.pitchErrorNegative.n}) deg/s, difference ${fmt(s.difference)} +- ${fmt(s.differenceSe)}; axisO share roll ${fmt(s.oShare[0])}, pitch ${fmt(s.oShare[1])}; report only` }); } }
+                add('C9', 'note', f, p, { axis: 'pitch', value: s.difference, se: s.differenceSe, n, text: (n < R.minBlocks ? thin(n, R.minBlocks, 'periods on one side') + '\n' : '') + `The pitch error at positive collective is ${fmt(s.pitchErrorPositive.mean)} deg/s in ${s.pitchErrorPositive.n} periods. At negative collective, it is ${fmt(s.pitchErrorNegative.mean)} deg/s in ${s.pitchErrorNegative.n} periods. The difference is ${fmt(s.difference)} ± ${fmt(s.differenceSe)} deg/s. The axisO ratio is ${fmt(s.oShare[0])} for roll and ${fmt(s.oShare[1])} for pitch. This is information only.` }); } }
         // C10
         if (M.C10) { const R = RULES.C10; if (M.C10.skipped) add('C10', 'skipped', f, null, { text: M.C10.skipped });
             else { for (const ax of ['roll', 'pitch']) for (const [p, s] of Object.entries(M.C10[ax].byProfile)) for (const b of s.bins) {
                     const lab = `${b.collectiveDeg[0]}-${b.collectiveDeg[1]} deg`;
-                    if (b.spans < R.minSpans) { add('C10', 'note', f, p, { axis: ax, value: b.tauS, n: b.spans, text: thin(b.spans, R.minSpans, `quiet 0.1 s spans at ${lab}`) + `; tau ${fmt(b.tauS)} s` }); continue; }
-                    if (b.tauS === null) { add('C10', 'note', f, p, { axis: ax, value: b.lambdaPerS, se: b.lambdaSe, n: b.spans, text: `no finding: ${ax} I decay rate at ${lab} ${fmt(b.lambdaPerS, 3)} +- ${fmt(b.lambdaSe, 3)} /s is not positive over ${b.spans} spans` }); continue; }
+                    if (b.spans < R.minSpans) { add('C10', 'note', f, p, { axis: ax, value: b.tauS, n: b.spans, text: thin(b.spans, R.minSpans, `stable periods of 0.1 s at ${lab}`) + ` The time constant is ${fmt(b.tauS)} s.` }); continue; }
+                    if (b.tauS === null) { add('C10', 'note', f, p, { axis: ax, value: b.lambdaPerS, se: b.lambdaSe, n: b.spans, text: `No result: the ${ax} I-term decrease rate at ${lab} is ${fmt(b.lambdaPerS, 3)} ± ${fmt(b.lambdaSe, 3)} /s. This rate is not positive in ${b.spans} periods.` }); continue; }
                     const inBand = b.tauS >= R.tau[0] && b.tauS <= R.tau[1], slowExpected = b.expectedAirborneTauS === null || b.expectedAirborneTauS >= R.airborneTauMin, fast = inBand && slowExpected;
                     // With AIRBORNE_STATE events every measured sample is firmware-airborne (ok needs airborneAt), and pid.c then
                     // applies the airborne curve: a ground-rate tau cannot be misdetection. Only without the events can it be.
                     const known = M.C10.airborneStateLogged !== undefined ? M.C10.airborneStateLogged : !!(M.C10.landedWhileMoving && !M.C10.landedWhileMoving.skipped), flag = fast && !known;
                     add('C10', flag ? 'flag' : fast ? 'note' : 'ok', f, p, { axis: ax, value: b.tauS, se: b.tauSe, n: b.spans, threshold: `tau in ${R.tau.join('-')} s where airborne tau >= ${R.airborneTauMin} s`,
-                        text: `${ax} I decay at ${lab}: tau ${fmt(b.tauS)} +- ${fmt(b.tauSe)} s (airborne expected ${fmt(b.expectedAirborneTauS, 1)} s, ground ${fmt(b.expectedGroundTauS, 1)} s)` + (flag ? ': decays at the ground rate in flight and the log has no AIRBORNE_STATE events: possible airborne misdetection'
-                            : fast ? ': decays faster than the airborne curve in firmware-airborne flight (offset flood moving I into O, or error rotation?); not airborne misdetection, the firmware applied the airborne curve here' : '') }); }
-                const lw = M.C10.landedWhileMoving; if (lw && !lw.skipped) add('C10', lw.seconds > 0 ? 'flag' : 'ok', f, null, { value: lw.seconds, n: lw.events.length, threshold: '> 0 s', text: `${fmt(lw.seconds, 1)} s spooled up and turning while the firmware says landed (ground decay active)` }); } }
+                        text: `The ${ax} I-term time constant at ${lab} is ${fmt(b.tauS)} ± ${fmt(b.tauSe)} s. The firmware curve gives ${fmt(b.expectedAirborneTauS, 1)} s in flight and ${fmt(b.expectedGroundTauS, 1)} s on the ground.` + (flag ? '\nThe I-term decreases at the ground rate in flight. The log has no AIRBORNE_STATE log events. The airborne condition can be incorrect.'
+                            : fast ? '\nThe I-term decreases faster than the airborne curve in firmware-airborne flight. The firmware applied the airborne curve here. Examine other effects on the I-term.' : '') }); }
+                const lw = M.C10.landedWhileMoving; if (lw && !lw.skipped) add('C10', lw.seconds > 0 ? 'flag' : 'ok', f, null, { value: lw.seconds, n: lw.events.length, threshold: '> 0 s', text: `The rotor is at speed with helicopter movement for ${fmt(lw.seconds, 1)} s "while the firmware says landed". The ground I-term decrease is active.` }); } }
         // C11
         if (M.C11) { const R = RULES.C11; for (const ax of ['roll', 'pitch']) { const m = M.C11[ax]; if (!m) continue;
             if (m.skipped) { add('C11', 'skipped', f, null, { axis: ax, text: m.skipped }); continue; }
             for (const [p, s] of Object.entries(m.byProfile)) { if (s.windows < R.minWindows) { add('C11', 'note', f, p, { axis: ax, value: s.share, n: s.windows, text: thin(s.windows, R.minWindows, 'windows') }); continue; }
                 const flag = s.share > R.share;
-                add('C11', flag ? 'flag' : 'ok', f, p, { axis: ax, value: s.share, se: s.perWindow.se, n: s.windows, threshold: `> ${R.share}`, text: `${ax} axisD power above ${RULE.dNoise.hz} Hz: ${fmt(s.share * 100, 0)} % (per window ${fmt(s.perWindow.mean * 100, 0)} +- ${fmt(s.perWindow.se * 100, 1)} %)` + (flag ? ': D is driven by noise' : '') }); } } }
+                add('C11', flag ? 'flag' : 'ok', f, p, { axis: ax, value: s.share, se: s.perWindow.se, n: s.windows, threshold: `> ${R.share}`, text: `The ${ax} axisD power at more than ${RULE.dNoise.hz} Hz is ${fmt(s.share * 100, 0)} % of its total power. The mean of the window percentages is ${fmt(s.perWindow.mean * 100, 0)} ± ${fmt(s.perWindow.se * 100, 1)} %.` + (flag ? ' High-frequency D power can come from vibration. Examine the gyro spectra.' : '') }); } } }
         // T6
         if (M.T6) { const R = RULES.T6; if (M.T6.skipped) add('T6', 'skipped', f, null, { text: M.T6.skipped });
-            else { const profs = Object.keys(M.T6.byProfile); if (!profs.length) add('T6', 'note', f, null, { n: 0, text: `no finding: no collective step >= ${RULE.kick.fraction * 100} % of range with the yaw stick quiet` });
+            else { const profs = Object.keys(M.T6.byProfile); if (!profs.length) add('T6', 'note', f, null, { n: 0, text: `No result: no collective step of ${RULE.kick.fraction * 100} % of the range or more with stable yaw stick input.` });
                 for (const p of profs) { const s = M.T6.byProfile[p], n = s.absPeak.n;
-                    if (n < R.minEvents) { add('T6', 'note', f, p, { value: s.absPeak.mean, n, text: thin(n, R.minEvents, 'collective steps') + `; mean |kick| ${fmt(s.absPeak.mean, 1)} deg/s` }); continue; }
+                    if (n < R.minEvents) { add('T6', 'note', f, p, { value: s.absPeak.mean, n, text: thin(n, R.minEvents, 'collective steps') + ` The mean yaw kick without its sign is ${fmt(s.absPeak.mean, 1)} deg/s.` }); continue; }
                     const flag = s.absPeak.mean >= R.kick, dir = s.towardTorque.mean, sure = dir !== null && s.towardTorque.se !== null && Math.abs(dir) > 2 * s.towardTorque.se;
                     add('T6', flag ? 'flag' : 'ok', f, p, { value: s.absPeak.mean, se: s.absPeak.se, n, threshold: `>= ${R.kick} deg/s`, towardTorque: s.towardTorque,
-                        text: `yaw kick after collective steps ${fmt(s.absPeak.mean, 1)} +- ${fmt(s.absPeak.se, 1)} deg/s over ${n} steps, toward the torque change ${fmt(dir, 1)} +- ${fmt(s.towardTorque.se, 1)} deg/s (${fmt(s.withTorqueShare * 100, 0)} % of steps)` +
-                        (flag ? (!sure ? ': direction not consistent across steps, no precomp direction (check yaw_precomp_cutoff, pilot input)' : dir > 0 ? ': precomp too small, raise yaw collective FF' : ': precomp too large, lower yaw collective FF') : '') }); } } }
+                        text: `The yaw kick after ${n} collective steps is ${fmt(s.absPeak.mean, 1)} ± ${fmt(s.absPeak.se, 1)} deg/s. The value in the direction of the torque change is ${fmt(dir, 1)} ± ${fmt(s.towardTorque.se, 1)} deg/s. This direction occurs in ${fmt(s.withTorqueShare * 100, 0)} % of the steps.` +
+                        (flag ? (!sure ? '\nThe direction is not the same in the steps. The check gives no precompensation direction. Examine yaw_precomp_cutoff and the pilot input.' : dir > 0 ? ' A low collective precompensation is one possible cause.' : ' A high collective precompensation is one possible cause.') : '') }); } } }
         // T7
         if (M.T7) { const R = RULES.T7; if (M.T7.skipped) add('T7', 'skipped', f, null, { text: M.T7.skipped });
-            else { const profs = Object.keys(M.T7.byProfile); if (!profs.length) add('T7', 'note', f, null, { n: 0, text: 'no finding: no collective pumps with the yaw stick quiet' });
+            else { const profs = Object.keys(M.T7.byProfile); if (!profs.length) add('T7', 'note', f, null, { n: 0, text: 'No result: no collective movements with stable yaw stick input.' });
                 for (const p of profs) { const s = M.T7.byProfile[p];
-                    if (s.windows < R.minWindows) { add('T7', 'note', f, p, { value: s.r.mean, n: s.windows, text: thin(s.windows, R.minWindows, 'pump windows') + `; r ${fmt(s.r.mean)}` }); continue; }
+                    if (s.windows < R.minWindows) { add('T7', 'note', f, p, { value: s.r.mean, n: s.windows, text: thin(s.windows, R.minWindows, 'windows with collective movement') + ` The correlation is ${fmt(s.r.mean)}.` }); continue; }
                     const flag = Math.abs(s.r.mean) >= R.r;
                     add('T7', flag ? 'flag' : 'ok', f, p, { value: s.r.mean, se: s.r.se, n: s.windows, threshold: `|r| >= ${R.r}`, precompScale: s.precompScale,
-                        text: `yaw I vs precomp in pumps: r ${fmt(s.r.mean)} +- ${fmt(s.r.se)}, slope ${fmt(s.slope)} +- ${fmt(s.slopeSe)} (I flat at ${fmt(s.precompScale)} x the present precomp)` +
-                        (flag ? (s.precompScale < 0 ? ': precomp has the wrong sign' : s.r.mean < 0 ? ': precomp too large' : ': precomp too small') : '') }); } } }
+                        text: `In collective movements, yaw I and precompensation have a correlation of ${fmt(s.r.mean)} ± ${fmt(s.r.se)}. The slope is ${fmt(s.slope)} ± ${fmt(s.slopeSe)}. The fit gives a scale estimate of ${fmt(s.precompScale)} for the recorded precompensation. The estimate does not show that this change is correct.` +
+                        (flag ? (s.precompScale < 0 ? '\nThe fit can show an incorrect sign.' : s.r.mean < 0 ? '\nThe fit can show too much precompensation.' : '\nThe fit can show that precompensation is not sufficient.') : '') }); } } }
     }
 
     // T4 across logs: wag frequency per gain set
@@ -668,9 +668,9 @@ function judge(flights, RULES = DEFAULT_RULES) {
             const a = sets[i], b = sets[j], dg = Math.max(rel(a.P, b.P), rel(a.I, b.I), rel(a.D, b.D)); if (dg <= R.gainChange) continue;
             pairs++; const dh = rel(a.hz, b.hz), flag = dh < R.hzChange;
             F.push({ id: 'T4', severity: flag ? 'note' : 'ok', log: a.log, profile: a.profile, value: r(dh, 3), se: null, n: a.n + b.n, threshold: `hz change < ${R.hzChange} while gains change > ${R.gainChange}`, source: R.source, other: { log: b.log, profile: b.profile },
-                text: `yaw wag ${fmt(a.hz)} Hz (log ${a.log} profile ${a.profile}, P x mean stop gain/I/D ${fmt(a.P, 0)}/${fmt(a.I, 0)}/${fmt(a.D, 0)}) vs ${fmt(b.hz)} Hz (log ${b.log} profile ${b.profile}, ${fmt(b.P, 0)}/${fmt(b.I, 0)}/${fmt(b.D, 0)}): gains differ ${fmt(dg * 100, 0)} %, frequency ${fmt(dh * 100, 1)} %` + (flag ? ': suspect mechanics' : '') });
+                text: `The tail oscillation is ${fmt(a.hz)} Hz in log ${a.log}, PID profile ${a.profile}, and ${fmt(b.hz)} Hz in log ${b.log}, PID profile ${b.profile}. The mean applied P/I/D gains are ${fmt(a.P, 0)}/${fmt(a.I, 0)}/${fmt(a.D, 0)} and ${fmt(b.P, 0)}/${fmt(b.I, 0)}/${fmt(b.D, 0)}. The gain difference is ${fmt(dg * 100, 0)} %, and the frequency difference is ${fmt(dh * 100, 1)} %.` + (flag ? ' The result is "suspect mechanics": examine the mechanical parts.' : '') });
         }
-        if (!pairs) F.push({ id: 'T4', severity: 'note', log: null, profile: null, value: null, se: null, n: sets.length, threshold: null, source: R.source, text: `no finding: no two gain sets with ${R.minBursts}+ yaw bursts whose gains differ by more than ${R.gainChange * 100} % (${sets.length} sets)` });
+        if (!pairs) F.push({ id: 'T4', severity: 'note', log: null, profile: null, value: null, se: null, n: sets.length, threshold: null, source: R.source, text: `No result: no two gain sets have ${R.minBursts} or more yaw oscillations and a gain difference of more than ${R.gainChange * 100} %. The analysis has ${sets.length} sets.` });
     }
     return F;
 }

@@ -157,7 +157,7 @@ test('summaries: the number, its uncertainty and the limit; facts from the evide
     assert.equal(s(VARIANTS[15]), 'This check did not operate because of an analysis error. The toolkit text gives the cause.');
     assert.equal(s(finding('C7', 'flag')), 'At 2500 rpm, the model calculates that pitch_f_gain 80 decreases the tracking error by 1.2 ± 0.4 deg/s. A change must decrease the tracking error by 10 % or more, and by 2 standard errors (SE) or more.');
     assert.equal(s(VARIANTS[8]), 'In PID profile 1, the headspeed is 34.8 ± 3.5 % more than the target after a collective change. The limit is 3 %.', 'the RULES object of the finding');
-    assert.equal(s(VARIANTS[12]), 'In PID profile 1, the roll rate has 1 oscillation that increases with no stick input. Each oscillation of this type is a problem.');
+    assert.equal(s(VARIANTS[12]), 'In PID profile 1, the roll rate has 1 oscillation that increases with small stick input. Each oscillation of this type is a problem.');
     assert.match(s(VARIANTS[13]), /^In PID profile 1, the median throttle is 67\.7 %, and the throttle stays at its limit in 1 period of 0\.1 s or more\. The limit is 85 %\./);
     assert.equal(s(VARIANTS[10]), 'In an unknown PID profile, the roll tracking error is 34.8 ± 3.5 % of the setpoint. The limit is 45 %. At more than 30 %, the result is "Monitor".');
     // the limit follows the finding's threshold object over the module's DEFAULT_RULES
@@ -247,13 +247,13 @@ test('new checks (health_phase.cjs, SPEC2 section 6): the unit of the finding ch
     assert.deepEqual(['G15', 'G16', 'G17', 'G18', 'C15'].map(id => C.CHECKS[id].phases), [['spoolup'], ['spoolup', 'ground', 'flight'], ['idle', 'spoolup', 'ground'], ['idle'], ['ground']], 'G16: a change after the liftoff is in flight');
 });
 
-test('G16 after the liftoff (review D-M5c): the summary says that a longer spool-up time does not correct it', () => {
+test('G16 after the liftoff (review D-M5c): the summary treats rotor load as a possible contributor', () => {
     const f = { id: 'G16', severity: 'flag', log: 0, profile: 1, n: 1, unit: 'fraction', value: 0.0711, se: null, threshold: { flag: 0.03, settleS: 1 }, settleS: 1.0, reference: 'govTarget',
         phase: 'flight', afterLiftoff: true, liftoffT: 7.279, afterLiftoffS: 1.274 };
     assert.equal(C.summary(f).split('\n').pop(), 'In PID profile 1, at the change from SPOOLUP to ACTIVE, the headspeed is 7.11 % more than the target. The limits are 3 % and 1 s to become stable. '
-        + 'A longer spool-up time does not correct this error, because the change comes 1.27 s after the liftoff.');
+        + 'The change comes 1.27 s after the liftoff. A change in rotor load can cause part of the error. The time of this change does not identify a governor parameter change.');
     assert.equal(C.CHECKS.G16.evidence.expected(f), 'The governor is ACTIVE before the liftoff. Then the headspeed goes to the target with no overshoot.');
-    assert.match(C.summary(Object.assign({}, f, { afterLiftoffS: null })), /because the change comes in flight\.$/);
+    assert.match(C.summary(Object.assign({}, f, { afterLiftoffS: null })), /The change comes in flight\. A change in rotor load can cause part of the error\./);
     assert.match(C.summary(Object.assign({}, f, { afterLiftoff: false })), /The headspeed becomes stable in 1 s\.$/);
     assert.equal(C.CHECKS.G16.evidence.expected(Object.assign({}, f, { afterLiftoff: false })), 'At the change to ACTIVE, the headspeed goes to the target with no overshoot and no step of the throttle.');
 });
@@ -302,6 +302,31 @@ test('profiles (SPEC2 D12): "PID profile 1-6", "PID profile unknown" for 0 or ar
     assert.equal(H.profileKey ? H.profileKey({ id: 'C12', profile: 0, pidProfile: 2 }) : '2', '2', 'the hierarchy agrees');
     assert.match(C.summary({ id: 'C12', severity: 'note', axis: 'roll', profile: 0, pidProfile: 2, value: 0.3, se: 0.02 }).split('\n').pop(), /^In PID profile 2, the roll tracking error is 30 ± 2 % of the setpoint\./);
     assert.equal(C.format({ id: 'C12', profile: 0, pidProfile: 2, value: 0.3 }).profile, 'PID profile 2');
+});
+
+test('G1 summaries keep FALLBACK and a proxy distinct from a confirmed RPM defect', () => {
+    const fallback = C.summary({id:'G1',severity:'flag',value:1,log:0,profile:null});
+    assert.match(fallback,/governor changes to FALLBACK/);
+    assert.match(fallback,/FALLBACK mode switch that is on can cause this condition/);
+    assert.match(fallback,/condition does not show that the RPM source is incorrect/);
+    const proxy = C.summary({id:'G1',severity:'note',value:2,log:0,profile:null});
+    assert.match(proxy,/possible errors/);
+    assert.match(proxy,/does not identify an RPM source problem/);
+    assert.doesNotMatch(fallback + proxy,/signal (?:was|is) not available|signal shows errors\./);
+});
+
+test('D8 summary reports a nearby PID profile change without identifying its command or changed gains', () => {
+    const text=C.summary({id:'D8',severity:'flag',value:1,n:1,log:0,profile:2,fromProfile:3,toProfile:2});
+    assert.match(text,/PID profile changes near the rescue start/);
+    assert.match(text,/can change gains or headspeed/);
+    assert.match(text,/time of a PID profile change does not identify its source/);
+    assert.doesNotMatch(text,/Then the rescue pulls up with different gains/);
+    assert.doesNotMatch(text,/headspeed target (?:stays|changes)/, 'Unknown targets do not imply a target change.');
+    const equal = C.summary({id:'D8',severity:'flag',value:1,n:1,log:0,profile:2,fromProfile:3,toProfile:2,fromTarget:2500,toTarget:2500});
+    assert.match(equal,/governor headspeed target stays at 2500 rpm/);
+    assert.doesNotMatch(equal,/headspeed(?: target)? changes from/);
+    const changed = C.summary({id:'D8',severity:'flag',value:1,n:1,log:0,profile:2,fromProfile:3,toProfile:2,fromTarget:2500,toTarget:2000});
+    assert.match(changed,/governor headspeed target changes from 2500 rpm to 2000 rpm/);
 });
 
 test('GEAR RULE (SPEC2 section 6): no text tells that a gear ratio, a pulley or a tooth count can be incorrect; G12 states that the gear ratios are correct', () => {

@@ -7,6 +7,7 @@
 // test/ste_text.test.cjs runs these tests again to read every text that the view writes: the containers come from the
 // stand-in document, so that the lint reads what the view writes into them.
 'use strict';
+
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -388,7 +389,7 @@ test('the verdict: the summary in items, the 3 most important items, the start s
     // the counts of the items for each status
     assert.ok(vib.includes('<span class="analysis-count st-problem">Problem <b>2</b></span><span class="analysis-count st-satisfactory">Satisfactory <b>2</b></span>'));
     // the toolkit text, collapsed and quoted
-    assert.ok(cyc.includes('<details class="analysis-raw" data-ste="quoted"><summary>Toolkit text (not STE)</summary>toolkit text of C12</details>'));
+    assert.ok(cyc.includes('<details class="analysis-raw" data-ste="quoted"><summary>Analysis information</summary>toolkit text of C12</details>'));
     // an empty area
     assert.ok(h.includes('<section class="analysis-card st-notMeasured" data-area="rpm">'));
     assert.ok(card('rpm').includes('The analysis has no result for this area.'));
@@ -808,7 +809,7 @@ test('escapes what comes from the result: summaries, texts, thresholds, the file
     for (const bad of ['<img', 'onerror=alert(1)>']) assert.ok(!h.includes(bad), bad);
     assert.ok(h.includes('<code>&lt;img src=x onerror=alert(1)&gt;&quot;&#39;&amp;</code>'), 'the file name and the threshold in code font');
     assert.ok(h.includes('<div class="analysis-summary">&lt;img'));
-    assert.ok(h.includes('data-ste="quoted"><summary>Toolkit text (not STE)</summary>&lt;img'));
+    assert.ok(h.includes('data-ste="quoted"><summary>Analysis information</summary>&lt;img'));
 });
 
 test('without js/log_lens.js the view says so; without js/tuning_dialog.js "Show the measurement" says so', async () => {
@@ -1003,4 +1004,14 @@ test('values possibly not from the log header: no summary without epochs; the ca
     const one = withStale(synthIssues(synthResult()));
     for (const f of one.findings) if (f.fid !== 'c12') f.stale = null;
     assert.ok(I.epochSummaryHtml(one, I.rowsOf(one)).includes('1 of 21 results uses values that are possibly not the values of the log header. 1 of 4 recommendations uses these results.'));
+});
+
+test('passing measurements cannot hide missing data in analysis cards', () => {
+    const { I } = setup();
+    for (const status of ['insufficient', 'notMeasured', 'error']) {
+        assert.equal(I.cardStatus([{ status: 'satisfactory' }, { status }]), status);
+        assert.equal(I.cardStatus([{ status: 'information' }, { status }]), status);
+    }
+    assert.equal(I.cardStatus([{ status: 'satisfactory' }]), 'satisfactory');
+    assert.equal(I.cardStatus([{ status: 'problem', size: 2 }, { status: 'insufficient' }]), 'problem');
 });

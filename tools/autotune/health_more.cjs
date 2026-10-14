@@ -640,7 +640,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     if (few) { add('F10', 'note', f, p, Object.assign(o, { thin: true, text: para(few, `${dTxt} ${ctl}`) })); continue; }
                     const flag = pass(s.share, s.shareSe, R.share);
                     add('F10', flag ? 'flag' : 'ok', f, p, Object.assign(o, { text: para(`${dTxt} This is ${flag ? '' : 'not '}more than ${fmt(R.share * 100, 0)} % ${by}.` +
-                        (flag ? ` Most of the yaw D-term comes from gyro noise at more than ${hz} Hz. Correct the filters first. Then decrease yaw_d_gain.` : ''), ctl) })); } } }
+                        (flag ? ` This power can come from gyro noise at more than ${hz} Hz. Examine the filters first. Read the recommendation before you change yaw_d_gain.` : ''), ctl) })); } } }
         // F11
         if (M.F11) { const R = RULES.F11; if (M.F11.skipped) add('F11', 'skipped', f, null, { text: M.F11.skipped });
             else for (const ax of AXES) { const s = M.F11[ax], o = { axis: ax, value: s.delayMs, se: s.delaySe, n: M.F11.windows, unit: 'ms', threshold: `delay - ${sig} SE > ${R.flagMs} ms`, gain12: s.gain12, measuredMs: s.measuredMs, logOffsetMs: M.F11.logOffsetMs };
@@ -649,7 +649,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 if (M.F11.windows < R.minWindows || M.F11.blocks < R.minBlocks) { add('F11', 'note', f, null, Object.assign(o, { thin: true,
                     text: para(`${NONE} The number of windows in flight is ${M.F11.windows}, in ${bl(M.F11.blocks)}. A minimum of ${R.minWindows} windows in ${R.minBlocks} periods is necessary.`, txt) })); continue; }
                 const flag = pass(s.delayMs, s.delaySe, R.flagMs);
-                add('F11', flag ? 'flag' : 'note', f, null, Object.assign(o, { text: txt + (flag ? ` The time delay is more than ${R.flagMs} ms ${by}. This time delay is too large for the loop. ` +
+                add('F11', flag ? 'flag' : 'note', f, null, Object.assign(o, { text: txt + (flag ? ` The time delay is more than ${R.flagMs} ms ${by}. This is more than the check limit. ` +
                     'Examine the low-pass filter cutoffs, the notch filters and the dynamic notch filter.' : ` ${info(R.flagMs)}`) })); } }
         // T13: the one-sided authority pooled over the logs of this call (authority(): this log's clamp, the file's, the CLI)
         if (M.T13) { const R = RULES.T13, T = M.T13, ps = Object.entries(T.byProfile), Hv = RULE.hover;
@@ -668,7 +668,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 const flag = pass(Math.abs(share), shareSe, R.share);
                 add('T13', flag ? 'flag' : 'note', f, p, Object.assign(o, { text: para(`${p1} The I-term is ${flag ? '' : 'not '}more than ${fmt(R.share * 100, 0)} % of this limit ${by}.`,
                     flag ? 'The I-term holds a constant trim in hover, and the feedforward does not supply it. Examine the tail center trim (tail_center_trim, MIXS). ' +
-                        'If the I-term follows the collective, the collective precompensation is too low (T7). The PID gains are not the cause.' : '', p2, p3) })); } }
+                        'If the I-term changes with the collective, examine collective precompensation (T7). This check does not identify a PID gain change.' : '', p2, p3) })); } }
         // C14
         if (M.C14) { const R = RULES.C14, P = RULE.pitch; if (M.C14.skipped) add('C14', 'skipped', f, null, { text: M.C14.skipped });
             else { const ps = Object.entries(M.C14.byProfile); if (!ps.length) add('C14', 'note', f, null, { n: 0, unit: 'per 1000 collective', thin: true, text: `${NONE} The check has no samples with a stable pitch stick.` });
@@ -677,13 +677,13 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     const st = s.steps, fs = s.fast, io = M.C14.axisOLogged ? 'sum of axisI[1] and axisO[1]' : 'pitch I-term', o = { value: s.slope, se: s.slopeSe, n: s.blocks, unit: 'per 1000 collective',
                         threshold: `|slope| - ${sig} SE > ${R.flag}, a gain change >= ${R.minGainChange}, the fast coupling not of the other sign by ${sig} SE`, gainChange: s.gainChange, gainChangeSe: s.gainChangeSe, from: g0, to, fast: fs };
                     const p1 = `The ${io} changes by ${pm(s.slope, s.slopeSe, 1)} ‰ for each 1000 units of collective at ${P.slow[0]}-${P.slow[1]} Hz (${s.seconds} s, ${many(s.blocks, 'period')} of ${P.slowBlockS} s). ` +
-                        `A pitch_collective_ff_gain change of ${pm(s.gainChange, s.gainChangeSe, 0)} can supply this, and the header value is ${g0 === null ? 'unknown' : g0}.`;
+                        `The fit gives a pitch_collective_ff_gain change of ${pm(s.gainChange, s.gainChangeSe, 0)}. The header value is ${g0 === null ? 'unknown' : g0}.`;
                     const p2 = `At more than ${P.hpHz} Hz, the change is ${pm(fs.slope, fs.se, 1)} ‰ for each 1000 units. The check does not use this value, because the loop does not fully correct the pitch change from the collective at these frequencies.`;
                     const p3 = st.n ? `In ${many(st.n, 'collective step')}, the pitch error is ${pm(st.err.mean, st.err.se, 1)} deg/s. In ${st.n === 1 ? 'this step' : 'these steps'}, the ${io} changes by ${pm(st.perK.mean, st.perK.se, 0)} ‰ for each 1000 units.` : 'The log has no collective steps with the cyclic sticks stable.';
                     if (s.blocks < R.minBlocks || s.slopeSe === null) { add('C14', 'note', f, p, Object.assign(o, { thin: true, text: para(thin(`periods of ${P.slowBlockS} s`, s.blocks, R.minBlocks), p1, p2, p3) })); continue; }
                     const big = pass(Math.abs(s.slope), s.slopeSe, R.flag), against = fs.slope !== null && Math.sign(fs.slope) === -Math.sign(s.slope) && pass(Math.abs(fs.slope), fs.se, 0);
                     const flag = big && !against && change !== null && Math.abs(change) >= R.minGainChange;
-                    const verdict = flag ? `${change > 0 ? 'Increase' : 'Decrease'} pitch_collective_ff_gain from ${g0} to ${to}.`
+                    const verdict = flag ? `With the header value, the fit gives a pitch_collective_ff_gain value of ${pm(g0 + s.gainChange, s.gainChangeSe, 0)}. This is an estimate. Read the recommendation for the prerequisite checks and the step limit.`
                         : big && against ? `The change at more than ${P.hpHz} Hz has the opposite sign. Thus, one feedforward gain cannot supply the two.`
                         : big && g0 === null ? 'The header does not give the present gain. Thus, there is no target value.'
                         : big ? `The parameter range (0 to 250) cannot supply this change, and the header value is ${g0}. Examine the swashplate and the servos.`
@@ -703,19 +703,19 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 const why = [[m.unexplainedRamps, 'with no change of the governor target'], [m.stateChangeRamps, 'at a change of the governor condition'], [m.collectiveRamps, 'with collective movement'],
                     [m.stickRamps, 'with yaw stick movement'], [m.limitRamps, 'with the tail at its output limit']].filter(([k]) => k > 0).map(([k, w]) => `The number of headspeed changes ${w} is ${k}.`).join(' ');
                 const p1 = `The check uses ${m.n} of the ${many(m.rampsInFlight, 'headspeed change')} of the governor in flight. ${why}`;
-                const p2 = g.value === null ? '' : `A yaw_inertia_precomp_gain change of ${pm(g.value, g.se, 0)} can supply the part of the tail control that follows the rotor acceleration. ` +
+                const p2 = g.value === null ? '' : `The fit gives a yaw_inertia_precomp_gain change of ${pm(g.value, g.se, 0)} from the tail control that follows the rotor acceleration. ` +
                     `The regression of each headspeed change gives this sign in ${Math.round((m.fitConsistency || 0) * 100)} % of the changes. The header value is ${g0 === null ? 'unknown' : g0}, and the firmware maximum is ${max}.`;
                 const p3 = !m.n ? '' : `The peak yaw rate in the direction that the rotor acceleration turns the helicopter is ${pm(tw.mean, tw.se, 1)} deg/s. This peak has one sign in ${Math.round((m.consistency || 0) * 100)} % of the changes. ` +
-                    'The check does not use this peak. The precompensation has a time delay. Thus, a peak of this dimension stays at the correct gain. ' +
+                    'The check does not use this peak. The precompensation has a time delay. The peak yaw rate with a new gain is unknown. ' +
                     `The tail control moved ${m.rotationSign < 0 ? 'against' : 'with'} the rotor acceleration (${m.mainRotor} rotor) in ${m.antiTorque} of ${many(m.n, 'change')}.`;
                 const fails = [g.value === null || !pass(Math.abs(g.value), g.se, minChange) ? `The change is not more than ${fmt(minChange, 0)} ${by}.` : '',
                     m.fitConsistency === null || m.fitConsistency < R.consistent ? `Less than ${fmt(R.consistent * 100, 0)} % of the changes give this sign.` : ''].join(' ');
-                const verdict = flag ? `${change > 0 ? 'Increase' : 'Decrease'} yaw_inertia_precomp_gain from ${g0} to ${to}.` +
-                        (beyond ? ` The necessary value (${pm(g0 + g.value, g.se, 0)}) is more than the firmware maximum of ${max}. Thus, also make the headspeed changes slower (gov_tracking_time).` : '') +
-                        ' In simulated loops, the regression was as much as 14 % too high. After the change, record a log with PID profile changes in flight.'
-                    : beyond ? `The parameter range (0 to ${max}) cannot supply this change, and the header value is ${g0}. Make the headspeed changes slower (gov_tracking_time).`
+                const verdict = flag ? `With the header value, the fit gives a yaw_inertia_precomp_gain value of ${pm(g0 + g.value, g.se, 0)}. This is an estimate.` +
+                        (beyond ? ` The estimate is more than the firmware maximum of ${max}.` : '') +
+                        ' In simulated loops, the regression was as much as 14 % too high. Read the recommendation for the prerequisite checks and the step limit.'
+                    : beyond ? `The estimate is out of the parameter range (0 to ${max}), and the header value is ${g0}. This does not identify a gov_tracking_time change.`
                     : sure && g0 === null ? 'The header does not have yaw_inertia_precomp. Thus, there is no target value.'
-                    : sure && g.value < 0 && change === 0 ? `The necessary change is less than the parameter range (0 to ${max}). Examine the rotor direction that the analysis finds from the tail control (${m.mainRotor}).`
+                    : sure && g.value < 0 && change === 0 ? `The estimate is less than the parameter range (0 to ${max}). Examine the rotor direction that the analysis finds from the tail control (${m.mainRotor}).`
                     : sure ? `The parameter range (0 to ${max}) limits the change to ${change}, but a minimum of ${fmt(minChange, 0)} is necessary.` : fails;
                 add('T14', flag ? 'flag' : 'note', f, null, Object.assign(o, m.n < R.minEvents ? { thin: true, text: para(thin('headspeed changes', m.n, R.minEvents), p1, p2, p3) } : { text: para(p1, p2, verdict, p3) })); } }
         // G14

@@ -15,6 +15,26 @@ const byId = new Map(H.NODES.map(n => [n.id, n]));
 const before = (a, b) => H.bySequence(a, b) < 0;
 const PREREQ = ['logging', 'rpm', 'power', 'mechanics', 'rescue', 'controller'], BLOCKS = ['filters', 'governor', 'cyclic', 'tail', 'cycomp', 'tailcomp'];
 
+test('all procedure statuses retain missing evidence beside satisfactory checks', () => {
+    const checks = { filters: 'F6', governor: 'G3', cyclic: 'C12', tail: 'T11', cycomp: 'C8', tailcomp: 'T7' };
+    for (const [node, id] of Object.entries(checks)) {
+        const good = { id, node, fid: `${node}:good`, severity: 'ok', text: 'The measured result is satisfactory.' };
+        const status = extra => H.status([good].concat(extra), [], {}).nodes[node];
+        assert.equal(status([]).status, 'satisfactory', node);
+        assert.equal(status([{ id, node, fid: `${node}:thin`, severity: 'note', thin: true, text: 'No result. More flight data is necessary.' }]).status,
+            'insufficient', `${node}: a passing check does not validate an unmeasured response`);
+        const skipped = status([{ id, node, fid: `${node}:skip`, severity: 'skipped', text: 'The log does not record the necessary field.' }]);
+        assert.equal(skipped.status, 'notMeasured', node);
+        assert.match(skipped.reason, /One or more checks/, `${node}: do not claim that all checks failed to operate`);
+        const failed = status([{ id, node, fid: `${node}:error`, severity: 'error', text: 'The analysis failed.' }]);
+        assert.equal(failed.status, 'error', node);
+        assert.match(failed.reason, /analysis error/, node);
+    }
+    const prereq = H.status([{ id: 'G12', severity: 'ok', text: 'The measured result is satisfactory.' },
+        { id: 'G1', severity: 'skipped', text: 'No recorded governor state.' }], [], {}).nodes.rpm;
+    assert.equal(prereq.status, 'ok', 'the prerequisite rule still reports only measured problems');
+});
+
 // a simple local STE check: no semicolons, no Latin abbreviations, no contractions, no math in running text, and a
 // sentence length of 25 words or fewer (20 for an instruction: a sentence that starts with a verb of this list)
 const VERBS = new Set(['add', 'adjust', 'balance', 'calibrate', 'correct', 'decrease', 'do', 'examine', 'find', 'fly', 'increase', 'install', 'keep', 'load', 'make', 'measure', 'prepare',
@@ -141,7 +161,10 @@ test('K rules: K1-K27 with known check ids, documented steps, sources', () => {
     }
     // K14 is the tail authority (SPEC3 B): the advice of T8, never a calibration and never the gear ratio
     const k14 = H.RULES.find(k => k.id === 'K14');
-    assert.equal(k14.name, 'Tail authority'); assert.ok(k14.first.some(s => /tail torque assist/.test(s)) && k14.first.some(s => /larger tail blades or increase the headspeed/.test(s)));
+    assert.equal(k14.name, 'Tail authority');
+    assert.ok(k14.first.some(s => /error and tail output before each limit/.test(s)));
+    assert.ok(k14.first.some(s => /throttle.*limit.*before you increase the headspeed/.test(s)));
+    assert.ok(k14.first.some(s => /does not identify a blade or tail torque assist change/.test(s)));
     assert.ok(!H.RULES.some(k => k.first.some(s => /calibrat/i.test(s) && /tail/i.test(s))), 'no tail calibration');
     const f = (fid, id, log, profile, axis) => ({ fid, id, severity: 'flag', log, profile, axis });
     const F = [f('a', 'C11', 3, 1, 'pitch'), f('b', 'F5', 3, 1), f('c', 'F1', 3, null), f('d', 'F5', 4, 1), f('e', 'F5', 3, 2), f('g', 'T8', 3, 2), f('h', 'C5', 3, 2, 'roll')];
@@ -151,6 +174,68 @@ test('K rules: K1-K27 with known check ids, documented steps, sources', () => {
     assert.deepEqual(H.causesOf(F[0], F, (u) => u.id !== 'F1').map(c => c.fids), [['b']], 'only: a filter on the upstream flags');
     const rec = { id: 'C11:pitch', severity: 'check', axis: 'pitch', profile: 1, evidence: [{ fid: 'a', id: 'C11', log: 3, profile: 1 }] };
     assert.deepEqual(H.causesOf(rec, F).map(c => [c.rule, c.fids]), [['K1', ['b', 'c']]]);
+});
+
+test('audit K1-K27: every cause rule requires compatible flagged evidence and preserves time direction', () => {
+    const span = (t0,t1) => ({spans:[{log:3,t0,t1}]});
+    const match = (id,s,u,only) => H.causesOf(s,[s,u],only).find(k => k.rule === id);
+    for (const rule of H.RULES) {
+        assert.ok(rule.first.length && rule.first.every(s => typeof s === 'string' && s.length),rule.id);
+        // K15, K17 and K18 are standalone procedures, not causal assertions.
+        if (!rule.upstream.length) {
+            assert.ok(['K15','K17','K18'].includes(rule.id));
+            const s = {fid:'symptom',id:rule.symptoms[0],severity:'flag',log:3,profile:1};
+            assert.equal(match(rule.id,s,{fid:'unrelated',id:'G6',severity:'flag',log:3,profile:1}),undefined);
+            continue;
+        }
+        for (const symptom of rule.symptoms) for (const upstream of rule.upstream) {
+            const context = `${rule.id} ${upstream} -> ${symptom}`;
+            // Use one physical axis in each pair. Explicit axis also permits
+            // checking rejection of an incompatible axis independently of IDs.
+            const axis = /^T/.test(symptom) || /^T/.test(upstream) ? 'yaw' : 'pitch';
+            const s = {fid:'symptom',id:symptom,severity:'flag',log:3,profile:1,axis,evidence:span(20,22)};
+            const u = {fid:'cause',id:upstream,severity:'flag',log:3,profile:1,axis,evidence:span(18.5,19.5)};
+            const accepted = match(rule.id,s,u);
+            assert.ok(accepted,context);
+            assert.deepEqual(accepted.ids,[upstream],context);
+            assert.deepEqual(accepted.fids,['cause'],context);
+            assert.deepEqual(accepted.first,rule.first,context);
+            assert.notEqual(accepted.first,rule.first,'displayed procedure must not mutate the rule');
+            for (const change of [{log:4},{profile:2},{axis:axis === 'yaw' ? 'roll' : 'yaw'},
+                {severity:'note'},{severity:'ok'},{severity:'skipped'},
+                {evidence:span(20.2,20.8)}]) {
+                assert.equal(match(rule.id,s,{...u,...change}),undefined,`${context} ${JSON.stringify(change)}`);
+            }
+            assert.equal(match(rule.id,s,u,() => false),undefined,`${context} explicit prerequisite filter`);
+            assert.ok(match(rule.id,s,{...u,profile:null}),`${context} globally applicable evidence`);
+            const rec = {id:'proposal',severity:'action',profile:1,axis,evidence:[{fid:'symptom',id:symptom,log:3,profile:1}]};
+            assert.ok(H.causesOf(rec,[s,u]).some(k=>k.rule===rule.id),`${context} recommendation retrieves original spans`);
+            if (rule.before) {
+                assert.equal(match(rule.id,s,{...u,evidence:undefined,times:[]}),undefined,`${context} unknown onset cannot establish precedence`);
+                assert.equal(match(rule.id,s,{...u,evidence:span(10,11)}),undefined,`${context} remote earlier event is not a cause`);
+                assert.equal(match(rule.id,s,{...u,evidence:undefined,times:[19]}),undefined,`${context} different time bases cannot establish precedence`);
+            }
+        }
+    }
+});
+
+test('audit hierarchy guidance: directions, uncertainty and output-limit diagnosis remain consistent with advice', () => {
+    const text = id => H.RULES.find(k=>k.id===id).first.join(' ');
+    assert.match(text('K4'),/time delay does not identify a B or F gain change/);
+    assert.doesNotMatch(text('K4'),/Then increase the B gain|acceleration limit|response time/);
+    assert.match(text('K13'),/Coherence does not show which loop causes/);
+    assert.doesNotMatch(text('K13'),/Decrease the governor gain/);
+    assert.match(text('K14'),/throttle.*limit.*before you increase the headspeed/);
+    assert.match(text('K16'),/estimate and its uncertainty/);
+    assert.doesNotMatch(text('K16'),/Adjust pitch_collective_ff_gain first/);
+    assert.match(text('K18'),/larger acceleration limit.*setpoint change faster/i);
+    assert.doesNotMatch(text('K18'),/Decrease the.*acceleration limit/);
+    assert.match(text('K22'),/same time does not show that the RPM signal is correct/);
+    for (const id of ['K12','K24','K25','K26']) {
+        assert.match(text(id),/before/,id);
+        assert.doesNotMatch(text(id),/Gains cannot correct|Gain changes cannot correct|decrease the governor headspeed/,id);
+    }
+    for (const id of ['K24','K25','K26']) assert.match(text(id),/does not identify.*cause/,id);
 });
 
 test('texts: titles, about texts, edge reasons, K rule names and steps, notes are STE (simple local check)', () => {

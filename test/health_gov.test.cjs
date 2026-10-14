@@ -130,7 +130,8 @@ test('low governor F: droop flagged, F carries little of the load', () => {
     assert.equal(g3.severity, 'flag', show(r.of('G3')));
     assert.ok(g3.value > 0.05, `droop ${g3.value}`);
     assert.ok(Math.abs(r.metrics.authority.byProfile[1].F.mean) < 0.05, 'F share with F = 0');
-    assert.match(g3.text, /F too low/);
+    assert.match(g3.text, /higher F gain is a possible test after its prerequisite checks/);
+    assert.doesNotMatch(g3.text, /F too low/);
     assert.ok(g3.value > clean.of('G3')[0].value * 2, 'droop grows when F is removed');
 });
 
@@ -162,12 +163,18 @@ test('high governor P: oscillation flagged in the P band at the loop crossover',
 test('throttle ceiling: saturation flagged as headroom, not gains', () => {
     const r = run({ maxThrottle: 0.8 }, { maxThrottle: { 1: 80 } }), g6 = r.of('G6')[0], g7 = r.of('G7')[0];
     assert.equal(g6.severity, 'flag', g6.text);
-    assert.match(g6.text, /Saturation, not a gain problem/);
+    assert.match(g6.text, /no reserve during these periods/);
+    assert.doesNotMatch(g6.text, /not a gain problem/);
+    assert.deepEqual(g6.throttleLimit, { value: 800, source: 'CLI gov_max_throttle', estimated: false });
+    const inferred = run({ maxThrottle: 0.8 }).of('G6')[0];
+    assert.equal(inferred.throttleLimit.estimated, true);
+    assert.match(inferred.text, /These periods do not show that the throttle was at its maximum/);
+    assert.doesNotMatch(inferred.text, /no reserve during these periods/);
     const runs = r.metrics.G6.byProfile[1].runs.filter(q => q.value >= 0.1 && q.deficit > 0.02);
     assert.ok(runs.length >= 8, `saturated runs ${runs.length}: every pump needs more than 80 %`);
     assert.ok(g7 && g7.value > 0, 'the governor asks for more than the output at the ceiling');
     const g3 = r.of('G3')[0];
-    if (g3.severity !== 'ok') assert.match(g3.text, /headroom|saturate|ceiling/);
+    if (g3.severity !== 'ok') assert.match(g3.text, /throttle limit/);
 });
 
 test('RPM dropouts: every FALLBACK found at its time, with glitch evidence', () => {
@@ -176,6 +183,11 @@ test('RPM dropouts: every FALLBACK found at its time, with glitch evidence', () 
     assert.ok(g1, show(r.of('G1')));
     const fb = r.metrics.G1.fallbackEntries;
     assert.equal(fb.length, 4, JSON.stringify(fb));
+    // Worker/report time links retain the lowercase legacy "at N s" anchor.
+    assert.deepEqual([...g1.text.matchAll(/\bat (\d+(?:\.\d+)?) s\b/g)].map(m => +m[1]), fb.map(e => e.t));
+    assert.match(g1.text, /FALLBACK does not show that the RPM source is incorrect/);
+    assert.match(g1.text, /FALLBACK mode switch that is on/);
+    assert.doesNotMatch(g1.text, /The RPM signal is not available or has errors/);
     for (const t of at.concat([80.4])) assert.ok(fb.some(e => Math.abs(e.t - t) < 0.02 && e.glitchSamplesNear > 0), `fallback at ${t}`);
     for (const t of at) assert.ok(r.metrics.G1.events.some(e => Math.abs(e.t - t) < 0.05), `glitch proxy near ${t}`);
     assert.ok(r.metrics.states.entries.filter(e => e.state === 'RECOVERY').length === 4, 'each fallback ends in recovery');
@@ -197,8 +209,8 @@ test('voltage compensation on is recognised from motor[0]/govSum', () => {
     assert.ok(m.unityShare < 0.1, `unity share ${m.unityShare}`);
     assert.ok(m.corrWithPredicted > 0.9, `correlation with the predicted gain ${m.corrWithPredicted}`);
     assert.ok(Math.abs(m.median - m.predictedMedian) < 0.01);
-    assert.match(r.of('G8')[0].text, /voltage compensation on/);
-    assert.match(clean.of('G8')[0].text, /voltage compensation off/);
+    assert.match(r.of('G8')[0].text, /voltage compensation is on/);
+    assert.match(clean.of('G8')[0].text, /voltage compensation is off/);
 });
 
 test('wrong motor poles: main rotor line off the logged headspeed', () => {
@@ -247,7 +259,7 @@ test('few events: no finding, with the count', () => {
     const r = run({ seconds: 8 });
     const g3 = r.of('G3')[0];
     assert.equal(g3.severity, 'note');
-    assert.match(g3.text, /no finding: \d+ collective rises/);
+    assert.match(g3.text, /No result: \d+ collective increases/);
 });
 
 test('G7 compares the compensated demand with the output: govSum is logged before vcomp, motor[0] after', () => {
@@ -268,7 +280,7 @@ test('collective events are measured on the one-sided travel: full pitch is 1, e
     // the pumps go from 0.1 (1.2 deg) to 0.95-1.25 of 1000 units: 0.08 to 0.76-1.0 of the travel
     assert.ok(Math.max(...ev.map(e => e.to)) > 0.9, `largest 'to' ${Math.max(...ev.map(e => e.to))}`);
     assert.ok(ev.some(e => e.bin === 3), 'the >= 0.60 bin is reachable');
-    assert.match(clean.of('G3')[0].text, /of one-sided collective travel/);
+    assert.match(clean.of('G3')[0].text, /of travel from center to maximum/);
 });
 
 test('cell count: an inferred count that is ambiguous gives no per-cell verdict; the CLI count is used as given', () => {
@@ -383,4 +395,114 @@ test('collective events: one event per step, never the same step twice', () => {
     s.w.extra['mixer[3]'] = c;
     const ev = hg.analyse(s.w, s.ctx).G3.events, key = ev.map(e => e.dir + e.t);
     assert.equal(new Set(key).size, key.length, `duplicate events: ${key.length} events, ${new Set(key).size} distinct`);
+});
+
+
+test('governor gain diagnosis separates unsaturated response from severe output limits', () => {
+    const event = (i, saturated, droop, share = 0.2) => ({ t: 5 + i * 3, dir: 'rise', profile: 1, size: 0.4,
+        saturated, droop, overshoot: 0.005, recoveryS: saturated ? 2.5 : 0.2, censored: false,
+        delta: {sum: 0.2, F: share * 0.2}, share: {F: share} });
+    const events = Array.from({length:20}, (_,i)=>event(i,false,0.02)).concat(Array.from({length:5},(_,i)=>event(i+20,true,0.12)));
+    const judge = list => hg.judge([{ log: 1, metrics: {...clean.metrics, G3: {...clean.metrics.G3, events:list}} }]);
+    const findings = judge(events), g3 = findings.find(f=>f.id==='G3'), g5 = findings.find(f=>f.id==='G5');
+    assert.equal(g3.governorResponse.unsaturated.n,20);
+    assert.ok(Math.abs(g3.governorResponse.unsaturated.mean-0.02)<1e-12);
+    assert.ok(Math.abs(g3.governorResponse.saturated.mean-0.12)<1e-12);
+    assert.equal(g3.governorResponse.lowF,false,'good response below the limit does not authorize extra F');
+    assert.equal(g5.value,0.2); assert.equal(g5.severity,'ok','saturated recovery does not size P');
+    assert.equal(g5.governorResponse.saturatedExcluded,5);
+    for(const shares of [[0,0.3,0.6],[-0.1,-0.1,-0.1],[3,4,5]]) {
+        const g=judge(shares.map((s,i)=>event(i,false,0.08,s))).find(f=>f.id==='G3');
+        assert.equal(g.governorResponse.lowF,false,'invalid or uncertain shares cannot justify F');
+    }
+    const low = judge([0.10,0.11,0.12].map((s,i)=>event(i,false,0.08,s))).find(f=>f.id==='G3');
+    assert.equal(low.governorResponse.lowF,true,'repeated droop and a clearly small F share justify a trial');
+    const negative = [0,1,2].map(i=>({...event(i,false,0.08),delta:{sum:-0.1,F:-0.02}}));
+    assert.equal(judge(negative).find(f=>f.id==='G3').governorResponse.lowF,false,'negative output differences cannot identify an added-throttle fraction');
+});
+
+test('governor event evidence preserves when the throttle first reaches its limit', () => {
+    const events = run({maxThrottle:0.8}).metrics.G3.events;
+    assert.ok(events.some(e=>e.saturated));
+    for(const e of events) {
+        if(e.saturated) {
+            assert.equal(typeof e.firstCeilingT,'number');
+            assert.ok(e.firstCeilingT < e.t+1.001);
+            if(e.firstCeilingT>e.t) assert.ok(e.droopBeforeCeiling>=0);
+        } else assert.equal(e.firstCeilingT,null);
+        if(e.delta.sum<=0.001) assert.equal(e.share,null);
+    }
+});
+
+test('raw G9 text preserves the frequency classification without making it a causal diagnosis', () => {
+    const peak = { hz:3, hzSe:0.1, band:[2,10], prominence:8, prominenceSe:0.2, amplitude:0.01, collectiveCoherence:0.1, n:10 };
+    const judge = (band, over={}) => hg.judge([{log:0,metrics:{...clean.metrics,G9:{windowS:2,byProfile:{1:{windows:10,[band]:{...peak,...over}}}}}}])
+        .find(f=>f.id==='G9'&&f.text.includes(`(${band}-type)`));
+    for (const band of ['P','I']) {
+        const f=judge(band);
+        assert.equal(f.severity,'flag');
+        assert.equal(f.value,8); assert.equal(f.se,0.2);
+        assert.match(f.text,new RegExp(`lower governor ${band} gain is a possible test after its prerequisite checks`));
+        assert.match(f.text,/does not identify the cause/);
+        assert.doesNotMatch(f.text,/gain too high|governor [PI] too high/);
+    }
+    const forced=judge('P',{collectiveCoherence:0.9});
+    assert.equal(forced.severity,'note');
+    assert.match(forced.text,/collective can cause this response/);
+    assert.doesNotMatch(forced.text,/gain is a possible test/);
+});
+
+test('raw G1 without a glitch proxy requires cause inspection instead of a sensor-failure claim', () => {
+    const metrics={...clean.metrics,G1:{...clean.metrics.G1,glitchInFlight:0,fallbackEntries:[{
+        t:10,value:0.25,headspeedAt:2200,headspeedMax:2200,glitchSamplesNear:0,profile:1}]}};
+    const finding=hg.judge([{log:0,metrics}]).find(f=>f.id==='G1'&&f.severity==='flag');
+    assert.equal(finding.value,1,'The FALLBACK prerequisite remains open even without detected proxy glitches.');
+    assert.match(finding.text,/at 10 s \(0\.25 s long\)/);
+    assert.match(finding.text,/"glitch-proxy" has 0 samples/);
+    assert.match(finding.text,/FALLBACK does not show that the RPM source is incorrect/);
+    assert.match(finding.text,/low RPM, sudden RPM changes, or a FALLBACK mode switch that is on/);
+    assert.match(finding.text,/Examine the mode switch and the RPM signal at each entry/);
+    assert.doesNotMatch(finding.text,/The RPM signal is not available or has errors/);
+});
+
+test('raw G10 text reports association or weak evidence without implicating or ruling out the governor', () => {
+    const judge = (coherence,heads=20) => hg.judge([{log:0,metrics:{...clean.metrics,G10:{byProfile:{1:{
+        windows:10,coherence,coherenceSe:0.01,headspeedAmplitude:heads,frameSign:-1,coherenceRaw:0.9,
+        wagHz:8,maxCoherence:coherence,maxCoherenceHz:8,yawAmplitude:30}}}}}]).find(f=>f.id==='G10');
+    const high=judge(0.8), low=judge(0.05,5), middle=judge(0.3);
+    assert.equal(high.severity,'flag'); assert.equal(low.severity,'ok'); assert.equal(middle.severity,'note');
+    assert.match(high.text,/does not show which loop causes/);
+    assert.match(low.text,/small in these windows/);
+    for (const f of [high,low,middle]) assert.doesNotMatch(f.text,/governor implicated|governor ruled out/);
+});
+
+test('raw G12 text directs the RPM check to motor poles and sensor while accepting the configured ratios', () => {
+    const f=hg.judge([{log:0,metrics:{...clean.metrics,G12:{...clean.metrics.G12,mainOrder:0.8,mainOrderSe:0.001,mainProminence:10}}}])
+        .find(f=>f.id==='G12');
+    assert.equal(f.severity,'flag'); assert.equal(f.value,0.8);
+    assert.match(f.text,/Check motor_poles and the RPM sensor/);
+    assert.match(f.text,/gear ratios in the configuration are correct/);
+    assert.doesNotMatch(f.text,/check motor_poles and gear ratio/i);
+    assert.doesNotMatch(clean.of('G12')[0].text,/Check motor_poles/);
+});
+
+test('raw G3 and G5 text distinguishes a conditional gain test from unobserved recovery', () => {
+    const event=i=>({t:i*4,dir:'rise',profile:1,size:0.4,saturated:false,droop:0.08,overshoot:0.005,
+        recoveryS:1+i*0.1,censored:false,delta:{sum:0.2},share:{F:0.1}});
+    const judge=events=>hg.judge([{log:0,metrics:{...clean.metrics,G3:{events}}}]);
+    const events=[0,1,2].map(event), observed=judge(events), censored=judge(events.map((e,i)=>({...e,censored:i===1})));
+    const g3=observed.find(f=>f.id==='G3');
+    assert.equal(g3.governorResponse.lowF,true);
+    assert.match(g3.text,/possible test after its prerequisite checks/);
+    const measured=observed.find(f=>f.id==='G5'), lower=censored.find(f=>f.id==='G5');
+    assert.equal(lower.value,measured.value,'the wording does not change the measured lower bounds');
+    assert.equal(lower.se,measured.se);
+    assert.match(lower.text,/is a minimum of 1\.1 s/);
+    assert.match(lower.text,/1 responses did not get to the band/);
+    assert.match(lower.text,/minimum times have an SE/);
+    assert.doesNotMatch(measured.text,/minimum|did not get to the band|minimum times/);
+    assert.match(measured.text,/1\.1 ± 0\.058 s/);
+    const held=judge(events.map(e=>({...e,share:{F:0.8}}))).find(f=>f.id==='G3');
+    assert.equal(held.governorResponse.lowF,false);
+    assert.match(held.text,/does not identify an F gain change/);
 });

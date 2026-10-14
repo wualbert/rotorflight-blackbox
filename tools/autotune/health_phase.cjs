@@ -524,14 +524,13 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 const size = wv.value >= 0 ? `${fmt(pct(wv.value), 2)} % more than ${ref}` : `${fmt(-pct(wv.value), 2)} % less than ${ref}`;
                 const band = `a band of ${fmt(RULE.handover.band * 100, 0)} % around ${ref}`, settle = wv.censored ? `The headspeed does not become stable in ${band} in ${fmt(wv.windowS, 1)} s.`
                     : wv.settleS > 0 ? `The headspeed becomes stable in ${band} after ${fmt(wv.settleS, 2)} s.` : `The headspeed stays in ${band} from the change.`;
-                // a change after the liftoff (D-M5c): the pilot increased the collective before the governor was ACTIVE. The
-                // spool-up time is not the cause: the procedure of C15 is the correction (advice reads afterLiftoff)
+                // A change after liftoff can coincide with a rotor-load change. Timing alone does not isolate its cause.
                 const air = !!wv.afterLiftoff, lifted = air && wv.liftoffT !== null;
                 const verdict = !flag ? `This is less than ${fmt(R.flag * 100, 0)} %, and the time is less than ${R.settleS} s.`
                     : air ? `This is more than the limit of ${fmt(R.flag * 100, 0)} % or ${R.settleS} s.` : `This is more than the limit of ${fmt(R.flag * 100, 0)} % or ${R.settleS} s. Examine the spool-up and governor adjustments.`;
                 const inAir = !air ? '' : (lifted ? `The change comes ${fmt(wv.afterLiftoffS, 2)} s after the liftoff ${at(wv.liftoffT)}. ` : 'The change comes in flight. ')
-                    + 'Thus, the helicopter was airborne before the governor was ACTIVE, and the load of the rotor causes a part of the error. A longer spool-up time does not correct this.'
-                    + (flag ? ' Keep the collective low until the governor is ACTIVE. Then increase the collective to the hover value.' : '');
+                    + 'A change in rotor load can cause part of the error. The time of this change does not identify a governor parameter change.'
+                    + (flag ? ' Compare collective, throttle and headspeed around the change to ACTIVE.' : '');
                 add('G16', flag ? 'flag' : 'ok', f, wv.profile, { value: wv.value, se: m.n >= 3 ? m.peakError.se : null, n: m.n, threshold: { flag: R.flag, settleS: R.settleS }, overshoot: wv.overshoot, undershoot: wv.undershoot,
                     throttleStepPct: wv.throttleStepPct, settleS: wv.settleS, censored: wv.censored, reference: m.reference, phase: air ? 'flight' : PHASE_OF.G16,
                     afterLiftoff: air, liftoffT: wv.liftoffT, afterLiftoffS: wv.afterLiftoffS, afterLiftoffN: m.afterLiftoffN || 0,
@@ -567,8 +566,8 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 const one = (e) => `At ${fmt(e.t, 1)} s, the ${e.axis} rate has an oscillation${e.hz !== null ? ` at ${pm(e.hz, e.hzSe, 1)} Hz` : ''} of ${fmt(e.value, 1)} deg/s rms on the skids.` +
                     (e.growth !== null ? ` The oscillation ${grows(e) ? 'increases' : 'does not increase'} (${pm(e.growth, e.growthSe, 2)} /s).` : '') +
                     ` The collective is ${e.collective === null ? 'unknown' : fmt(e.collective, 0)} and the headspeed is ${fmt(e.headspeed, 0)} rpm${e.state ? `, with the governor in ${e.state}` : ''}.`;
-                const verdict = bad.length ? 'This is a ground resonance. Keep the collective low until the governor is ACTIVE. Then increase the collective to the hover value quickly. Examine the dampers of the main rotor and the skids.'
-                    : ep.length ? `The oscillation does not increase. Thus, it is not a ground resonance.` : '';
+                const verdict = bad.length ? 'Ground resonance is a possible cause. This check does not identify a gain change. Examine the dampers of the main rotor and the skids.'
+                    : ep.length ? `The measured oscillation does not increase by more than ${sig} SE. This check does not identify its cause.` : '';
                 add('C15', bad.length ? 'flag' : ep.length ? 'note' : 'ok', f, top ? top.profile : null, { value: top ? top.value : 0, n: ep.length, axis: top ? top.axis : null, threshold: { peak: R.peak, sig, limit: R.peak }, hz: top ? top.hz : null, hzSe: top ? top.hzSe : null,
                     growth: top ? top.growth : null, growthSe: top ? top.growthSe : null, collective: top ? top.collective : null, headspeed: top ? top.headspeed : null, groundS: m.groundS,
                     events: ep.map(e => ({ t: e.t, value: e.value, axis: e.axis, seconds: e.seconds, hz: e.hz, growth: e.growth })),

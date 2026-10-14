@@ -1,5 +1,29 @@
 # Unreleased
 
+- Build an aircraft-specific rotational digital twin from automatically selected flight intervals. Save fitted parameters, physical priors, validation traces and rejected intervals. Require independent plant, firmware and closed-loop checks before control gain export. Execute pinned Rotorflight PID, mixer and governor source through WebAssembly, with unsupported dynamics and configuration gaps reported explicitly.
+- Accelerate native gyro reconstruction with indexed typed-array loops. Preserve sample coverage, arithmetic order, solver stopping rules and validation thresholds.
+- Distinguish corrected filter settings from unconfirmed signal predictions. Report valid short profile periods as unmeasured instead of invalidating the long-period replay. Accept validated partial corrections or significant measured progress while retaining unresolved problems, regression checks and export prerequisites. Prefer lower delay when finalists have the same check results and training noise differences within one standard error.
+- Select filter candidates by correction of recorded filter problems before noise reduction. Combine missing LPF and rotor-notch repairs and validate the original checks on training and reserved periods. Preserve missing measurements and removed RPM-bank checks as unresolved results that cannot count as corrections.
+- Keep header-change history in recorded log order when the flight controller clock is unset or moves backwards.
+- Put throttle-limit actions before the measurements, including before control Autotune. Show numbered battery, ESC and governor-response checks, the next flight test and its success condition. Keep measurements in expandable details and include the same procedure in saved reports.
+- Distinguish an inferred throttle ceiling from confirmed full throttle. When the highest logged output supplies the ceiling, ask the pilot to confirm the governor limit before diagnosing exhausted reserve.
+- Preserve full-flight phase masks across configuration changes during filter replay. Keep each interval's original values when resetting filters, label the unchanged baseline consistently, and suppress its CLI export. Distinguish missing coverage from model disagreement, show precise excluded periods and next actions, and allow a new search after changing the delay limit.
+- Add one-trial selection to control Export, identify recorded base values, and show blocked prerequisites explicitly. Decode only selected logs for gain extraction.
+- Start each tuning step at its heading when switching tabs. Retain the scroll position for updates within the same step.
+- Show remaining filter problems beside accepted replay results. Display checklist periods in seconds so short intervals keep distinct endpoints.
+- Defer tuning workspace replacement until the native dropdown finishes its change event, preventing macOS crashes when changing flights or plot intervals.
+
+- Audit all tuning recommendation generators and prerequisite instructions. Remove arbitrary input-reduction trials, retain unresolved diagnoses, and distinguish proposed changes from measured outcomes. Require valid uncertainty and complete model validation before gain export.
+- Separate governor response before full throttle from speed loss at the output limit. Exclude saturated events and incomplete recoveries from gain-increase decisions. Keep the RPM prerequisite open when FALLBACK coincides with an output limit.
+- Correct rate acceleration guidance and tail-limit diagnosis. Validate recorded filter values, scopes and conflicting exports. Show the evidence, prerequisites and next measurement for each control result.
+- Use structured setup measurements for recommendation decisions and include all health modules in text validation.
+- Align raw measurement details and saved reports with guarded recommendations. Keep fitted gains descriptive, remove circular diagnostic instructions, and preserve actual PID profile numbers at rescue transitions.
+- Diagnose FALLBACK without assuming an RPM-source defect. Keep insufficient measurements and analysis errors visible when other checks pass, and use consistent analysis-detail labels.
+- Put available prerequisite work before held parameter changes. Keep long prerequisite lists accessible in a labeled expansion. Require diagnosis of rescue/profile switching before a transmitter change.
+- Explain every filter CLI refusal beside the replay result and in Export. Keep replay acceptance separate from export eligibility, and use the same validation for both filter export paths.
+
+- Replace repeated filter autotune with Simulate again for the current parameter values. Remove the redundant Recorded output and model replay plots. Hide completed control autotune actions.
+
 - Simplify the Tuning Overview to its prerequisite checklist and tuning sequence. Keep priorities on the steps and show recommendations, parameter changes and blockers in the selected step's details.
 
 - Refocus control autotune on recorded problems and the reasons for each recommended change. Show the evidence and parameter values together. Remove unmeasurable new-response columns and keep recorded comparisons and model estimates in supporting details.

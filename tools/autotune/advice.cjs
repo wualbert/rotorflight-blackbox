@@ -30,8 +30,9 @@
  *                           1 as the viewer's log picker)
  *
  * A recommendation: { id, node, area, order, severity, title, text, parameter, scope, cliProfile, profile, rateProfile,
- * axis, from, fromSource, fromSets, to, direction, cli, evidence, rule, confidence, blockedBy, gate, causes, caveats, group,
- * groupSize, citedFids? }. profile is the PID profile (1-6, 0 = PID profile unknown, null for a global value), cliProfile its
+ * axis, from, fromSource, fromSets, to, direction, cli, evidence, rule, confidence, blockedBy, holds, gate, causes, caveats, group,
+ * groupSize, citedFids?, procedure? }. procedure contains the next action, ordered diagnostic steps and the follow-up.
+ * It does not authorize a parameter change. profile is the PID profile (1-6, 0 = PID profile unknown, null for a global value), cliProfile its
  * CLI index; rateProfile the rate profile (1-6) of a rate result when the log shows it, else null. from is null when the
  * present value of that profile is unknown; fromSource says where from comes from (SPEC2 D12); fromSets { name: the value
  * at this time } for each name that the change sets, when it is known (the export comments). group 'C7:<axis>:<bin>' and
@@ -45,6 +46,7 @@
  *             "Profiles"), profileLabel the toolkit label when it is different, pidProfile 1-6 or null
  *   node      the step of the tuning sequence (hierarchy.cjs homeOf); the list is sorted by step and row, then by the
  *             documented sequence inside the step (D, P, I, then FF on each axis: K7), the axis and the severity
+ *   holds     steps whose guards block this change, including guards not represented by a direct hierarchy gate
  *   gate      null, or { by, held, profileBy } when hierarchy.cjs status (all PID profiles) calls the node Blocked:
  *             by = the steps before it that have a problem, profileBy = those that block the node in the status of the
  *             PID profile of the recommendation (SPEC2 D12; all profiles for one with no PID profile), held = those
@@ -138,6 +140,7 @@ const RULES = {
     sigmas: 2,              // a flag with an SE must clear its threshold by this many SE to keep its CLI (guard 4)
     maxStep: 0.20,          // relative step bound (guard 5)
     dirStep: 0.10,          // relative step when a check gives a direction but no size
+    compensationStart: 10, // first pitch collective FF trial from zero, bounded by the measured change minus 2 SE
     minLpfHz: 60,           // never propose a gyro LPF below this (guard 6)
     noteLpfHz: 80,
     lpfHz: 100,             // the one LPF to add with RPM or dynamic notches
@@ -208,7 +211,7 @@ const RULES = {
 // gains PID_GAIN_MAX (flight/pid.h:35). The notch arrays (MODE_ARRAY) have no range there.
 const RANGE = { gyro_decimation_hz:[0,1000], motor_rpm_lpf:[0,255], blackbox_rate_denom: [1, 8000], gyro_lpf1_static_hz: [0, 1000], gyro_lpf2_static_hz: [0, 1000], gyro_lpf1_dyn_min_hz: [0, 1000], gyro_lpf1_dyn_max_hz: [0, 1000], dyn_notch_q: [10, 100],
     yaw_cw_stop_gain: [25, 250], yaw_ccw_stop_gain: [25, 250], yaw_collective_ff_gain: [0, 250], pitch_collective_ff_gain: [0, 250],
-    gov_p_gain: [0, 250], gov_i_gain: [0, 250], gov_f_gain: [0, 250], gyro_rpm_notch_preset: [0, 3], yaw_inertia_precomp_gain: [0, 250], gov_spoolup_time: [0, 600],  // settings.c:959
+    gov_p_gain: [0, 250], gov_i_gain: [0, 250], gov_f_gain: [0, 250], gov_gain: [0, 250], gyro_rpm_notch_preset: [0, 3], yaw_inertia_precomp_gain: [0, 250], gov_spoolup_time: [0, 600],  // settings.c:959
     // round 3 M2, the filter search (filter_tune.cjs FW_RANGE): settings.c:672-681 (LPF_MAX_HZ 1000, DYN_NOTCH_COUNT_MAX 8), 1124-1134
     dyn_notch_count: [0, 8], dyn_notch_min_hz: [10, 200], dyn_notch_max_hz: [100, 500], gyro_notch1_hz: [0, 1000], gyro_notch1_cutoff: [0, 1000],
     gyro_notch2_hz: [0, 1000], gyro_notch2_cutoff: [0, 1000], gyro_rpm_notch_min_hz: [1, 100] };
@@ -238,6 +241,7 @@ const OSC = (TRACK && TRACK.RULE && TRACK.RULE.osc) || {}, ONSET = OSC.onset || 
 const TTRACK = (TRACK && TRACK.RULE && TRACK.RULE.track) || {};                              // health_track RULE: the C12 / T11 low-pass and setpoint gate
 const MRULE = (MORE && MORE.RULE) || {};                                                    // health_more RULE: the F10 and F11 bands
 const SIGMA = { C3: [LR.C3.iShare, 0], T9: [LR.T9.iShare, 0], C11: [LR.C11.share, 1], T5: [LR.T5.ratio, 1], T6: [LR.T6.kick, 1], T7: [LR.T7.r, 0], F6: [SR.F6.minDb, -1],
+    G5: [GR.G5.flag, 1], G10: [GR.G10.implicated, 1], C6: [LR.C6.prominence, 1], T2: [LR.T2.prominence, 1],
     C12: [ruleNum(TR, 'C12', 'flag'), 1], T11: [ruleNum(TR, 'T11', 'flag'), 1], C13: [ruleNum(TR, 'C13', 'flag'), 1], T12: [ruleNum(TR, 'T12', 'flag'), 1], R1: [ruleNum(TR, 'R1', 'flag'), 1],
     F10: [ruleNum(MR, 'F10', 'share'), 1], C14: [ruleNum(MR, 'C14', 'flag'), 0] };
 
@@ -277,6 +281,7 @@ for (const [ax, def] of [['roll', [50, 100, 0, 100, 0]], ['pitch', [50, 100, 40,
     ['p', 'i', 'd', 'f', 'b'].forEach((k, i) => { PARAMS[`${ax}_${k}_gain`] = ['profile', `${ax}PID`, i, def[i]]; });
 Object.assign(PARAMS, {
     gov_p_gain: ['profile', 'govPID', 0, 40], gov_i_gain: ['profile', 'govPID', 1, 50], gov_f_gain: ['profile', 'govPID', 3, 10],
+    gov_gain: ['profile', 'govPID', 4, 40],
     yaw_cw_stop_gain: ['profile', 'yaw_stop_gain', 0, 120], yaw_ccw_stop_gain: ['profile', 'yaw_stop_gain', 1, 80],
     yaw_collective_ff_gain: ['profile', 'yaw_precomp', 2, 60], pitch_collective_ff_gain: ['profile', 'pitch_compensation', null, 0],
     yaw_inertia_precomp_gain: ['profile', 'yaw_inertia_precomp', 0, 0],   // the T14 target: its value of each PID profile; T14 is a check, never CLI
@@ -472,7 +477,7 @@ const arr = (v) => Array.isArray(v) ? v : v === null || v === undefined ? null :
 const pick = (v, i) => v === undefined || v === null ? null : i === null || i === 'all' ? v : (arr(v)[i] === undefined ? null : arr(v)[i]);
 const sum = (list) => list.reduce((s, f) => s + (num(f.value) || 0), 0);
 const isFlag = (f) => f.severity === 'flag';
-const thin = (f) => !!f.thin || /^no finding/i.test(String(f.text || ''));   // SPEC2 D5: our modules mark thin data, the others still write "no finding"
+const thin = (f) => !!f.thin || /^no (?:finding|result)/i.test(String(f.text || ''));   // SPEC2 D5: our modules mark thin data, the others still write "no finding"
 const measured = (f) => (f.severity === 'flag' || f.severity === 'ok' || f.severity === 'note') && !thin(f);
 const logsOf = (f) => Array.isArray(f.log) ? f.log : f.log === null || f.log === undefined ? [] : [f.log];
 const lab = (l, c) => typeof l === 'number' && c ? l + c.logBase : l; // a log as the reader counts them (input.logBase)
@@ -491,6 +496,7 @@ function resolved(f) {
 }
 // the PID profile of an H finding (its scope 'start profile N'), or null for 'global'
 const hProfile = (h) => { const q = pidOk(h.pidProfile); if (q !== null) return q; const m = /^start profile (\d+)$/.exec(String(h.profile)); return m && +m[1] > 0 ? +m[1] : null; };
+const headerKeyOf = (f) => typeof f.headerKey === 'string' ? f.headerKey : String(f.text).split(':')[0];
 // the arming profile of a log of input.logs when the worker confirmed it (an in-flight event, the CLI sections, the CLI
 // gov_headspeed, or 'headspeed': the logged govRequest at the log start agrees with the gov_headspeed of exactly one PID
 // profile at the logged PID profile changes of the same file, user decision 2026-10-06), else null: then its profile 0 is
@@ -568,12 +574,14 @@ function hold(r, text, ids) { r.blockedBy.push(text); for (const id of ids || []
 
 // Estimate over logs, the flight being the independent unit: the inverse-variance mean when every log has an SE, with
 // SE the larger of the inverse-variance SE and the between-log SE (sd / sqrt(n)); a single log keeps its own SE.
+// Missing or invalid within-log uncertainty stays unknown. Zero SE uses the arithmetic mean and propagated uncertainty.
 function pooled(items) {
     const v = items.filter(x => num(x[0]) !== null);
     if (!v.length) return null;
-    if (v.length === 1) return { value: v[0][0], se: num(v[0][1]), n: 1 };
+    if (v.length === 1) return { value: v[0][0], se: num(v[0][1]) !== null && v[0][1] >= 0 ? v[0][1] : null, n: 1 };
     const m = v.reduce((s, x) => s + x[0], 0) / v.length, seB = Math.sqrt(v.reduce((s, x) => s + (x[0] - m) ** 2, 0) / (v.length - 1) / v.length);
-    if (!v.every(x => num(x[1]) > 0)) return { value: m, se: seB, n: v.length };
+    if (!v.every(x => num(x[1]) !== null && x[1] >= 0)) return { value: m, se: null, n: v.length };
+    if (v.some(x => x[1] === 0)) return { value: m, se: Math.max(seB, Math.sqrt(v.reduce((s,x) => s + x[1] ** 2, 0)) / v.length), n: v.length };
     const w = v.map(x => 1 / x[1] ** 2), W = w.reduce((s, x) => s + x, 0);
     return { value: v.reduce((s, x, i) => s + w[i] * x[0], 0) / W, se: Math.max(1 / Math.sqrt(W), seB), n: v.length };
 }
@@ -581,13 +589,14 @@ function pooled(items) {
 // guard 4: does estimate e clear threshold thr by RULES.sigmas SE (side 1 above, -1 below, 0 on |value|)? null when it
 // cannot be tested (no SE or no threshold)
 function clears(e, thr, side) {
-    if (!e || num(e.value) === null || num(e.se) === null || num(thr) === null) return null;
+    if (!e || num(e.value) === null || num(e.se) === null || e.se < 0 || num(thr) === null) return null;
     const k = RULES.sigmas * e.se;
     return side < 0 ? e.value + k < thr : side === 0 ? Math.abs(e.value) - k > thr : e.value - k > thr;
 }
 // the failed 2-SE test in words, or null
 const fails = (e, thr, side, what) => clears(e, thr, side) === false ? `${what} gives ${pm(e.value, e.se, 3)} (${many(e.n, 'log')}). `
-    + (side === 0 ? `Without its sign, this is not more than ${thr} by ${RULES.sigmas} SE.` : `This is not ${side < 0 ? 'less' : 'more'} than ${thr} by ${RULES.sigmas} SE.`) : null;
+    + (side === 0 ? `Without its sign, this is not more than ${thr} by ${RULES.sigmas} SE.` : `This is not ${side < 0 ? 'less' : 'more'} than ${thr} by ${RULES.sigmas} SE.`)
+    : num(thr) !== null && clears(e, thr, side) === null ? `${what} has no uncertainty estimate. Thus, the ${RULES.sigmas} SE test cannot be satisfactory.` : null;
 function sig(r, e, id) {
     const [t, side] = SIGMA[id] || [null, 1], thr = t === null ? num(r.evidence.length ? r.evidence[0].threshold : null) : t;
     r.sig = fails(e, thr, side, `Check ${id}`);
@@ -635,10 +644,10 @@ function current(c, param, p) {
         : scope !== 'global' && hv !== null ? 'otherProfile' : 'missing';
     return { value: null, unknown: why };
 }
-// what records the values of a PID profile: the log header of a log that starts in it (the header is written once, when the
-// pilot arms the helicopter). A description (a caveat or a note): never an instruction, and never a CLI dump (user rule
+// what records the values of a PID profile: the header is written only when a new log starts. A re-arm in
+// blackbox_grace_period continues the existing log. A description (a caveat or a note): never a CLI dump (user rule
 // 2026-10-06: the log is the only necessary input)
-const armedText = (p) => num(p) > 0 ? `The log header records the values of ${prof(p)} only when the pilot arms the helicopter in ${prof(p)}.` : 'The log header records the values of a PID profile only when the pilot arms the helicopter in that PID profile.';
+const armedText = (p) => num(p) > 0 ? `The log header records the values of ${prof(p)} only when a new log starts in ${prof(p)}.` : 'The log header records the values of the PID profile that is active when a new log starts.';
 // why the value of param on log profile p is unknown, for the pilot: the cause, then `then` (a sentence), then what records it
 function unknownText(c, param, p, why, then) {
     const t = then ? ` ${then}` : '';
@@ -684,7 +693,12 @@ function change(c, o) {
     }
     if (typeof b.value !== 'number') { r.severity = 'check'; r.caveats.push(`The value of ${o.parameter} is not a number (${b.source}). Thus, the app does not calculate a step.`); return r; }
     let to, want = null;
-    if (o.to !== undefined) to = o.to;
+    if (b.value === 0 && num(o.startStep) >= 1 && num(o.delta) > 0) {
+        to = Math.min(RULES.compensationStart, Math.floor(o.startStep));
+        r.rule += `\nFrom zero, the test step is at most ${RULES.compensationStart} units. It cannot be more than the measured change minus ${RULES.sigmas} SE.`;
+        r.caveats.push(`The first step from zero is ${to} units or less. This is a test step, not a measured best value.`);
+    }
+    else if (o.to !== undefined) to = o.to;
     else if (o.add !== undefined) { to = lim ? b.value + o.add : Math.max(0, b.value + o.add); if (Math.abs(o.add) >= 0.5 * b.value) r.caveats.push(`The step of the documentation, ${Math.abs(o.add)}, is 50 % or more of the value ${b.value}. A smaller step is possibly better.`); }
     else { want = o.mult !== undefined ? b.value * o.mult : b.value + o.delta; const step = RULES.maxStep * Math.abs(b.value), lo = b.value - step, hi = b.value + step;
         to = Math.round(Math.min(hi, Math.max(lo, want)));
@@ -815,7 +829,9 @@ const GEN = {
     },
     D2(L, c) {
         const bad = L.filter(isFlag), n = (f, re) => matchNum(re, f.text) || 0;
-        const parser = bad.filter(f => f.source === 'parser'), lost = bad.filter(f => f.source !== 'parser' && (n(f, /^(\d+) logging gaps/) || n(f, /(\d+) time jumps/) || n(f, /(\d+) non-increasing/) || n(f, /(\d+) loopIteration jumps/)));
+        const parser = bad.filter(f => f.source === 'parser'), lost = bad.filter(f => f.source !== 'parser' && (f.counts
+            ? ['logGaps', 'timeJumps', 'timeBackwards', 'iterationJumps'].some(k => num(f.counts[k]) > 0)
+            : n(f, /^(\d+) logging gaps/) || n(f, /(\d+) time jumps/) || n(f, /(\d+) non-increasing/) || n(f, /(\d+) loopIteration jumps/)));
         const stalls = bad.filter(f => !parser.includes(f) && !lost.includes(f)), parts = [];
         // the loop stalls of the flags (health_setup D2 events, in ms): their number and the longest, the cause of the flag
         // when no frame is missing (review V5: the value of check D2 does not count them)
@@ -823,7 +839,7 @@ const GEN = {
         const WHEN = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
         const whenOf = (f, e) => { const s = f.evidence && Array.isArray(f.evidence.spans) ? f.evidence.spans.find(q => q && q.value === e.value) || f.evidence.spans[0] : null; return s && WHEN[s.phase] ? `, ${WHEN[s.phase]}` : ''; };
         if (stalls.length) { const all = stalls.flatMap(f => stallsOf(f).map(e => ({ f, e }))), top = all.filter(x => num(x.e.value) !== null).sort((a, b) => b.e.value - a.e.value)[0];
-            const k = stalls.reduce((s, f) => s + (stallsOf(f).length || n(f, /(\d+) loop stalls/)), 0);
+            const k = stalls.reduce((s, f) => s + (f.counts ? num(f.counts.loopStalls) || 0 : stallsOf(f).length || n(f, /(\d+) loop stalls/)), 0);
             parts.push(`${cap(logsText(stalls, c))} ${stalls.length === 1 ? 'has' : 'have'} ${k ? many(k, 'loop stall') : 'loop stalls'} and no missing frame. Some intervals between frames are long.`
                 + (top ? ` The longest loop stall is ${fmt(top.e.value, 1)} ms (${whereOf(top.f, c)}${whenOf(top.f, top.e)}).` : '')
                 + ' A loop stall after disarm has no effect, but a loop stall in flight gives a time delay to the PID loop.'); }
@@ -834,8 +850,9 @@ const GEN = {
             sources: [src(SR.D2.source)], text: parts.join(' ') });
     },
     D3(L, c) {  // the parts naming checks that no module implements (NO_CHECK) are left out: logging those fields enables nothing
-        const sk = L.filter(f => f.severity === 'note' && /^checks that cannot run: /.test(String(f.text))), count = new Map();
-        for (const f of sk) for (const part of f.text.replace(/^checks that cannot run: /, '').split('; ')) if (!NO_CHECK.test(part)) { const m = /^([^(]+?) \(([^)]*)\)/.exec(part); if (!m) continue;
+        const sk = L.filter(f => f.severity === 'note' && (Array.isArray(f.skips) || /^checks that cannot run: /.test(String(f.text)))), count = new Map();
+        const parts = (f) => Array.isArray(f.skips) ? f.skips.map(s => `${s.checks.join('/')} (${s.missing.join(', ')})`) : f.text.replace(/^checks that cannot run: /, '').split('; ');
+        for (const f of sk) for (const part of parts(f)) if (!NO_CHECK.test(part)) { const m = /^([^(]+?) \(([^)]*)\)/.exec(part); if (!m) continue;
             const k = `${m[1]}|${and([...m[2].matchAll(/([\w]+(?:\[\d\])?) (absent|zero)/g)].map(x => `\`${x[1]}\`${x[2] === 'zero' ? ' (always 0)' : ''}`))}`; count.set(k, (count.get(k) || 0) + 1); }
         const items = [...count].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)); if (!items.length) return [];
         const say = ([k, v]) => { const [ids, fields] = k.split('|'); return `In ${many(v, 'log')}, ${checks(ids.split('/'))} did not operate${fields ? `, because the log does not have ${fields}` : ''}.`; };
@@ -876,7 +893,7 @@ const GEN = {
         return bad.map(f => rec({ id: `P1:${logsOf(f).join('+')}`, area: 'precondition', severity: 'check', title: `Possibly a weak battery (${logsText([f], c)})`, evidence: [evidence(f)], rule, sources,
                 text: `In ${logsText([f], c)}, ${many(f.severe, 'load step')} ${f.severe === 1 ? 'decreases' : 'decrease'} the voltage from ${fmt(lv(f).warning)} V or more for each cell to less than ${fmt(lv(f).min)} V. `
                     + `The lowest voltage is ${fmt(f.minCell, 2)} V for each cell, from ${fmt(f.beforeCell, 2)} V before the step.`
-                    + '\nCharge the battery, and measure the voltage of each cell. Then fly with a different battery, and compare the result of check P1.' }))
+                    + '\nCharge the battery. Measure the voltage of each cell. Then fly with a different battery. Compare the result of check P1.' }))
             .concat(low.map(f => rec({ id: `P1:${logsOf(f).join('+')}:low`, area: 'precondition', severity: 'watch', title: `Low battery voltage at the load steps (${logsText([f], c)})`, evidence: [evidence(f)], rule, sources,
                 text: `In ${logsText([f], c)}, the lowest voltage at a load step is ${fmt(f.minCell, 2)} V for each cell. This is less than the warning level of ${fmt(lv(f).warning)} V for each cell.\nLand at a higher battery voltage, or examine the battery.` })));
     },
@@ -884,7 +901,7 @@ const GEN = {
         const hi = L.filter(f => f.severity === 'note' && f.higher === true && !thin(f));
         return hi.map(f => rec({ id: `P2:${logsOf(f).join('+')}`, area: 'precondition', severity: 'watch', title: 'A battery with a larger voltage decrease for each 1 A', evidence: [evidence(f)], sources: [ruleSrc(PWR, 'P2')],
             rule: `Check P2 compares the voltage decrease for each 1 A of the batteries. A battery with more than ${fmt(num((PWR.P2 || {}).relHigh), 2)} x the median of the other batteries, by ${RULES.sigmas} SE, is a value to monitor.`,
-            text: `In ${logsText([f], c)}, the voltage decreases by ${pm(f.value, f.se, 1)} mΩ, and the median of the other batteries is ${fmt(f.othersMedian, 1)} mΩ.\nExamine this battery, for example with the charger.` }));
+            text: `In ${logsText([f], c)}, the voltage/current slope gives a resistance estimate of ${pm(f.value, f.se, 1)} mΩ, and the median of the other batteries is ${fmt(f.othersMedian, 1)} mΩ.\nExamine this battery, for example with the charger.` }));
     },
     D5: diag('D5', 'precondition', 'Battery voltage steps or low voltage', `Check D5 has a problem if \`Vbat\` changes by more than ${GR.D5.step} V in 10 ms. It also has a problem if \`Vbat\` stays less than ${GR.D5.minCell} V for each cell for ${GR.D5.minS} s or more.`,
         'Examine the battery, its connector and the voltage sensor. The app does not use the power results (G8, G11 and G13) at these times.', { noun: 'value', sources: [src(GR.D5.source)] }),
@@ -903,7 +920,7 @@ const GEN = {
                 text: lines.join(' ') + (ex.length > 2 ? ` ${cap(many(ex.length - 2, 'more log'))} also ${ex.length - 2 === 1 ? 'has' : 'have'} parts of this type.` : '') }));
     },
     H(L) {
-        const ch = L.filter(f => f.severity === 'note'), keys = new Map(); for (const f of ch) { const k = String(f.text).split(':')[0]; keys.set(k, (keys.get(k) || 0) + 1); }
+        const ch = L.filter(f => f.severity === 'note'), keys = new Map(); for (const f of ch) { const k = headerKeyOf(f); keys.set(k, (keys.get(k) || 0) + 1); }
         return one(ch, { id: 'H', area: 'logging', severity: 'info', title: 'Changes of the log header between logs', rule: 'Check H compares the log header of each log with the log header of the log before it.',
             text: `The log header has ${many(ch.length, 'change')} between logs: ${and([...keys].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `\`${k}\` (${v})`).concat(keys.size > 6 ? [`${keys.size - 6} more values`] : []))}. `
                 + 'A result from some logs together can mix different values. The app gives no CLI text for a change that it measured before the last change of its parameter.' });
@@ -938,8 +955,8 @@ const GEN = {
         return one(bad, Object.assign(base, { severity: 'action', title: `Add a gyro low-pass filter at ${RULES.lpfHz} Hz`, parameter: 'gyro_lpf1_static_hz', scope: 'global', from: num(h.gyro_lowpass_hz), to: RULES.lpfHz, direction: 'set', sets,
             fromSets: { gyro_lpf1_type: typeName, gyro_lpf1_static_hz: num(h.gyro_lowpass_hz) },
             rule: `${base.rule} The cutoff is ${RULES.lpfHz} Hz.`, sources: base.sources.concat(RULES.source.lpfHz), text: `No gyro low-pass filter is on, but the RPM filters are on. Only the PID bandwidth filter changes the gyro signal before the P-term.`,
-            setText: `Add a FIRST_ORDER low-pass filter at ${RULES.lpfHz} Hz, the default of 4.6.`, setNote: `A FIRST_ORDER low-pass filter at ${RULES.lpfHz} Hz is the default of 4.6.`,
-            caveats: [`A FIRST_ORDER low-pass filter at ${RULES.lpfHz} Hz adds a time delay of approximately 1.6 ms (calculated). After the change, checks C11 and F10 and the checks of the tracking error give new values.`] }))
+            setText: `Set the ${h.gyro_soft_type > 0 ? typeName : 'FIRST_ORDER'} low-pass filter cutoff to ${RULES.lpfHz} Hz.`, setNote: `The estimated ${h.gyro_soft_type > 0 ? typeName : 'FIRST_ORDER'} low-pass filter cutoff is ${RULES.lpfHz} Hz.`,
+            caveats: ['This filter adds a time delay. After the change, checks C11 and F10 and the checks of the tracking error give new values.'] }))
             .map(r => fromHeader(r, c, [['gyro_soft2_type', 'global'], ['gyro_lowpass2_hz', 'global'], ['gyro_lowpass_dyn_hz', 'global'], ['features', 'global']], true));
     },
     F2(L, c) {
@@ -979,7 +996,7 @@ const GEN = {
         }
         if (out.length) c.filterIssues.add('F3');
         return out.length ? out : one(bad, { id: 'F3', area: 'filters', severity: 'info', title: `Notch filter Q of less than ${RULES.minNotchQ.toFixed(1)} in previous logs`, rule: base.rule, sources: base.sources,
-            text: `In ${logsText(bad, c)}, a notch filter had a Q of less than ${RULES.minNotchQ.toFixed(1)}. The selected log has no such notch filter.` });
+            text: `In ${logsText(bad, c)}, a notch filter had a Q of less than ${RULES.minNotchQ.toFixed(1)}. The selected log has no notch filter with this Q.` });
     },
     F4(L) {
         return [...group(L.filter(f => f.severity === 'note'), f => f.profile)].map(([ax, list]) => { const v = list[list.length - 1].value;
@@ -996,7 +1013,12 @@ const GEN = {
         // that have no notch filter at 2 % or less from it, and what the gyro filters pass of it (the worker's filterPass:
         // gyroRAW to gyroADC at the line, in a log with curves)
         const maxPass = (q) => q && lib.AXES.every(ax => num(q[ax]) !== null) ? Math.max(...lib.AXES.map(ax => q[ax])) : null;
-        const lines = bad.flatMap(f => String(f.text).split('; ').map((seg, i) => {
+        const lines = bad.flatMap(f => Array.isArray(f.lines) ? f.lines.filter(l => num(l.order) !== null && num(l.hz) !== null && num(l.prominence) !== null).map((l, i) => {
+            const axes = (l.axes || []).map(a => ({ axis: a.axis, code: a.nearestNotch ? num(a.nearestNotch.code) : null, distance: a.nearestNotch ? num(a.nearestNotch.distance) : null }));
+            const pass = Array.isArray(f.filterPass) ? f.filterPass.find(q => Math.abs(q.hz - l.hz) < 0.5) || null : null;
+            return { f, seg: '', first: i === 0, order: l.order, hz: l.hz, prominence: l.prominence, locked: l.rotorLocked === true,
+                uncovered: axes.filter(a => a.code === null || a.distance === null || a.distance > tol).map(a => a.axis), axes, pass, passMax: maxPass(pass) };
+        }) : String(f.text).split('; ').map((seg, i) => {
             const m = /^line at ([\d.]+) x rotor \(([\d.]+) Hz, prominence ([\d.]+)/.exec(seg); if (!m) return null;
             const uncovered = lib.AXES.filter(ax => { const a = new RegExp(`\\b${ax} (?:\\d+ at [\\d.]+ \\(([\\d.]+) %\\)|none)`).exec(seg); return a && (a[1] === undefined || +a[1] > tol * 100); });
             const pass = Array.isArray(f.filterPass) ? f.filterPass.find(q => Math.abs(q.hz - +m[2]) < 0.5) || null : null;
@@ -1172,7 +1194,7 @@ const GEN = {
         return [r];
     },
     F8(L, c) {
-        const sel = L.filter(f => f.severity === 'note'), unc = sel.filter(f => /without RPM notch coverage/.test(String(f.text))), forced = sel.filter(f => /forced off/.test(String(f.text)));
+        const sel = L.filter(f => f.severity === 'note'), unc = sel.filter(f => num(f.uncoveredLines) !== null ? f.uncoveredLines > 0 : /without RPM notch coverage/.test(String(f.text))), forced = sel.filter(f => typeof f.forcedOff === 'boolean' ? f.forcedOff : /forced off/.test(String(f.text)));
         return one(unc, { id: 'F8', area: 'filters', title: 'Dynamic notch filter off, but some lines have no notch filter', rule: 'Check F8 compares the dynamic notch filter with the F5 lines that have no notch filter. The firmware turns it off when the PID loop rate is less than 1 kHz.',
             text: `The dynamic notch filter is off, but strong lines have no RPM notch filter (check F5, ${logsText(unc, c)}). \`feature DYN_NOTCH\` turns it on, up to dyn_notch_max_hz (${fmt(c.header.dyn_notch_max_hz, 0)} Hz).`
                 + (c.topLine && num(c.header.dyn_notch_max_hz) !== null && c.topLine.hz > c.header.dyn_notch_max_hz ? ` The strongest line with no notch filter is at ${c.topLine.hz} Hz, which is more than this maximum.` : '') + ' RPMF: keep it on if an autorotation is possible.' })
@@ -1190,7 +1212,7 @@ const GEN = {
         return one(bad, { id: 'F10', area: 'filters', axis: 'yaw', title: 'Gyro noise in the yaw D-term', rule, sources: sources.concat(RULES.source.community),
             text: `Most of the yaw D-term power is at more than ${fmt(hz, 0)} Hz (${logsText(bad, c)}). Examine the tail notch filters first (checks F5 and F6). A recommendation from other pilots is: "keep D at 0 until RPM filters work".` })
             .concat(perProfile(yaw, c, 'F10', { area: 'tail', axis: 'yaw', rule: `${rule} The estimate uses all measured logs of the PID profile. The step is ${RULES.tailDStep}.`, sources: sources.concat(RULES.source.tailDStep),
-                size: () => ({ parameter: 'yaw_d_gain', add: -RULES.tailDStep, direction: 'lower', title: 'Decrease the yaw D gain', text: 'The yaw D gain makes the vibration larger, and it adds only a small quantity of damping to the tail.',
+                size: () => ({ parameter: 'yaw_d_gain', add: -RULES.tailDStep, direction: 'lower', title: 'Decrease the yaw D gain', text: 'The yaw D-term contains high frequency vibration. A smaller D gain can decrease this vibration. The measurement does not show the change of damping.',
                     caveats: ['It is better to correct the filters first. A lower D gain gives less damping to the tail.'] }) }));
     },
     F7: diag('F7', 'filters', 'The vibration level changed', 'Check F7 has a problem if the ratio of the gyroRAW vibration levels of 2 groups of flights is 2 or more.',
@@ -1204,57 +1226,90 @@ const GEN = {
     },
     G1(L, c) {
         const bad0 = L.filter(isFlag), proxy = L.filter(f => f.severity === 'note' && !thin(f) && /glitch-proxy/.test(String(f.text)));
-        // K22: a FALLBACK that comes at an overload of check G19 (the headspeed decreases with the throttle at its high value before
-        // the governor changes) is a possible result of that overload: a watch with the cause, not a repair of the RPM source
-        const ex = bad0.filter(f => c.g1Overload.has(f)), bad = bad0.filter(f => !c.g1Overload.has(f)), g20 = (c.F || []).filter(f => f.id === 'G20' && ex.some(g => logsOf(g).some(l => logsOf(f).includes(l))));
-        return one(bad, { id: 'G1', title: 'The RPM signal is not available or not correct', rule: 'Check G1 has a problem if the governor goes to FALLBACK.', sources: [src(GR.G1.source)],
-            text: `There ${sum(bad) === 1 ? 'is 1 FALLBACK entry' : `are ${fmt(sum(bad), 0)} FALLBACK entries`} (${logsText(bad, c)}). Repair the RPM source (its electrical parts, the sensor or the ESC telemetry) before you change the governor or the RPM filters.` })
+        // K22 adds context for coincident overload. It does not clear the RPM prerequisite or defer its diagnosis.
+        const ex = bad0.filter(f => c.g1Overload.has(f)), bad = bad0, g20 = (c.F || []).filter(f => f.id === 'G20' && ex.some(g => logsOf(g).some(l => logsOf(f).includes(l))));
+        return one(bad, { id: 'G1', title: 'Examine the cause of FALLBACK', rule: 'Check G1 has a problem if the governor goes to FALLBACK.', sources: [src(GR.G1.source)],
+            text: `There ${sum(bad) === 1 ? 'is 1 FALLBACK entry' : `are ${fmt(sum(bad), 0)} FALLBACK entries`} (${logsText(bad, c)}). FALLBACK does not show that the RPM source is incorrect. `
+                + 'Possible causes are low RPM, sudden RPM changes, or a FALLBACK mode switch that is on. '
+                + '\nExamine the FALLBACK mode switch, RPM signal, headspeed and throttle at each entry. '
+                + 'If you find an RPM source problem, repair it. Complete this check before you change governor gains or RPM filters.' })
             .concat(one(ex.concat(g20), { id: 'G1:overload', severity: 'watch', title: 'FALLBACK at a headspeed decrease at full throttle', sources: [src(GR.G1.source), ruleSrc(RR, 'G19'), ruleSrc(RR, 'G20')],
                 rule: 'Check G1 has a problem if the governor goes to FALLBACK. Rule K22: a FALLBACK at a large load of check G19 or G20 is a possible result of that load.',
                 text: `There ${sum(ex) === 1 ? 'is 1 FALLBACK entry' : `are ${fmt(sum(ex), 0)} FALLBACK entries`} (${logsText(ex, c)}). Each one comes while the headspeed decreases with the throttle at its limit (checks G19 and G20). `
-                    + 'Thus, the FALLBACK is possibly a result of this large load, and the RPM signal is possibly correct. Decrease the load first (check G19). If FALLBACK also occurs at a constant load, repair the RPM source.' }))
+                    + 'The same time does not show that the RPM signal is correct. Examine the RPM signal and the power response at these times. The RPM prerequisite stays open.' }))
             .concat(one(bad0.length ? [] : proxy, { id: 'G1:proxy', severity: 'watch', title: 'Possible errors of the RPM signal', rule: 'Check G1: possible errors of the RPM signal in flight. This is an indication only, because the log records the headspeed after a different filter.',
                 text: `The recorded headspeed shows ${proxy.length === 1 && num(proxy[0].value) !== null ? many(proxy[0].value, 'possible error') : 'possible errors'} of the RPM signal (${logsText(proxy, c)}). Monitor the RPM signal in the next flights.` }));
     },
     G2: diag('G2', 'governor', 'The governor does not keep the headspeed stable', `Check G2 has a problem if the median headspeed error is more than ${GR.G2.median * 100} % by 2 SE. It also has a problem if the range from 5 % to 95 % of the error is more than ±${GR.G2.band * 100} %.`,
         'Checks G6 (throttle headroom) and G9 (oscillation) can show the cause.', { noun: 'headspeed error', sources: [src(GR.G2.source)] }),
     G3(L, c) {
-        const rule = `Check G3 has a problem if the headspeed decreases by more than ${GR.G3.flag * 100} % by ${GR.sig} SE when the collective increases. If the F-term gives less than 50 % of the added throttle, F is too low (GOVT).`, sources = [src(GR.G3.source)];
-        return L.filter(f => (isFlag(f) || f.severity === 'note') && !thin(f)).map(f => { const p = profileOf(f), low = /F too low/.test(String(f.text));
+        const rule = `Check G3 has a problem if the headspeed decreases by more than ${GR.G3.flag * 100} % by ${GR.sig} SE when the collective increases. `
+            + `An F increase must have ${GR.G3.minEvents} collective increases or more with no throttle limit. Their headspeed decrease must be more than this limit. `
+            + '\nThe F percentage must be less than 50 % by 2 SE. The app uses positive output changes and F percentages from 0 to 100 %.', sources = [src(GR.G3.source), 'toolkit rule: separate saturated and unsaturated collective rises'];
+        return L.filter(f => (isFlag(f) || f.severity === 'note') && !thin(f)).map(f => {
+            const p = profileOf(f), g = f.governorResponse, u = g && g.unsaturated, s = g && g.saturated, ff = g && g.feedforward;
+            const estimated = c.F.some(q => q.id === 'G6' && profileOf(q) === p && q.throttleLimit && q.throttleLimit.estimated
+                && logsOf(f).some(log => logsOf(q).includes(log)));
+            const low = !!u && u.n >= GR.G3.minEvents && clears({value:u.mean,se:u.se},GR.G3.flag,1) === true
+                && !!ff && ff.n >= GR.G3.minEvents && num(ff.mean) !== null && num(ff.se) !== null && ff.se >= 0 && ff.mean >= 0 && ff.mean + GR.sig * ff.se < 0.5;
+            const split = u && s ? `With the throttle less than its limit, ${many(u.n,'collective increase')} gave a headspeed decrease of ${pmPct(u.mean,u.se,2)}. `
+                + `${many(s.n,'collective increase')} got to the throttle limit${s.n ? `, with a headspeed decrease of ${pmPct(s.mean,s.se,2)}` : ''}.` : 'The result does not compare collective increases with and without a throttle limit.';
+            const recovery = c.F.find(q => q.id === 'G5' && profileOf(q) === p && num(q.value) !== null && !thin(q));
+            const next = low ? '' : (u && u.n >= GR.G3.minEvents && num(u.se) !== null && u.mean + GR.sig * u.se <= GR.G3.flag
+                ? `The measured decrease with no throttle limit is less than ${GR.G3.flag * 100} % by ${GR.sig} SE. It does not show that an F increase is necessary.`
+                : 'The measurements do not identify an F gain change.');
+            const detail = [split, ff && ff.n ? `The measured F percentage is ${pmPct(ff.mean,ff.se,1)} (${many(ff.n,'collective increase')}).` : 'No sufficient F-term measurement is available.',
+                recovery ? `The mean time to the target is ${recovery.governorResponse && recovery.governorResponse.censored > 0 ? 'a minimum of ' : ''}${pm(recovery.value,recovery.se,3)} s (check G5).` : '', next].filter(Boolean).join(' ');
             const r = low ? change(c, { id: `G3:gov_f_gain:p${p}`, area: 'governor', profile: p, parameter: 'gov_f_gain', add: RULES.govSteps.F, direction: 'raise', title: 'Increase the governor F gain', evidence: [evidence(f)],
-                rule: `${rule} The step is ${RULES.govSteps.F}.`, sources: sources.concat(RULES.source.govSteps), text: `When the collective increases, the headspeed decreases by ${pmPct(f.value, f.se, 2)}. The governor F-term gives less than 50 % of the added throttle.`,
+                rule: `${rule} The step is ${RULES.govSteps.F}.`, sources: sources.concat(RULES.source.govSteps), text: detail,
                 caveats: c.flags('G6').some(g => profileOf(g) === p) ? [`Check G6 shows a problem with the throttle headroom (${prof(p)}). When the throttle is at its maximum, more F cannot help.`] : [] })
                 : rec({ id: `G3:p${p}`, area: 'governor', profile: p, title: 'The headspeed decreases when the collective increases', evidence: [evidence(f)], rule, sources,
-                    text: `When the collective increases, the headspeed decreases by ${pmPct(f.value, f.se, 2)} (${whereOf(f, c)}). ${/headroom/.test(String(f.text)) ? 'The cause is the throttle headroom (check G6), not the F gain.' : 'The F-term gives most of the added throttle. Examine the time to the target again (check G5) and the throttle headroom (check G6).'}` });
-            if (!isFlag(f)) r.sig = `Check G3 gives ${pmPct(f.value, f.se, 2)}. This is not more than ${GR.G3.flag * 100} % by ${GR.sig} SE.`;
+                    procedure: s && s.n ? governorLimitProcedure(true, estimated) : null,
+                    text: `All collective increases together give a headspeed decrease of ${pmPct(f.value, f.se, 2)} (${whereOf(f, c)}).\n${detail}`
+                        + (s && s.n ? '' : '\nExamine the governor term signals and the output limits before you change a gain.') });
+            if (!isFlag(f) && !low) r.sig = `Check G3 gives ${pmPct(f.value, f.se, 2)}. This is not more than ${GR.G3.flag * 100} % by ${GR.sig} SE.`;
             return r; });
     },
     G4(L, c) {
-        const rule = `Check G4 has a problem if the headspeed overshoot is more than ${GR.G4.flag * 100} % by 2 SE. An overshoot when the collective increases shows that F is too high (GOVT).`, sources = [src(GR.G4.source)];
+        const rule = `Check G4 has a problem if the headspeed overshoot is more than ${GR.G4.flag * 100} % by 2 SE. An overshoot when the collective increases can show that F is too high (GOVT).`, sources = [src(GR.G4.source)];
         return L.filter(isFlag).map(f => { const p = profileOf(f);
-            if (/load onset/.test(String(f.text))) return change(c, { id: `G4:gov_f_gain:p${p}`, area: 'governor', profile: p, parameter: 'gov_f_gain', add: -RULES.govSteps.F, direction: 'lower', title: 'Decrease the governor F gain', evidence: [evidence(f)],
-                rule: `${rule} The step is ${RULES.govSteps.F}.`, sources: sources.concat(RULES.source.govSteps), text: `When the collective increases, the headspeed overshoot is ${pmPct(f.value, f.se, 2)}. GOVT: "headspeed temporarily too high".` });
+            if (/load onset/.test(String(f.text))) {
+                const r = change(c, { id: `G4:gov_f_gain:p${p}`, area: 'governor', profile: p, parameter: 'gov_f_gain', add: -RULES.govSteps.F, direction: 'lower', title: 'Decrease the governor F gain', evidence: [evidence(f)],
+                    rule: `${rule} The step is ${RULES.govSteps.F}.`, sources: sources.concat(RULES.source.govSteps), text: `When the collective increases, the headspeed overshoot is ${pmPct(f.value, f.se, 2)}. GOVT: "headspeed temporarily too high".` });
+                r.sig = fails({value:f.value,se:num(f.se),n:1},GR.G4.flag,1,'Check G4'); return r;
+            }
             return rec({ id: `G4:drop:p${p}`, area: 'governor', profile: p, title: 'Headspeed overshoot when the collective decreases', evidence: [evidence(f)], rule, sources,
-                text: `When the collective decreases, the headspeed overshoot is ${pmPct(f.value, f.se, 2)} (${whereOf(f, c)}). The governor decreases the throttle too slowly when the load decreases.` }); });
+                text: `When the collective decreases, the headspeed overshoot is ${pmPct(f.value, f.se, 2)} (${whereOf(f, c)}). Compare the throttle decrease and governor terms at these times. The overshoot does not identify which gain must change.` }); });
     },
-    G5: diag('G5', 'governor', 'The headspeed increases to the target slowly', `Check G5 has a problem if, after a collective increase, the headspeed gets to the target again after more than ${GR.G5.flag} s by 2 SE.`,
-        `If check G6 shows no throttle saturation, FLYR "bog or droop under load" shows that the governor P gain is too low. GOVT increases it in steps of ${RULES.govSteps.P}.`, { noun: 'time to the target again', unit: 's', sources: [src(GR.G5.source), RULES.source.govSteps] }),
+    G5: (L, c) => perProfile(L, c, 'G5', { area: 'governor',
+        rule: `The time to the target must be more than ${GR.G5.flag} s by 2 SE. The test step is ${RULES.govSteps.P} gain units.`,
+        sources: [src(GR.G5.source), RULES.source.govSteps],
+        size: (fl, e, ax, p, list) => {
+            const censored = list.some(f => f.governorResponse && f.governorResponse.censored > 0);
+            return { ...(num(e.se) !== null && e.se >= 0 && !censored ? { parameter: 'gov_p_gain', add: RULES.govSteps.P, direction: 'raise' } : {}),
+                title: 'Time to the governor target', text: (censored
+                    ? `The mean time to the target is a minimum of ${pm(e.value, e.se)} s. Some responses did not get to the target in the recorded period. The app gives no P-gain change. Record the complete response in one PID profile.`
+                    : `After a collective increase, the headspeed gets to the target after ${pm(e.value, e.se)} s. A larger P gain can decrease this time. The new response is not measured.`) +
+                    (num(e.se) === null ? '\nThe uncertainty is unknown. A new log must measure the time to the target again.' : '') };
+        } }),
     G6(L, c) {
         // the two rules of health_gov G6, from its finding: the median throttle (value) and the periods at the throttle maximum
         // with the headspeed low (its text lists them: "N runs >= 100 ms at the ceiling ... at <t> s (<s> s, <deficit> %)")
         const bad = L.filter(isFlag), runsOf = (f) => { const m = /(\d+) runs >= [\d.]+ ms at the ceiling[^;.]*? below target(?: at ((?:[\d.]+ s \([\d.]+ s, [\d.]+ %\)(?:, )?)+))?/.exec(String(f.text || ''));
             return { n: m ? +m[1] : 0, items: m && m[2] ? [...m[2].matchAll(/([\d.]+) s \(([\d.]+) s, ([\d.]+) %\)/g)].map(x => ({ f, t: +x[1], s: +x[2], deficit: +x[3] })) : [] }; };
         const high = bad.filter(f => num(f.value) !== null && f.value > GR.G6.median), sat = bad.filter(f => runsOf(f).n > 0), runs = sat.reduce((n, f) => n + runsOf(f).n, 0);
+        const estimated = sat.some(f => f.throttleLimit ? f.throttleLimit.estimated : /limit (?:[1-9]\d{0,2}) for .*Limit source: \"guessed/.test(f.text || ''));
         const longest = bad.flatMap(f => runsOf(f).items).sort((a, b) => b.s - a.s), ps = [...new Set(bad.map(profileOf))].sort((a, b) => (a > 0 ? a : 9) - (b > 0 ? b : 9));
         const med = bad.length === 1 ? `The median throttle is ${fmt(bad[0].value, 1)} % (${whereOf(bad[0], c)}).` : `${range('median throttle', bad, '%')} (${many(bad.length, 'result')}, ${and(ps.map(prof))})`.replace(/\.\s\(/, ' (') + '.';
-        const run = sat.length ? `In ${many(sat.length, 'result')}, the throttle stayed at its maximum for ${GR.G6.runS * 1000} ms or more with the headspeed more than ${GR.G6.deficit * 100} % low (${many(runs, 'period')}).` : '';
+        const run = sat.length && estimated ? `The throttle stayed at a limit from the recorded output for ${GR.G6.runS * 1000} ms or more. The headspeed was more than ${GR.G6.deficit * 100} % low in ${many(runs, 'period')}.` : sat.length ? `In ${many(sat.length, 'result')}, the throttle stayed at its maximum for ${GR.G6.runS * 1000} ms or more with the headspeed more than ${GR.G6.deficit * 100} % low (${many(runs, 'period')}).` : '';
         const top = longest.length ? `The longest period is ${fmt(longest[0].s, 3)} s at ${fmt(longest[0].t, 3)} s, with the headspeed ${fmt(longest[0].deficit, 1)} % low (${whereOf(longest[0].f, c)}).` : '';
         const why = high.length ? `The median throttle is more than ${GR.G6.median} %${high.length < bad.length ? ` in ${many(high.length, 'result')}` : ''}. Thus, the throttle headroom is too small.`
-            : sat.length ? 'Thus, the throttle headroom was not sufficient at these times, and the governor did not keep the headspeed.' : '';
+            : estimated ? 'These periods show a headspeed decrease at high throttle. This result does not show the available throttle reserve.' : sat.length ? 'Thus, the throttle headroom was not sufficient at these times, and the governor did not keep the headspeed.' : '';
         return one(bad, { id: 'G6', area: 'governor', title: 'Throttle headroom', rule: `Check G6 has a problem if the median throttle is more than ${GR.G6.median} %. It also has a problem if the throttle stays at its maximum for ${GR.G6.runS * 1000} ms or more with the headspeed more than ${GR.G6.deficit * 100} % low.`,
             sources: [src(GR.G6.source), 'Rotorflight documentation, "FlyRotor governor setup": a throttle of 75 % to 85 %'],
-            text: [med, run, top, why, 'A lower target headspeed or a battery with more cells gives more headroom.'].filter(Boolean).join(' '),
-            caveats: [REFUTED.G6, 'FLYR recommends a throttle of 75 % to 85 %, with a reserve of 15 % to 25 %.', 'Check G6 gives no SE, because the median throttle and the number of periods at the maximum come from all samples, not from a mean.']
+            procedure: governorLimitProcedure(sat.length > 0, estimated),
+            text: [med, run, top, why].filter(Boolean).join(' '),
+            caveats: ['The output limit does not show the cause of the headspeed decrease before the throttle got to that limit.', 'Check G6 gives no SE, because the median throttle and the number of periods at the maximum come from all samples, not from a mean.']
                 .concat(longest.length > 1 ? [`The ${Math.min(3, longest.length)} longest periods are ${and(longest.slice(0, 3).map(x => `${fmt(x.s, 3)} s at ${fmt(x.t, 3)} s (${fmt(x.deficit, 1)} % low, ${whereOf(x.f, c)})`))}.`] : []) });
     },
     G8: diag('G8', 'governor', 'The throttle output does not agree with govSum', `Check G8 has a problem if \`motor[0] / govSum\` is not in the firmware range of the voltage compensation, ${GR.G8.bounds.join(' to ')}.`,
@@ -1264,19 +1319,26 @@ const GEN = {
             + `Also, the coherence with the collective must be less than ${GR.G9.maxCollectiveCoherence}.`, sources = [src(GR.G9.source)];
         // GOVT cuts I or P by 1/3 once it plays up (its steps of 25 and 10 are for raising), bounded to 20 % a step (guard 5)
         return L.filter(f => isFlag(f) || (f.severity === 'note' && /not by \d SE/.test(String(f.text)))).map(f => { const p = profileOf(f), P = /P-type/.test(String(f.text)), k = P ? 'P' : 'I';
+            if (!/[PI]-type/.test(String(f.text))) return rec({id:`G9:p${p}`,area:'governor',profile:p,title:'Governor oscillation: gain not identified',evidence:[evidence(f)],rule,sources,
+                text:'The oscillation frequency band is unknown. The app cannot select P or I from this result.'});
             const r = change(c, { id: `G9:gov_${k.toLowerCase()}_gain:p${p}`, area: 'governor', profile: p, parameter: `gov_${k.toLowerCase()}_gain`, mult: 1 - RULES.govCut, asks: (w) => `GOVT decreases the gain by 1/3, to ${w}.`, direction: 'lower', title: `Decrease the governor ${k} gain`, evidence: [evidence(f)],
                 rule: `${rule} GOVT decreases the gain by 1/3, and the app limits each step to ${RULES.maxStep * 100} %.`, sources: sources.concat(RULES.source.govCut, RULES.source.maxStep),
                 text: (isFlag(f) ? `The headspeed has an oscillation in the band of ${P ? '3 Hz to 10 Hz (P type)' : '0.3 Hz to 3 Hz (I type)'}, with a prominence of ${pm(f.value, f.se)}.`
                     : `The headspeed error has a peak in the band of ${P ? '3 Hz to 10 Hz (P type)' : '0.3 Hz to 3 Hz (I type)'}, with a prominence of ${pm(f.value, f.se)}. This is not more than the limit by ${GR.sig} SE. Thus, it is not sure that the headspeed has an oscillation.`)
                     + (P ? ' FLYR: "head speed will oscillate or surge". GOVT decreases P by 1/3 after a small oscillation, and gov_gain is a different gain that can also change it.'
                         : ' GOVT increases I until an oscillation starts, and then decreases it by 1/3.') });
-            if (!isFlag(f)) r.sig = `Check G9 gives a prominence of ${pm(f.value, f.se)}. This is not more than ${GR.G9.prominence} by ${GR.sig} SE.`;
+            r.sig = fails({value:f.value,se:num(f.se),n:1},GR.G9.prominence,1,'Check G9');
+            if (!isFlag(f) && !r.sig) r.sig = `Check G9 gives a prominence of ${pm(f.value, f.se)}. This is not more than ${GR.G9.prominence} by ${GR.sig} SE.`;
             return r; });
     },
-    G10: diag('G10', 'governor', 'Tail oscillation that follows the headspeed', `Check G10 measures the coherence of the headspeed and the yaw gyro at the frequency of the tail oscillation. It has a problem if the coherence is ${GR.G10.implicated} or more by 2 SE.`,
-        `Possibly, the governor causes the tail oscillation. A decrease of gov_gain, ${RULES.maxStep * 100} % or less for each step, can stop it. You can also examine gov_rpm_filter. GOVT: a "governor so strong the tail cannot hold torque".`, { noun: 'coherence', sources: [src(GR.G10.source), 'Rotorflight 1 documentation, "Tail tuning"'] }),
+    G10: (L, c) => perProfile(L, c, 'G10', { area: 'governor',
+        rule: `The headspeed and yaw coherence must be more than ${GR.G10.implicated} by 2 SE. The test step is ${RULES.dirStep * 100} %.`,
+        sources: [src(GR.G10.source), RULES.source.dirStep, 'Rotorflight documentation, "Tune the Governor"'],
+        size: (fl, e) => ({ ...(num(e.se) !== null && e.se >= 0 ? { parameter: 'gov_gain', mult: 1 - RULES.dirStep, direction: 'lower' } : {}),
+            title: 'Governor and tail oscillation', text: `The headspeed and yaw coherence is ${pm(e.value, e.se)} at the tail oscillation frequency. A smaller governor gain can decrease torque changes. The log does not measure the effect of this test step.` +
+                (num(e.se) === null ? ' The uncertainty is unknown. A new log must measure the coherence again.' : '') }) }),
     G11: diag('G11', 'governor', 'The throttle increases during each battery', `Check G11 has a problem if the stable throttle increases by more than ${GR.G11.perPack} % during a battery, by 2 SE.`,
-        'The battery voltage decreases. gov_use_voltage_comp ON corrects this, with an ADC battery voltage source.', { sources: [src(GR.G11.source), RULES.source.firmware] }),
+        'Compare the battery voltage and throttle change at equal load. If voltage compensation is off, examine gov_use_voltage_comp with an ADC battery voltage source. Compensation cannot add power when the throttle is at its limit.', { sources: [src(GR.G11.source), RULES.source.firmware] }),
     G12(L, c) {
         const bad = L.filter(isFlag), o = bad.length ? num(bad[0].value) : null, poles = c.cli ? pick(c.cli.global.motor_poles, 0) : null;
         // the configured gear ratios are correct (CLAUDE.md): G12 names motor_poles and the RPM sensor only
@@ -1307,16 +1369,22 @@ const GEN = {
     },
     C4(L, c) {
         const test = (list) => { const eo = pooled(list.map(f => [f.value, f.se])), es = pooled(list.map(f => f.settleS ? [f.settleS.mean, f.settleS.se] : [null])), a = clears(eo, LR.C4.overshootPct, 1), b = clears(es, LR.C4.settleS, 1);
-            return a !== true && b !== true && (a === false || b === false) ? `Check C4 gives an overshoot of ${pm(eo && eo.value, eo && eo.se, 1)} %, and the rate becomes stable after ${pm(es && es.value, es && es.se)} s. These are not more than ${LR.C4.overshootPct} % and ${LR.C4.settleS} s by ${RULES.sigmas} SE.` : null; };
+            return a === true || b === true ? null : a === null && b === null
+                ? 'Check C4 has no sufficient uncertainty estimate. The app cannot identify a gain change.'
+                : `Check C4 gives an overshoot of ${pm(eo && eo.value, eo && eo.se, 1)} %, and the rate becomes stable after ${pm(es && es.value, es && es.se)} s. These measurements do not show values more than ${LR.C4.overshootPct} % or ${LR.C4.settleS} s by ${RULES.sigmas} SE.`; };
         return perProfile(L, c, 'C4', { area: 'cyclic', test, sources: [src(LR.C4.source)], rule: `Check C4 has a problem if the overshoot at the stops is more than ${LR.C4.overshootPct} %. It also has a problem if the rate becomes stable after more than ${LR.C4.settleS} s. If the I-term has the sign of the turn at the stop, FF is too low.`,
-            size: (fl, e, ax) => /FF too low/.test(String(fl[0].text))
+            size: (fl, e, ax) => fl.every(f => /FF too low/.test(String(f.text)))
                 ? { parameter: `${ax}_f_gain`, mult: 1 + RULES.dirStep, direction: 'raise', title: `Increase the ${ax} F gain`, text: `At the ${ax} stops, the overshoot is ${pm(e.value, e.se, 1)} %, and the I-term has the sign of the turn. FF is too low (FF). The step is ${RULES.dirStep * 100} %.` }
+                : fl.every(f => /FF too high/.test(String(f.text)))
+                ? { parameter: `${ax}_f_gain`, mult: 1 - RULES.dirStep, direction: 'lower', title: `Decrease the ${ax} F gain`,
+                    text: `At the ${ax} stops, the overshoot is ${pm(e.value, e.se, 1)} %. The I-term operates against the turn. A smaller F gain can decrease the overshoot at the stops.\nThe test step is ${RULES.dirStep * 100} %. The app selects this step for a test. It is not a measured best value. The next flight must measure the stop overshoot again.`,
+                    sources: [src(LR.C4.source), RULES.source.dirStep, 'Rotorflight documentation, "Tune Feedforward"'],
+                    caveats: ['The I-term relax and B gain can also cause the overshoot. The log does not show which cause is correct.'] }
                 : { title: `Overshoot at the ${ax} stops`, text: `At the ${ax} stops, the overshoot is ${pm(e.value, e.se, 1)} %. Possible causes: FF is too high (FF: "stops and bounces back"), the I-term relax is too weak (PROF), or B is too high (TUNE).` } });
     },
     C5: (L, c) => oscillation(L, 'C5', 'cyclic', c),
     T1: (L, c) => oscillation(L, 'T1', 'tail', c),
-    C6: perAxis('C6', 'cyclic', 'slow oscillation', `Check C6 has a problem if the prominence of the error peak at 0.5 Hz to 3 Hz is ${LR.C6.prominence} or more (the band is from the documentation).`,
-        (l) => `${/driven by I/.test(l[0].text) ? 'TUNE: "Lower the I-gain or raise the P-gain". You can also try the I-term relax.' : 'The I-term does not cause it. Examine the mechanical parts and the governor.'} The documentation does not agree on the frequency bands. Thus, the frequency does not show which term causes it.`, { noun: 'prominence', sources: [src(LR.C6.source)] }),
+    C6: (L, c) => slowTrial(L, c, 'C6', 'cyclic'),
     C10(L, c) {  // the landed-while-moving part is a watch: its test is the one CYC-LANDED refuted
         const rule = `Check C10 has a problem if, in flight, the I-term decreases at the ground rate (in ${LR.C10.tau.join(' s to ')} s). It also has a problem if the firmware shows "landed" while the rotor turns at speed.`, sources = [src(LR.C10.note)];
         const bad = L.filter(isFlag), moving = bad.filter(f => /while the firmware says landed/.test(String(f.text)));
@@ -1335,12 +1403,14 @@ const GEN = {
         return perProfile(L, c, 'C14', { area: 'cyclic', axis: 'pitch', rule: `Check C14 measures the cyclic pitch that the pitch I-term and O-term add for each 1 deg of collective (mixer units: 1000 is 12 deg). It has a problem if this value, without its sign, is more than ${fmt(SIGMA.C14[0] / 1000, 3)} deg by ${RULES.sigmas} SE. `
             + `The estimate uses all measured logs of the PID profile, and the gain change must be ${fmt(ruleNum(MR, 'C14', 'minGainChange'))} or more. The firmware pitch FF is \`collective × gain / 500\`.`, sources: [ruleSrc(MR, 'C14'), RULES.source.firmware],
             size: (fl, e, ax, p, list) => { const d = pooled(list.map(f => [f.gainChange, f.gainChangeSe]));
-                if (!d) return { title: 'Pitch movement with the collective', text: `For each 1 deg of collective, the pitch I-term and O-term add ${pm(e.value / 1000, num(e.se) === null ? null : e.se / 1000, 3)} deg of cyclic pitch. The result gives no gain change. Thus, there is no value to set.` };
-                return { parameter: 'pitch_collective_ff_gain', delta: d.value, direction: d.value > 0 ? 'raise' : 'lower', confidence: 'measured', title: `${d.value > 0 ? 'Increase' : 'Decrease'} the pitch collective FF`,
-                    text: `For each 1 deg of collective, the pitch I-term and O-term add ${pm(e.value / 1000, num(e.se) === null ? null : e.se / 1000, 3)} deg of cyclic pitch (${flagLogs(list)}). A change of ${pm(d.value, d.se, 0)} in pitch_collective_ff_gain supplies this. PROF: "relatively low value to be conservative".` }; } });
+                if (!d || clears(d,ruleNum(MR,'C14','minGainChange'),0) !== true) return { title: 'Pitch movement with the collective', text: `For each 1 deg of collective, the pitch I-term and O-term add ${pm(e.value / 1000, num(e.se) === null ? null : e.se / 1000, 3)} deg of cyclic pitch. The gain change estimate is not sufficient by 2 SE. Thus, there is no value to set.` };
+                return { parameter: 'pitch_collective_ff_gain', delta: d.value,
+                    startStep: num(d.se) !== null && d.se >= 0 ? Math.min(RULES.compensationStart, d.value - RULES.sigmas * d.se) : null,
+                    direction: d.value > 0 ? 'raise' : 'lower', confidence: 'measured', title: `${d.value > 0 ? 'Increase' : 'Decrease'} the pitch collective FF`,
+                    text: `For each 1 deg of collective, the pitch I-term and O-term add ${pm(e.value / 1000, num(e.se) === null ? null : e.se / 1000, 3)} deg of cyclic pitch (${flagLogs(list)}). The pitch_collective_ff_gain change estimate is ${pm(d.value, d.se, 0)}. A new flight must measure its effect. PROF: "relatively low value to be conservative".` }; } });
     },
     R1: (L, c) => perAxis('R1', 'rates', 'time delay from the stick to the setpoint', `Check R1 has a problem if the time delay from rcCommand to the setpoint is more than ${fmt(SIGMA.R1[0], 0)} ms by ${RULES.sigmas} SE.`,
-        'The response time (a PT1 filter at `500 / response` Hz), the acceleration limit and rc_smoothness change the setpoint. A lower value of the one that you set, in the rate profile, decreases the time delay.', { noun: 'time delay', unit: 'ms', sources: [ruleSrc(TR, 'R1'), RULES.source.firmware] })(L, c)
+        '\nThe response time, acceleration limit and rc_smoothness change the setpoint. A smaller response time decreases the filter time delay. A larger acceleration limit lets the setpoint change faster. Examine which limit is active before you change the rate profile.', { noun: 'time delay', unit: 'ms', sources: [ruleSrc(TR, 'R1'), RULES.source.firmware] })(L, c)
         .map(r => { // the rate values are values of each rate profile (SPEC2 D12): the rate profile of the findings, or the assumption in a caveat
             // the worker counts the rate profile changes in the logs of a result (rateChanges, SPEC2 A9): then the result can
             // mix rate profiles, and the rate profile of the change is unknown
@@ -1350,8 +1420,7 @@ const GEN = {
             else r.caveats.push(rp.some(q => q > 0) ? 'The results come from more than one rate profile. Thus, the values of each rate profile are important.'
                 : 'The log does not show the rate profile. Thus, the result is for the rate profile that was active in the logs.');
             return sigAny(r, L.filter(f => axisOf(f) === r.axis), 'R1'); }),
-    T2: diag('T2', 'tail', 'Slow tail oscillation', `Check T2 has a problem if the prominence of the yaw error peak at 0.5 Hz to 3 Hz is ${LR.T2.prominence} or more.`,
-        'A recommendation from other pilots is: "Slow wags are almost always mechanical". Make sure that the tail linkage moves freely. If the I-term causes it, TUNE: "lower I or raise P".', { noun: 'prominence', rec: { axis: 'yaw' }, sources: [src(LR.T2.source), RULES.source.community] }),
+    T2: (L, c) => slowTrial(L, c, 'T2', 'tail'),
     T3: diag('T3', 'tail', 'Tail oscillation that changes with the headspeed', 'Check T3 compares the tail oscillation of 2 PID profiles with the same gains. It has a problem if the ratio of the amplitudes is 2 or more.',
         'On a belt tail, the loop gain increases with the headspeed. OLDWIKI, Rotorflight 1: "might need lower PIDs for higher headspeeds".', { rec: { axis: 'yaw' }, sources: ['toolkit rule', 'Rotorflight 1 documentation, "Tuning introduction"'] }),
     T4(L, c) {
@@ -1362,7 +1431,7 @@ const GEN = {
     T5(L, c) {
         return perProfile(L, c, 'T5', { area: 'tail', axis: 'yaw', key: (f) => `${profileOf(f)}|${f.larger}`, sources: [src(LR.T5.source)], rule: `Check T5 has a problem if the ratio of the stop overshoots of the 2 sides is ${LR.T5.ratio} or more. The step is ${RULES.dirStep * 100} % on the side with the larger overshoot.`,
             size: (fl, e, ax, p, list) => ({ parameter: `yaw_${fl[0].larger}_stop_gain`, mult: 1 - RULES.dirStep, direction: 'lower', title: `Decrease the yaw ${String(fl[0].larger).toUpperCase()} stop gain`,
-                text: `The ratio of the yaw stop overshoots, ${String(fl[0].larger).toUpperCase()} side to the other side, is ${pm(e.value, e.se)} (${flagLogs(list)}). The ${String(fl[0].larger).toUpperCase()} stop gain is too large for the other side. The ratio of the two stop gains is more important than their values (a recommendation from other pilots). Thus, a larger gain on the other side is also possible.`,
+                text: `The ratio of the yaw stop overshoots, ${String(fl[0].larger).toUpperCase()} side to the other side, is ${pm(e.value, e.se)} (${flagLogs(list)}). A smaller ${String(fl[0].larger).toUpperCase()} stop gain is a test of this difference. The next flight must measure the two stops.`,
                 caveats: ['The documentation does not tell which stop uses yaw_cw_stop_gain. Check T5 calculates P for each side to find it.'] }) });
     },
     T6(L, c) {
@@ -1374,7 +1443,7 @@ const GEN = {
                         + 'Check T6 measures the amplitude and the sign of the kick, not its time, and check T7 measures the precompensation. Do collective steps with the yaw stick at its center, not through zero collective.' };
                 const up = t.value > 0;
                 return { parameter: 'yaw_collective_ff_gain', mult: 1 + (up ? 1 : -1) * RULES.dirStep, direction: up ? 'raise' : 'lower', severity: 'check', caveats: [REFUTED.T6], title: `${up ? 'Increase' : 'Decrease'} the yaw collective precompensation`,
-                    text: `After collective steps, the yaw kick is ${pm(e.value, e.se, 1)} deg/s, and its part in the direction of the torque change is ${pm(t.value, t.se, 1)} deg/s (${flagLogs(list)}). The precompensation is too ${up ? 'small' : 'large'}. The step is ${RULES.dirStep * 100} % (PROF: "higher gain results in CW response" on a CW rotor).` }; } });
+                    text: `After collective steps, the yaw kick is ${pm(e.value, e.se, 1)} deg/s, and its part in the direction of the torque change is ${pm(t.value, t.se, 1)} deg/s (${flagLogs(list)}). This can show precompensation that is too ${up ? 'small' : 'large'}. The step is ${RULES.dirStep * 100} % (PROF: "higher gain results in CW response" on a CW rotor).` }; } });
     },
     T7(L, c) {
         return perProfile(L, c, 'T7', { area: 'tail', axis: 'yaw', sources: [src(LR.T7.source), RULES.source.firmware], rule: `Check T7 measures the correlation of the yaw I-term and the precompensation in collective movements. It has a problem if the correlation, without its sign, is ${LR.T7.r} or more. `
@@ -1382,26 +1451,25 @@ const GEN = {
             size: (fl, e, ax, p, list) => { const s = list.map(f => num(f.precompScale)).filter(v => v !== null).sort((a, b) => a - b), scale = s.length ? s[s.length >> 1] : null;
                 if (scale === null || scale <= 0) return { title: 'Yaw precompensation with the incorrect sign', text: `In collective movements, the yaw I-term moves opposite to the precompensation (${flagLogs(list)}). Examine main_rotor_dir and the direction of the precompensation before you change a gain.` };
                 return { parameter: 'yaw_collective_ff_gain', mult: Math.sqrt(scale), direction: scale > 1 ? 'raise' : 'lower', confidence: 'measured', title: `${scale > 1 ? 'Increase' : 'Decrease'} the yaw collective precompensation`,
-                    text: `In collective movements, the yaw I-term follows the precompensation. The tail must have ${fmt(scale, 2)} multiplied by the precompensation at this time (median of ${many(s.length, 'measured log')}, ${flagLogs(list)}). Thus, the correct collective FF is ${fmt(Math.sqrt(scale), 3)} multiplied by the value at this time.`,
+                    text: `In collective movements, the yaw I-term follows the precompensation. The fit estimates ${fmt(scale, 2)} multiplied by the recorded precompensation (median of ${many(s.length, 'measured log')}, ${flagLogs(list)}). The collective FF estimate is ${fmt(Math.sqrt(scale), 3)} multiplied by the recorded value. The next flight must measure the effect.`,
                     caveats: ['This value is correct only if the cyclic part of the precompensation is small in these movements.'] }; } });
     },
     T8(L, c) {
-        const bad = L.filter(isFlag), mot = !!(gearOf(c.cli) || {}).motorisedTail;
-        return one(bad, { id: 'T8', area: 'tail', axis: 'yaw', title: 'The tail does not have sufficient authority', rule: `Check T8 has a problem if mixer[2] or servo[3] is at a limit for ${LR.T8.minEpisodes} period or more. The toolkit finds the limit in the data.`, sources: [src(LR.T8.source), RULES.source.tta],
-            text: `The tail was at its output limit for ${fmt(sum(bad), 2)} s in ${many(bad.length, 'result')} (${[...group(bad, profileOf)].map(([p, l]) => `${prof(p)}: ${fmt(sum(l), 2)} s`).join(', ')}). At its limit, the tail does not have sufficient authority. Gain changes cannot correct this.`
-                + `\nA larger tail pitch range (if the mechanical parts let it), larger tail blades${mot ? ', a higher tail motor speed' : ''} or a higher headspeed (gov_headspeed) give the tail more authority.`
-                + ` On a tail with a motor, the tail torque assist (gov_tta_gain, steps of ${RULES.ttaStep}) helps the tail. A lower governor gain decreases the torque changes (GOVT).` });
+        const bad = L.filter(isFlag);
+        return one(bad, { id: 'T8', area: 'tail', axis: 'yaw', title: 'The tail output gets to its limit', rule: `Check T8 has a problem if mixer[2] or servo[3] is at a limit for ${LR.T8.minEpisodes} period or more. The toolkit finds the limit in the data.`, sources: [src(LR.T8.source), RULES.source.tta],
+            text: `The tail was at its output limit for ${fmt(sum(bad), 2)} s in ${many(bad.length, 'result')} (${[...group(bad, profileOf)].map(([p, l]) => `${prof(p)}: ${fmt(sum(l), 2)} s`).join(', ')}). Gains cannot increase the output range.`
+                + `\n${tailLimitAdvice(c, bad.map(profileOf))}` });
     },
     T9(L, c) {
         return perProfile(L, c, 'T9', { area: 'tail', axis: 'yaw', test: shareTest('T9', LR.T9), sources: [src(LR.T9.source)], rule: `Check T9 has a problem if the I-term is more than ${pct(LR.T9.iShare)} of the control change in stable pirouettes. The step is ${RULES.dirStep * 100} %, because the part is of the control change, not of F.`,
             size: (fl, e, ax, p, list) => Math.abs(e.value) > LR.T9.iShare
                 ? { parameter: 'yaw_f_gain', mult: 1 + Math.sign(e.value) * RULES.dirStep, direction: e.value > 0 ? 'raise' : 'lower', severity: 'check', caveats: [REFUTED.T9], title: `${e.value > 0 ? 'Increase' : 'Decrease'} the yaw F gain`,
-                    text: `In stable pirouettes, the I-term is ${pmPct(e.value, e.se, 0)} of the control change (${flagLogs(list)}). ${e.value > 0 ? 'The stops are slow, and the yaw FF is possibly too small.' : 'The I-term operates against FF, and the yaw FF is possibly too large.'} FF: start at 0 on the tail.` }
+                    text: `In stable pirouettes, the I-term is ${pmPct(e.value, e.se, 0)} of the control change (${flagLogs(list)}). ${e.value > 0 ? 'The yaw FF is possibly too small.' : 'The I-term operates against FF, and the yaw FF is possibly too large.'} FF: start at 0 on the tail.` }
                 : { title: 'Yaw rate not equal to the setpoint in pirouettes', text: `In stable pirouettes, the yaw rate is ${fl[0].gyroRatio ? `${pm(fl[0].gyroRatio.mean, fl[0].gyroRatio.se)} of` : 'not equal to'} the setpoint, with the I-term near 0. Examine the tail output saturation (check T8).` } });
     },
     T10: diag('T10', 'tail', 'Small yaw phase margin', 'Check T10 has a problem if the yaw phase margin is less than 35 deg after a change.', 'Do not increase the yaw P gain or the stop gains.', { rec: { axis: 'yaw' }, sources: ['toolkit rule'] }),
     T13: diag('T13', 'tail', 'Constant yaw I-term in hover', `Check T13 has a problem if the hover axisI[2], without its sign, is more than ${pct(ruleNum(MR, 'T13', 'share'))} of the yaw output range by ${RULES.sigmas} SE.`,
-        'The P, I and D gains cannot correct a constant offset. A tail_center_trim that keeps the yaw I-term near zero in hover corrects it (MIXS: the center trim "helps the feedforwards to work correctly"). If the I-term follows the collective (check T7), a larger yaw_collective_ff_gain can correct it.', { rec: { axis: 'yaw' }, sources: [ruleSrc(MR, 'T13')] }),
+        'Examine the tail center trim and mechanical center in stable hover. The I-term corrects a constant torque offset. More I gain does not remove that torque. If the I-term changes with collective, use check T7 to find the direction of a precompensation change.', { rec: { axis: 'yaw' }, sources: [ruleSrc(MR, 'T13')] }),
     T14: (L, c) => inertia(L, c),
     // the phase checks of health_phase.cjs (SPEC2 D13 and section 6): their fields, see the head of this file
     D7(L, c) {
@@ -1438,7 +1506,7 @@ const GEN = {
             [num(f0.throttleStepPct) !== null ? `At the change, the throttle changes by ${fmt(f0.throttleStepPct, 1)} %` : '', num(f0.settleS) !== null ? `the headspeed becomes stable after ${fmt(f0.settleS, 2)} s` : ''].filter(Boolean).join(', and ').replace(/^the/, 'The').replace(/(.)$/, '$1.')].filter(Boolean).join(' ');
         // the change to ACTIVE after the liftoff (SPEC2 D-M5c): health_phase gives afterLiftoff (afterLiftoffS, liftoffT); without
         // them, the flights of D7 of the same log (health_phase index time, as the events of G16) hold the time of the change.
-        // Then the load of the rotor causes a part of the error, and the procedure is the one of C15, not a slower spool-up
+        // The liftoff timing identifies a possible load change, not the cause of the governor error.
         const flightsOf = (f) => c.F.filter(d => d.id === 'D7' && logsOf(d).some(l => logsOf(f).includes(l))).flatMap(d => Array.isArray(d.flights) ? d.flights : []);
         const changeAt = (f) => (Array.isArray(f.events) ? f.events : []).map(e => num(e && e.t)).filter(t => t !== null);
         const liftoffOf = (f) => { if (f.afterLiftoff === false) return null;
@@ -1449,8 +1517,8 @@ const GEN = {
         const airborne = bad.map(f => ({ f, at: liftoffOf(f) })).filter(x => x.at);
         const when = (x) => x.at.t !== null && x.at.t0 !== null ? `${fmt(x.at.t - x.at.t0, 2)} s after the liftoff at ${fmt(x.at.t0, 2)} s (${whereOf(x.f, c)})`
             : `${num(x.at.dt) !== null ? `${fmt(x.at.dt, 2)} s ` : ''}after the liftoff (${whereOf(x.f, c)})`;
-        const air = airborne.length ? `${airborne.length === 1 ? 'The change to ACTIVE came' : `In ${airborne.length} results, the change to ACTIVE came after the liftoff. The first came`} ${when(airborne[0])}, and the rotor load causes a part of the error. `
-            + 'Keep the collective low until the governor is ACTIVE. Then do the liftoff in one movement.' : '';
+        const air = airborne.length ? `${airborne.length === 1 ? 'The change to ACTIVE came' : `In ${airborne.length} results, the change to ACTIVE came after the liftoff. The first came`} ${when(airborne[0])}. `
+            + 'A change in rotor load can cause part of the error. Compare collective, throttle and headspeed around this change before you adjust the governor. Keep the collective low until the governor is ACTIVE. Then do the liftoff in one movement.' : '';
         const slower = f0 && num(f0.value) > 0 && airborne.length < bad.length ? 'A slower spool-up can possibly give a smaller overshoot (no flight test), and a larger gov_spoolup_time gives a slower spool-up.' : '';
         const rule = `Check G16 examines the change from SPOOLUP to ACTIVE. It has a problem if the headspeed error is ${pct(ruleNum(PR, 'G16', 'flag'))} or more, or if the headspeed becomes stable after more than ${fmt(ruleNum(PR, 'G16', 'settleS'))} s.`;
         const n1 = bad.filter(f => !(num(f.se) > 0));
@@ -1490,15 +1558,14 @@ const GEN = {
         return [...group(bad, profileOf)].map(([p, list]) => {
             const worst = list.slice().sort((a, b) => a.value - b.value)[0], ov = list.filter(f => f.overload), lv = list.filter(f => f.leave);
             const text = [`At the rescue, the headspeed decreases to ${pct(Math.abs(worst.value), 1)} less than the target (${whereOf(worst, c)}). ${list.length > 1 ? `${many(list.length, 'result')} have this problem.` : ''}`.trim(),
-                ov.length ? `In ${many(ov.length, 'result')}, the headspeed decreases while the throttle is at ${hi} % or more. At the throttle limit, the governor cannot hold the headspeed, and gain changes cannot correct this.`
-                    : `The throttle is not at ${hi} % or more before the largest decrease. A larger gov_collective_ff_weight adds the throttle earlier when the collective increases.`,
+                ov.length ? `In ${many(ov.length, 'result')}, the headspeed decreases while the throttle is at ${hi} % or more. This shows a small throttle reserve.`
+                    : `The throttle is not at ${hi} % or more before the largest decrease. Examine the response to collective in check G3.`,
                 ov.length && list.some(f => num(f.throttleMax) !== null && f.throttleMax >= 995) ? 'The throttle gets to 100 %. Thus, a larger gov_max_throttle cannot give more throttle.'
-                    : ov.length ? `The throttle gets to only ${fmt(Math.max(...list.map(f => num(f.throttleMax) || 0)) / 10, 1)} %. Examine gov_max_throttle: a larger value gives more throttle.` : '',
+                    : ov.length ? `The throttle gets to ${fmt(Math.max(...list.map(f => num(f.throttleMax) || 0)) / 10, 1)} %. Compare this with gov_max_throttle and the ESC output range.` : '',
                 lv.length ? `\nIn ${many(lv.length, 'result')}, the governor changes from ACTIVE to ${and([...new Set(lv.map(f => f.leave))])}. In FALLBACK, the firmware decreases the throttle by gov_fallback_drop. In RECOVERY, the throttle increases at the rate of gov_recovery_time.` : '',
-                '\nDecrease the load at the rescue. For example, decrease rescue_pull_up_collective, or start the rescue with less collective.',
-                'A smaller rescue_pull_up_collective with a longer rescue_pull_up_time gives a smaller load for a longer time (no flight test).',
-                'If the throttle is also at its limit out of the rescue (check L1), decrease gov_headspeed to get a throttle reserve.'];
+                'A change to rescue collective or time changes the rescue response. This log does not measure the effect of that change.'];
             return rec({ id: `G19:p${p}`, area: 'governor', profile: p, title: 'Headspeed decrease at a rescue', evidence: list.map(evidence), sources: [ruleSrc(RR, 'G19'), RULES.source.fallback],
+                procedure: ov.length ? governorLimitProcedure(true, !list.some(f => num(f.throttleMax) !== null && f.throttleMax >= 995)) : null,
                 rule: `Check G19 has a problem if the headspeed at a rescue decreases to more than ${pct(ruleNum(RR, 'G19', 'flag'))} less than the target. A governor change from ACTIVE to FALLBACK, RECOVERY or BAILOUT is also a problem.`,
                 text: text.filter(Boolean).join(' ').replace(/ \n/g, '\n') }); });
     },
@@ -1513,9 +1580,9 @@ const GEN = {
             const text = [`At the rescue, the largest yaw error is ${fmt(worst.value, 0)} deg/s more than the largest yaw error before the rescue (${whereOf(worst, c)}).`,
                 lim.length ? `The tail output is at its limit for ${fmt(Math.max(...lim.map(f => f.atLimitS)), 3)} s in the first ${num(RRULE.tail && RRULE.tail.afterS) || 1.5} s. At its limit, the tail does not have sufficient authority.` : '',
                 g19 ? '\nAt this rescue, the headspeed also decreases (check G19). A torque change of the main rotor pushes the tail.' : '',
-                d8 ? 'At this rescue, the PID profile also changes (check D8). This changes the tail gains and the precompensation.' : '',
+                d8 ? 'At this rescue, the PID profile also changes (check D8). This can change the tail gains and the precompensation.' : '',
                 '\nExamine yaw_collective_ff_gain, because the pull-up of the rescue is a large collective step.',
-                lim.length ? 'A larger tail pitch range or a higher headspeed gives the tail more authority.' : '',
+                lim.length ? tailLimitAdvice(c, [p]) : '',
                 mot ? 'On a tail with a motor, examine the tail torque assist (gov_tta_gain).' : ''];
             return rec({ id: `T15:p${p}`, area: 'tail', axis: 'yaw', profile: p, title: 'Tail kick at a rescue', evidence: list.map(evidence), sources: [ruleSrc(RR, 'T15')],
                 rule: `Check T15 has a problem if the yaw error at a rescue increases by more than ${fmt(ruleNum(RR, 'T15', 'kick'), 0)} deg/s from the largest error before the rescue. A tail output at its limit is also a problem.`,
@@ -1528,10 +1595,12 @@ const GEN = {
             return `${w ? `In ${w}, ` : ''}${prof(f.fromProfile)} changes to ${prof(f.toProfile)}.`; });
         return one(bad, { id: 'D8', area: 'precondition', title: 'PID profile change at a rescue', sources: [ruleSrc(RR, 'D8')],
             rule: 'Check D8 has a problem if the PID profile changes from 1 s before to 0.1 s after a rescue starts.',
-            text: [`At ${many(bad.length, 'rescue')}, the PID profile changes when the rescue starts.`].concat(items).join(' ') + '\n' +
-                ['The rescue then flies with the gains, the governor headspeed and the precompensation of a different PID profile.',
-                'Put the rescue on a switch that does not change the PID profile.',
-                'Make sure that the transmitter and the Adjustments tab do not change the PID profile with the rescue switch.'].join(' ') });
+            text: [`At ${many(bad.length, 'rescue')}, the PID profile changes near the rescue start.`].concat(items).join(' ') + '\n' +
+                ['This can change gains, governor headspeed and precompensation during the rescue.',
+                'The time of a PID profile change does not identify its source.',
+                'Examine the transmitter, Modes tab and Adjustments tab to find the command that changed the PID profile.',
+                'If the rescue switch changes the PID profile incorrectly, put the PID profile change on a different switch.',
+                'Then test the rescue switch on the ground with the motor off.'].join(' ') });
     },
     L1: (L, c) => limits(L, c, 'L1'), L2: (L, c) => limits(L, c, 'L2'), L3: (L, c) => limits(L, c, 'L3'), L4: (L, c) => limits(L, c, 'L4'), L5: (L, c) => limits(L, c, 'L5'), L6: (L, c) => limits(L, c, 'L6'), L7: (L, c) => limits(L, c, 'L7'),
     C15(L, c) {  // ground resonance before liftoff: a procedure for the pilot, never a gain change (analysis/gaui-x4/FINDINGS.md 1.1: a source, RULES.source.liftoff)
@@ -1552,49 +1621,92 @@ GEN.SETUP.always = true; // run once even without findings of the id
 // evidence row links to its periods). A check when a period is a problem, else a watch. Never CLI: no limit check sizes a value
 const LIMIT_TITLE = { throttle: 'Throttle at its limit', collective: 'Collective output at its limit', collectiveCommand: 'Collective stick at its end', roll: 'Roll output at its limit', pitch: 'Pitch output at its limit',
     ring: 'Swash ring at its limit', tail: 'Tail output at its limit' };
+function governorLimitProcedure(hasPeriods, estimated = false) {
+    return {
+        title: estimated ? 'Examine the throttle limit before you increase governor gains.' : 'Examine the battery and ESC before you increase governor gains.',
+        steps: [
+            ...(estimated ? ['Compare the governor maximum throttle value with the highest recorded throttle.'] : []),
+            estimated ? 'Open the period at high throttle with \"Show in the log\".' : hasPeriods ? 'Open a period at full throttle with "Show in the log".' : 'Open the throttle and headspeed measurements below.',
+            hasPeriods && !estimated ? 'At full throttle, examine battery voltage, battery current and ESC temperature. Examine the ESC limit warnings.'
+                : 'During high throttle, examine battery voltage, battery current and ESC temperature. Examine the ESC limit warnings.',
+            'If voltage is less than the battery limit or the ESC limits power, correct that problem before tuning.',
+            'If headspeed falls before full throttle, examine the governor response to the collective increase (G3).',
+            'If these signals are missing, record battery current and ESC telemetry on the next flight.'
+        ],
+        after: 'After these checks, record a short flight. Increase collective gradually. If headspeed continues to fall at full throttle, do a flight test at a lower headspeed. '
+            + 'Start with a hover test. A lower headspeed can decrease tail authority.',
+        success: 'The new log must show that headspeed stays at its target with throttle available for a load increase.'
+    };
+}
+function tailLimitAdvice(c, profiles) {
+    const same = f => !profiles.length || !profileOf(f) || profiles.some(p => !p || p === profileOf(f));
+    const noReserve = c.flags('G6').concat(c.flags('L1')).some(same);
+    return 'Compare the yaw error, tail output and headspeed before each limit period. '
+        + 'If oscillation starts first, examine the gains and filters before you change the output range. '
+        + 'If the output stays at its limit with a yaw error, examine the tail pitch range and linkage. '
+        + (noReserve ? '\nThe governor also reports an output limit. Do not increase headspeed as a tail change before you correct that limit.'
+            : '\nMore tail speed or larger tail blades can add authority, but the log does not show a correct mechanical change.')
+        + ' After a change, the same maneuver must give less yaw error without longer output limits.';
+}
 const LIMIT_DO = {
-    L1: ['Decrease the load at these times. For example, decrease the collective or rescue_pull_up_collective.', 'If the throttle is frequently at its limit, decrease gov_headspeed to get a throttle reserve.', 'Gain changes cannot correct this.'],
-    L2: ['Decrease the collective command that moves the output to its limit.', 'Examine the collective range of the mixer (the mixer input SC).'],
-    L3: ['Decrease the cyclic command that moves the output to its limit.', 'Examine the cyclic limits of the mixer and the swash ring.', 'Gains cannot correct an output at its limit.'],
-    L4: ['At its limit, the tail does not have sufficient authority.', 'A larger tail pitch range (if the mechanical parts let it), larger tail blades or a higher headspeed (gov_headspeed) give the tail more authority.',
-        'On a tail with a motor, the tail torque assist (gov_tta_gain) helps the tail.', 'Gains cannot correct an output at its limit.'],
-    L5: ['Examine the servo limits and the linkage.', 'If it is safe, increase the servo travel.', 'Decrease the command that moves the servo to its limit.'],
-    L6: ['Examine the trim of this axis, the center of gravity and the mixer calibration (check C1).', 'Gains cannot correct a trim.'],
-    L7: ['A large collective is a large load. Examine the headspeed at these times (checks G19 and L1).', 'If the collective rate is more than necessary, decrease it.'],
+    L1: [],
+    L2: ['Examine the collective range of the mixer (the mixer input SC) and the available blade pitch.', 'Compare the command and output at these times to identify the limit.', 'The log does not show a new mechanical range.'],
+    L3: ['Compare the cyclic error and output before each limit period.', 'Examine the cyclic mixer limits, swash ring and available mechanical travel.', 'Gains cannot increase the output range. Oscillation before the limit must be examined separately.'],
+    L5: ['Examine the servo limits and the linkage for a mechanical stop.', 'Compare the servo command and movement before you change travel.', 'The log does not measure the available mechanical travel.'],
+    L6: ['Examine the trim of this axis, the center of gravity and the mixer calibration (check C1).', 'An I-term at its limit does not identify which of these must change.'],
+    L7: ['Examine the headspeed and output limits at these times (checks G19 and L1).', 'A full collective command does not identify a problem or a gain change.'],
 };
 function limits(L, c, id) {
     const sel = L.filter(f => f.severity === 'flag' || (f.severity === 'note' && !thin(f)));
     return [...group(sel, f => `${f.channel}|${profileOf(f)}`)].map(([k, list]) => {
         const f0 = list[0], p = profileOf(f0), ch = f0.channel, flag = list.some(isFlag), periods = list.flatMap(f => (f.events || []).map(e => Object.assign({ log: logsOf(f)[0] }, e))).sort((a, b) => b.seconds - a.seconds);
         const total = list.reduce((s0, f) => s0 + (num(f.value) || 0), 0), n = list.reduce((s0, f) => s0 + (num(f.n) || 0), 0), with2 = [...new Set(list.flatMap(f => f.with || []))];
+        const estimated = id === 'L1' && list.some(f => f.throttleLimit ? f.throttleLimit.estimated : f.limits && f.limits.source === 'data' && f.limits.hi < 1000);
         const title = LIMIT_TITLE[ch] || (/^servo/.test(ch) ? `Servo \`${ch}\` at its limit` : /^iterm/.test(ch) ? `${cap(f0.axis || 'axis')} I-term at its limit` : 'Output at its limit');
         const PW = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
         const lines = periods.slice(0, 3).map(e => `In log ${lab(e.log, c)}, the period from ${fmt(e.tS, 2)} s to ${fmt(e.t1S, 2)} s is ${fmt(e.seconds, 3)} s long${[PW[e.phase], e.rescue ? (e.rescue === 'rescue' ? 'in a rescue' : 'before a rescue') : null].filter(Boolean).map(x => `, ${x}`).join('')}.`);
         const subject = title.replace(/ at its (limit|maximum|end)$/, '');
-        const text = [`${subject.charAt(0) === '`' ? subject : `The ${subject.charAt(0).toLowerCase()}${subject.slice(1)}`} is at its limit in ${many(n, 'period')}, for a total of ${fmt(total, 3)} s (${logsText(list, c)}, ${prof(p)}).`, ...lines,
+        const text = [estimated ? 'The throttle limit is an estimate from recorded output. These periods do not show full throttle.' : '',
+            `${subject.charAt(0) === '`' ? subject : `The ${subject.charAt(0).toLowerCase()}${subject.slice(1)}`} is at its limit in ${many(n, 'period')}, for a total of ${fmt(total, 3)} s (${logsText(list, c)}, ${prof(p)}).`, ...lines,
             `\n${with2.length ? `Other outputs are at their limits at the same time: ${and(with2.map(q => LIMIT_TITLE[q] ? LIMIT_TITLE[q].replace(/ at its (limit|maximum|end)$/, '').toLowerCase() : `\`${q}\``))}. ` : ''}`
-                + (flag ? 'This is a problem. An output at its limit is the possible first cause of the errors that come after it.' : 'Examine these periods. They are short, and they come with no large error.'), `\n${(LIMIT_DO[id] || []).join(' ')}`];
+                + (flag ? 'This limit must be examined. The sequence of the output limit and the error is necessary to identify the cause.' : 'Examine these periods. They are short, and they come with no large error.'), `\n${id === 'L4' ? tailLimitAdvice(c, [p]) : (LIMIT_DO[id] || []).join(' ')}`];
         return rec({ id: `${id}:${ch}:p${p}`, area: id === 'L1' ? 'governor' : id === 'L7' ? 'precondition' : id === 'L4' || f0.axis === 'yaw' ? 'tail' : 'cyclic', axis: f0.axis || null, profile: p, severity: flag && id !== 'L7' ? 'check' : 'watch',   // L7: a command of the pilot, never a problem of the flight controller
-            title, evidence: list.map(evidence), sources: [ruleSrc(LR2, id)],
+            title: estimated ? 'Examine the throttle limit' : title, evidence: list.map(evidence), sources: [ruleSrc(LR2, id)],
+            procedure: id === 'L1' ? governorLimitProcedure(periods.length > 0, estimated) : null,
             rule: `Check ${id} finds each period with the output at 0.5 % of its limit or nearer, in all flight phases and in the rescue. A period of ${fmt(num(LR2.longS) || 0.1)} s or more is a problem. `
                 + 'An error more than the limit of the related check is also a problem. Two outputs at their limits at the same time are also a problem.',
             text: text.filter(Boolean).join(' ').replace(/ \n/g, '\n').trim() }); });
+}
+
+function slowTrial(L, c, id, area) {
+    return perProfile(L, c, id, { area, axis: area === 'tail' ? 'yaw' : undefined,
+        rule: `Check ${id} measures the error peak at 0.5 Hz to 3 Hz. Its prominence limit is ${LR[id].prominence}. The test step is ${RULES.dirStep * 100} %.`,
+        sources: [src(LR[id].source), RULES.source.dirStep, 'Rotorflight documentation, "Tuning your Helicopter"'],
+        size: (fl, e, ax) => {
+            const driven = fl.every(f => /driven by I/.test(String(f.text)) && !/not driven by I/.test(String(f.text)));
+            const text = `The ${ax} error peak has a prominence of ${pm(e.value, e.se)}. ` +
+                (num(e.se) === null ? 'The log gives no SE for this spectrum peak. ' : '') +
+                (driven ? `The I-term supplies a minimum of 50 % of the control at this frequency. A smaller I gain can decrease this oscillation.\nThe ${RULES.dirStep * 100} % step is a test, not a measured best value.`
+                    : 'The data does not identify the I-term as the cause. Examine the mechanical parts and the governor.');
+            return Object.assign({ title: `${cap(ax)} slow oscillation`, text }, driven ?
+                { parameter: `${ax}_i_gain`, mult: 1 - RULES.dirStep, direction: 'lower' } : {});
+        } });
 }
 
 function oscillation(L, id, area, c) {
     const ax0 = area === 'tail' ? 'yaw' : null, bad = L.filter(isFlag), mild = L.filter(f => f.severity === 'note' && !thin(f));
     const grows = `It has a problem if the oscillation increases from less than ${fmt(ONSET.small, 0)} deg/s to ${fmt(ONSET.high, 0)} deg/s or more in ${fmt(ONSET.minHalfCycles, 0)} half-cycles or more`;
     return [...group(bad, f => axisOf(f) || ax0)].map(([ax, list]) => { const n = sum(list), few = n < RULES.minBursts;
-        return rec({ id: `${id}:${ax}`, area, axis: ax, severity: few ? 'watch' : 'check', title: `${cap(ax)} oscillation that increases with no stick input${few ? ': 1 period' : ''}`, evidence: list.map(evidence),
-            rule: `Check ${id} examines the oscillation with no stick input, in the band of its axis. ${grows}.${num(OSC.stickDriven) !== null ? ` A period has no stick input if the setpoint oscillation is ${pct(OSC.stickDriven)} or less of the gyro oscillation.` : ''} Less than ${RULES.minBursts} of these periods give a recommendation to monitor.`,
+        return rec({ id: `${id}:${ax}`, area, axis: ax, severity: few ? 'watch' : 'check', title: `${cap(ax)} oscillation that increases with small stick input${few ? ': 1 period' : ''}`, evidence: list.map(evidence),
+            rule: `Check ${id} examines the oscillation with small stick input, in the band of its axis. ${grows}.${num(OSC.stickDriven) !== null ? ` A period has small stick input if the setpoint oscillation is ${pct(OSC.stickDriven)} or less of the gyro oscillation.` : ''} Less than ${RULES.minBursts} of these periods give a recommendation to monitor.`,
             sources: [ruleSrc(TR, id), RULES.source.minBursts],
-            text: `There ${n === 1 ? 'is 1 period' : `are ${n} periods`} of ${ax} oscillation that ${n === 1 ? 'increases' : 'increase'} with no stick input (${many(list.length, 'log-profile pair')}, ${logsText(list, c)}). ` + (few ? '1 period cannot show the difference between the loop gain, the load, a time delay and a low battery. Do one more flight and look for a second period before you change a gain.'
+            text: `There ${n === 1 ? 'is 1 period' : `are ${n} periods`} of ${ax} oscillation that ${n === 1 ? 'increases' : 'increase'} with small stick input (${many(list.length, 'log-profile pair')}, ${logsText(list, c)}). ` + (few ? '1 period cannot show the difference between the loop gain, the load, a time delay and a low battery. Do one more flight and look for a second period before you change a gain.'
                 : `Possible causes: ${area === 'tail' ? 'the yaw P gain, a stop gain or the D gain is too high, or gyro noise in the D-term (PROF and a recommendation from other pilots)' : 'the P or D gain is too high, or gyro noise in the D-term'}. TUNE gives a decrease of the gain that you increased last. The frequency does not show which term causes it.`) }); })
         .concat([...group(mild, f => axisOf(f) || ax0)].map(([ax, list]) => { const e = pooled(list.map(f => [f.value, f.se]));
             return rec({ id: `${id}:${ax}:watch`, area, axis: ax, severity: 'watch', title: `${cap(ax)} oscillation`, evidence: list.map(evidence),
-                rule: `Check ${id} gives a value to monitor if, with no stick input, the oscillation is ${fmt(ruleNum(TR, id, 'level'), 0)} deg/s or more for more than ${pct(ruleNum(TR, id, 'share'))} of the time. `
+                rule: `Check ${id} gives a value to monitor if the oscillation in selected windows is ${fmt(ruleNum(TR, id, 'level'), 0)} deg/s or more for more than ${pct(ruleNum(TR, id, 'share'))} of the time. `
                     + `The value must be more than this limit by ${RULES.sigmas} SE.`, sources: [ruleSrc(TR, id)],
-                text: `With no stick input, the ${ax} oscillation is ${fmt(ruleNum(TR, id, 'level'), 0)} deg/s or more for ${e ? pmPct(e.value, e.se) : 'some'} of the time (${logsText(list, c)}). The stick or the load causes it, not the loop. Monitor it after you increase a gain.` }); }));
+                text: `In selected windows, the ${ax} oscillation is ${fmt(ruleNum(TR, id, 'level'), 0)} deg/s or more for ${e ? pmPct(e.value, e.se) : 'some'} of the time (${logsText(list, c)}). The measurement does not identify the cause. Compare the oscillation with the load and governor response before you change a gain.` }); }));
 }
 // C12 / T11 per axis, over every measured log-profile pair (ok ones too: pooling only the pairs above the note level
 // would read above it by construction); a recommendation where a pair is above the note level. An elevated pair
@@ -1619,11 +1731,11 @@ function tracking(L, id, area, c) {
         return sigAny(r, list, id); });
 }
 // H findings of the keys in the start-profile scope of finding f that come after f's log (either log of the change)
-const laterChanges = (c, keys, f) => { const l = logsOf(f)[0], p = profileOf(f); return typeof l !== 'number' ? [] : c.F.filter(h => h.id === 'H' && hProfile(h) !== null && hProfile(h) === p && keys.includes(String(h.text).split(':')[0])
-    && Math.max(...logsOf(h).concat(matchNum(/since log (\d+)/, h.text) === null ? [] : [matchNum(/since log (\d+)/, h.text)])) > l); };
+const laterChanges = (c, keys, f) => { const l = logsOf(f)[0], p = profileOf(f); return typeof l !== 'number' ? [] : c.F.filter(h => h.id === 'H' && hProfile(h) !== null && hProfile(h) === p && keys.includes(headerKeyOf(h))
+    && Math.max(...logsOf(h).concat(num(h.since) !== null ? [h.since] : matchNum(/since log (\d+)/, h.text) === null ? [] : [matchNum(/since log (\d+)/, h.text)])) > l); };
 // an H finding ("key: old -> new (since log N, ...)", health_setup) in the reader's words
-const changeText = (h, c, bare) => { const m = /^([\w\[\]]+): (.*?) -> (.*?)(?: \(since|$)/.exec(String(h.text)), key = String(h.text).split(':')[0];
-    return `${bare ? '' : `${key} changed `}${m ? `from ${m[2]} to ${m[3]} ` : ''}in log ${lab(logsOf(h)[0], c)}`.trim(); };
+const changeText = (h, c, bare) => { const m = /^([\w\[\]]+): (.*?) -> (.*?)(?: \(since|$)/.exec(String(h.text)), key = headerKeyOf(h);
+    return `${bare ? '' : `${key} changed `}${typeof h.headerKey === 'string' ? `from ${h.from} to ${h.value} ` : m ? `from ${m[2]} to ${m[3]} ` : ''}in log ${lab(logsOf(h)[0], c)}`.trim(); };
 
 // T14 by the yaw setup each log flew: the yaw PID, stop and inertia gains of its header (health_setup SETUP finding),
 // against the analysed header. The present setup leads and must pass the T14 rule again with its logs pooled (the
@@ -1633,18 +1745,44 @@ const changeText = (h, c, bare) => { const m = /^([\w\[\]]+): (.*?) -> (.*?)(?: 
 // (minGainChange, relGainChange), or in its earlier form on the peak yaw toward the reaction torque (peak).
 const YAW_PID = /\bPID R [-\d.,]+ P [-\d.,]+ Y ([-\d.,]+);/, YAW_REST = /\byaw stop ([-\d.,]+), precomp [-\d.,]+, inertia ([-\d.,]+), TTA\b/;
 const yawSet = (pid, stop, inertia) => `yaw PID ${pid}, stop ${stop}, inertia ${inertia}`;
-const headerYawSet = (h) => [h.yawPID, h.yaw_stop_gain, h.yaw_inertia_precomp].some(v => v === undefined || v === null) ? null : yawSet(arr(h.yawPID).join(','), arr(h.yaw_stop_gain).join(','), arr(h.yaw_inertia_precomp).join(','));
+const headerYawSet = (h) => {
+    const values = [h.yawPID, h.yaw_stop_gain, h.yaw_inertia_precomp], lengths = [5, 2, 2];
+    if (values.some((a, i) => !Array.isArray(a) || a.length < lengths[i] || Array.from(a).some(v => num(v) === null))) return null;
+    return yawSet(...values.map(a => a.join(',')));
+};
 function logYawSets(c) {
     const m = new Map();
-    for (const f of c.F) if (f.id === 'SETUP') { const a = YAW_PID.exec(String(f.text)), b = YAW_REST.exec(String(f.text)); if (a && b) for (const l of logsOf(f)) m.set(l, yawSet(a[1], b[1], b[2])); }
+    for (const f of c.F) if (f.id === 'SETUP') {
+        for (const l of logsOf(f)) if (!m.has(l)) m.set(l, null);
+        if (f.setup && f.setup.pid && f.setup.yaw) { const s = f.setup, key = headerYawSet({ yawPID: s.pid.yaw, yaw_stop_gain: s.yaw.stopGain, yaw_inertia_precomp: s.yaw.inertia });
+            if (key !== null) for (const l of logsOf(f)) m.set(l, key);
+        } else { const a = YAW_PID.exec(String(f.text)), b = YAW_REST.exec(String(f.text));
+            if (a && b) { const numbers = (s) => s.split(',').map(v => v === '' ? null : Number(v));
+                const key = headerYawSet({ yawPID: numbers(a[1]), yaw_stop_gain: numbers(b[1]), yaw_inertia_precomp: numbers(b[2]) });
+                if (key !== null) for (const l of logsOf(f)) m.set(l, key); }
+        }
+    }
     return m;
 }
 function inertia(L, c) {
     const bad = L.filter(isFlag); if (!bad.length) return [];
     const R = MR.T14 || {}, byGain = typeof R.minGainChange === 'number', [lo, hi] = RANGE.yaw_inertia_precomp_gain, g0 = num(pick(c.header.yaw_inertia_precomp, 0));
     const now = headerYawSet(c.header), sets = logYawSets(c), setOf = (f) => sets.get(logsOf(f)[0]) || null, M = L.filter(measured);
-    const byLog = (a, b) => (logsOf(a)[0] || 0) - (logsOf(b)[0] || 0), split = now !== null && M.some(f => setOf(f) !== null);
+    if (now === null) {
+        const profiles = [...new Set(M.map(profileOf).filter(v => num(v) > 0))];
+        const p = profiles.length === 1 ? profiles[0] : c.headerProfile > 0 && c.headerConfirmed ? c.headerProfile : 0;
+        return [rec({ id: 'T14', area: 'tail', axis: 'yaw', parameter: 'yaw_inertia_precomp_gain', profile: p,
+            title: 'Yaw at headspeed ramps: selected yaw values unknown', evidence: M.map(evidence), sources: [ruleSrc(MR, 'T14')],
+            rule: 'The recorded yaw PID, stop and inertia values are necessary for check T14 to compare the headspeed ramps.',
+            text: 'The recorded data do not give all yaw PID, stop and inertia values of the selected PID profile. '
+                + 'Thus, the app cannot compare these results with the selected yaw values. '
+                + 'These results do not give a gain change for the selected PID profile. '
+                + `Start a new log with ${p > 0 ? prof(p) : 'the PID profile that you will test'} selected to record its values. `
+                + `Then record ${R.minEvents} headspeed ramps or more in flight. Do the analysis again.` })];
+    }
+    const byLog = (a, b) => (logsOf(a)[0] || 0) - (logsOf(b)[0] || 0), split = M.some(f => sets.has(logsOf(f)[0]));
     const present = (split ? M.filter(f => setOf(f) === now) : M).sort(byLog), old = split ? M.filter(f => setOf(f) !== now && isFlag(f)).sort(byLog) : [];
+    const unknownOld = old.some(f => setOf(f) === null);
     const G = pooled(present.map(f => [num(f.gainChange), num(f.gainChangeSe)])), Y = pooled(present.map(f => byGain ? [num(f.toward), num(f.towardSe)] : [num(f.value), num(f.se)]));
     const e = byGain ? G : Y, thr = byGain ? Math.max(R.minGainChange, (num(R.relGainChange) || 0) * (g0 || 0)) : num(R.peak), n = present.reduce((s, f) => s + (num(f.n) || 0), 0);
     const x = present.flatMap(f => Array.isArray(f.events) ? f.events.map(q => num(q.value)).filter(v => v !== null) : []), sign = e && num(e.value) !== null ? Math.sign(e.value) : 0;
@@ -1655,7 +1793,7 @@ function inertia(L, c) {
     // the PID profile of the change (SPEC2 D12): of the findings when they have one, else the confirmed arming profile of the
     // analysed log header (whose yaw values select the logs above), else PID profile unknown
     const fp = [...new Set(present.map(profileOf).filter(v => num(v) > 0))], p = fp.length === 1 ? fp[0] : c.headerProfile > 0 && c.headerConfirmed ? c.headerProfile : 0;
-    const gain = G ? `A yaw_inertia_precomp_gain change of ${pm(G.value, G.se, 0)} supplies the tail feedback that moves with the rotor acceleration (range ${lo} to ${hi}).` : 'The analysis has no estimate of the gain change.';
+    const gain = G ? `The fit estimates a yaw_inertia_precomp_gain change of ${pm(G.value, G.se, 0)}. The firmware range is ${lo} to ${hi}.\nA new flight must measure the effect.` : 'The analysis has no estimate of the gain change.';
     const peak = Y ? `The peak yaw rate is ${pm(Y.value, Y.se, 1)} deg/s in the direction of the reaction torque.` : 'The analysis has no estimate of the peak yaw rate.';
     const judged = `${!split && present.length === 1 ? 'has' : 'have'} ${many(n, 'headspeed ramp')}${share === null ? '' : `, and ${pct(share)} of them have the sign of the estimate`}.`;
     const other = byGain ? `${peak} This value is information only, because a precompensation with a time delay gives a kick of this type also at the correct gain.` : gain;
@@ -1673,22 +1811,22 @@ function inertia(L, c) {
         const from = num(r.from), beyond = G && from !== null && num(G.se) !== null && from + G.value - RULES.sigmas * G.se > hi;
         r.text = `${on} ${judged} ${byGain ? gain : peak}${byGain ? '' : ` ${up ? 'An increase' : 'A decrease'} of yaw_inertia_precomp_gain can correct it.`}`
             + ' This gain changes the tail output when the rotor speed changes, and the documentation gives no tuning procedure.';
-        if (beyond) r.caveats.push(`The necessary value, ${pm(from + G.value, G.se, 0)}, is more than the firmware maximum, ${hi}. Slower headspeed changes (gov_tracking_time) also decrease the yaw.`);
+        if (beyond) r.caveats.push(`The estimate, ${pm(from + G.value, G.se, 0)}, is more than the firmware maximum, ${hi}. The estimate does not show that a larger value is correct. Slower headspeed changes (gov_tracking_time) are a possible test.`);
         r.caveats.push('A small step, and then PID profile changes in flight, give the next measurement.', other);
         if (byGain && from !== null && num(r.to) !== null && r.to !== from) { const want = Math.round(from + G.value), sim = 'In the tests of the toolkit with a model of the tail, the regression was -1 % to +14 % incorrect at gain 0. At the correct gain, it was 5 to 13 units too high. Thus, a step in its direction is better than the full change.';
             r.caveats.push(`The full estimate of the regression is ${pm(want, G.se, 0)}. ${sim}`); }
         if (!fp.length && p > 0) r.caveats.push(`Check T14 uses the headspeed ramps of all PID profiles of a log. Thus, the estimate is correct for ${prof(p)} only if all PID profiles have the same yaw_inertia_precomp_gain. The log header records this value only for the PID profile at the start of the log.`); }
     else if (present.length) Object.assign(r, { severity: 'watch', title: `Yaw at headspeed ramps: less than the T14 limit${split ? ' with the yaw values of the selected log' : ''}`,
-        text: `${old.length ? 'Other yaw values show a problem (refer to the notes). ' : ''}${on} ${judged} ${byGain ? gain : peak} This is not more than the limit of check T14. Do more PID profile changes in flight, and then do the analysis again.` });
+        text: `${old.length ? unknownOld ? 'Other results have different or unknown yaw values (refer to the notes). ' : 'Other yaw values show a problem (refer to the notes). ' : ''}${on} ${judged} ${byGain ? gain : peak} This is not more than the limit of check T14. Do more PID profile changes in flight, and then do the analysis again.` });
     else Object.assign(r, { severity: 'watch', title: 'Yaw at headspeed ramps: measure again with the yaw values of the selected log',
-        text: `Only other yaw values show a problem (refer to the notes). No log with the yaw values of the selected log (${now}) has ${R.minEvents} or more headspeed ramps. Do PID profile changes in flight with these values, and then do the analysis again.` });
+        text: `${unknownOld ? 'The measured results have different or unknown yaw values' : 'Only other yaw values show a problem'} (refer to the notes). No log with the yaw values of the selected log (${now}) has ${R.minEvents} or more headspeed ramps. Do PID profile changes in flight with these values, and then do the analysis again.` });
     if (present.length && !stands) r.caveats.push(other);
     if (split) r.caveats.push('The yaw values of a log are in its log header, for the PID profile at the start of the log. Check T14 uses the ramps of all PID profiles of a log, and most of them are PID profile changes.');
-    if (old.length) r.caveats.push(`Other yaw values show a problem, but the analysis measured them with different gains. They are information, not a target: ${old.slice(0, 4).map(f => `log ${lab(logsOf(f)[0], c)} (${setOf(f) || 'values unknown'}), gain change ${pm(num(f.gainChange), num(f.gainChangeSe), 0)}${byGain ? '' : `, peak yaw rate ${pm(f.value, f.se, 1)} deg/s`}`).join('. ')}${old.length > 4 ? `. There are ${old.length - 4} more` : ''}.`);
+    if (old.length) r.caveats.push(`${unknownOld ? 'Other results show a problem, but their yaw values are different or unknown.' : 'Other yaw values show a problem, but the analysis measured them with different gains.'} They are information, not a target: ${old.slice(0, 4).map(f => `log ${lab(logsOf(f)[0], c)} (${setOf(f) || 'values unknown'}), gain change ${pm(num(f.gainChange), num(f.gainChangeSe), 0)}${byGain ? '' : `, peak yaw rate ${pm(f.value, f.se, 1)} deg/s`}`).join('. ')}${old.length > 4 ? `. There are ${old.length - 4} more` : ''}.`);
     return [r];
 }
 const lag = (L, id, area, c) => perAxis(id, area, 'time delay is large', `Check ${id} has a problem if the time delay from the setpoint to the gyro is more than ${fmt(SIGMA[id][0], 0)} ms by ${RULES.sigmas} SE.`,
-    'Possible causes: too many filters (check F11), a B gain that is too low (FF: "raise B, not FF"), or the time delay from the stick to the setpoint (check R1).', { noun: 'time delay', unit: 'ms', sources: [ruleSrc(TR, id)] })(L, c).map(r => sigAny(r, L.filter(f => axisOf(f) === r.axis), id));
+    'Examine filter time delay (check F11), output limits and the response to acceleration. This measurement starts at the setpoint. It does not measure the time delay from the stick to the setpoint (check R1). The time delay does not identify a gain change.', { noun: 'time delay', unit: 'ms', sources: [ruleSrc(TR, id)] })(L, c).map(r => sigAny(r, L.filter(f => axisOf(f) === r.axis), id));
 
 // ---------------------------------------------------------------------------------------------
 // report.cjs decisions (C7)
@@ -1715,7 +1853,9 @@ function decisionRecs(D, c) {
             text: d.change ? `Tracking error ${two(d.tracking)} deg/s (${pm(d.dTrack, d.seTrack)}, ${fmt(d.dTrack / d.seTrack, 1)} SE). Disturbance error ${two(d.disturbance)}, total ${two(d.total)}, gain at 1 Hz to 3 Hz ${two(d.lowFreqGain, 3)}.${gates ? ` Conditions: ${gates}.` : ''} Band ${(d.validBand || []).join(' Hz to ')} Hz, ${counts}.`
                 : `The gain model gives no change: "${d.reason}".${gates ? ` Conditions: ${gates}.` : ''} ${cap(counts)}.` };
         const where = p ? [] : [cand.length ? `${d.bin} rpm agrees with the governor target of PID profiles ${and(cand.map(String))}. Thus, the PID profile is not clear.` : `No PID profile has a governor target in the ${d.bin} rpm range. Thus, the PID profile is unknown.`];
-        if (!d.change) { out.push(rec({ id: `C7:${ax}:${d.bin}`, area, severity: 'info', axis: ax, profile: p, title: `No ${ax} gain change at ${d.bin} rpm`, evidence: [e], rule, sources: [RULES.source.maxStep], confidence: 'predicted', text: `The gain model gives no change: "${d.reason}".` })); continue; }
+        const qualified = ['V1','V2a','V2b','V3'].every(k => g[k] && g[k].pass === true) && d.flights >= 3;
+        if (!d.change || !qualified) { out.push(rec({ id: `C7:${ax}:${d.bin}`, area, severity: !d.change ? 'info' : 'check', axis: ax, profile: p, title: `No ${ax} gain change at ${d.bin} rpm`, evidence: [e], rule, sources: [RULES.source.maxStep], confidence: 'predicted',
+            text: !d.change ? `The gain model gives no change: "${d.reason}".` : 'The gain model does not have satisfactory results for all four checks with 3 flights or more. Thus, there is no gain change.' })); continue; }
         // the gains that the model changes together are one change (SPEC2 C3): group C7:<axis>:<bin>, and finish gives
         // CLI text to all of them or to none
         const joint = (d.changes || []).filter(s => PARAMS[`${ax}_${String(s.gain).toLowerCase()}_gain`]), group = joint.length > 1 ? `C7:${ax}:${d.bin}` : null;
@@ -1732,7 +1872,7 @@ function decisionRecs(D, c) {
             // report.cjs evaluates the multipliers x0.8-x1.2 only: at the end of that grid nothing further was evaluated
             if (s.atBound) { r.caveats.push(`${s.multiplier} is the largest step of the gain model (${1 - RULES.maxStep} to ${1 + RULES.maxStep}, ${RULES.maxStep * 100} % for each step), and the model did not calculate a larger step. Thus, a larger change is possibly not better.`
                 + (Array.isArray(d.lowFreqGain) && num(d.lowFreqGain[0]) !== null && num(d.lowFreqGain[1]) !== null && (d.lowFreqGain[0] - 1) * (d.lowFreqGain[1] - 1) < 0 ? ` In the model, the gain at 1 Hz to 3 Hz goes through 1 in this step (${two(d.lowFreqGain, 3)}).` : ''));
-                r.text += ' Do a flight with this value, and then do the analysis again.'; }
+                r.text += ' The model did not calculate a larger step.'; }
             // the model ran with the recovered gain; the CLI is written only when it agrees with the configured value of the
             // same PID profile (its CLI section, or the header of the confirmed arming profile: current). Yaw P is recovered
             // as P x the mean stop gain: an agreement shows yaw_p_gain only when the two stop gains of the profile are known
@@ -1797,11 +1937,11 @@ function stale(c, r) {
     if (fromHeader && c.headerLog !== null && bench(c.headerLog) && c.logs.some(x => x.log !== c.headerLog && (x.logClass === 'flight' || (!x.logClass && x.flown))))
         return { keys: [...keys.keys()], text: `The values come from the log header of log ${lab(c.headerLog, c)}, a bench run with no flight. The flight logs can have different values. Thus, these values can be different from the values in flight.` };
     const p = num(r.profile) > 0 ? r.profile : null;
-    const ch = c.F.filter(f => f.id === 'H' && keys.has(String(f.text).split(':')[0]) && (keys.get(String(f.text).split(':')[0]) === 'global' ? f.profile === 'global' : f.profile !== 'global' && (p === null || hProfile(f) === p)));
+    const ch = c.F.filter(f => f.id === 'H' && keys.has(headerKeyOf(f)) && (keys.get(headerKeyOf(f)) === 'global' ? f.profile === 'global' : f.profile !== 'global' && (p === null || hProfile(f) === p)));
     if (!ch.length) return null;
     const t = (l) => c.start.has(l) ? String(c.start.get(l)) : null, last = ch.map(f => t(logsOf(f)[0])).sort().pop();
     if (ch.every(f => t(logsOf(f)[0]) !== null) && (c.headerLog !== null || !fromHeader) && mine.every(l => t(l) !== null && t(l) >= last)) return null;
-    const names = [...new Set(ch.map(h => String(h.text).split(':')[0]))], changed = and(ch.slice(-3).map(h => changeText(h, c, true)));
+    const names = [...new Set(ch.map(h => headerKeyOf(h)))], changed = and(ch.slice(-3).map(h => changeText(h, c, true)));
     return { keys: names, text: only ? `The values come from the log header${c.headerLog !== null ? ` of log ${lab(c.headerLog, c)}` : ''}. The value of ${and(names)} changed between logs (${changed}). Thus, the log header can have values that are different from the values at this time.`
         : `The value of ${and(names)} changed between logs (${changed}). Thus, the results from ${logsText(r.evidence, c)} can be from different values.` };
 }
@@ -1839,7 +1979,7 @@ function guard(r, c) {
     // guard 2: governor and RPM-notch changes wait for poles / gear and for the RPM signal (TUNING_KNOWLEDGE 9.1 step 0)
     if (chg && (r.area === 'governor' || /^gyro_rpm_notch/.test(param))) {
         if (c.flags('G12').length) hold(r, 'Check G12 shows an incorrect headspeed. The governor and the RPM notch filters use this headspeed. Correct motor_poles or the RPM sensor first.', ['G12']);
-        if (c.flags('G1').some(f => !c.g1Overload.has(f))) hold(r, 'Check G1 shows FALLBACK entries: the RPM signal was not available. The governor and the RPM notch filters use this signal.', ['G1']);
+        if (c.flags('G1').length) hold(r, 'Check G1 shows FALLBACK entries. Their cause and the RPM signal must be examined before a governor or RPM notch filter change.', ['G1']);
     }
     // guard 2, cyclic and tail: a headspeed factor error beyond the RPM-notch tolerance moves every RPM notch off its line
     // and, under a governor, the flown headspeed; what was measured before the poles / gear fix waits (TUNING_KNOWLEDGE 9.1
@@ -1860,10 +2000,12 @@ function guard(r, c) {
     // TUNING_KNOWLEDGE 8; analysis/gaui-x4/FINDINGS.md 1.7: stiffen only after the tail change passes). Lowering stays.
     if (chg && r.area === 'governor' && r.direction === 'raise' && GOV_GAIN.test(param)) {
         const same = (f) => !(num(r.profile) > 0) || !(num(profileOf(f)) > 0) || profileOf(f) === r.profile, tail = c.authority('yaw', r.profile), g10 = c.flags('G10').filter(same);
+        const throttle = c.flags('G6').concat(c.flags('L1')).filter(same);
+        if (throttle.length) hold(r, `The throttle has no sufficient reserve (${checks([...new Set(throttle.map(f => f.id))])}). A larger gain cannot increase the maximum output.`, throttle.map(f => f.id));
         if (tail) { hold(r, 'The tail is at its output limit (check T8). GOVT: "a well tuned governor might generate too much torque for the tail to counteract".', ['T8']);
             r.caveats.push('A governor with higher gains adds the motor torque more quickly when the collective increases. This torque goes to a tail at its limit (possible, not measured). '
                 + 'On a tail that the main rotor turns, a smaller headspeed decrease also gives more tail speed (calculated). After the tail change, an increase is correct only if the tail does not go to its limit more than before.'); }
-        if (g10.length) hold(r, `Check G10 shows that the governor causes the tail oscillation (coherence ${pm(g10[0].value, g10[0].se)}, ${many(g10.length, 'log-profile pair')}). For this condition, GOVT gives a smaller governor gain, not a larger one.`, ['G10']);
+        if (g10.length) hold(r, `Check G10 shows related headspeed and tail oscillations (coherence ${pm(g10[0].value, g10[0].se)}, ${many(g10.length, 'log-profile pair')}). This does not show which loop causes the oscillation. Examine check G10 before you increase the governor gains.`, ['G10']);
     }
     // TTA on while tuning the governor confounds it (GOVT)
     if (chg && r.area === 'governor' && GOV_GAIN.test(param) && pick(c.header.yaw_tta, 0) > 0) r.caveats.push(`gov_tta_gain is ${pick(c.header.yaw_tta, 0)}. GOVT tunes the governor with the TTA off (gov_tta_gain 0).`);
@@ -1917,7 +2059,9 @@ function causes(r, c) {
         // a rule with before (K24-K27): the upstream period starts before the error of the symptom (hierarchy.cjs startsBefore)
         const ups = ups0.filter(u => !within.includes(u) && (!K.before || !HIER || typeof HIER.startsBefore !== 'function' || s.some(x => Q.compatible(x, u) && HIER.startsBefore(u, x))));
         if (!ups.length) continue;
-        out.push({ rule: K.id, name: K.name, fids: ups.map(u => u.fid).filter(Boolean), ids: [...new Set(ups.map(u => u.id))], first: (K.first || []).slice(), holds: ups.some(u => (c.cited.get(u) || []).some(x => x === 'action' || x === 'check')) });
+        // RPM diagnosis and the coincident power response must be examined together. Holding G1 on G19/L1 would
+        // create a cycle: the governor changes already wait for G1 through the RPM prerequisite.
+        out.push({ rule: K.id, name: K.name, fids: ups.map(u => u.fid).filter(Boolean), ids: [...new Set(ups.map(u => u.id))], first: (K.first || []).slice(), holds: K.id !== 'K22' && ups.some(u => (c.cited.get(u) || []).some(x => x === 'action' || x === 'check')) });
     }
     return out;
 }
@@ -1987,10 +2131,10 @@ const NO_PROFILE = 'The PID profile of this result is unknown (PID profile unkno
 // noun ("The yaw CCW stop gain: a decrease (to monitor)"), and its text the change as a description (setNote)
 const TITLE_VERB = /^(Increase|Raise|Decrease|Lower|Reduce|Set|Add|Use|Make)\s+(.+)$/;   // not "Change": the titles use it as a noun
 const TITLE_NOUN = { Increase: 'an increase', Raise: 'an increase', Decrease: 'a decrease', Lower: 'a decrease', Reduce: 'a decrease', Add: 'a change', Use: 'a possible change', Make: 'a possible change' };
-function nounTitle(r) {
-    const m = TITLE_VERB.exec(String(r.title || '')); if (!m || (r.severity !== 'check' && r.severity !== 'watch')) return;
+function nounTitle(r, eligible) {
+    const m = TITLE_VERB.exec(String(r.title || '')); if (!m || (r.severity !== 'check' && r.severity !== 'watch' && eligible !== false)) return;
     const to = /^(.*?) (to .+)$/.exec(m[2]), obj = to ? to[1] : m[2], noun = TITLE_NOUN[m[1]] || 'a change';
-    r.title = `${cap(obj)}: ${noun}${to ? ` ${to[2]}` : ''} (${r.severity === 'watch' ? 'to monitor' : r.severity === 'check' ? 'to examine' : 'information'})`;
+    r.title = `${cap(obj)}: ${noun}${to ? ` ${to[2]}` : ''} (${r.severity === 'watch' ? 'to monitor' : 'to examine'})`;
 }
 // the checks that read the configuration (the log header or the CLI dump), not a measurement of the flights
 const HEADER_IDS = new Set(['D1', 'D3', 'D4', 'F1', 'F2', 'F3', 'F4', 'F8', 'F9', 'H', 'SETUP']);
@@ -2007,29 +2151,29 @@ function confidenceOf(r) {
 const LEAD_STATUS = { action: 'problem', check: 'problem', watch: 'monitor', info: 'information' };
 function leadOfRec(r) {
     if (!CAT || typeof CAT.lead !== 'function') return [];
-    const rows = r.evidence.map(e => SOURCE.get(e) || e).filter(Boolean), f = rows.find(isFlag) || rows[0];
+    const rows = r.evidence.map(e => SOURCE.get(e) || e).filter(Boolean), f = rows.find(q => q.id === 'G5' && q.governorResponse && q.governorResponse.censored > 0) || rows.find(isFlag) || rows[0];
     if (!f || !CAT.CHECKS || !CAT.CHECKS[f.id]) return [];
     return CAT.lead(f, LEAD_STATUS[r.severity] || 'monitor').filter(t => typeof t === 'string' && t && !String(r.text).includes(t));
 }
 // the expected effect of a change (an action), by its check and direction: the documented purpose of the parameter
 const EFFECT = {
-    D1: () => 'Then the frequency results of the next log are accurate.',
-    F1: () => 'Then less vibration gets to the PID controller and the servos.', F5: () => 'Then the filtered gyro has less vibration at this line.', F6: () => 'Then the filtered gyro has less vibration at this line.',
+    D1: () => 'A higher log rate increases the frequency range that the next log can measure.',
+    F1: () => 'This filter can decrease vibration at the PID controller and the servos.', F5: () => 'This change can decrease vibration at this line.', F6: () => 'This change can decrease vibration at this line.',
     F2: () => 'Then the filter time delay decreases, but more vibration gets through.', F3: () => 'Then the notch filter has a smaller bandwidth and a smaller time delay.',
-    C11: () => 'Then less vibration goes to the servos.', F10: () => 'Then less vibration goes to the tail.',
+    C11: () => 'This change can decrease vibration at the servos.', F10: () => 'This change can decrease vibration at the tail.',
     C1: () => 'Then the I-term has more range to correct a constant error.',
-    C3: (r) => r.direction === 'raise' ? 'Then the stick response is faster, and the I-term must help less.' : 'Then the I-term operates less against the feedforward.',
-    C4: (r) => r.direction === 'raise' ? 'Then the overshoot at the stops decreases, because the I-term must help less.' : 'Then the overshoot at the stops decreases.',
-    C5: () => 'Then the oscillation decreases.', T1: () => 'Then the tail oscillation decreases.', C6: () => 'Then the slow oscillation decreases.', T2: () => 'Then the slow tail oscillation decreases.',
+    C3: (r) => r.direction === 'raise' ? 'This change can make the response faster and decrease the I-term output.' : 'This change can decrease the I-term output against the feedforward.',
+    C4: () => 'This change can decrease the overshoot at the stops.',
+    C5: () => 'This change can decrease the oscillation.', T1: () => 'This change can decrease the tail oscillation.', C6: () => 'This change can decrease the slow oscillation.', T2: () => 'This change can decrease the slow tail oscillation.',
     C12: () => 'Then the gyro follows the sticks more accurately.', T11: () => 'Then the tail follows the yaw stick more accurately.', C13: () => 'Then the response to the stick is faster.', T12: () => 'Then the tail response to the stick is faster.',
-    C14: () => 'Then the helicopter pitches less when the collective changes, and the pitch I-term stays nearer to zero.',
-    T5: () => 'Then the yaw stops on the two sides are more equal.', T6: () => 'Then the tail moves less when the collective changes.', T7: () => 'Then the tail moves less when the collective changes.',
-    T9: (r) => r.direction === 'raise' ? 'Then the pirouette response is faster, and the yaw I-term must help less.' : 'Then the yaw I-term operates less against the feedforward.',
-    T14: () => 'Then the tail moves less when the headspeed changes.',
-    G2: () => 'Then the headspeed stays nearer to the target in stable flight.', G3: () => 'Then the headspeed decreases less when the collective increases.', G4: () => 'Then the headspeed overshoot after a collective change decreases.',
-    G5: () => 'Then the headspeed comes back to the target faster.', G9: () => 'Then the headspeed oscillation decreases.', G10: () => 'Then the governor causes less tail oscillation.',
-    G15: () => 'Then the spool-up gives less torque, and the helicopter does not turn on the ground.',
-    C7: () => 'The model calculates that the tracking error decreases after this change.',
+    C14: () => 'This change can decrease the pitch movement after a collective change.',
+    T5: () => 'This change can make the two yaw stops more equal.', T6: () => 'This change can decrease the tail movement when collective changes.', T7: () => 'This change can decrease the tail movement when collective changes.',
+    T9: (r) => r.direction === 'raise' ? 'This change can make the pirouette response faster and decrease the yaw I-term output.' : 'This change can decrease the yaw I-term output against the feedforward.',
+    T14: () => 'This change can decrease the tail movement when headspeed changes.',
+    G2: () => 'This change can keep the headspeed nearer to the target in stable flight.', G3: () => 'This change can decrease the headspeed decrease when collective increases.', G4: () => 'This change can decrease the headspeed overshoot after a collective change.',
+    G5: () => 'This change can decrease the time to the headspeed target.', G9: () => 'This change can decrease the headspeed oscillation.', G10: () => 'This change can decrease the effect of the governor on the tail oscillation.',
+    G15: () => 'This change can decrease the torque during spool-up.',
+    C7: () => 'The gain model estimates the response. A new flight must measure the response with the exported values.',
 };
 const effectOf = (r) => { const id = String(r.id).split(':')[0].replace(/#\d+$/, ''), e = EFFECT[id]; try { return e ? e(r) : null; } catch (err) { return null; } };
 function finish(r) {
@@ -2040,17 +2184,24 @@ function finish(r) {
     r.rule = [r.rule, sourceSentences(r.sources)].filter(Boolean).join(' ');
     // where the from-value comes from (the export comments): the present value of change(), else the analysed log header
     r.fromSource = r.base && r.base.source ? r.base.source : r.from !== null && r.from !== undefined && r.scope === 'global' ? 'log header' : null;
-    const st = r.severity === 'action' ? r.setText : r.setNote !== undefined ? r.setNote : null;
-    // symptom and why, then the numbers (the generator's text), then the change and its expected effect (SPEC3 F): one paragraph each
-    const lead = leadOfRec(r).join(' '), eff = r.severity === 'action' && (r.sets || r.relative) ? effectOf(r) : null, change = [st, eff].filter(Boolean).join(' ');
-    r.text = [lead, String(r.text || '').trim()].concat(r.dsText || [], [change]).filter(Boolean).join('\n').replace(/ *\n+ */g, '\n'); // the configurations after the numbers (round 3 M1)
-    nounTitle(r);
-    // a cause that holds: "Possible result of" (SPEC2 3.5), no CLI until it is corrected
     const held = r.causes.filter(x => x.holds);
+    const eligible = !!(r.severity === 'action' && r.sets && r.sets.length && !r.blockedBy.length && !r.stale && !held.length
+        && (r.scope !== 'profile' || Number.isInteger(r.profile) && r.profile >= 1 && r.profile <= 6)
+        && !(r.base && (r.base.unknown || r.base.approx || r.base.unconfirmed))
+        && r.sets.every(([k, v]) => PARAMS[k] && PARAMS[k][0] === r.scope && floorsOk(k, v) && legal(k, v)));
+    const st = eligible ? r.setText : r.setNote !== undefined ? r.setNote : null;
+    // symptom and why, then the numbers (the generator's text), then the change and its expected effect (SPEC3 F): one paragraph each
+    const lead = leadOfRec(r).join(' '), eff = eligible ? effectOf(r) : null;
+    const conditional = !eligible && !r.stale && r.severity === 'action' && (r.sets || r.relative)
+        ? 'This change must wait. Complete the prerequisite checks and measure a new flight before you use it.' : null;
+    const change = [conditional, st, eff, eligible && eff ? 'The next flight must measure this effect.' : null].filter(Boolean).join(' ');
+    r.text = [lead, String(r.text || '').trim()].concat(r.dsText || [], [change]).filter(Boolean).join('\n').replace(/ *\n+ */g, '\n'); // the configurations after the numbers (round 3 M1)
+    nounTitle(r, eligible);
+    // a cause that holds: "Possible result of" (SPEC2 3.5), no CLI until it is corrected
     if (held.length && (r.sets || r.relative) && r.severity === 'action')
         r.caveats.push(`This can be a result of the problems of ${checks([...new Set([].concat(...held.map(x => x.ids)))])} (${and(held.map(x => `rule ${x.rule}, "${x.name}"`))}). The app gives no CLI text for it until you correct them.`);
     if (r.severity !== 'action' || !r.sets || !r.sets.length || r.blockedBy.length || r.stale || held.length) return;
-    if (r.scope === 'profile' && !(num(r.profile) > 0)) { if (!r.profileNote && !(r.base && r.base.unknown === 'profile')) r.caveats.push(NO_PROFILE); return; }
+    if (r.scope === 'profile' && !(Number.isInteger(r.profile) && r.profile >= 1 && r.profile <= 6)) { if (!r.profileNote && !(r.base && r.base.unknown === 'profile')) r.caveats.push(NO_PROFILE); return; }
     if (r.base && (r.base.unknown || r.base.approx || r.base.unconfirmed)) return;
     if (!r.sets.every(([k, v]) => PARAMS[k] && PARAMS[k][0] === r.scope && floorsOk(k, v) && legal(k, v))) { r.caveats.push('The app does not write a value that is less than a filter limit, not in its firmware range, an RPM notch source that the firmware does not accept, or not a Rotorflight 4.6 name.'); return; }
     r.cli = (r.scope === 'profile' ? [`profile ${r.cliProfile}`] : []).concat(r.sets.map(([k, v]) => `set ${k} = ${v}`));
@@ -2078,7 +2229,7 @@ const sortKey = (r) => { const n = r.node ? Q.byId.get(r.node) : null;
     return [r.id === 'ERROR' ? 0 : n ? n.step : 9, n ? n.row : 0, rank(r), AXR[r.axis] === undefined ? 3 : AXR[r.axis], SEV[r.severity], num(r.profile) === null ? -1 : r.profile]; };
 function compare(a, b) { const x = sortKey(a), y = sortKey(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; }
 
-const OUT_KEYS = ['id', 'node', 'area', 'order', 'severity', 'title', 'text', 'parameter', 'scope', 'cliProfile', 'profile', 'rateProfile', 'axis', 'from', 'fromSource', 'fromSources', 'fromSets', 'to', 'direction', 'cli', 'evidence', 'rule', 'sources', 'confidence', 'blockedBy', 'gate', 'causes', 'caveats', 'group', 'groupSize',
+const OUT_KEYS = ['id', 'node', 'area', 'order', 'severity', 'title', 'text', 'procedure', 'parameter', 'scope', 'cliProfile', 'profile', 'rateProfile', 'axis', 'from', 'fromSource', 'fromSources', 'fromSets', 'to', 'direction', 'cli', 'evidence', 'rule', 'sources', 'confidence', 'blockedBy', 'holds', 'gate', 'causes', 'caveats', 'group', 'groupSize',
     'dataset', 'supportedBy', 'ab', 'slope'];   // round 3 M1: null and [] without configurations
 
 // ---------------------------------------------------------------------------------------------
@@ -2092,7 +2243,7 @@ const OUT_KEYS = ['id', 'node', 'area', 'order', 'severity', 'title', 'text', 'p
 // COVERAGE nolog). A row whose checks operated on the data with too little of it is needs-flights, also when its values are
 // not in the log header (the column cli). With a CLI dump, the PID mode row is judged on the CLI capture. The CLI dump is an
 // optional input (user rule 2026-10-06): no status asks for it
-const NOT_IN_LOG = /CLI|gear ratio|log header does not record/i;   // the text of a result that was not done because the log does not record a value
+const NOT_IN_LOG = /CLI|gear ratio|log(?: header)? does not record/i;   // the text of a result that was not done because the log does not record a value
 const STATE = { flag: 'problem', note: 'monitor', ok: 'satisfactory', skipped: 'not measured', error: 'analysis error', thin: 'not sufficient data' };
 const FIELD_STATE = { present: 'recorded', zero: 'always 0', absent: 'missing' };
 function coverage(c, decisions, recommendations) {
@@ -2159,7 +2310,8 @@ function advise(input) {
     // tells it (cliSection.usable: true; false for the section of another profile, null when the arming profile is not
     // confirmed, js/tuning_worker.js sectionOf). Without cliSection, every value counts. The global values always count
     for (const f of flags('D4')) { const guessed = !!f.cliSection && typeof f.cliSection === 'object' && f.cliSection.usable !== true;
-        for (const m of String(f.text).matchAll(/ vs ([a-z][a-z0-9_]*)(?:\[\d\])? /g)) if (!guessed || D4_GLOBAL.test(m[1])) c.staleCli.add(m[1]); }
+        const names = Array.isArray(f.mismatches) ? f.mismatches.map(m => String(m.cli).replace(/\[\d\]$/, '')) : [...String(f.text).matchAll(/ vs ([a-z][a-z0-9_]*)(?:\[\d\])? /g)].map(m => m[1]);
+        for (const name of names) if (!guessed || D4_GLOBAL.test(name)) c.staleCli.add(name); }
     c.c2Axes = (f) => { const w = (/output limit \(([^)]*)\)/.exec(String(f.text)) || [])[1] || '', only = (a, b) => new RegExp(`mixer\\[${a}\\]`).test(w) && !new RegExp(`mixer\\[${b}\\]|ring|servo|collective`).test(w);
         return only(0, 1) ? ['roll'] : only(1, 0) ? ['pitch'] : ['roll', 'pitch']; };
     c.authority = (axis, p) => { const id = axis === 'yaw' ? 'T8' : 'C2', same = (f) => !(num(p) > 0) || !(num(profileOf(f)) > 0) || profileOf(f) === p, fl = flags(id).filter(f => (id === 'T8' || c.c2Axes(f).includes(axis)) && same(f));
@@ -2176,7 +2328,7 @@ function advise(input) {
     recs.push(...decisionRecs(decisions, c));
     const errors = F.filter(f => f.severity === 'error');
     recs.push(...one(errors, { id: 'ERROR', area: 'logging', title: 'Some checks did not operate', rule: 'An error in the analysis stops its checks, and they give no result.',
-        text: [...group(errors, f => f.module || f.id)].map(([m, l]) => `Module ${m}: "${String(l[0].text).replace(/"/g, "'")}"${l.length > 1 ? ` (${many(l.length, 'error')})` : ''}.`).join(' ') }));
+        text: [...group(errors, f => f.module || f.id)].map(([m, l]) => `Module \`${m}\`: "${String(l[0].text).replace(/"/g, "'")}"${l.length > 1 ? ` (${many(l.length, 'error')})` : ''}.`).join(' ') }));
     const unknown = [...byId.keys()].filter(id => !known.has(id));
     if (unknown.length) notes.push(`${cap(checks(unknown))} ${unknown.length === 1 ? 'has' : 'have'} no recommendation. ${unknown.length === 1 ? 'It is' : 'They are'} only in the results.`);
 
@@ -2328,8 +2480,8 @@ function abBody(id, pair, R, u) {
     const A = R[pair.a], B = R[pair.b], d = Math.abs(pair.delta) < 5e-7 ? 0 : pair.delta;
     return [`Check ${id} gives ${numText(A.mean, A.se, u)} in configuration ${pair.a} and ${numText(B.mean, B.se, u)} in configuration ${pair.b}.`,
         !pair.testable ? 'These results have no SE. Thus, the app cannot do the 2-SE test, and the logs do not show an effect.'
-            : pair.significant ? `The difference is ${numText(d, pair.se, u)}, more than 2 SE. Thus, the logs show an effect of these parameters on this result.`
-                : `The difference is ${numText(d, pair.se, u)}, not more than 2 SE. Thus, the logs show no effect of these parameters on this result.`].join(' ');
+            : pair.significant ? `The difference is ${numText(d, pair.se, u)}, more than 2 SE. The recorded results are different. Other changes can also change these results.`
+                : `The difference is ${numText(d, pair.se, u)}, not more than 2 SE. These logs cannot identify an effect of these parameters on this result.`].join(' ');
 }
 const AB_NOTE = 'Other conditions of the flights can also change a result, for example the maneuvers and the battery.';
 // The configurations of a recommendation (before finish): r.dataset (the newest configuration of its PID profile), r.supportedBy
@@ -2370,7 +2522,7 @@ function dsStep(r, c) {
                 r.slope = { name: r.parameter, perUnit: pr.slope.slope, se: pr.slope.se, datasets: pr.slope.datasets.slice(), change: pr.change, changeSe: pr.se, together: pr.together.slice(), range: pr.slope.range.slice(),
                     check: first.id, unit: cmp.unit.unit || null, scale: cmp.unit.scale || 1 };
                 r.slope.text = `In ${dsList(pr.slope.datasets)}, check ${first.id} changes by ${numText(pr.slope.slope, pr.slope.se, cmp.unit)} for each 1 of \`${r.parameter}\`${pr.together.length ? ` (with ${and(pr.together.map(n => `\`${n}\``))})` : ''}. `
-                    + `Thus, the change from ${r.from} to ${r.to} gives ${numText(pr.change, pr.se, cmp.unit)}.`;
+                    + `The slope gives an estimate of ${numText(pr.change, pr.se, cmp.unit)} for a step from ${r.from} to ${r.to}. This is not a measured response to that step.`;
                 paras.push(r.slope.text);
             } else if (pr && pr.slope && pr.significant && !pr.inRange) paras.push(`The measured slope of check ${first.id} is for \`${r.parameter}\` from ${pr.slope.range[0]} to ${pr.slope.range[1]}. The change goes out of this range, thus the app does not use the slope.`);
         }
@@ -2408,7 +2560,7 @@ function comparisons(findings, datasets) {
                 : !test.length ? `The two configurations have ${many(rel.length, 'result')} of the checks that these parameters change, but no result has an SE. Thus, the logs do not show an effect.`
                     : `${many(test.length, 'result')} of the checks that these parameters change ${test.length === 1 ? 'has' : 'have'} an SE. ` + (sig.length
                         ? `Of these, ${sig.length} ${sig.length === 1 ? 'is' : 'are'} different by 2 SE or more: ${say(sig)}. ${AB_NOTE}`
-                        : 'No result is different by 2 SE or more. Thus, the logs show no effect of these parameters.')].join(' ');
+                        : 'No result is different by 2 SE or more. These logs cannot identify an effect of these parameters.')].join(' ');
         return o; });
 }
 
@@ -2423,11 +2575,15 @@ const FILTER_RULE = 'The app recommends a set of filter values only if the filte
 const FILTER_SOURCES = ['toolkit rule, no flight test: a model of the Rotorflight 4.6 gyro filters (firmware 4.6.0, sensors/gyro_filter_impl.c)', 'Rotorflight documentation, "First flight and filter tuning"'];
 function filterReplayRule(res) {
     const limit=res.limits && num(res.limits.maxAddMs)!==null ? res.limits.maxAddMs : 0.5;
+    const checks=res.recommended&&res.recommended.validation&&res.recommended.validation.checks;
+    const corrective=checks&&checks.training&&checks.training.passed&&checks.training.corrected>0;
     return 'The replay must agree with the recorded gyro on all axes. '
         + `The maximum added time delay is ${limit} ms.\nThe control-band gain must not decrease by more than 0.5 dB. `
         + 'The gyro vibration on each axis must not increase by more than 0.25 dB.\n'
+        + 'If the recorded data has filter problems, the replay must correct or decrease one or more. It must give no new filter problem.\n'
+        + 'The filter parameter checks must be satisfactory. A previous filter problem must not increase by more than the measurement uncertainty.\n'
         + (res.mode==='simulation' ? 'The replay checks the changed values on the recorded flight periods.'
-            : 'The vibration must decrease by 3 dB or more, and by more than 2 SE. '
+            : (corrective ? 'The vibration must decrease by more than 2 SE. ' : 'The vibration must decrease by 3 dB or more, and by more than 2 SE. ')
             + 'The analysis keeps some flight periods for a different test. The selected values must decrease vibration in 80 % of those periods.');
 }
 // the Q of a static notch from its center and its cutoff (firmware filter.c notchFilterGetQ)
@@ -2444,26 +2600,41 @@ const notchQOf = (hz, cutoff) => hz > 0 && cutoff > 0 && hz > cutoff ? hz * cuto
  */
 function filterRecommendations(res, meta = {}) {
     const R = (res && res.recommended) || {}, M = (res && res.model) || {}, T = meta.texts || {}, rows = res && res.version===2 && Array.isArray(R.fullRows) ? R.fullRows : Array.isArray(R.rows) ? R.rows : [];
-    const action = R.status === 'recommended' && M.passed === true && rows.length > 0 && (!res || res.mode!=='simulation' || (R.rows||[]).length>0), why = (T.why || []).slice(), blocked = Array.isArray(meta.blockedBy) ? meta.blockedBy.filter(Boolean) : [];
-    const replayValidated = res && res.version === 2 && M.passed && R.status === 'recommended';
+    const recordedOnly = res && res.mode === 'simulation' && R.params && !Object.keys(R.params).length;
+    const checks = res && res.checklist ? require('./filter_checklist.cjs').assess(res.checklist) : null;
+    const action = R.status === 'recommended' && M.passed === true && rows.length > 0 && !recordedOnly && (!checks || checks.passed), why = (T.why || []).slice(), blocked = Array.isArray(meta.blockedBy) ? meta.blockedBy.filter(Boolean) : [];
+    if(checks&&!checks.passed)why.push(...checks.reasons);
+    const replayValidated = res && res.version === 2 && M.passed && R.status === 'recommended' && (!checks || checks.passed);
     const base = { node: 'filters', area: 'filters', rule: res && res.version === 2 ? filterReplayRule(res) : FILTER_RULE, sources: FILTER_SOURCES.slice(), confidence: 'predicted', dataset: meta.dataset || null, replayValidated: !!replayValidated };
     const paras = [T.summary, T.recommendation, T.delay, T.validation, T.parity].filter(Boolean);
     const check = (caveats) => [finishFilter(rec(Object.assign({}, base, { id: 'F:filters', severity: 'check', scope: 'global', title: 'Filter values from the flight logs: no change (to examine)',
         text: paras.join('\n'), caveats })))];
-    if (!action) return check(why.length ? [] : ['The analysis of the filter values gives no set of changes.']);
+    if (!action) return check(checks&&!checks.passed ? checks.reasons : why.length ? [] : ['The analysis of the filter values gives no set of changes.']);
     // the values of the set, as the CLI accepts them
-    const bad = [], glob = { features: [], sets: [] }, byProf = new Map(), from = {}, srcOf = {};
+    const bad = [], glob = { features: [], sets: [] }, byProf = new Map(), from = {}, srcOf = {}, seen = new Map();
     const SRC = { header: 'log header', cli: cliWords({ cliName: meta.cliName || null }) };
     for (const row of rows) {
+        if (!row) { bad.push('The filter result contains an empty parameter row.'); continue; }
+        const id = `${row.scope}:${row.scope === 'profile' ? row.profile : ''}:${row.name}`, values = `${row.from}|${row.to}`;
+        if (seen.has(id)) { if (seen.get(id) !== values) bad.push(`The filter result gives different values for \`${row.name}\` in the same scope.`); continue; }
+        seen.set(id, values);
         const nm = String(row.name), f = /^feature (\w+)$/.exec(nm);
-        if (f) { if (!FEATURE_NAMES.includes(f[1])) bad.push(`\`${f[1]}\` is not a feature of Rotorflight 4.6.`); else { glob.features.push([f[1], row.to === true || row.to === 'true']); from[nm] = row.from === null || row.from === undefined ? null : !!row.from; } continue; }
+        if (f) {
+            const bool = v => v === true || v === 'true' ? true : v === false || v === 'false' ? false : null;
+            if (!FEATURE_NAMES.includes(f[1])) bad.push(`\`${f[1]}\` is not a feature of Rotorflight 4.6.`);
+            else if (row.scope !== 'global' || !SRC[row.source] || bool(row.from) === null || bool(row.to) === null)
+                bad.push(`The recorded value or the possible value of \`${nm}\` is not correct.`);
+            else { glob.features.push([f[1], bool(row.to)]); from[nm] = bool(row.from); srcOf[nm] = SRC[row.source]; }
+            continue;
+        }
         const P = PARAMS[nm], v = row.to === null || row.to === undefined ? '' : String(row.to);
         if (!P) { bad.push(`\`${nm}\` is not a name that the app writes.`); continue; }
         // a value at this time from the log header or the CLI dump only (CLAUDE.md "PID profiles"): a default of the model is not one
         if (!SRC[row.source] || row.from === null || row.from === undefined) { bad.push(`The value of \`${nm}\` at this time is unknown, because ${meta.cli ? 'the log header and the CLI dump do not give it' : 'the log header does not record it'}.`); continue; }
-        if (P[0] !== (row.scope === 'profile' ? 'profile' : 'global')) { bad.push(`\`${nm}\` is not a ${row.scope === 'profile' ? 'PID profile' : 'global'} value.`); continue; }
+        if (!cliValueOk(nm, String(row.from), true)) { bad.push(`The recorded value of \`${nm}\` is not correct.`); continue; }
+        if (!['global', 'profile'].includes(row.scope) || P[0] !== row.scope) { bad.push(`The scope of \`${nm}\` does not agree with its firmware scope.`); continue; }
         if (!cliValueOk(nm, v, replayValidated)) { bad.push(`The value ${v} of \`${nm}\` is not in its firmware range, or it is less than a filter limit.`); continue; }
-        if (row.scope === 'profile') { const p = num(row.profile); if (!(p > 0)) { bad.push(`The PID profile of \`${nm}\` is unknown (PID profile unknown).`); continue; }
+        if (row.scope === 'profile') { const p = num(row.profile); if (!(Number.isInteger(p) && p >= 1 && p <= 6)) { bad.push(`The PID profile of \`${nm}\` is unknown (PID profile unknown).`); continue; }
             if (!byProf.has(p)) byProf.set(p, []); byProf.get(p).push([nm, v]); }
         else glob.sets.push([nm, v]);
         const key = `${row.scope === 'profile' ? `p${row.profile}:` : ''}${nm}`; from[key] = row.from; srcOf[key] = SRC[row.source];
@@ -2478,21 +2649,26 @@ function filterRecommendations(res, meta = {}) {
     if (bad.length) return check(bad.concat(['Thus, there is no CLI text.']));
     const n = (glob.features.length || glob.sets.length ? 1 : 0) + byProf.size, group = n > 1 ? 'F:filters' : null, out = [];
     const pick = (keep, strip) => Object.fromEntries(Object.entries(keep).filter(([k]) => strip(k) !== null).map(([k, v]) => [strip(k), v]));
-    const rowText = (sel) => sel.map(x => x.text).filter(Boolean), chunks = (list) => { const o = []; for (let i = 0; i < list.length; i += 5) o.push(list.slice(i, i + 5).join(' ')); return o; };
-    const effect = res.mode === 'simulation' ? 'The replay shows the change of vibration with these values.' : 'Then less vibration gets to the PID controller and the servos.';
+    const rowValue = v => typeof v === 'boolean' ? v ? 'on' : 'off' : String(v);
+    const rowText = (sel) => sel.map(x => blocked.length ? `The possible value of \`${x.name}\` is ${rowValue(x.to)}. The recorded value is ${rowValue(x.from)}.` : x.text).filter(Boolean), chunks = (list) => { const o = []; for (let i = 0; i < list.length; i += blocked.length ? 3 : 5) o.push(list.slice(i, i + (blocked.length ? 3 : 5)).join(' ')); return o; };
+    const effect = 'The replay estimates the change of vibration with these values. A new flight must measure the response.';
     if (glob.features.length || glob.sets.length) {
-        const gr = (T.rows || []).filter(x => x.scope !== 'profile');
-        out.push(rec(Object.assign({}, base, { id: 'F:filters', severity: 'action', scope: 'global', title: 'Set the gyro filter values that the app found', group, groupSize: group ? n : null,
+        const gr = (blocked.length ? rows : T.rows || []).filter(x => x.scope !== 'profile');
+        out.push(rec(Object.assign({}, base, { id: 'F:filters', severity: 'action', scope: 'global', title: blocked.length ? 'Possible gyro filter values' : 'Set the gyro filter values that the app found', group, groupSize: group ? n : null,
             text: paras.concat(chunks(rowText(gr)), [effect]).join('\n'), cli: glob.features.map(([f, on]) => `feature ${on ? '' : '-'}${f}`).concat(glob.sets.map(([k, v]) => `set ${k} = ${v}`)),
             sets: glob.sets.slice(), fromSets: pick(from, (k) => /^p\d+:/.test(k) ? null : k), fromSources: pick(srcOf, (k) => /^p\d+:/.test(k) ? null : k) })));
     }
     for (const [p, sets] of [...byProf].sort((a, b) => a[0] - b[0])) {
-        const pr = (T.rows || []).filter(x => x.scope === 'profile' && x.profile === p);
-        out.push(rec(Object.assign({}, base, { id: `F:filters:p${p}`, severity: 'action', scope: 'profile', profile: p, cliProfile: p - 1, title: `Set the PID cutoffs that the app found on ${prof(p)}`, group, groupSize: group ? n : null,
+        const pr = (blocked.length ? rows : T.rows || []).filter(x => x.scope === 'profile' && x.profile === p);
+        out.push(rec(Object.assign({}, base, { id: `F:filters:p${p}`, severity: 'action', scope: 'profile', profile: p, cliProfile: p - 1, title: blocked.length ? `Possible PID cutoffs on ${prof(p)}` : `Set the PID cutoffs that the app found on ${prof(p)}`, group, groupSize: group ? n : null,
             text: (out.length ? [] : paras).concat(chunks(rowText(pr)), [effect]).join('\n'), cli: [`profile ${p - 1}`].concat(sets.map(([k, v]) => `set ${k} = ${v}`)), sets: sets.slice(),
             fromSets: pick(from, (k) => k.startsWith(`p${p}:`) ? k.replace(/^p\d+:/, '') : null), fromSources: pick(srcOf, (k) => k.startsWith(`p${p}:`) ? k.replace(/^p\d+:/, '') : null) })));
     }
-    for (const r of out) { if (blocked.length) { r.blockedBy = blocked.slice(); r.cli = []; r.caveats.push('A step before the filters in the tuning sequence has a problem. Thus, there is no CLI text until you correct it.'); } finishFilter(r); }
+    for (const r of out) {
+        if(checks&&checks.remaining)r.caveats.push('These filter problems are not corrected: '+checks.ids.remaining.join(', ')+'.');
+        for(const period of res.unmeasuredPeriods||[])r.caveats.push(`Log ${period.log+1}, ${fmt(period.fromS,3)} s to ${fmt(period.toS,3)} s: ${period.reason}`);
+        if (blocked.length) { r.blockedBy = blocked.slice(); r.cli = []; r.text = 'These filter changes must wait. Complete the prerequisite checks. Then record a new flight and start autotune again.\n' + r.text;
+        r.caveats.push('A step before the filters in the tuning sequence has a problem. Thus, there is no CLI text until you correct it.'); } finishFilter(r); }
     return out;
 }
 // the end of a filter recommendation (as finish, without the generators' fields): the sources after the rule, the output keys
@@ -2523,7 +2699,7 @@ function defaultPicks(recommendations) { return (Array.isArray(recommendations) 
 // one value that the CLI accepts for name k (guards 5, 6 and 12): a number in RANGE, a filter type name, or a list of
 // exactly 16 integers for the RPM notch arrays (SPEC2 C10); the filter floors and the RPM notch sources that the firmware knows
 function cliValueOk(k, v, replayValidated = false) {
-    if(k==='motor_rpm_lpf') {const values=String(v).split(',').map(Number);return replayValidated&&values.length===4&&values.every(x=>Number.isInteger(x)&&x>=0&&x<=255);}
+    if(k==='motor_rpm_lpf') {const values=String(v).split(',').map(Number);return replayValidated&&/^\d+(,\d+){3}$/.test(String(v))&&values.every(x=>Number.isInteger(x)&&x>=0&&x<=255);}
     const P = PARAMS[k]; if (!P || typeof v !== 'string' || !v.length) return false;
     if (P[2] === 'all') return /^-?\d+(,-?\d+)*$/.test(v) && v.split(',').length === BANKS && (replayValidated || floorsOk(k, v)) && legal(k, v);
     if (/_type$/.test(k)) return setup.LPF_TYPES.includes(v);
@@ -2773,6 +2949,7 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
         for (const e of ev.slice(0, 3)) out.push(...evidenceLines(e, base));
         if (ev.length > 3) out.push(`#   The recommendation has ${ev.length - 3} more results.`);
         if (r.rule) out.push(...commentLines(`Rule: ${r.rule}`, true));
+        if (r.replayValidated) for (const caveat of r.caveats || []) out.push(...commentLines(caveat, true));
         out.push('#');
     });
     for (const { r, plan } of bad) out.push(...commentLines(`Not in the file: ${r.title} (\`${clean(r.id).replace(/`/g, "'")}\`). ${plan.why}`));

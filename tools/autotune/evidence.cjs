@@ -582,7 +582,7 @@ const CAPTION = {
     C13: (f, R) => `The curve is the phase from the setpoint to the gyro rate, and the limit is a time delay of ${lim(R.flag, 'ms') || 'the limit'}.`,
     T12: (f, R) => `The curve is the phase from the yaw setpoint to the yaw rate, and the limit is a time delay of ${lim(R.flag, 'ms') || 'the limit'}.`,
     R1: (f, R) => `The curves are the stick command and the setpoint, and the limit is a time delay of ${lim(R.flag, 'ms') || 'the limit'}.`,
-    C14: () => 'The points are the pitch I-term against the collective, and the slope is the pitch movement that the feedforward must supply.',
+    C14: () => 'The points compare pitch I + O with the collective, and the slope estimates a feedforward change.',
     C15: () => 'The curves are the roll or pitch rate, the collective and the headspeed on the ground, and an oscillation that increases is a problem.',
     D6: () => 'The points are the parts of the log that the analysis does not use.',
     D8: () => 'The points are the PID profile changes at the rescues, and each change is a problem.',
@@ -594,7 +594,7 @@ const CAPTION = {
     T5: () => 'The curves are the yaw setpoint and the yaw rate at the stops on the two sides.',
     T6: (f, R) => `The curves are the yaw rate and its setpoint at the collective steps, and the lines show the limit of ${lim(R.kick, 'deg/s') || 'the yaw change'}.`,
     T7: () => 'The points are the yaw I-term against the precompensation during the collective movements.',
-    T8: () => 'The curve is the tail output, and the lines are the tail output limits: at a line, the tail does not have sufficient authority.',
+    T8: () => 'The curve is the tail output, and the lines are its limits: the limit does not identify its cause.',
     T9: () => 'The curves are the yaw setpoint, the yaw rate, the yaw I-term and the feedforward during the pirouettes.',
     T13: () => 'The curve is the yaw I-term in hover, and the lines are the limits of the tail offset.',
     T14: () => 'The curves are the tail output, the feedforward and the headspeed at the headspeed changes.',
@@ -609,7 +609,7 @@ const CAPTION = {
     C7: () => 'The curves are the response from the setpoint to the gyro rate at this headspeed.',
     C9: () => 'The points are the pitch errors at positive and at negative collective.',
 };
-for (const id of ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7']) CAPTION[id] = (f) => `The curve is the output, and the lines are its limits${id === 'L4' ? ': at a line, the tail does not have sufficient authority' : ''}.`;
+for (const id of ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7']) CAPTION[id] = () => 'The curve is the output, and the lines are its limits: the limit does not identify its cause.';
 const KIND_CAPTION = { table: 'The table gives the values of the log header for this check.', events: 'The points are the results of this check at their times.', spectrum: 'The curves are the spectra of the fields of this check.',
     phase: 'The curve is the phase of the response of this check.', governor: 'The curves are the headspeed and its target.', scatter: 'The points are the values of this check.', time: 'The curves are the fields of this check over time.',
     transmission: 'The curves are the response of this check.' };

@@ -339,6 +339,8 @@ function judge(flights, RULES = DEFAULT_RULES) {
             const byP = new Map(); for (const p of c.periods) { const k = p.profile === null ? 'null' : String(p.profile); if (!byP.has(k)) byP.set(k, []); byP.get(k).push(p); }
             for (const [k, ps] of byP) {
                 const pp = k === 'null' ? null : +k, total = ps.reduce((s, p) => s + p.seconds, 0), longest = ps.reduce((a, b) => b.seconds > a.seconds ? b : a), errs = ps.map(p => errorOf(c, p, R));
+                const cliLimit = c.limits && c.limits.source === 'cli' && c.limits.byProfile && c.limits.byProfile[pp];
+                const estimatedThrottle = c.id === 'L1' && !cliLimit && ps.some(p => p.limit < RULE.throttleMax);
                 const worstE = errs.filter(x => x.value !== null).sort((x, y) => x.kind === 'headspeed' ? x.value - y.value : y.value - x.value)[0] || null, combined = ps.filter(p => p.with.length + 1 >= R.combined), over = errs.some(x => x.over), long = longest.seconds >= R.longS;
                 const flag = long || over || combined.length > 0, why = [long ? `A period is ${fmt(longest.seconds, 3)} s long. This is ${R.longS} s or more.` : null, over ? 'During a period, the error is more than the limit of the related check.' : null,
                     combined.length ? `${cap(many(combined.length, 'period'))} ${combined.length === 1 ? 'comes' : 'come'} with other outputs at their limits.` : null].filter(Boolean);
@@ -348,9 +350,11 @@ function judge(flights, RULES = DEFAULT_RULES) {
                     + (p.same && p.same.length ? ` ${cap(listOf(p.same.map(shortOf)))} ${p.same.length === 1 ? 'follows' : 'follow'} this output to ${p.same.length === 1 ? 'its' : 'their'} limit.` : '') + (errText(x) ? ` During this period, ${errText(x)}.` : '')
                     + (p.errors && p.errors.states && p.errors.states.length ? ` The governor is in ${listOf(p.errors.states)}.` : ''); });
                 add(f, c, flag ? 'flag' : 'note', pp, { value: r(total, 3), n: ps.length, longestS: longest.seconds, longestT: longest.tS, combined: combined.length > 0, with: [...new Set(ps.flatMap(p => p.with))], rescueN: ps.filter(p => p.rescue).length,
+                    ...(c.id === 'L1' ? { throttleLimit: { value: longest.limit, source: cliLimit ? 'cli' : estimatedThrottle ? 'data' : 'firmware', estimated: estimatedThrottle } } : {}),
                     worstError: worstE, errorOver: over, threshold: { longS: R.longS, combined: R.combined, error: R.limit }, phase: longest.phase, max: c.max, min: c.min,
                     events: top.map(p => ({ t: p.t, t1: p.t1, tS: p.tS, t1S: p.t1S, seconds: p.seconds, value: p.seconds, side: p.side, limit: p.limit, phase: p.phase, profile: p.profile, rescue: p.rescue, with: p.with, same: p.same || [], errors: p.errors })),
-                    text: para(`In ${prof(pp)}, ${labelOf(c).charAt(0).toLowerCase() + labelOf(c).slice(1)} is at its limit in ${many(ps.length, 'period')}, for a total of ${fmt(total, 3)} s. The longest period is ${fmt(longest.seconds, 3)} s. The limit comes from ${from}.`,
+                    text: para(estimatedThrottle ? 'The throttle limit is an estimate from recorded output. These periods do not show full throttle.' : '',
+                        `In ${prof(pp)}, ${labelOf(c).charAt(0).toLowerCase() + labelOf(c).slice(1)} is at its limit in ${many(ps.length, 'period')}, for a total of ${fmt(total, 3)} s. The longest period is ${fmt(longest.seconds, 3)} s. The limit comes from ${from}.`,
                         ...lines, flag ? `This is a problem. ${why.join(' ')}` : `Each period is shorter than ${R.longS} s, and the errors are not more than the limit of the related check. No other output is at its limit at the same time. Examine these periods.`,
                         'These values are a count and times. Thus, they have no SE.', rej) });
             }
