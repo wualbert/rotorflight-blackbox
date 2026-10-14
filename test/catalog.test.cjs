@@ -173,7 +173,7 @@ test('status: SPEC2 D9', () => {
     assert.equal(st({ severity: 'note' }), 'monitor');
     assert.equal(st({ id: 'C13' }), 'information', 'report-only check');
     assert.equal(st({ id: 'F10', axis: 'roll', unit: 'permille' }), 'information', 'the control noise of roll is report only');
-    assert.equal(st({ id: 'F10', axis: 'yaw', se: 0.02 }), 'monitor');
+    assert.equal(st({ id: 'F10', axis: 'yaw', se: 0.02 }), 'information');
     assert.equal(st({ thin: true }), 'insufficient');
     assert.equal(st({ text: 'no finding: 1 blocks of 10 s' }), 'insufficient', 'the other modules write "no finding"');
     assert.equal(st({ severity: 'ok' }), 'satisfactory');
@@ -262,7 +262,7 @@ test('F5 (review D-M5a): the summary states for each axis if a notch filter is n
     const f = (axes) => Object.assign(finding('F5', 'flag'), { value: 4.07, se: null, evidence: { facts: { hz: 156.2, axes } } });
     const axes = [{ axis: 'roll', near: true, distance: 0.015, hz: 153.9 }, { axis: 'pitch', near: true, distance: 0.015, hz: 153.9 }, { axis: 'yaw', near: false, distance: 0.082, hz: 169 }];
     assert.equal(C.summary(f(axes)).split('\n').pop(), 'In PID profile 1, the raw gyro has a peak at 4.07 x the rotor frequency (156 Hz). The yaw axis has no notch filter near this peak, but the roll and pitch axes have one. '
-        + 'A peak of 5 x the median level or more with no notch filter in ±2 % of its frequency is a problem.');
+        + 'The reference range has an RPM notch filter in ±2 % of each peak at 5 x the median level or more.');
     assert.match(C.summary(f(axes.map(q => Object.assign({}, q, { near: false })))), / No axis has a notch filter near this peak\. /);
     assert.match(C.summary(f([axes[0], axes[2]])), / The yaw axis has no notch filter near this peak, but the roll axis has one\. /);
     assert.match(C.summary(f(undefined)), / One or more axes have no notch filter near this peak\. /, 'without the facts: true for each flag');
@@ -414,7 +414,7 @@ test('display (review V5): D2, G0, F5, D5, G10, T6 and T13 show the quantities o
     const f5 = Object.assign(finding('F5', 'flag'), { value: 2.9989, se: null, evidence: { facts: { hz: 224.9, prominence: 33.6, axes } } }), d5 = C.display(f5);
     assert.equal(d5.value, '33.6 x the median level at 3 x the rotor frequency, 25 % from the nearest yaw notch filter');
     assert.equal(d5.bound, '5 x the median level or more, with no notch filter in ±2 %');
-    assert.equal(d5.limit, 'A peak of 5 x the median level or more with no notch filter in ±2 % of its frequency is a problem.');
+    assert.equal(d5.limit, 'The reference range has an RPM notch filter in ±2 % of each peak at 5 x the median level or more.');
     assert.doesNotMatch(C.summary(f5), /must/, 'review V5: no instruction in the limit');
     // F5 that a recommendation explains (Information): the summary says why, and no row says that it must have a notch filter
     const ex = Object.assign({}, f5, { explained: 'The filters remove the vibration line', filterPass: [{ hz: 224.9, roll: 0.0041, pitch: 0.004, yaw: 0.006 }] });

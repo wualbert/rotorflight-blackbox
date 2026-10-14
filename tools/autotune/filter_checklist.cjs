@@ -52,7 +52,7 @@ function findings(P,changes,app,opts={}) {
     }
     return all;
 }
-const bad=f=>f.severity==='flag'||f.severity==='error';
+const bad=f=>f.severity==='error'||f.severity==='flag'&&!setup.filterGuidance(f);
 function group(list) {
     const out=new Map();
     for(const f of list){const k=[f.id,f.log,f.segment,f.profile,f.axis||'',f.notchSource==null?'':f.notchSource].join(':');if(!out.has(k))out.set(k,[]);out.get(k).push(f);}
@@ -61,7 +61,7 @@ function group(list) {
 function summary(list) {
     if(!list||!list.length)return {status:'Not evaluated',issues:0,findings:[]};
     const issues=list.filter(bad).length;
-    return {status:issues?'Issue':list.some(f=>f.severity==='skipped')?'Not evaluated':list.some(f=>f.thin||/^no (?:finding|result):/i.test(f.text||''))?'Insufficient data':list.every(f=>f.severity==='ok')?'Pass':'Information',issues,findings:list};
+    return {status:issues?'Issue':list.some(f=>f.severity==='skipped')?'Not evaluated':list.some(f=>f.thin||/^no (?:finding|result):/i.test(f.text||''))?'Insufficient data':list.some(setup.filterGuidance)?'Information':list.every(f=>f.severity==='ok')?'Pass':'Information',issues,findings:list};
 }
 function trend(id,before,after) {
     if(id==='F5') {
@@ -87,7 +87,7 @@ function compareFindings(before,after,opts={}) {
         const b=summary(B.get(key)),a=summary(N.get(key)),f=(B.get(key)||N.get(key))[0];
         const reproduced=!baseline || summary(baseline.get(key)).issues>0;
         let outcome=a.status==='Not evaluated'||a.status==='Insufficient data'?'Not evaluated':b.issues&& !a.issues?'Cleared in replay':b.issues&&a.issues?'Remains':!b.issues&&a.issues?'New issue':'Unchanged';
-        let detail=f.id==='F5'?'This check requires an RPM notch near each strong raw gyro line. Other filters do not change this coverage check.':'';
+        let detail=setup.filterGuidance(f)||'';
         if(outcome==='Cleared in replay'&&(!reproduced||opts.unchanged)) {
             outcome='Not evaluated';
             detail='The replay with recorded values does not show this problem. This check cannot confirm a correction.';

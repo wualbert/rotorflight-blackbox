@@ -107,42 +107,36 @@ test('audit D1/D3: unavailable input is distinguished from a correct selected co
     assert.equal(run([{...d3,text:'checks that cannot run: no parseable field list'}]).recommendations.length,0);
 });
 
-test('audit F1: enable the recorded LPF type without claiming a different type was tested', () => {
+test('audit F1: a reference LPF configuration never authorizes an unvalidated parameter change', () => {
     const f = finding('F1',{module:'setup',profile:null,value:0});
-    const r = only(run([f],{header:{...HEADER,gyro_soft_type:2,gyro_lowpass_hz:0}}),'F1');
-    assert.equal(r.severity,'action');
-    assert.deepEqual(r.cli,['set gyro_lpf1_static_hz = 100']);
-    assert.match(r.text,/SECOND_ORDER/);
-    assert.doesNotMatch(r.text,/FIRST_ORDER/);
-    assert.match(r.text,/next flight must measure/i);
-    const off = only(run([{...f,severity:'note'}],{header:{...HEADER,features:0,gyro_soft_type:0,gyro_lowpass_hz:0}}),'F1');
-    assert.equal(off.severity,'check');
-    noCommands([off]);
+    for (const header of [{...HEADER,gyro_soft_type:2,gyro_lowpass_hz:0},
+        {...HEADER,features:0,gyro_soft_type:0,gyro_lowpass_hz:0}]) {
+        const r = only(run([f],{header}),'F1');
+        assert.equal(r.severity,'info');
+        assert.equal(r.parameter,null);
+        assert.equal(r.evidence[0].value,0);
+        noCommands([r]);
+        assert.match(r.text,/reference information/);
+    }
 });
 
-test('audit F2/F3: old limits do not cause another change; incomplete or preset banks cannot export', () => {
-    const f2 = finding('F2',{module:'setup',profile:null,value:40});
-    const old = only(run([f2]),'F2');
-    assert.equal(old.severity,'info');
-    noCommands([old]);
-    const stage2 = only(run([f2],{header:{...HEADER,gyro_soft2_type:1,gyro_lowpass2_hz:40}}),'F2');
-    assert.deepEqual(stage2.cli,['set gyro_lpf2_static_hz = 60']);
-    const f3 = finding('F3',{module:'setup',profile:null,value:1.5});
-    const preset = only(run([f3],{header:{...HEADER,gyro_rpm_notch_preset:1,gyro_rpm_notch_q_roll:pad([15,40])}}),'F3');
-    assert.equal(preset.severity,'check');
-    assert.match(preset.text,/preset 0/);
-    noCommands([preset]);
-    const short = only(run([f3],{header:{...HEADER,gyro_rpm_notch_source_roll:[11],gyro_rpm_notch_q_roll:[15]}}),'F3');
-    assert.match(short.caveats.join(' '),/16/);
-    noCommands([short]);
-    const fixed = only(run([f3]),'F3');
-    assert.equal(fixed.severity,'info');
-    noCommands([fixed]);
+test('audit F2/F3: cutoff and Q references retain their measurements without unconditional CLI changes', () => {
+    for (const [id,value,header] of [
+        ['F2',40,HEADER],['F2',40,{...HEADER,gyro_soft2_type:1,gyro_lowpass2_hz:40}],
+        ['F3',1.5,{...HEADER,gyro_rpm_notch_preset:1,gyro_rpm_notch_q_roll:pad([15,40])}],
+        ['F3',1.5,{...HEADER,gyro_rpm_notch_source_roll:[11],gyro_rpm_notch_q_roll:[15]}],['F3',1.5,HEADER]
+    ]) {
+        const r=only(run([finding(id,{module:'setup',profile:null,value})],{header}),id);
+        assert.equal(r.severity,'info');
+        assert.equal(r.evidence[0].value,value);
+        assert.equal(r.parameter,null);
+        noCommands([r]);
+    }
 });
 
 test('audit F5/C3/T9 diagnostics: a missing line fit or rate mismatch cannot invent a corrective parameter', () => {
     const missing=only(run([finding('F5',{module:'setup',value:null,se:null})]),'F5');
-    assert.equal(missing.severity,'check');
+    assert.equal(missing.severity,'info');
     assert.equal(missing.parameter,null);
     noCommands([missing]);
     for(const [id,axis] of [['C3','roll'],['T9','yaw']]) {
@@ -196,8 +190,8 @@ test('audit T13/G10: offset and coherence diagnoses do not identify a measured c
 
 test('audit finish: blocked and unknown-base proposals contain no direct set instruction or promised result', () => {
     const c14 = finding('C14',{module:'more',axis:'pitch',value:100,se:5,gainChange:100,gainChangeSe:10});
-    const f1 = finding('F1',{module:'setup',profile:null,value:0});
-    const held = only(run([c14,f1],{header:{...HEADER,gyro_soft_type:0,gyro_lowpass_hz:0}}),'C14');
+    const limit = finding('C2',{module:'loop',profile:1,axis:'pitch',value:0.2,threshold:0.05});
+    const held = only(run([c14,limit],{header:{...HEADER,gyro_soft_type:0,gyro_lowpass_hz:0}}),'C14');
     assert.match(held.text,/This change must wait|conditional proposal/i);
     assert.doesNotMatch(held.text,/(?:^|[.\n] )Set pitch_collective_ff_gain/);
     assert.doesNotMatch(held.text,/Then the helicopter pitches less/);
@@ -214,7 +208,7 @@ test('audit finish: blocked and unknown-base proposals contain no direct set ins
     assert.match(accepted.text,/next flight must measure/i);
 });
 
-test('audit finish missing base: held F10 and sibling actions have descriptive titles without export authority', () => {
+test('audit finish missing base: F10 stays information and sibling actions lack export authority', () => {
     const cases = [
         finding('F10',{module:'more',axis:'yaw',profile:3,value:0.85,se:0.01}),
         finding('C14',{module:'more',axis:'pitch',profile:3,value:100,se:5,gainChange:100,gainChangeSe:10}),
@@ -224,9 +218,13 @@ test('audit finish missing base: held F10 and sibling actions have descriptive t
     ];
     const imperative = /^(?:Increase|Raise|Decrease|Lower|Reduce|Set|Add|Use|Make)\b/;
     for (const f of cases) for (const held of [false,true]) {
-        const out = run(held ? [f,finding('F1',{module:'setup',profile:null,value:0})] : [f],
+        const out = run(held ? [f,finding('F6',{module:'setup',profile:3,value:0.8,threshold:0.1})] : [f],
             held ? {header:{...HEADER,gyro_soft_type:0,gyro_lowpass_hz:0}} : {});
-        const r = f.id === 'F10' ? out.recommendations.find(q=>q.parameter==='yaw_d_gain') : only(out,f.id);
+        const r = only(out,f.id);
+        if(f.id==='F10') {
+            assert.equal(r.severity,'info');assert.equal(r.parameter,null);
+            assert.ok(!out.recommendations.some(q=>q.parameter==='yaw_d_gain'));noCommands([r]);continue;
+        }
         assert.ok(r,`${f.id}: proposal exists`);
         assert.equal(r.severity,'action',`${f.id}: underlying action remains visible`);
         assert.equal(r.from,null,`${f.id}: profile 3 base is unrecorded`);
@@ -647,11 +645,12 @@ test('audit numeric filter path: recorded replay passes without a target; a boun
     assert.equal(baseline.recommended.predicted.totalDb,0);
     assert.equal(filter.cliFile(baseline),'');
     const changed=simulate({gyro_lpf1_static_hz:90});
-    assert.equal(changed.recommended.status,'not recommended','noise reduction alone cannot clear the original RPM-coverage problem');
+    assert.equal(changed.recommended.status,'recommended','RPM-notch location guidance does not block a measured improvement');
     assert.ok(changed.recommended.predicted.totalDb<0);
     assert.ok(changed.recommended.delay.maxAddMs>0);
-    assert.match(changed.recommended.reasons.join(' '),/does not correct or decrease a measured filter problem/);
-    assert.equal(filter.cliFile(changed),'');
+    assert.equal(changed.recommended.validation.checks.passed,true);
+    assert.equal(changed.recommended.validation.checks.targets,0);
+    assert.match(filter.cliFile(changed),/^set gyro_lpf1_static_hz = 90$/m);
     const tooSlow=simulate({gyro_lpf1_static_hz:90},0);
     assert.equal(tooSlow.recommended.status,'not recommended');
     assert.ok(tooSlow.recommended.reasons.some(s=>/time delay, control-band or vibration limits/.test(s)));
@@ -663,7 +662,7 @@ test('audit numeric filter path: recorded replay passes without a target; a boun
 
 test('audit numeric filter refusal: search with no improved candidate, unsupported firmware and excluded input stay visible', () => {
     const {item,gear}=replayFixture(), prepared=filter.prepare([item],{gear});
-    const search=filter.tune([item],{gear,prepared,maxCandidates:1,budgetMs:10000,curves:false});
+    const search=filter.tune([item],{gear,prepared,maxCandidates:1,optimizerEvaluations:1,budgetMs:10000,curves:false});
     assert.equal(search.model.passed,true);
     assert.equal(search.recommended.status,'not recommended');
     assert.ok(search.recommended.reasons.some(s=>/No filter set in the analysis decreases vibration by 3 dB/.test(s)));
@@ -680,13 +679,14 @@ test('audit numeric filter refusal: search with no improved candidate, unsupport
     assert.equal(filter.cliFile(missing),'');
 });
 
-test('audit numeric filter search: noise improvements and a passing holdout cannot bypass an unresolved filter check', () => {
+test('audit numeric filter search: reference coverage does not block validated improvement or either CLI entry point', () => {
     const {item,gear}=replayFixture(), prepared=filter.prepare([item],{gear}), progress=[];
     const result=filter.tune([item],{gear,prepared,maxAddMs:3,maxCandidates:60,budgetMs:120000,curves:false,
         progress:(text,fraction)=>progress.push({text,fraction})});
     assert.equal(result.model.passed,true);
-    assert.equal(result.recommended.status,'not recommended');
-    assert.match(result.recommended.reasons.join(' '),/does not correct or decrease a measured filter problem/);
+    assert.equal(result.recommended.status,'recommended');
+    assert.equal(result.recommended.validation.checks.passed,true);
+    assert.equal(result.recommended.validation.checks.targets,0);
     assert.ok(result.search.tested>60,'the search refines a promoted candidate');
     assert.ok(result.search.finalistCount>0);
     assert.ok(result.recommended.predicted.totalDb<=-3);
@@ -698,9 +698,9 @@ test('audit numeric filter search: noise improvements and a passing holdout cann
     assert.ok(progress.some(p=>/replayed.*filter sets/.test(p.text)));
     assert.ok(progress.every(p=>p.fraction>=0&&p.fraction<=1));
     const recs=filterOut(result), direct=filter.cliFile(result), shared=advice.exportScript(recs,null,{});
-    assert.ok(recs.every(r=>r.severity==='check'&&!r.cli.length));
-    assert.equal(direct,'');
-    assert.doesNotMatch(shared,/^(?:set |feature |profile |rateprofile |save$)/m);
+    assert.ok(recs.some(r=>r.severity==='action'&&r.cli.length));
+    assert.match(direct,/^set /m);
+    assert.match(shared,/^set /m);
     assert.match(filter.texts(result).validation,/selects the values with the other periods/);
 });
 

@@ -1,20 +1,171 @@
 {
   "version": 1,
-  "documents": ["FILTER_AUTOTUNE.md", "DEVELOPMENT.md"],
+  "documents": [
+    "FILTER_AUTOTUNE.md",
+    "DEVELOPMENT.md"
+  ],
   "scopes": [
     {
-      "name": "Filter autotune replay score",
-      "files": ["FILTER_AUTOTUNE.md"],
+      "name": "Filter equations and replay score",
+      "files": [
+        "FILTER_AUTOTUNE.md"
+      ],
       "strict_components": true,
-      "component_carriers": [],
+      "component_carriers": [
+        "a",
+        "b",
+        "f",
+        "x",
+        "y"
+      ],
       "symbols": [
-        {"tex": ["\\rho"], "role": "quantity", "meaning": "mean candidate to baseline output energy ratio within one flight block", "space": "positive real, dimensionless"},
-        {"tex": ["d"], "role": "quantity", "meaning": "noise change for one flight block", "space": "real, decibels"}
+        {
+          "tex": [
+            "\\rho"
+          ],
+          "role": "quantity",
+          "meaning": "mean candidate to baseline output energy ratio within one flight block",
+          "space": "positive real, dimensionless"
+        },
+        {
+          "tex": [
+            "d"
+          ],
+          "role": "quantity",
+          "meaning": "noise change for one flight block",
+          "space": "real, decibels"
+        },
+        {
+          "tex": [
+            "f"
+          ],
+          "role": "quantity",
+          "meaning": "frequency, with s and c labels identifying sample rate and stage cutoff",
+          "space": "positive real, hertz"
+        },
+        {
+          "tex": [
+            "s",
+            "c"
+          ],
+          "role": "label",
+          "meaning": "sample-rate and cutoff labels, respectively",
+          "space": "fixed frequency labels"
+        },
+        {
+          "tex": [
+            "n"
+          ],
+          "role": "index",
+          "meaning": "discrete sample index",
+          "space": "integers"
+        },
+        {
+          "tex": [
+            "x",
+            "y"
+          ],
+          "role": "quantity",
+          "meaning": "input and output sample sequences of the current filter stage",
+          "space": "real sequences"
+        },
+        {
+          "tex": [
+            "g"
+          ],
+          "role": "quantity",
+          "meaning": "PT1 update gain",
+          "space": "real in (0,1)"
+        },
+        {
+          "tex": [
+            "W"
+          ],
+          "role": "quantity",
+          "meaning": "prewarped normalized frequency of a first-order section",
+          "space": "positive real"
+        },
+        {
+          "tex": [
+            "a",
+            "b"
+          ],
+          "role": "quantity",
+          "meaning": "denominator and numerator filter coefficients; subscripts identify coefficient positions",
+          "space": "real scalars"
+        },
+        {
+          "tex": [
+            "Q"
+          ],
+          "role": "quantity",
+          "meaning": "biquad quality factor",
+          "space": "positive real"
+        },
+        {
+          "tex": [
+            "\\omega"
+          ],
+          "role": "quantity",
+          "meaning": "normalized angular cutoff frequency",
+          "space": "real radians per sample"
+        },
+        {
+          "tex": [
+            "\\alpha"
+          ],
+          "role": "quantity",
+          "meaning": "biquad damping coefficient sin(omega)/(2Q)",
+          "space": "real"
+        },
+        {
+          "tex": [
+            "N"
+          ],
+          "role": "quantity",
+          "meaning": "number of cascaded PT1 sections",
+          "space": "positive integers"
+        },
+        {
+          "tex": [
+            "z"
+          ],
+          "role": "quantity",
+          "meaning": "complex frequency variable of the z transform",
+          "space": "complex numbers"
+        },
+        {
+          "tex": [
+            "H"
+          ],
+          "role": "quantity",
+          "meaning": "transfer function of one constant-coefficient filter section",
+          "space": "complex-valued rational function"
+        },
+        {
+          "tex": [
+            "\\mathrm{center}",
+            "\\mathrm{lower}"
+          ],
+          "role": "label",
+          "meaning": "static-notch center and lower cutoff frequency labels",
+          "space": "fixed labels"
+        },
+        {
+          "tex": [
+            "\\gamma"
+          ],
+          "role": "quantity",
+          "meaning": "positive per-stage analog cutoff multiplier for a cascade of identical first-order sections",
+          "space": "positive real, dimensionless"
+        }
       ]
     },
     {
       "name": "Application development documentation",
-      "files": ["DEVELOPMENT.md"],
+      "files": [
+        "DEVELOPMENT.md"
+      ],
       "strict_components": true,
       "component_carriers": [],
       "symbols": []

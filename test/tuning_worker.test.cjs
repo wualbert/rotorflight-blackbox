@@ -43,7 +43,7 @@ function worker(override = {}) {
     const run = (code, filename) => vm.runInContext(code, ctx, { filename }), pending = new Map(), progress = [], fetches = [];
     run(POST_CHROMIUM_99, 'chromium-99-builtins.js');
     Object.assign(ctx, {
-        console: { log() {}, info() {}, warn() {}, debug() {}, error() {} }, setTimeout,
+        console: { log() {}, info() {}, warn() {}, debug() {}, error() {} }, setTimeout, performance: require('node:perf_hooks').performance,
         importScripts: (...urls) => { for (const u of urls) { const f = path.resolve(JS, u); run(fs.readFileSync(f, 'utf8'), f); } },
         fetch: async (url) => {
             fetches.push(url);
@@ -266,8 +266,8 @@ test('T0: the worker is Chromium 99 syntax as written (esbuild chrome99 output e
 
 test('T0: the toolkit files the worker runs in Chromium 99 are Chromium 99 syntax and use no newer API', (t) => {
     const { dir, names, optional } = fetchedToolkit();
-    assert.equal(names.length, 35);
-    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'control_tune', 'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline']);
+    assert.equal(names.length, 37);
+    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline']);
     let esbuild = null; try { esbuild = require(path.join(REPO, 'node_modules/esbuild')); } catch (e) { /* the API check still runs */ }
     for (const n of names) {
         const file = path.join(JS, `${dir}${n}.cjs`);
@@ -286,7 +286,7 @@ test('T0: every file the worker loads is a relative URL to a file that exists an
     const list = /(?:var distSources|APP_ASSET_SOURCES) = \[([\s\S]*?)\];/.exec(gulp)[1], quoted = (s) => [...s.matchAll(/'([^']+)'/g)].map(m => m[1]);
     const scripts = quoted(/importScripts\(([^)]*)\)/.exec(src)[1]).map(u => path.posix.join('js', u));
     const toolkit = names.map(n => path.posix.normalize(path.posix.join('js', `${dir}${n}.cjs`)));
-    assert.equal(scripts.length, 12); assert.equal(names.length, 35);
+    assert.equal(scripts.length, 12); assert.equal(names.length, 37);
     toolkit.forEach((f, i) => { if (optional.includes(names[i]) && !fs.existsSync(path.join(REPO, f))) { t.diagnostic(`${f} is not in the repo yet: an optional module`); toolkit[i] = null; } });
     for (const f of scripts.concat(toolkit.filter(Boolean))) {
         assert.ok(!/^\/|^[a-z]+:/i.test(f) && !f.startsWith('..'), `${f} relative to the app root`);
@@ -1134,11 +1134,11 @@ test('derive: init loads the toolkit once; derive never decodes, makes no fs cal
     assert.deepEqual(Object.keys(ready.result.modules), ['track', 'more', 'gov', 'catalog']);
     assert.ok(ready.result.modules.track && ready.result.modules.more && ready.result.modules.gov, J(ready.result));
     assert.equal(ready.result.modules.catalog, has('catalog.cjs'));
-    assert.equal(W.fetches.length, 35, 'each toolkit file fetched once');
+    assert.equal(W.fetches.length, 37, 'each toolkit file fetched once');
     const x = Float32Array.from(noise(4000, 1, 10));
     await W.derive('bandpass', { x }, 1000, { lo: 5, hi: 50 });
     await W.derive('window', { 'setpoint[0]': x, 'gyroADC[0]': x }, 1000, {});
-    assert.equal(W.fetches.length, 35, 'no fetch after init');
+    assert.equal(W.fetches.length, 37, 'no fetch after init');
     assert.equal((await TW.deriveKit()).calls.n, 0, 'no fs call');
     const bad = async (msg, text) => { const m = await W.post(Object.assign({ cmd: 'derive' }, msg)); assert.deepEqual([m.type, m.message], ['error', text]); };
     await bad({ kind: 'nope', rate: 1000, cols: { x } }, 'The function "nope" is unknown.');
@@ -2194,7 +2194,7 @@ test('notch orders of the log: without a CLI dump, the tail rotor notch order of
         && f.text.includes(`The rotor order is ${N.tail.order},`) && f.status === 'satisfactory'), J(f6.map(f => f.text)));
     assert.ok(R.findings.filter(f => f.id === 'F9').every(f => f.status === 'satisfactory' && !/unknown frequency/.test(f.text)), 'F9');
     assert.ok(R.findings.filter(f => f.id === 'F5').every(f => f.severity !== 'flag'), J(R.findings.filter(f => f.id === 'F5').map(f => f.text)));
-    assert.ok(!R.advice.recommendations.some(r => /^F[5689]/.test(r.id)), J(R.advice.recommendations.map(r => r.id)));
+    assert.ok(!R.advice.recommendations.some(r => /^F[5689]/.test(r.id) && r.severity !== 'info'), J(R.advice.recommendations.map(r => r.id)));
     // the notch markers of the curves of the log on screen (the Tuning view, the log lens): the tail rotor notch has its frequency
     const yaw = R.curves[0].more.vib.notches.yaw.find(q => q.code === 21);
     assert.ok(yaw.order === N.tail.order && yaw.hz > 150 && yaw.hz < 180, J(yaw));
@@ -2221,28 +2221,22 @@ test('notch orders of the log: without a CLI dump, the tail rotor notch order of
     assert.ok(L.findings.some(f => f.id === 'F6' && f.severity === 'skipped'), 'a fit that does not pass: F6 as before');
 });
 
-test('notch orders of the log: a line at a tail rotor harmonic gets an RPM notch filter with source 20 + k (advice F5), not the words of a resonance', async () => {
+test('notch orders of the log: harmonic and resonance measurements remain information pending replay', async () => {
     const G = simGear(10), W = worker(), run = (options, g = G) => W.result({ cmd: 'analyseFile', fileName: 'gear2.bbl', selectedLog: 1, options: Object.assign({ flightRpm: null }, options) }, g.bytes);
     const R = await run({});
     assert.ok(R.notchFit.used, J(R.notchFit));
     const f5 = R.findings.filter(f => f.id === 'F5' && f.severity === 'flag');
     assert.ok(f5.length === 3 && f5.every(f => f.lines && f.lines.some(line => Math.abs(line.order - 8.1334) < 0.001)), J(f5.map(f => f.text)));
     const r = R.advice.recommendations.find(x => x.id === 'F5');
-    assert.deepEqual([r.severity, r.title], ['action', 'RPM notch filter at tail rotor harmonic 2']);
-    assert.match(r.text, /is at `8\.13\d* × rotor` \([\d.]+ Hz, prominence [\d.]+, log \d, PID profile unknown\), tail rotor harmonic 2\. The gear ratios in the configuration are correct\./);
-    assert.match(r.text, /\nAn RPM notch filter with source 22 and Q 4\.0 \(FILT\) on the roll, pitch and yaw axes can remove tail rotor harmonic 2\.$/);
-    assert.deepEqual(r.cli, [], 'unknown recorded notch banks retain a descriptive target without an apply command');
-    assert.match(r.rule, /RPM notch filters follow the main rotor harmonics 1 to 8 and the tail rotor harmonics 1 to 8\./);
-    assert.ok(!/resonance/i.test(`${r.title} ${r.text} ${r.caveats.join(' ')}`), r.text);
-    assert.ok(r.caveats.includes('The gyro filters let 100 % to 100 % of tail rotor harmonic 2 through.'), J(r.caveats));
-    // without the orders of the log, the same line is a check: the log does not give the frequency of the tail rotor notch filter
-    const O = await run({ logGear: false }), o = O.advice.recommendations.find(x => x.id === 'F5');
-    assert.equal(o.severity, 'check'); assert.match(o.text, /The log does not record the frequency of the tail rotor notch filters\./);
-    // a resonance 1 x rotor from the harmonic (the strongest line of the last flight): the harmonic is not a part of it
-    const S = await run({}, simGear(10, 25)), rs = S.advice.recommendations.find(x => /^Resonance at /.test(x.title)), th = S.advice.recommendations.find(x => /tail rotor harmonic 2/.test(x.title));
-    assert.ok(rs && th && th.severity === 'action', J(S.advice.recommendations.map(x => [x.id, x.title])));
-    assert.match(rs.text, /is at `9\.13\d* × rotor` .*It is not a main rotor harmonic or a tail rotor harmonic \(the nearest tail rotor harmonic is harmonic 2, at `8\.13\d* × rotor`, 1[0-9]\.\d % from the line\)/);
-    assert.ok(!rs.caveats.some(t => /`8\.1\d × rotor`.* 1 × rotor from this resonance/.test(t)), J(rs.caveats));
+    assert.deepEqual([r.severity,r.title],['info','Filter reference values']);
+    assert.deepEqual(r.cli,[]);assert.equal(r.evidence.length,3);
+    assert.ok(r.evidence.every(e=>f5.some(f=>f.fid===e.fid)),'all measured harmonic findings remain linked');
+    const O=await run({logGear:false}),o=O.advice.recommendations.find(x=>x.id==='F5');
+    assert.equal(o.severity,'info');assert.deepEqual(o.cli,[]);
+    const S=await run({},simGear(10,25)),rs=S.advice.recommendations.find(x=>x.id==='F5');
+    assert.equal(rs.severity,'info');assert.deepEqual(rs.cli,[]);
+    assert.ok(S.findings.some(f=>f.id==='F5'&&f.lines.some(l=>Math.abs(l.order-9.1334)<.01)),
+        'the resonance remains in the measured evidence without an untested parameter change');
 });
 
 // ---------------------------------------------------------------------------------------------

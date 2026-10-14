@@ -440,6 +440,9 @@ var TuningDialog = (function () {
     // The status of a finding: the worker's (catalog.cjs status, after explain), else from its severity
     function findingStatus(f) {
         if (typeof f.status === "string" && STATUS.hasOwnProperty(f.status)) return f.status;
+        // Match health_setup.filterGuidance when the worker supplied no status.
+        if (f.severity !== "error" && f.severity !== "skipped" && !isThin(f) &&
+            (["F1", "F2", "F3", "F4", "F5", "C11"].indexOf(f.id) >= 0 || f.id === "F10" && f.unit !== "permille")) return "information";
         switch (f.severity) {
             case "error": return "error";
             case "flag": return f.explained || infoOnly(f) ? "information" : flagStatus(f); // explained: the worker found every recommendation on it is information
@@ -5384,16 +5387,16 @@ var TuningDialog = (function () {
         function ctEvidenceHtml() {
             var e=ctEvidence();if(!e)return '';
             var disabled=e.state!=='ready'?' disabled':'';
-            return '<section class="tuning-ct-section" aria-label="Parameter history"><h6>Parameter history</h6>' +
-                '<p>Use log numbers in file order. FBL dates can be incorrect.</p>' +
+            return '<section class="tuning-ct-section" aria-label="Parameters in selected logs"><h6>Parameters in selected logs</h6>' +
+                '<p>Use log numbers in the file sequence. FBL dates can be incorrect.</p>' +
                 '<label>First log <input type="number" class="tuning-ct-evidence-from" min="1" max="'+e.count+'" value="'+e.from+'"'+disabled+'></label> ' +
                 '<label>Last log <input type="number" class="tuning-ct-evidence-to" min="1" max="'+e.count+'" value="'+e.to+'"'+disabled+'></label>' +
                 '<p><label><input type="checkbox" class="tuning-ct-evidence-confirm"'+(e.confirmed?' checked':'')+disabled+'> Parameters did not change in this log range.</label></p>' +
-                '<p>This confirmation applies separately to each PID profile. Each profile still requires recorded gains from a log header.</p>' +
-                '<p>The app saves this confirmation for this exact file only. It does not confirm that mechanical parts stayed the same.</p>' +
-                (e.state==='checking'?'<p role="status">The app checks the file contents.</p>':e.state==='unavailable'?'<p>The file check is not available. Parameter confirmation is disabled.</p>':
-                    !ctEvidenceValid(e)?'<p>Enter a valid log range.</p>':'') +
-                (e.storageUnavailable?'<p>The app cannot save the confirmation between sessions.</p>':'')+'</section>';
+                '<p>These values apply to each PID profile. Recorded gains from a log header are necessary for each PID profile.</p>' +
+                '<p>The app saves this selection for files with the same data. This selection does not show changes to mechanical parts.</p>' +
+                (e.state==='checking'?'<p role="status">The app checks the file data.</p>':e.state==='unavailable'?'<p>The file check is not available. The parameter selection is disabled.</p>':
+                    !ctEvidenceValid(e)?'<p>Enter a correct log range.</p>':'') +
+                (e.storageUnavailable?'<p>The app cannot save this selection. Select it again after the app starts.</p>':'')+'</section>';
         }
         function ctDiscardAll() {
             if(!shown)return;

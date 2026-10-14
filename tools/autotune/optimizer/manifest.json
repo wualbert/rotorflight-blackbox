@@ -1,0 +1,16 @@
+{
+  "name": "NOMAD",
+  "version": "4.5.1",
+  "release": "https://github.com/bbopt/nomad/releases/tag/v.4.5.1",
+  "sourceArchive": "https://github.com/bbopt/nomad/archive/refs/tags/v.4.5.1.tar.gz",
+  "license": "LGPL-3.0-or-later",
+  "compiler": "Emscripten 4.0.18",
+  "algorithmChanges": false,
+  "files": {
+    "nomad.cjs": "6b5f20c878d8aad244f6ac75012ab86f252c76eea3012b9752a5578faf4ebc62",
+    "nomad-4.5.1.tar.gz": "ce5db6f0db0a410fd80ed251557272472a49efd911274d8a52959f24ed95368c",
+    "bridge.cpp": "9fc24d55010680e145aeeb2c6ddec483c2477bce7aaaa9752b4d6a7db6f4d7b0",
+    "exports.js": "fb3515a425525f0cebf9c7a1b1b864543e048582df73945f847e2dac0a7a6b48",
+    "LICENSE": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+  }
+}

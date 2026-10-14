@@ -181,12 +181,14 @@ const EDGES = [
 const k = (id, name, symptoms, upstream, validity, first, source, confidence, before) => Object.assign({ id, name, symptoms, upstream, validity, first, source, confidence }, before ? { before: true } : {});
 const RULES = [
     k('K1', 'D-term noise', ['C11', 'F10'], ['F5', 'F6', 'F1', 'F8', 'F4', 'G12', 'G1'], ['D1', 'F9'],
-        ['Find the cause of the vibration: balance, blade tracking or bearings.', 'Add or move an RPM notch filter for each rotor harmonic (F5, F6).',
-            'For a peak that is not a rotor harmonic, use the dynamic notch filter.', 'For a resonance at a constant frequency, use a static notch filter.',
-            'Make sure that one gyro low-pass filter is on (F1).', 'Keep the D-term cutoff at approximately 20 Hz (F4).', 'Fly again and record a new log.', 'Then change the D gain.'],
+        ['Compare the D-term power percentage with its RMS value.', 'A large percentage does not show the D-term RMS value.',
+            'Use replay to compare vibration and filter time delay.', 'Examine measured vibration lines and the RPM signal.',
+            'Test a dynamic notch filter for a peak that is not a rotor harmonic.',
+            'Test a static notch filter for a resonance at a constant frequency.',
+            'Do not change the D gain from only the power percentage.'],
         ['TUNE caution', 'MSG profilesDerivativeHelp', 'FILT', 'PROF D-term cutoff', 'MOTORS'], ['DOC']),
     k('K2', 'Fast oscillation', ['C5', 'T1'], ['C11', 'F10', 'F11', 'F2', 'G10', 'T4', 'C2', 'T8', 'G13', 'D5', 'G1'], ['D1'],
-        ['Make sure that the D-term noise is less than its limit (C11, F10).', 'Make sure that the tail linkage is not loose (T4).', 'For the tail, examine the governor tail coherence (G10).',
+        ['Examine the D-term RMS value and its spectrum (C11, F10).', 'Make sure that the tail linkage is not loose (T4).', 'For the tail, examine the governor tail coherence (G10).',
             'Then decrease the gain that you increased last.'],
         ['PROF Derivative', 'FILT', 'OLDWIKI Tail-tuning', 'PROC45 yaw', 'TUNE'], ['DOC', 'DOC-old', 'INF']),
     k('K3', 'Slow oscillation', ['C6', 'T2'], ['T4', 'C9', 'G9', 'G10', 'C1'], ['D1'],
@@ -376,7 +378,7 @@ function causesOf(target, findings, only) {
     const own = new Set(symptoms.map(x => x.fid).filter(Boolean)), out = [];
     for (const K of RULES) {
         const s = symptoms.filter(x => K.symptoms.includes(x.id)); if (!s.length || !K.upstream.length) continue;
-        const ups = (findings || []).filter(u => u && u !== target && u.severity === 'flag' && K.upstream.includes(u.id) && !(u.fid && own.has(u.fid)) && (!only || only(u)) && s.some(x => compatible(x, u))
+        const ups = (findings || []).filter(u => u && u !== target && u.severity === 'flag' && !require('./health_setup.cjs').filterGuidance(u) && K.upstream.includes(u.id) && !(u.fid && own.has(u.fid)) && (!only || only(u)) && s.some(x => compatible(x, u))
             // a rule with before (a control limit): the time order decides, a limit period inside the window of the error included
             && (K.before ? s.some(x => compatible(x, u) && startsBefore(u, findingOf(x))) : !s.filter(x => compatible(x, u)).every(x => insideOf(u, findingOf(x)))));
         if (ups.length) out.push({ rule: K.id, name: K.name, fids: ups.map(u => u.fid).filter(Boolean), ids: [...new Set(ups.map(u => u.id))], first: K.first.slice() });
@@ -493,6 +495,7 @@ function statusOne(findings, recs, opts, want) {
     const sevOf = (f) => cited.get(fidKey(f)) || cited.get(key(f)) || [];
     const problemFinding = (f) => f.severity === 'flag' && !NO_PROBLEM.has(f.id) && (f.id !== 'D2' && !ownStatus(f.id) || catalogProblem(f)) && !f.explained && !(Array.isArray(f.resultOf) && f.resultOf.length) && (!R || sevOf(f).some(s => ACT.has(s)));
     const classOf = (f) => {
+        if(C&&C.status(f)==='information')return 'information';
         if (problemFinding(f)) return 'problem';
         if (f.severity === 'flag') { const s = sevOf(f); return f.explained || (s.length && s.every(x => x === 'info')) ? 'information' : 'monitor'; }
         if (C) return C.status(f);

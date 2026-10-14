@@ -1,0 +1,14 @@
+NOMAD 4.5.1
+Copyright (C) 2001-2025 GERAD
+https://github.com/bbopt/nomad/releases/tag/v.4.5.1
+
+NOMAD is licensed under the GNU Lesser General Public License, version 3
+or later. See LICENSE and the application GNU General Public License.
+The complete upstream source, the WebAssembly bridge, and the offline build
+script are in tools/autotune/optimizer in the application source repository:
+https://github.com/wualbert/rotorflight-blackbox
+
+No optimization algorithm source was modified. A build-only adaptation
+generates attribute headers with the host compiler before cross-compilation.
+The JavaScript adapter configures MADS with progressive barrier constraints.
+See docs/FILTER_AUTOTUNE.md for algorithm settings and guarantee limitations.

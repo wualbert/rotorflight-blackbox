@@ -1,7 +1,7 @@
 'use strict';
 const Math = require('./filter_math.cjs');
 
-// Deterministic, constrained successive-halving search. All objective values,
+// Topology proposals followed by upstream NOMAD constrained integer search. All objective values,
 // latency estimates and plots come from filter_replay on recorded samples.
 // See docs/FILTER_AUTOTUNE.md for sources, assumptions and validation coverage.
 const FT = require('./filter_tune.cjs');
@@ -9,6 +9,7 @@ const replay = require('./filter_replay.cjs');
 const reconstruct = require('./filter_reconstruct.cjs');
 const setup = require('./health_setup.cjs');
 const checklist = require('./filter_checklist.cjs');
+const optimizer = require('./filter_optimizer.cjs');
 const AXES = ['roll', 'pitch', 'yaw'];
 const RULES = Object.freeze({ window: 1024, leadS: 2, blockS: 30, noiseHz: 30,
     nyquistShare: 0.8, parityDb: 1, parityDelayMs: 0.3, maxAddMs: 0.5,
@@ -283,6 +284,7 @@ function compare(candidate, base, limits = RULES) {
     const delta = axes.slice(0, 3).map((a, i) => ({ axis: AXES[i], db: db(a.c, a.b), pidDb: db(a.pc, a.pb), se: null }));
     const valid = checks >= 3 && maxAddMs <= limits.maxAddMs && maxLossDb <= RULES.maxControlLossDb && delta.every(a => a.db <= RULES.maxAxisWorseDb);
     return { db: st.mean, se: st.se, axes: delta, units: values, n: values.length, valid,
+        constraints:[maxAddMs-limits.maxAddMs,maxLossDb-RULES.maxControlLossDb,...delta.map(a=>a.db-RULES.maxAxisWorseDb)],
         delay: { maxAddMs: round(maxAddMs,6), maxLossDb: round(maxLossDb), checks, at, f11BaseMs: null, f11MaxMs: null } };
 }
 
@@ -789,7 +791,8 @@ function tune(items, opts = {}) {
     const limits = { maxAddMs: delayLimit(opts.maxAddMs) }, judge = (a,b) => compare(a,b,limits), manual = opts.simulate !== undefined;
     const P = opts.prepared || prepare(items, opts);
     P.evaluations=0; P.samples=0;
-    const result = { version: 2, mode: manual ? 'simulation' : 'autotune', limits, method: 'constrained successive halving, firmware-rate time-domain replay',
+    // Version 2 is the firmware-replay result schema; optimizer changes are additive.
+    const result = { version: 2, mode: manual ? 'simulation' : 'autotune', limits, method: 'NOMAD 4.5.1 constrained integer MADS, firmware-rate time-domain replay',
         capabilities: capabilities(P), bench: P.excluded, unmeasuredPeriods:P.unmeasured||[], notes: P.notes, model: { passed: false, parity: [], leftOut: [], rules: { bandDb: RULES.parityDb, delayMs: RULES.parityDelayMs } },
         recommended: { status: 'no flight log', reasons: [], rows: [], cli: [], validation: {} }, curves: null,
         units: { kind: 'block', n: P.units.length }, tailFit: P.fit ? Object.assign({}, P.fit, { used: P.segments.some(s => s.cfg.gear && s.cfg.gear.source === 'log notch') }) : null };
@@ -810,16 +813,19 @@ function tune(items, opts = {}) {
     const baseTrain=evaluate(P,{},training,true,true);
     trainP.checklistBefore=checklist.findings(trainP,null,opts.app);
     P.trainingChecklistBefore=trainP.checklistBefore;
-    const hasTargets=trainP.checklistBefore.some(f=>f.replayable!==false&&f.severity==='flag');
+    const hasTargets=trainP.checklistBefore.some(f=>f.replayable!==false&&f.severity==='flag'&&!setup.filterGuidance(f));
     const trainingBaseline=checklist.findings(trainP,{},opts.app,{outputs:baseTrain.outputs});
     const ref = P.ref, budget = opts.budgetMs || RULES.budgetMs, searchStart = Date.now();
-    const tried = [], seen = new Set(), finalists = [], maxCandidates = opts.maxCandidates || RULES.maxCandidates;
-    let proposals = manual ? [] : candidates(P), incumbent = {}, timedOut = false;
-    for (let roundNo = 0; !manual && roundNo < 3; roundNo++) {
+    const tried = [], seen = new Set(), finalists = [], optimizerRuns=[], maxCandidates = opts.maxCandidates || RULES.maxCandidates;
+    let timedOut = false;
+    if(!manual) {
         const scored = [];
-        for (const proposal of proposals.slice(0, maxCandidates)) {
+        // The seed catalogue explores categorical choices. This stage is not
+        // MADS and supplies no convergence guarantee. Reserve time for numeric
+        // optimization instead of spending the full budget on grid proposals.
+        for (const proposal of candidates(P).slice(0, maxCandidates)) {
             const k = key(proposal.changes); if (seen.has(k)) continue; seen.add(k);
-            if (Date.now() - searchStart > budget) { timedOut = true; break; }
+            if (Date.now() - searchStart > budget*.25) break;
             let c, sc;
             try { c = evaluate(P, proposal.changes, short); sc = judge(c, baseShort); } catch (e) { tried.push({ family: proposal.family, reason: String(e.message) }); continue; }
             const configurationIssues=checklist.configurationIssues(P,proposal.changes).length;
@@ -831,9 +837,38 @@ function tune(items, opts = {}) {
         const promoted = [];
         for (const q of scored.slice(0, 12)) { const ev = evaluate(P, q.changes, medium), sc = judge(ev, baseMedium); if (sc.valid) promoted.push({ ...q, score: sc }); }
         promoted.sort(rankCandidates);
-        finalists.push(...promoted.slice(0, RULES.finalists).map(q => ({ ...q, round: roundNo })));
-        if (!promoted.length || timedOut) break;
-        incumbent = promoted[0].changes; proposals = candidates(P, incumbent);
+        finalists.push(...promoted.slice(0, RULES.finalists).map(q => ({ ...q, round: 0 })));
+        // Each solve retains a fixed topology and the SAME 24 training
+        // windows. Never change its objective mid-run or use reserved data.
+        const starts=[],topologies=new Set();
+        for(const q of promoted) {
+            const t=optimizer.topology(P,q.changes);
+            if(!topologies.has(t)&&starts.length<3){starts.push(q);topologies.add(t);}
+        }
+        // An infeasible numerical start is allowed by the progressive barrier.
+        // A seed that only the sparse screen rejects must not prevent all polls.
+        if(!starts.length)starts.push({family:'recorded topology',changes:{}});
+        for(let i=0;i<starts.length;i++) {
+            const q=starts[i],domain=optimizer.domain(P,q.changes),remaining=budget-(Date.now()-searchStart);
+            if(remaining<=0){timedOut=true;break;}
+            if(!domain.variables.length)continue;
+            progress('The app uses NOMAD to select filter values.',Math.min(.65,.2+.45*(Date.now()-searchStart)/budget));
+            const run=optimizer.minimize({...domain,timeMs:remaining/(starts.length-i),maxEvaluations:opts.optimizerEvaluations||180,constraints:5,
+                evaluate:x=>{
+                    if(!domain.admissible(x))return null;
+                    const changes=domain.decode(x),ev=evaluate(P,changes,medium),score=judge(ev,baseMedium);
+                    if(!Number.isFinite(score.db)||score.delay.checks<3||!score.constraints.every(Number.isFinite))return null;
+                    tried.push({family:'NOMAD',db:round(score.db),valid:score.valid});
+                    if(score.valid)finalists.push({family:'NOMAD',changes,score,round:i+1});
+                    if(tried.length%10===0)progress(`The app replayed ${tried.length} filter sets.`,Math.min(.65,.1+.55*(Date.now()-searchStart)/budget));
+                    return [score.db,...score.constraints];
+                }});
+            const {best,infeasible,...report}=run;
+            optimizerRuns.push({...report,topology:optimizer.topology(P,q.changes),variables:domain.variables,
+                best:best?{objective:best.values[0],constraints:best.values.slice(1),values:best.x}:null,
+                infeasible:infeasible?{objective:infeasible.values[0],violation:infeasible.violation}:null});
+            if(run.stop==='time budget')timedOut=true;
+        }
     }
     progress('The app tests the best sets on all training windows.', 0.7);
     const ranked = [];
@@ -843,7 +878,7 @@ function tune(items, opts = {}) {
     // sparsely sampled profile exposes extra delay at the full-data stage.
     const ordered = finalists.sort(rankCandidates), full = [], fullSeen = new Set();
     const addFull = q => { if (q && !fullSeen.has(key(q.changes)) && full.length < RULES.finalists) { fullSeen.add(key(q.changes)); full.push(q); } };
-    for (let r = 0; r < 3; r++) addFull(ordered.find(q => q.round === r));
+    for (let r = 0; r <= 3; r++) addFull(ordered.find(q => q.round === r));
     for (const family of new Set(ordered.map(q => q.family))) addFull(ordered.find(q => q.family === family));
     for (const q of ordered) addFull(q);
     for (const q of full) {
@@ -909,7 +944,8 @@ function tune(items, opts = {}) {
     Object.assign(result, { ms: { total: Date.now() - started, search: Date.now() - searchStart, exactEvaluations: P.evaluations, screened: 0, simulations: P.evaluations, timedOut },
         craft: P.segments[P.segments.length - 1].w.flight.craft || '', fileName: P.segments[P.segments.length - 1].file || '',
         firmware: P.segments[P.segments.length - 1].firmware, bootProfile: P.cli && P.cli.selectedProfile !== null ? P.cli.selectedProfile + 1 : opts.armingProfile || P.segments[P.segments.length - 1].firstProfile || null,
-        search: { tested: tried.length, families: [...new Set(tried.map(t => t.family))], finalistCount: ranked.length, selection, replayedSamples: P.samples, trainingWindows: training.length, heldoutWindows: heldout.length },
+        search: { tested: tried.length, families: [...new Set(tried.map(t => t.family))], finalistCount: ranked.length, selection, optimizerRuns,
+            objectiveWindows:medium.map(w=>w.id),replayedSamples: P.samples, trainingWindows: training.length, heldoutWindows: heldout.length },
         current: { settings: ref.s, from: ref.from }, model: { ...result.model, passed: !unsupported && !P.excluded.length && par.every(p => p.passed), supported:!unsupported, parity: par,
             coverage, reconstructed, reconstructionMethod:'firmware multichannel reconstruction', continuousValidation:true, gear: ref.gear,
             observers:P.segments.map(s=>({log:s.log,profiles:s.observers})),
@@ -955,7 +991,10 @@ function texts(res) {
     const R = res.recommended, good = R.status === 'recommended', p = R.predicted || {}, h = R.validation && R.validation.holdout;
     const recordedOnly = res.mode === 'simulation' && R.params && !Object.keys(R.params).length;
     const rows = (R.rows || []).map(r => ({ ...r, text: `Set \`${r.name}\` to \`${r.to}\`.` }));
-    return { status: R.status, summary: `The app replayed ${res.search ? res.search.tested : 0} filter sets on recorded gyro samples.`,
+    const runs=res.search&&res.search.optimizerRuns||[],limited=runs.filter(r=>/budget/.test(r.stop)).length;
+    const searchText=runs.length ? ` NOMAD compares parameter values in ${runs.length} filter configurations.`+
+        (limited?` NOMAD stopped ${limited} times at a time or test limit.`:'')+' These tests do not show that the selected values are the best possible values.' : '';
+    return { status: R.status, summary: `The app replayed ${res.search ? res.search.tested : 0} filter sets on recorded gyro samples.`+searchText,
         recommendation: (good && recordedOnly ? 'Recorded filter replay. No filter values changed. Each interval uses its recorded configuration.' : good && res.mode === 'simulation' ? 'The changed values are in the replay limits. Examine the checks and signals before export.' : good ? `The recommended set decreases the vibration in the replay by ${round(-p.totalDb, 2)} ± ${round(p.se, 2)} dB. Examine all filter values below.` : R.reasons.join('\n')) +
             (good&&!recordedOnly&&R.validation&&R.validation.checks&&R.validation.checks.remaining?' Some filter problems are not corrected. Examine the filter checks.':''),
         parity: res.model.passed ? 'The recorded configuration agrees with the replay on all measured axes.' : 'The recorded configuration does not agree with the replay on all axes.',

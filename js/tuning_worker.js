@@ -122,7 +122,7 @@ var TuningWorker = (function () {
         power: 'the battery checks at the load steps (P1, P2)', advice: 'recommendations', catalog: 'the STE summaries',
         hierarchy: 'the tuning sequence', evidence: 'the part of the log that gave each result', datasets: 'the configurations of the flights',
         epochs: 'the parts of the log in which the values are possibly not the values of the log header' }; // without that module
-    const ON_DEMAND = ['filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'control_tune',
+    const ON_DEMAND = ['filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune',
         'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline'];
     const CORE = ['setup', 'gov', 'loop'];                                 // health.cjs MODULES, in its order
     const JUDGED = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power']; // the new modules, judged after health_report.cjs

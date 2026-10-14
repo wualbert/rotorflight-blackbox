@@ -325,7 +325,7 @@ test('the pure window rules: clamp to the log and to 0.5-60 s, wheel notches, D9
 test('the results that each window shows: evidence spans of this log that overlap it, the worst first', () => {
     const I = setup().internals, fs = synthResult().findings, ids = (t0, t1, li = 1) => Array.from(I.overlapping(fs, li, t0, t1), (o) => o.f.fid);
     // ground truth from the spans of synthResult: fA 5-12, fB 19.5-25, fF 0-3 and 14-16, fG 16-17, fH 8-9, fI 12-13
-    assert.deepEqual(ids(10, 20), ['fG"><b>x', 'fA', 'fF', 'fB', 'fI'], 'problems C11, C12, F5, then monitor C5, then information R1');
+    assert.deepEqual(ids(10, 20), ['fA', 'fB', 'fG"><b>x', 'fF', 'fI'], 'problem C12, monitor C5, then reference information C11, F5 and R1');
     assert.deepEqual(ids(28, 38), ['fC']);
     assert.deepEqual(ids(0, 4), ['fF']);
     assert.deepEqual(ids(7.5, 9.5), ['fA', 'fH']);
@@ -390,7 +390,7 @@ test('without a result: the window of the viewer, the values of derive("window")
 
 test('with a result: the panel lists the results of the window, and they follow the window', async () => {
     const app = await shown({ result: synthResult() });
-    assert.deepEqual(app.fids(), ['fG&quot;&gt;&lt;b&gt;x', 'fA', 'fF', 'fB', 'fI']);
+    assert.deepEqual(app.fids(), ['fA', 'fB', 'fG&quot;&gt;&lt;b&gt;x', 'fF', 'fI']);
     const h = app.html('findings');
     assert.match(h, /Results in this time window <span class="log-lens-count">5<\/span>/);
     for (const s of ['Problem', 'Monitor', 'Information', 'Check C12, roll: the tracking error is 52 ± 3 % of the setpoint.', 'Value: 52.0 ± 3.0 %.',
@@ -409,7 +409,7 @@ test('with a result: the panel lists the results of the window, and they follow 
     const strip = lastDraw(ctx).filter((c) => c.m === 'fillRect' && c.a[1] === app.internals.timelineRows(96).S0); // the span strip of drawTimeline
     assert.equal(strip.length, 11, 'the 11 spans of log 1: none of log 2, none of a header check');
     const fF = strip.filter((c) => Math.abs(c.a[0] - (6 + 788 * 14 / LEN)) < 1e-9);
-    assert.deepEqual(fF.map((c) => [c.fill, +c.a[2].toFixed(6)]), [['#c9483f', +(788 * 2 / LEN).toFixed(6)]], 'F5 at 14-16 s, as a problem');
+    assert.deepEqual(fF.map((c) => [c.fill, +c.a[2].toFixed(6)]), [['#3a7fc1', +(788 * 2 / LEN).toFixed(6)]], 'F5 at 14-16 s remains visible as reference information');
     assert.ok(strip.some((c) => c.fill === '#3c9d40'), 'a satisfactory span');
     assert.ok(['#c9483f', '#ff5a4f'].includes(strip[strip.length - 1].fill), 'the worst drawn last, on top');
     const over = lastDraw(ctx).filter((c) => c.m === 'fillRect' && c.a[1] === app.internals.timelineRows(96).T && c.alpha === 0.16);

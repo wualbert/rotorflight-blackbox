@@ -313,8 +313,8 @@ test('the verdict shows the flight selection of the run (SPEC3 D: result.selecti
 test('the verdict: the summary in items, the 3 most important items, the start steps, the flights, the tiles and the cards in the sequence of their importance (M3)', async () => {
     const app = await shown({ result: synthResult() }), h = app.verdict(), catalog = require('../tools/autotune/catalog.cjs');
     for (const s of ['Results of the analysis', '<code>flight.bbl</code>', 'Log 1', 'PID profiles 1, 2, 3 and 4', 'Analysis time 12.5 s',
-        // without result.issues the view makes one item for each check and axis: 8 problems and 1 item to monitor in 21 results
-        'The analysis found 8 problems and 1 item to monitor in 21 results. Areas with a problem: &quot;Battery and power&quot;, &quot;Motor and ESC&quot;, &quot;Governor&quot;, &quot;Vibration and mechanical parts&quot;, &quot;Tail&quot; and &quot;Blackbox log&quot;.',
+        // without result.issues the view makes one item for each check and axis: 7 problems and 1 item to monitor in 21 results
+        'The analysis found 7 problems and 1 item to monitor in 21 results. Areas with a problem: &quot;Battery and power&quot;, &quot;Motor and ESC&quot;, &quot;Governor&quot;, &quot;Vibration and mechanical parts&quot;, &quot;Tail&quot; and &quot;Blackbox log&quot;.',
         '1 check did not operate because of an analysis error.', 'The log rate is less than 1 kHz.',
         '<p class="analysis-warn analysis-prereq">Items with a problem before the first flight: Rescue and Battery and power.</p>',
         '<strong>Start here</strong>', '<ol class="analysis-start-list"><li>Filters <span class="analysis-muted">(step 1)</span></li><li>Governor <span class="analysis-muted">(step 2)</span></li></ol>',
@@ -336,7 +336,7 @@ test('the verdict: the summary in items, the 3 most important items, the start s
     const tiles = [...h.matchAll(/<button type="button" class="analysis-tile st-(\w+)" data-analysis-act="area" data-area="(\w+)"><span class="analysis-tile-title">([^<]+)<\/span><span class="analysis-tile-state">([^<]+)<\/span>/g)]
         .map((m) => [m[2], m[1], m[4]]);
     eq(tiles, [['cyclic', 'error', 'Analysis error: 1 problem'], ['power', 'problem', 'Problem: 1 problem'], ['motor', 'problem', 'Problem: 1 problem'], ['governor', 'problem', 'Problem: 1 problem'],
-        ['vibration', 'problem', 'Problem: 2 problems'], ['tail', 'problem', 'Problem: 1 problem'], ['logging', 'problem', 'Problem: 1 problem'],
+        ['vibration', 'problem', 'Problem: 1 problem'], ['tail', 'problem', 'Problem: 1 problem'], ['logging', 'problem', 'Problem: 1 problem'],
         ['radio', 'information', 'Information'], ['rpm', 'notMeasured', 'Not measured'], ['limits', 'notMeasured', 'Not measured']]);
     app.click('area', { 'data-area': 'power' });
     assert.equal(app.dom.part('section[data-area="power"]').scrolled, 1, 'a tile shows its card');
@@ -376,18 +376,20 @@ test('the verdict: the summary in items, the 3 most important items, the start s
     assert.ok(cyc.includes('<li class="st-problem"><span class="analysis-key-noun">Tracking error, roll</span> <span class="analysis-key-value">52 ± 3 %</span></li>'), 'a main number with its axis');
     assert.ok(!card('tail').includes('data-analysis-act="tune"'), 'T8 with f.tuner false: no link');
     assert.ok(card('vibration').includes('C15, roll, PID profile 1, On the ground'));
-    // the vibration card: the items of F5 and C15 at the top, F2, and the item of the 4 F6 results (its numbers in one line) under "N more items"
+    // The vibration card keeps the measured C15 problem first, then F2/F5 reference information.
+    // The four satisfactory F6 measurements remain under the disclosure.
     const vib = card('vibration'), more = vib.indexOf('<details class="analysis-more"');
     assert.ok(more > 0 && vib.includes('<summary>1 more item</summary>'), vib.slice(0, 300));
     eq([...vib.slice(0, more).matchAll(/data-analysis-issue="i\d+"><div class="analysis-row-head"><span class="log-lens-badge st-\w+">[^<]+<\/span><span class="analysis-what"><strong>[^<]+<\/strong> <span class="analysis-where">([^<]*)</g)].map((m) => m[1]),
-        ['C15, roll', 'F5', 'F6'], 'the problems, then the first satisfactory item with a value (the item with more results first)');
-    assert.ok(vib.slice(more).includes('<span class="analysis-where">F2</span>'), 'the other items under "1 more item"');
-    assert.ok(vib.slice(0, more).includes('<span class="analysis-value" title="Value">41 ± 0.5 dB (3 more values)</span>'), 'the numbers of an item of more results: the first, and the number of the others');
-    assert.ok(vib.slice(0, more).includes('<div class="analysis-issue-where">Log 1 · PID profiles 1, 2, 3 and 4 · 4 results</div>'));
-    eq([...vib.slice(0, more).matchAll(/<li class="analysis-row st-\w+" data-analysis-row="r\d+"><div class="analysis-row-head"><span class="log-lens-badge st-\w+">[^<]+<\/span><span class="analysis-what"><strong>[^<]+<\/strong> <span class="analysis-where">([^<]*)</g)].map((m) => m[1]).filter((x) => x.startsWith('F6')),
+        ['C15, roll', 'F2', 'F5'], 'the measured problem, then information, ahead of satisfactory results');
+    assert.ok(vib.slice(more).includes('<span class="analysis-where">F6</span>'), 'the other items under "1 more item"');
+    assert.ok(vib.slice(more).includes('<span class="analysis-value" title="Value">41 ± 0.5 dB (3 more values)</span>'), 'the numbers of an item of more results: the first, and the number of the others');
+    assert.ok(vib.slice(more).includes('<div class="analysis-issue-where">Log 1 · PID profiles 1, 2, 3 and 4 · 4 results</div>'));
+    eq([...vib.slice(more).matchAll(/<li class="analysis-row st-\w+" data-analysis-row="r\d+"><div class="analysis-row-head"><span class="log-lens-badge st-\w+">[^<]+<\/span><span class="analysis-what"><strong>[^<]+<\/strong> <span class="analysis-where">([^<]*)</g)].map((m) => m[1]).filter((x) => x.startsWith('F6')),
         ['F6, PID profile 1', 'F6, PID profile 2', 'F6, PID profile 3', 'F6, PID profile 4'], 'the results of each log under the item');
     // the counts of the items for each status
-    assert.ok(vib.includes('<span class="analysis-count st-problem">Problem <b>2</b></span><span class="analysis-count st-satisfactory">Satisfactory <b>2</b></span>'));
+    for(const [status,label,count] of [['problem','Problem',1],['information','Information',2],['satisfactory','Satisfactory',1]])
+        assert.ok(vib.includes(`<span class="analysis-count st-${status}">${label} <b>${count}</b></span>`));
     // the toolkit text, collapsed and quoted
     assert.ok(cyc.includes('<details class="analysis-raw" data-ste="quoted"><summary>Analysis information</summary>toolkit text of C12</details>'));
     // an empty area
@@ -721,7 +723,7 @@ test('no result: "Start the analysis", then the result; a run that does not star
     assert.ok(app.verdict().includes('data-analysis-act="start" disabled'));
     assert.ok(app.verdict().includes('The analysis started. Wait for the results. The Tuning view shows when the analysis is complete.'));
     app.give(synthResult());
-    assert.ok(app.verdict().includes('The analysis found 8 problems and 1 item to monitor in 21 results.'), 'the result through onResult');
+    assert.ok(app.verdict().includes('The analysis found 7 problems and 1 item to monitor in 21 results.'), 'the result through onResult');
     assert.ok(!app.dom.part('[data-lens="notice"]').innerHTML.includes('not available'), 'the lens has the result too');
     app.give(synthResult({ fileName: 'other.bbl' }));
     assert.ok(app.verdict().includes('No analysis result is available.'), 'a result of another file');
@@ -742,7 +744,7 @@ test('no result: "Start the analysis", then the result; a run that does not star
     const p = await shown({ result: null, runAnalysis: () => Promise.resolve(synthResult()) });
     p.click('start');
     await flush();
-    assert.ok(p.verdict().includes('The analysis found 8 problems and 1 item to monitor in 21 results.'), 'a promise of the result');
+    assert.ok(p.verdict().includes('The analysis found 7 problems and 1 item to monitor in 21 results.'), 'a promise of the result');
 });
 
 test('"Start the analysis" ends: a run that stops, is canceled or is replaced, and a result for another log, give the button again (B1)', async () => {

@@ -492,7 +492,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 add({ id: 'F1', severity: bad ? 'flag' : none ? 'note' : 'ok', log, value: x.active.length, threshold: 'a gyro LPF when RPM filters are on', source: R.F1.source,
                     text: none ? para(`No gyro low-pass filter is on. LPF1 is ${quote(x.lpf1.typeName)} at ${val(x.lpf1.hz)} Hz, and LPF2 is ${quote(x.lpf2.typeName)} at ${val(x.lpf2.hz)} Hz.`,
                         `The LPF1 frequency range is ${val(x.lpf1Dynamic.min)} to ${val(x.lpf1Dynamic.max)} Hz. RPM filters are ${x.rpmFilter ? 'on' : 'off'}.`,
-                        `Only the PID bandwidth filter changes the gyro signal before P. Its gyro_cutoff values are ${quote([x.pidBandwidthHz.roll, x.pidBandwidthHz.pitch, x.pidBandwidthHz.yaw].map(val).join('/'))} Hz.`)
+                        `The PID bandwidth filter also changes the gyro signal before P. Its gyro_cutoff values are ${quote([x.pidBandwidthHz.roll, x.pidBandwidthHz.pitch, x.pidBandwidthHz.yaw].map(val).join('/'))} Hz.`)
                         : 'The gyro low-pass filters are ' + x.active.map(v => `${quote(v.stage)} (${quote(v.type || 'dynamic low-pass filter')}, ${val(v.hz)} Hz)`).join(', ') + '.' }); } }
         { const t = R.F2, v = m.F2.lowestHz;
             if (v === null) add({ id: 'F2', severity: 'skipped', log, source: t.source, text: 'No gyro low-pass filter is on. Thus, there is no cutoff to compare (check F1).' });
@@ -547,4 +547,19 @@ function judge(flights, RULES = DEFAULT_RULES) {
     return F;
 }
 
-module.exports = { EXTRA, RULE, DEFAULT_RULES, analyse, judge, parseCli, compareCli, decodeNotchSource, rpmBanks, headerChanges, GOV_STATES, LPF_TYPES, FEATURE_BITS };
+// These rules describe common starting configurations or dimensionless spectral
+// summaries. They are not necessary conditions for adequate filtering. Keep
+// their measurements, but do not use them as physical feasibility constraints.
+// The rationale and primary sources are in docs/FILTER_AUTOTUNE.md.
+function filterGuidance(f) {
+    if (!f) return null;
+    if (['F1', 'F2', 'F3', 'F4'].includes(f.id))
+        return 'These values are reference information. Use measured gyro noise and time delay to examine filter changes.';
+    if (f.id === 'F5')
+        return 'This check gives the RPM notch filter frequencies. A static notch filter or a dynamic notch filter can also decrease a vibration line.';
+    if (f.id === 'C11' || f.id === 'F10' && f.unit !== 'permille')
+        return 'The power percentage does not give the D-term RMS value. Examine its RMS value and the replay change.';
+    return null;
+}
+
+module.exports = { EXTRA, RULE, DEFAULT_RULES, analyse, judge, parseCli, compareCli, decodeNotchSource, rpmBanks, headerChanges, GOV_STATES, LPF_TYPES, FEATURE_BITS, filterGuidance };

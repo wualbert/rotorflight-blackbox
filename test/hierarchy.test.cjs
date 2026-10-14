@@ -167,11 +167,11 @@ test('K rules: K1-K27 with known check ids, documented steps, sources', () => {
     assert.ok(k14.first.some(s => /does not identify a blade or tail torque assist change/.test(s)));
     assert.ok(!H.RULES.some(k => k.first.some(s => /calibrat/i.test(s) && /tail/i.test(s))), 'no tail calibration');
     const f = (fid, id, log, profile, axis) => ({ fid, id, severity: 'flag', log, profile, axis });
-    const F = [f('a', 'C11', 3, 1, 'pitch'), f('b', 'F5', 3, 1), f('c', 'F1', 3, null), f('d', 'F5', 4, 1), f('e', 'F5', 3, 2), f('g', 'T8', 3, 2), f('h', 'C5', 3, 2, 'roll')];
-    assert.deepEqual(H.causesOf(F[0], F), [{ rule: 'K1', name: 'D-term noise', fids: ['b', 'c'], ids: ['F5', 'F1'], first: H.RULES[0].first }], 'same log, profile 1 or no profile; not log 4, not profile 2');
+    const F = [f('a', 'C11', 3, 1, 'pitch'), f('b', 'F6', 3, 1), f('c', 'G12', 3, null), f('d', 'F6', 4, 1), f('e', 'F6', 3, 2), f('g', 'T8', 3, 2), f('h', 'C5', 3, 2, 'roll')];
+    assert.deepEqual(H.causesOf(F[0], F), [{ rule: 'K1', name: 'D-term noise', fids: ['b', 'c'], ids: ['F6', 'G12'], first: H.RULES[0].first }], 'same log, profile 1 or no profile; not log 4, not profile 2');
     assert.deepEqual(H.causesOf(f('t', 'T1', 3, 2, 'yaw'), F).map(c => [c.rule, c.ids]), [['K2', ['T8']]], 'T8 is a yaw upstream of T1');
     assert.deepEqual(H.causesOf(F[6], F).map(c => c.rule), [], 'a roll symptom and a yaw upstream (T8) do not match');
-    assert.deepEqual(H.causesOf(F[0], F, (u) => u.id !== 'F1').map(c => c.fids), [['b']], 'only: a filter on the upstream flags');
+    assert.deepEqual(H.causesOf(F[0], F, (u) => u.id !== 'G12').map(c => c.fids), [['b']], 'only: a filter on the upstream flags');
     const rec = { id: 'C11:pitch', severity: 'check', axis: 'pitch', profile: 1, evidence: [{ fid: 'a', id: 'C11', log: 3, profile: 1 }] };
     assert.deepEqual(H.causesOf(rec, F).map(c => [c.rule, c.fids]), [['K1', ['b', 'c']]]);
 });
@@ -196,6 +196,9 @@ test('audit K1-K27: every cause rule requires compatible flagged evidence and pr
             const s = {fid:'symptom',id:symptom,severity:'flag',log:3,profile:1,axis,evidence:span(20,22)};
             const u = {fid:'cause',id:upstream,severity:'flag',log:3,profile:1,axis,evidence:span(18.5,19.5)};
             const accepted = match(rule.id,s,u);
+            if(require('../tools/autotune/health_setup.cjs').filterGuidance(u)) {
+                assert.equal(accepted,undefined,context+' is guidance');continue;
+            }
             assert.ok(accepted,context);
             assert.deepEqual(accepted.ids,[upstream],context);
             assert.deepEqual(accepted.fids,['cause'],context);
@@ -267,9 +270,9 @@ const load = (fx) => ({ findings: fx.flags.map(([fid, id, log, profile, axis]) =
 
 test('status, Gaui X4 #58: start here the filters; the tail authority waits for them; the loop stalls (D2) are no problem of the logging', () => {
     const { findings, recs } = load(FIXTURES.g58), st = H.status(findings, recs, {}), N = st.nodes;
-    assert.deepEqual(st.startHere, ['filters']); assert.deepEqual(st.prereqProblems, []);
-    assert.deepEqual([N.filters.number, N.tailcomp.status, N.tailcomp.after, N.tailcomp.number], [1, 'problem', ['filters'], null]);
-    assert.equal(N.tailcomp.reason, 'This tuning block has a problem. Correct this item before it first: "Filters".');
+    assert.deepEqual(st.startHere, ['tailcomp']); assert.deepEqual(st.prereqProblems, []);
+    assert.deepEqual([N.filters.number, N.tailcomp.status, N.tailcomp.after || [], N.tailcomp.number], [null, 'startHere', [], 1]);
+    assert.equal(N.filters.problem,false);
     assert.equal(N.logging.status, 'ok', 'D2 flags are never a problem: the logging is "No problem found"'); assert.deepEqual(N.logging.checksRun, ['D2']); assert.match(N.logging.reason, /^No problem found\. This check operated: D2\.$/);
     assert.equal(N.tail.status, 'notMeasured', 'T6 is evidence of the tail compensation');
     assert.deepEqual(N.tailcomp.problemFids.sort(), ['5', '6', '7', '8', '9']);
@@ -280,10 +283,10 @@ test('status, Gaui X4 #58: start here the filters; the tail authority waits for 
 
 test('status, Fireball #3: G11 (pack sag) is a value to monitor, not a power problem; the governor waits for the filters; the cyclic waits for the filters; the tail authority is a possible result of the throttle reserve', () => {
     const { findings, recs } = load(FIXTURES.fb3), st = H.status(findings, recs, {}), N = st.nodes;
-    assert.deepEqual(st.startHere, ['filters']); assert.deepEqual(st.prereqProblems, [], 'G11 is the governor that supplies the normal pack sag: no prerequisite problem');
+    assert.deepEqual(st.startHere, ['governor']); assert.deepEqual(st.prereqProblems, [], 'G11 is the governor that supplies the normal pack sag: no prerequisite problem');
     assert.equal(N.power.status, 'ok'); assert.match(N.power.reason, /^No problem found\./);
-    assert.equal(N.governor.status, 'problem'); assert.deepEqual(N.governor.blockedBy || [], []); assert.match(N.governor.reason, /Correct this item before it first: "Filters"\./);
-    assert.equal(N.cyclic.status, 'blocked'); assert.deepEqual(N.cyclic.blockedBy, ['filters']);
+    assert.equal(N.governor.status, 'startHere'); assert.deepEqual(N.governor.blockedBy || [], []); assert.equal(N.filters.problem,false);
+    assert.equal(N.cyclic.status, 'problem'); assert.deepEqual(N.cyclic.blockedBy || [], []);
     assert.equal(N.tailcomp.status, 'possible');
     assert.ok(N.tailcomp.possible.some(q => q.rule === 'K14' && q.from.includes('governor')) && N.tailcomp.possible.some(q => q.rule === 'cause' && q.from[0] === 'governor'));
     assert.equal(N.tail.problem, false, 'T1 is a watch'); assert.equal(N.logging.status, 'ok', 'D2 and D4 are no problem');
@@ -291,7 +294,7 @@ test('status, Fireball #3: G11 (pack sag) is a value to monitor, not a power pro
 
 test('status rules: prerequisites never blocked or possible; blocks blocked iff a gate upstream has a problem (random problem sets)', () => {
     let seed = 7; const rand = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
-    const flagOf = { logging: 'D1', rpm: 'G1', power: 'D5', mechanics: 'T4', rescue: 'D9', controller: 'R1', filters: 'F5', governor: 'G3', cyclic: 'C1', cycomp: 'C14', tail: 'T2', tailcomp: 'T6' };
+    const flagOf = { logging: 'D1', rpm: 'G1', power: 'D5', mechanics: 'T4', rescue: 'D9', controller: 'R1', filters: 'F6', governor: 'G3', cyclic: 'C1', cycomp: 'C14', tail: 'T2', tailcomp: 'T6' };
     for (let k = 0; k < 200; k++) {
         const P = new Set(Object.keys(flagOf).filter(() => rand() < 0.3));
         // each in a log of its own: no K rule matches, so possible comes from the cause edges (not viaRules) only
@@ -324,18 +327,18 @@ test('status rules: prerequisites never blocked or possible; blocks blocked iff 
 test('status rules: watch and info recommendations, D2 and D4, no advice, explained flags, C10 landed', () => {
     const f = (fid, id, extra) => Object.assign({ fid, id, severity: 'flag', log: 1, profile: 1 }, extra);
     const r = (id, severity, fids) => ({ id, severity, evidence: fids.map(x => ({ fid: x })) });
-    let st = H.status([f('a', 'F5')], [r('F5', 'watch', ['a'])]);
+    let st = H.status([f('a', 'F6')], [r('F6', 'watch', ['a'])]);
     assert.deepEqual([st.nodes.filters.status, st.nodes.filters.problem], ['monitor', false], 'a flag with a watch only');
-    st = H.status([f('a', 'F5')], [r('F5', 'info', ['a'])]);
+    st = H.status([f('a', 'F6')], [r('F6', 'info', ['a'])]);
     assert.equal(st.nodes.filters.status, 'information', 'a flag that every recommendation makes information');
-    st = H.status([f('a', 'F5', { explained: 'Already filtered' })], []);
+    st = H.status([f('a', 'F6', { explained: 'Already filtered' })], []);
     assert.equal(st.nodes.filters.status, 'information');
     st = H.status([f('a', 'D2'), f('b', 'D4')], [r('D2', 'action', ['a']), r('D4', 'check', ['b'])]);
     assert.equal(st.nodes.logging.status, 'ok'); assert.deepEqual(st.startHere, []); assert.deepEqual(st.prereqProblems, []);
-    st = H.status([f('a', 'F5')], null);
+    st = H.status([f('a', 'F6')], null);
     assert.deepEqual(st.startHere, ['filters'], 'without advice every flag counts');
-    assert.deepEqual(H.status([f('a', 'F5')], []).startHere, ['filters'], 'an empty list: advice did not run (the worker gives [] when it fails)');
-    st = H.status([{ module: 'setup', id: 'F5', severity: 'flag', log: 2, profile: 1, text: 'line' }], [{ id: 'F5', severity: 'check', evidence: [{ module: 'setup', id: 'F5', log: 2, profile: 1, text: 'line' }] }]);
+    assert.deepEqual(H.status([f('a', 'F6')], []).startHere, ['filters'], 'an empty list: advice did not run (the worker gives [] when it fails)');
+    st = H.status([{ module: 'setup', id: 'F6', severity: 'flag', log: 2, profile: 1, text: 'line' }], [{ id: 'F6', severity: 'check', evidence: [{ module: 'setup', id: 'F6', log: 2, profile: 1, text: 'line' }] }]);
     assert.deepEqual(st.startHere, ['filters']);
     // header rules and gain decisions count by their recommendation: the cyclic I rule is a mechanics problem (the mixer limit test)
     st = H.status([], [{ id: 'SETUP:roll_i_gain', severity: 'check', axis: 'roll', evidence: [] }, { id: 'C7:pitch_f_gain:p1', severity: 'action', axis: 'pitch', evidence: [{ id: 'C7' }] },
@@ -376,9 +379,9 @@ test('status: not applicable (DIRECT governor) and not accurate (log rate)', () 
     st = H.status([g('a', 'G0', 'ok', { value: 1000 })], []);
     assert.notEqual(st.nodes.governor.status, 'notApplicable');
     // D1 flags in log 2: the filter results of log 2 are not accurate, those of log 3 count; the logging itself is a problem
-    st = H.status([g('d', 'D1', 'flag', { log: 2 }), g('e', 'F5', 'flag', { log: 2, profile: 1 }), g('f', 'F6', 'ok', { log: 2, profile: 1 })], [{ id: 'F5', severity: 'check', evidence: [{ fid: 'e' }] }]);
+    st = H.status([g('d', 'D1', 'flag', { log: 2 }), g('e', 'F6', 'flag', { log: 2, profile: 1 }), g('f', 'F6', 'ok', { log: 2, profile: 1 })], [{ id: 'F6', severity: 'check', evidence: [{ fid: 'e' }] }]);
     assert.equal(st.nodes.filters.status, 'notAccurate'); assert.equal(st.nodes.filters.problem, false);
-    st = H.status([g('d', 'D1', 'flag', { log: 2 }), g('e', 'F5', 'flag', { log: 3, profile: 1 })], [{ id: 'F5', severity: 'check', evidence: [{ fid: 'e' }] }, { id: 'D1', severity: 'action', evidence: [{ fid: 'd' }] }]);
+    st = H.status([g('d', 'D1', 'flag', { log: 2 }), g('e', 'F6', 'flag', { log: 3, profile: 1 })], [{ id: 'F6', severity: 'check', evidence: [{ fid: 'e' }] }, { id: 'D1', severity: 'action', evidence: [{ fid: 'd' }] }]);
     assert.deepEqual([st.startHere, st.prereqProblems], [['filters'], ['logging']], 'D1 makes results not accurate, it gates nothing: the filters of log 3 are a problem');
     assert.equal(st.nodes.logging.status, 'problem');
 });
@@ -413,12 +416,12 @@ test('GEAR RULE: no item, edge, K rule or reason tells that a gear ratio, a pull
     for (const n of H.NODES) { assert.ok(!n.params.some(p => /gear_ratio/.test(p)), `${n.id}: ${n.params}`); for (const d of n.docs) assert.ok(!/gear/i.test(d.url + d.title), d.url); }
     assert.match(H.EDGES.find(e => e.from === 'rpm' && e.to === 'governor').why, /The gear ratios in the configuration are correct\.$/);
     assert.ok(H.RULES.find(k => k.id === 'K11').first.includes('Make sure that the motor pole count and the RPM sensor are correct (G12).'));
-    assert.ok(H.RULES[0].first.includes('For a peak that is not a rotor harmonic, use the dynamic notch filter.') && H.RULES[0].first.includes('For a resonance at a constant frequency, use a static notch filter.'));
+    assert.ok(H.RULES[0].first.includes('Test a dynamic notch filter for a peak that is not a rotor harmonic.') && H.RULES[0].first.includes('Test a static notch filter for a resonance at a constant frequency.'));
 });
 
 test('status per PID profile (SPEC2 D12): a profile sees its findings and those with no profile; byProfile, and the chips of "All profiles"', () => {
     const f = (fid, id, profile, extra) => Object.assign({ fid, id, severity: 'flag', log: 1, profile, text: '' }, extra);
-    const F = [f('a', 'F5', 1), f('b', 'C1', 2, { axis: 'roll' }), f('c', 'D2', null), f('d', 'C12', 0, { axis: 'roll' }), f('e', 'C3', 'arm', { axis: 'pitch' }), f('g', 'D4', 0), f('h', 'G6', 2),
+    const F = [f('a', 'F6', 1), f('b', 'C1', 2, { axis: 'roll' }), f('c', 'D2', null), f('d', 'C12', 0, { axis: 'roll' }), f('e', 'C3', 'arm', { axis: 'pitch' }), f('g', 'D4', 0), f('h', 'G6', 2),
         f('i', 'C5', 3, { axis: 'roll', severity: 'ok' }), f('j', 'F4', 'roll', { severity: 'ok' })];
     const R = F.filter(x => x.severity === 'flag').map(x => ({ id: x.id + (x.axis ? `:${x.axis}` : ''), severity: 'check', profile: x.id === 'D4' ? null : x.profile, evidence: [{ fid: x.fid }] }));
     const logs = [{ log: 1, profileSeconds: { 1: 30, 2: 40, 4: 0, 5: 12 } }];
@@ -428,7 +431,7 @@ test('status per PID profile (SPEC2 D12): a profile sees its findings and those 
     // all profiles together: the filters of profile 1 hold the cyclic gains of profile 2
     assert.deepEqual(st.startHere, ['filters']); assert.equal(st.nodes.governor.status, 'problem'); assert.equal(st.nodes.cyclic.status, 'blocked'); assert.deepEqual(st.nodes.cyclic.blockedBy, ['filters']);
     assert.deepEqual(P['1'].startHere, ['filters']); assert.equal(P['1'].nodes.cyclic.status, 'notMeasured');
-    assert.deepEqual(P['2'].startHere, ['governor']); assert.deepEqual([P['2'].nodes.cyclic.status, P['2'].nodes.cyclic.after], ['problem', ['governor']], 'the cyclic gains wait for the governor'); assert.equal(P['2'].nodes.filters.status, 'satisfactory', 'F4 has an axis, not a PID profile'); assert.deepEqual(P['2'].nodes.cyclic.recs, ['C1:roll']);
+    assert.deepEqual(P['2'].startHere, ['governor']); assert.deepEqual([P['2'].nodes.cyclic.status, P['2'].nodes.cyclic.after], ['problem', ['governor']], 'the cyclic gains wait for the governor'); assert.equal(P['2'].nodes.filters.status, 'information', 'F4 has an axis, not a PID profile'); assert.deepEqual(P['2'].nodes.cyclic.recs, ['C1:roll']);
     assert.deepEqual(P['0'].startHere, ['cyclic'], 'C3 of the stretch before the first switch (arm) and C12 of profile 0: "PID profile unknown"');
     assert.deepEqual(P['0'].nodes.cyclic.fids, ['d', 'e']);
     assert.equal(P['3'].nodes.cyclic.status, 'satisfactory');
@@ -450,7 +453,7 @@ test('status per PID profile (SPEC2 D12): a profile sees its findings and those 
 
 test('status per PID profile (review 2, A1): the worker\'s pidProfile first; the label 0 of a log is its arming profile only when it is confirmed', () => {
     const f = (fid, id, profile, extra) => Object.assign({ fid, id, severity: 'flag', log: 1, profile, text: '' }, extra);
-    const F = [f('a', 'C1', 0, { axis: 'roll', pidProfile: 1 }), f('b', 'F5', 0, { pidProfile: 1 })];
+    const F = [f('a', 'C1', 0, { axis: 'roll', pidProfile: 1 }), f('b', 'F6', 0, { pidProfile: 1 })];
     const R = F.map(x => ({ id: x.id, severity: 'check', profile: 1, evidence: [{ fid: x.fid }] }));
     const logs = (o) => [Object.assign({ log: 1, profileSeconds: { 0: 100 }, armingProfile: 1 }, o)];
     assert.deepEqual(H.status(F, R, { logs: logs({ armingBasis: ['cliTarget'] }) }).profiles, ['1']);
@@ -487,14 +490,14 @@ test('causes (review 2, D-M1): an upstream flag whose times all lie in the times
 test('status: the results of a bench run (D7, SPEC2 D13 correction) do not count', () => {
     const f = (fid, id, log, extra) => Object.assign({ fid, id, severity: 'flag', log, profile: 1, text: '' }, extra);
     const recs = (F) => F.filter(x => x.severity === 'flag').map(x => ({ id: x.id, severity: 'check', profile: 1, evidence: [{ fid: x.fid }] }));
-    let F = [f('a', 'G12', 2), f('z', 'D7', 2, { severity: 'note', profile: null, unit: 's', value: 0, flights: 0 }), f('b', 'F5', 3), f('y', 'D7', 3, { severity: 'note', profile: null, unit: 's', value: 120, flights: 1 })];
+    let F = [f('a', 'G12', 2), f('z', 'D7', 2, { severity: 'note', profile: null, unit: 's', value: 0, flights: 0 }), f('b', 'F6', 3), f('y', 'D7', 3, { severity: 'note', profile: null, unit: 's', value: 120, flights: 1 })];
     let st = H.status(F, recs(F));
     assert.deepEqual(st.bench, [2]); assert.equal(st.nodes.rpm.status, 'noData'); assert.deepEqual(st.startHere, ['filters']); assert.deepEqual(st.prereqProblems, []);
     assert.deepEqual(H.status([f('a', 'G12', 2, { profile: 4 }), F[1], F[2]], recs(F), { logs: [{ log: 2, profileSeconds: { 5: 10 } }] }).profiles, ['1'], 'a bench run gives no PID profile');
     assert.deepEqual(st.nodes.controller.fids.sort(), ['y', 'z'], 'the D7 results stay: they tell that the log is a bench run'); assert.equal(st.nodes.controller.status, 'ok');
     st = H.status(F, recs(F), { logs: [{ log: 3, bench: true }] });
     assert.deepEqual(st.bench, [2, 3]); assert.deepEqual(st.startHere, []);
-    F = [f('a', 'G12', 2), f('b', 'F5', [2, 3])];
+    F = [f('a', 'G12', 2), f('b', 'F6', [2, 3])];
     assert.deepEqual(H.status(F, recs(F), { logs: [{ log: 2, class: 'bench' }] }).startHere, ['filters'], 'a result that also uses a flight log counts');
 });
 
@@ -532,7 +535,7 @@ test('start here (coordinator, round 2): never a later block while an earlier on
     const f = (fid, id, extra) => Object.assign({ fid, id, severity: 'flag', log: 1, profile: 1 }, extra), r = (x) => ({ id: x.id, severity: 'check', evidence: [{ fid: x.fid }] });
     const run = (F) => H.status(F, F.map(r), {});
     // fb1005: the RPM signal (G1) gates filters and governor; the cyclic gains are blocked; the cyclic compensation (C14) must not start
-    let F = [f('g1', 'G1', { profile: null }), f('f5', 'F5'), f('g3', 'G3'), f('c1', 'C1', { axis: 'roll' }), f('c14', 'C14', { axis: 'pitch' })], st = run(F), N = st.nodes;
+    let F = [f('g1', 'G1', { profile: null }), f('f5', 'F6'), f('g3', 'G3'), f('c1', 'C1', { axis: 'roll' }), f('c14', 'C14', { axis: 'pitch' })], st = run(F), N = st.nodes;
     assert.deepEqual([st.startHere, st.prereqProblems], [[], ['rpm']]);
     assert.deepEqual([N.filters.status, N.governor.status, N.cyclic.status], ['blocked', 'blocked', 'blocked']);
     assert.deepEqual([N.cycomp.status, N.cycomp.after], ['problem', ['rpm', 'filters', 'governor', 'cyclic']]);
@@ -544,7 +547,7 @@ test('start here (coordinator, round 2): never a later block while an earlier on
     st = run([f('t4', 'T4'), f('t2', 'T2'), f('t8', 'T8')]);
     assert.deepEqual([st.startHere, st.nodes.tail.status, st.nodes.tailcomp.status, st.nodes.tailcomp.after], [[], 'blocked', 'problem', ['mechanics', 'tail']]);
     // a lane after a blocked governor (a weak battery): the filters can start, the cyclic and tail lanes wait
-    st = run([f('p1', 'P1', { profile: null }), f('g3', 'G3'), f('f1', 'F1', { profile: null }), f('c1', 'C1', { axis: 'roll' }), f('t5', 'T5')]);
+    st = run([f('p1', 'P1', { profile: null }), f('g3', 'G3'), f('f1', 'F11', { profile: null }), f('c1', 'C1', { axis: 'roll' }), f('t5', 'T5')]);
     assert.deepEqual([st.startHere, st.prereqProblems, st.nodes.governor.status], [['filters'], ['power'], 'blocked']);
     assert.deepEqual([st.nodes.cyclic.status, st.nodes.cyclic.blockedBy, st.nodes.tailcomp.status], ['blocked', ['filters'], 'possible'], 'the filters gate the cyclic gains; the governor is a cause of the tail compensation');
     st = run([f('p1', 'P1', { profile: null }), f('g3', 'G3'), f('c1', 'C1', { axis: 'roll' }), f('t2', 'T2')]);
@@ -562,7 +565,7 @@ test('round 2: D2 is a logging problem only for a loss of 1 % of the frames; the
     const lost = st([d2([{ t: 1, value: 2000, kind: 'time jump' }])]);
     assert.deepEqual([lost.nodes.logging.status, lost.prereqProblems], ['problem', ['logging']], '2 % of the frames lost');
     // G1 with a low-pass filter problem: the filters start; with an RPM notch problem they are blocked
-    const g1 = { fid: 'g', id: 'G1', severity: 'flag', log: 1, profile: null }, f1 = { fid: 'a', id: 'F1', severity: 'flag', log: 1, profile: null }, f5 = { fid: 'b', id: 'F5', severity: 'flag', log: 1, profile: 1 };
+    const g1 = { fid: 'g', id: 'G1', severity: 'flag', log: 1, profile: null }, f1 = { fid: 'a', id: 'F11', severity: 'flag', log: 1, profile: null }, f5 = { fid: 'b', id: 'F6', severity: 'flag', log: 1, profile: 1 };
     assert.deepEqual(st([g1, f1]).startHere, ['filters']);
     const b = st([g1, f1, f5]); assert.deepEqual([b.nodes.filters.status, b.nodes.filters.blockedBy, b.startHere], ['blocked', ['rpm'], []]);
     assert.deepEqual(H.scopeOf('rpm', 'filters'), ['F3', 'F5', 'F6', 'F9']); assert.equal(H.scopeOf('filters', 'cyclic'), null);

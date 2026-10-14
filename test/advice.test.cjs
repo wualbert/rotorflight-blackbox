@@ -136,35 +136,37 @@ test('SETUP: header rules for rates_type and the temporary I-gain trick', () => 
 // Filters
 // ---------------------------------------------------------------------------------------------
 
-test('F1: no gyro LPF with RPM filters on adds a 100 Hz first-order LPF', () => {
-    const flag = [f({ module: 'setup', id: 'F1', profile: null, value: 0, text: 'no gyro LPF active' })];
-    const r = only(run(flag, { header: Object.assign({}, HEADER, { gyro_soft_type: 0, gyro_lowpass_hz: 0 }) }), 'F1');
-    assert.equal(r.severity, 'action');
-    assert.deepEqual(r.cli, ['set gyro_lpf1_type = FIRST_ORDER', 'set gyro_lpf1_static_hz = 100']);
-    assert.equal(only(run(flag), 'F1').severity, 'info');                    // the analysed header has LPF1 100 Hz
-    assert.equal(only(run(flag, { header: {} }), 'F1').severity, 'check');   // no header: nothing to change
+test("Filter setup guides and D-term fractions retain measurements without unvalidated parameter changes", () => {
+    const cases=[['F1',0],['F2',40],['F3',1.5],['F4',40],['C11',0.97],['F10',0.97]];
+    for(const [id,value] of cases){
+        const finding=f({module:id==='C11'?'loop':'setup',id,axis:'yaw',value,se:.005});
+        const r=only(run([finding],{header:{...HEADER,gyro_soft_type:0,gyro_lowpass_hz:0}}),id);
+        assert.equal(r.severity,'info',id);assert.deepEqual(r.cli,[],id);
+        assert.equal(r.parameter,null,id);assert.equal(r.evidence[0].value,value,id);
+        assert.equal(advice.script([r]),'',id);
+    }
 });
 
-test('F2: an LPF below 60 Hz is raised to the documented floor, never lowered (guard 6)', () => {
-    const r = only(run([f({ module: 'setup', id: 'F2', profile: null, value: 40, text: 'lowest gyro LPF cutoff 40 Hz.' })], { header: Object.assign({}, HEADER, { gyro_lowpass_hz: 40 }) }), 'F2');
-    assert.equal(r.to, 60);
-    assert.deepEqual(r.cli, ['set gyro_lpf1_static_hz = 60']);
-    const w = only(run([f({ module: 'setup', id: 'F2', severity: 'note', profile: null, value: 70 })], { header: Object.assign({}, HEADER, { gyro_lowpass_hz: 70 }) }), 'F2');
-    assert.equal(w.severity, 'watch');
-    assert.deepEqual(w.cli, []);
+test("A cutoff below the setup guide requires replay rather than an unconditional cutoff increase", () => {
+    for(const value of [1,40,60,70,100]) {
+        const r=only(run([f({id:'F2',module:'setup',value,profile:null})],{header:{...HEADER,gyro_lowpass_hz:value}}),'F2');
+        assert.equal(r.severity,'info');assert.deepEqual(r.cli,[]);assert.equal(r.evidence[0].value,value);
+    }
 });
 
-test('F3: notch Q below 2.0 goes to 2.0 (custom banks and the dynamic notch)', () => {
-    const h = Object.assign({}, HEADER, { gyro_rpm_notch_preset: 0, gyro_rpm_notch_q_roll: pad([80, 15, 60, 50]), dyn_notch_q: 15 });
-    const out = run([f({ module: 'setup', id: 'F3', profile: null, value: 1.5, text: 'RPM notch Q 1.5..8' })], { header: h });
-    assert.deepEqual(only(out, 'F3:gyro_rpm_notch_q_roll').cli, [`set gyro_rpm_notch_q_roll = ${pad([80, 20, 60, 50]).join(',')}`]);
-    assert.deepEqual(only(out, 'F3:dyn_notch_q').cli, ['set dyn_notch_q = 20']);
+test("Narrow and broad notch choices require measured attenuation and delay", () => {
+    for(const preset of [0,1]) {
+        const h={...HEADER,gyro_rpm_notch_preset:preset,gyro_rpm_notch_q_roll:pad([15]),dyn_notch_q:15};
+        const r=only(run([f({id:'F3',module:'setup',profile:null,value:1.5})],{header:h}),'F3');
+        assert.equal(r.severity,'info');assert.deepEqual(r.cli,[]);assert.equal(r.to,null);
+    }
 });
 
 test('F4: D cutoff away from 20 Hz is advisory information', () => {
     const r = only(run([f({ module: 'setup', id: 'F4', severity: 'note', profile: 'yaw', value: 40, text: 'yaw D cutoff 40 Hz, +20 Hz from the documented ~20 Hz; advisory only.' })]), 'F4');
     assert.equal(r.severity, 'info');
-    assert.equal(r.parameter, 'yaw_d_cutoff');
+    assert.equal(r.parameter, null);
+    assert.equal(r.evidence[0].value,40);
     assert.deepEqual(r.cli, []);
 });
 
@@ -178,49 +180,17 @@ function noGearDoubt(out) {
     for (const t of texts) for (const sen of String(t).replace(/`[^`]*`/g, 'X').split(/(?<=[.!?])\s+/)) assert.ok(!(GEAR_TERM.test(sen) && GEAR_DOUBT.test(sen)), `gear rule: ${sen}`);
 }
 
-test('F5: no CLI and a tail notch of unknown order is a check (guard 9); a main harmonic gets a notch; a line that is not a rotor harmonic is a resonance (gear rule)', () => {
-    const text = (order) => `line at ${order} x rotor (155.7 Hz, prominence 300, rotor-locked): nearest notch roll 14 at 4 (1.5 %), pitch 14 at 4 (1.5 %), yaw 12 at 2 (103.0 %)`;
-    const unk = only(run([f({ module: 'setup', id: 'F5', value: 4.061, text: text(4.061) })]), 'F5');
-    assert.equal(unk.severity, 'check');
-    assert.deepEqual(unk.cli, []);
-    assert.match(unk.caveats.join(' '), /The log does not record its frequency\. Possibly, it is on this line\./);
-    assert.match(unk.text, /The log does not record the frequency of the tail rotor notch filters\./);
-    assert.doesNotMatch(unk.text + unk.caveats.join(' '), /CLI dump|diff all/, 'the log is the only necessary input (user rule 2026-10-06)');
-    assert.doesNotMatch(unk.caveats.join(' ') + unk.rule + unk.text, /advice\.cjs|rule 9/, 'review V3: no rule number of the app in the text');
-    const main = only(run([f({ module: 'setup', id: 'F5', value: 3, text: 'line at 3 x rotor (115 Hz, prominence 40, rotor-locked): nearest notch roll none, pitch none, yaw 12 at 2 (50.0 %)' })], { cli: CLI }), 'F5');
-    assert.equal(main.severity, 'action');
-    assert.deepEqual(main.cli.slice(0, 2), ['set gyro_rpm_notch_preset = 0', `set gyro_rpm_notch_source_roll = ${pad([11, 12, 14, 21, 13]).join(',')}`]);
-    assert.ok(main.cli.includes(`set gyro_rpm_notch_q_yaw = ${pad([80, 40, 50, 40]).join(',')}`), main.cli.join('\n'));
-    // 3.789 x rotor is no main harmonic and 5.3 % from tail harmonic 1 (76/19 = 4.000): a resonance, a filter target and a
-    // mechanical vibration to examine; the configured tail ratio is correct, and no text asks the pilot to test it
-    const out = run([f({ module: 'setup', id: 'F5', value: 3.789, text: text(3.789) })], { cli: CLI }), tail = only(out, 'F5');
-    assert.deepEqual([tail.severity, tail.cli, tail.title], ['check', [], 'Resonance at 155.7 Hz with no notch filter']);
-    assert.match(tail.text, /It is not a main rotor harmonic or a tail rotor harmonic \(the nearest tail rotor harmonic is harmonic 1, at `4 × rotor`, 5\.3 % from the line\)\. Because the gear ratios in the configuration are correct, this line is a resonance/);
-    assert.match(tail.text, /The dynamic notch filter is on, and its range \(20 Hz to 240 Hz\) contains the line at 155\.7 Hz\. Make sure that dyn_notch_count gives a notch filter for it\./);
-    assert.match(tail.caveats.join(' '), /A static notch filter \(gyro_notch1_hz, gyro_notch1_cutoff\) has one frequency/);
-    assert.match(tail.text, /Also examine the bearings, the frame, the tail boom and the blade grips for the cause of the vibration\./);
-    assert.doesNotMatch(tail.text, /pulley|tooth|belt|tail_rotor_gear_ratio agrees|line\.cjs/);
-    noGearDoubt(out);
+test("F5: raw line and RPM placement information does not prescribe untested filter changes", () => {
+    for(const order of [1,3,3.789,4.061,8,9,11.95])for(const cli of [null,CLI]) {
+        const text=`line at ${order} x rotor (300 Hz, prominence 40, rotor-locked): nearest notch roll none, pitch none, yaw none`;
+        const finding=f({module:'setup',id:'F5',value:order,text});
+        const out=run([finding],{cli}),r=only(out,'F5');
+        assert.equal(r.severity,'info');assert.deepEqual(r.cli,[]);assert.equal(r.evidence[0].text,text);
+        assert.match(r.rule,/static notch filter or a dynamic notch filter/);noGearDoubt(out);
+    }
 });
 
-test('F5: a line the gyro filters already remove (measured filterPass < 5 % on every axis) is information and blocks nothing', () => {
-    const text = 'line at 4.061 x rotor (155.7 Hz, prominence 300, rotor-locked): nearest notch roll 14 at 4 (1.5 %), pitch 14 at 4 (1.5 %), yaw 12 at 2 (103.0 %)';
-    const F5 = (pass) => f({ module: 'setup', id: 'F5', value: 4.061, text, filterPass: [{ hz: 155.7, roll: 0.002, pitch: 0.001, yaw: pass }] });
-    const out = run([C3UP, F5(0.004)], { cli: CLI }), r = only(out, 'F5');
-    assert.deepEqual([r.severity, r.title, r.cli], ['info', 'The filters remove the vibration line', []]);
-    assert.match(r.text, /the gyro filters let only 0\.2 %, 0\.1 % and 0\.4 % of it through \(roll, pitch and yaw, from gyroRAW to gyroADC\)\. Thus, a notch filter is not necessary/);
-    assert.deepEqual(r.evidence[0].filterPass, [{ hz: 155.7, roll: 0.002, pitch: 0.001, yaw: 0.004 }]);
-    assert.deepEqual(only(out, 'C3').blockedBy, [], 'a filtered-out line does not hold gain raises (guard 1)');
-    // one axis at or above the 5 % rule, or an axis not measured: the notch arithmetic decides, as before
-    for (const pass of [0.05, null]) assert.notEqual(only(run([F5(pass)], { cli: CLI }), 'F5').title, 'The filters remove the vibration line', String(pass));
-    // weaker lines of the finding that pass more are named, with no notch for them (C11 and F10 decide)
-    const weak = f({ module: 'setup', id: 'F5', value: 4.061, text: text + '; line at 8.12 x rotor (311.3 Hz, prominence 16.6): nearest notch roll none, pitch none, yaw none',
-        filterPass: [{ hz: 155.7, roll: 0.002, pitch: 0.001, yaw: 0.004 }, { hz: 311.3, roll: 0.25, pitch: 0.24, yaw: 0.23 }] });
-    const w = only(run([weak], { cli: CLI }), 'F5');
-    assert.deepEqual([w.severity, w.title, w.cli], ['info', 'The filters remove the strongest vibration line', []]);
-    assert.match(w.text, /Only the low-pass filter decreases 1 weaker line \(311\.3 Hz, up to 25 %\)\./);
-    assert.match(w.caveats.join(' '), /Thus, the app adds no notch filter for the weaker lines if checks C11 and F10 show no problem/);
-});
+
 
 test('notes: excluded spans are named for the pilot and zeros are left out', () => {
     const out = run([], { logs: [Object.assign({}, LOGS[0], { excluded: { rescueS: 10.6, levelModeS: 0, failsafeS: 0.02, groundS: 5, guardS: 2 } })] });
@@ -234,34 +204,9 @@ test('T13: a constant hover yaw I names the trim and the collective precomp, nev
     assert.match(r.text, /If the I-term changes with collective, use check T7/);
 });
 
-test('F5: an RPM notch only for main harmonics 1-8 (sources 11-18); higher lines point at the dynamic or a static notch', () => {
-    const line = (order, hz) => f({ module: 'setup', id: 'F5', value: order, text: `line at ${order} x rotor (${hz} Hz, prominence 40, rotor-locked): nearest notch roll none, pitch none, yaw none` });
-    const k8 = only(run([line(8, 300)], { cli: CLI }), 'F5');
-    assert.equal(k8.severity, 'action');
-    assert.ok(k8.cli.includes(`set gyro_rpm_notch_source_roll = ${pad([11, 12, 14, 21, 18]).join(',')}`), k8.cli.join('\n'));
-    // 19 fails rpmFilterInit and disables arming; 20 is the tail motor; 21 and 22 are tail-rotor harmonics 1 and 2
-    for (const [order, hz] of [[9, 340], [10, 380], [11, 420], [11.95, 455]]) {
-        const r = only(run([line(order, hz)], { cli: CLI }), 'F5'), k = Math.round(order);
-        assert.deepEqual([r.severity, r.cli, r.parameter], ['check', [], null], String(order));
-        assert.match(r.title, new RegExp(`main rotor harmonic ${k}: an RPM notch filter is not possible`));
-        assert.doesNotMatch(r.text, /Add an RPM notch filter with source/);
-        assert.doesNotMatch(r.text, /not a main rotor harmonic/, 'it is one');
-        assert.match(r.text, new RegExp(`The dynamic notch filter is on, but its range \\(20 Hz to 240 Hz\\) does not contain the line at ${hz} Hz\\. A range that contains ${hz} Hz can remove it \\(dyn_notch_min_hz and dyn_notch_max_hz`), r.text);
-        assert.match(r.text + r.rule, /The gear ratios in the configuration are correct\./, 'SPEC2 C9: the gear sentence');
-        assert.equal(advice.script(run([line(order, hz)], { cli: CLI }).recommendations), '', 'nothing to apply');
-    }
-    // inside the dynamic notch range: say so
-    assert.match(only(run([line(9, 200)], { cli: CLI }), 'F5').text, /The dynamic notch filter is on, and its range \(20 Hz to 240 Hz\) contains the line at 200 Hz/);
-    assert.match(only(run([line(9, 340)], { cli: CLI, header: Object.assign({}, HEADER, { features: RPMF }) }), 'F5').text, /The dynamic notch filter is off \(the bit of `feature DYN_NOTCH` in the log header is 0\)\. If you turn it on with a range that contains 340 Hz/);
-});
 
-test('F5: on a motorised tail no tail harmonic sits at a fixed rotor order', () => {
-    const mot = setup.parseCli(CLI_TEXT.replace('# master\n', '# master\nset tail_rotor_mode = MOTORIZED\n'));
-    const r = only(run([f({ module: 'setup', id: 'F5', value: 7.9, text: 'line at 7.9 x rotor (300.2 Hz, prominence 9.1): nearest notch roll none, pitch none, yaw none' })], { cli: mot }), 'F5');
-    assert.doesNotMatch(r.text, /the nearest tail harmonic is/);
-    assert.match(r.text, /on a motorized tail \(tail_rotor_mode MOTORIZED\) the tail rotor speed does not follow the main rotor/);
-    assert.match(only(run([f({ id: 'T8', value: 2, text: '20 episodes' })], { cli: mot }), 'T8').text, /If the output stays at its limit with a yaw error, examine the tail pitch range and linkage/);
-});
+
+
 
 test('F6: attenuation below 10 dB is a check; one not below 10 dB by 2 SE is a watch', () => {
     assert.equal(only(run([f({ module: 'setup', id: 'F6', value: 6, se: 1, text: 'yaw notch 21 ...: 6 +- 1 dB' })]), 'F6').severity, 'check');
@@ -276,17 +221,12 @@ test('F8, F9: the dynamic notch range is compared with the strongest uncovered l
     assert.equal(only(out, 'F9').severity, 'info');
 });
 
-test('F10: yaw D driven by noise is a filters check and one tail D step of 10', () => {
-    const out = run([f({ module: 'more', id: 'F10', axis: 'yaw', value: 0.8, se: 0.05, threshold: 'D share - 2 SE > 0.5 (yaw; roll and pitch are judged by C11)', unit: 'fraction', text: 'yaw axisD power above 30 Hz 80 %' })]);
-    assert.equal(out.recommendations.find(r => r.id === 'F10').severity, 'check');
-    const d = only(out, 'F10:yaw_d_gain');
-    assert.deepEqual([d.from, d.to], [14, 4]);
-    assert.deepEqual(d.cli, ['profile 0', 'set yaw_d_gain = 4']);
-    // with another filter flag standing (a line no notch covers, as on the Fireball) the D cut waits for the filter work
-    const f5 = f({ module: 'setup', id: 'F5', value: 3.79, text: 'line at 3.79 x rotor (284 Hz, prominence 142, rotor-locked): nearest notch roll 14 at 4 (5.3 %)' });
-    const held = only(run([f5, f({ module: 'more', id: 'F10', axis: 'yaw', value: 0.97, se: 0.005, threshold: 'D share - 2 SE > 0.5 (yaw; roll and pitch are judged by C11)', text: 'yaw axisD power above 30 Hz 97 %' })], { cli: CLI }), 'F10:yaw_d_gain');
-    assert.deepEqual(held.cli, []);
-    assert.match(held.blockedBy.join(' '), /Check F5 shows a filter problem\. The filter change comes first, because it changes the D-term noise\. Decrease yaw_d_gain only if/);
+test("A yaw D-term power fraction does not justify reducing D gain", () => {
+    for(const value of [.49,.8,.97])for(const rms of [.001,1,100]) {
+        const r=only(run([f({module:'more',id:'F10',axis:'yaw',value,se:.001,rms,unit:'fraction'})]),'F10');
+        assert.equal(r.severity,'info');assert.deepEqual(r.cli,[]);assert.equal(r.to,null);
+        assert.match(r.rule,/does not give the D-term RMS value/);
+    }
 });
 
 test('F7, F11: a vibration level change and a large measured filter delay are checks', () => {
@@ -377,7 +317,7 @@ test('G12: a wrong headspeed factor is an action with the pole count that would 
 test('C1, C2, C6, C10, C11: diagnostics are checks; landed while moving is a watch (CYC-LANDED refuted it)', () => {
     for (const [id, axis] of [['C1', 'roll'], ['C2', null], ['C6', 'pitch'], ['C10', null], ['C11', 'pitch']]) {
         const r = only(run([f({ id, axis, value: id === 'C6' ? 12 : 0.9, se: 0.01, text: `${axis || ''} ${id} finding at an output limit (mixer[1])` })]), id);
-        assert.equal(r.severity, 'check', id);
+        assert.equal(r.severity, id==='C11'?'info':'check', id);
         assert.deepEqual(r.cli, [], id);
     }
     const landed = only(run([f({ id: 'C10', profile: null, value: 1, text: '1.0 s spooled up and turning while the firmware says landed (ground decay active)' })]), 'C10');   // Fireball 09-28 #1
@@ -486,9 +426,9 @@ test('control trials retain uncertainty, profile scope, source and prerequisite 
     const other = only(run([stop({profile:2})]),'C4');
     assert.equal(other.from,null,'no borrowing the arming-profile value');
     assert.deepEqual(other.cli,[]);
-    const held = only(run([stop(),f({module:'setup',id:'F1',profile:null,value:0})],
+    const held = only(run([stop({text:'FF too low (raise F)'}),f({module:'setup',id:'F6',profile:null,value:4,se:.5})],
         {header:{...HEADER,gyro_soft_type:0,gyro_lowpass_hz:0}}),'C4');
-    assert.equal(held.to,90,'prerequisite does not erase a quantitative proposal');
+    assert.equal(held.to,110,'prerequisite does not erase a quantitative proposal');
     assert.ok(held.blockedBy.length);
     assert.ok(held.holds.includes('filters'),'guard prerequisites remain available to control autotune');
     assert.deepEqual(held.cli,[]);
@@ -535,10 +475,9 @@ test('F10, C14: the estimate pooled over the logs of a profile must pass the mod
     const more = require('../tools/autotune/health_more.cjs'), share = more.DEFAULT_RULES.F10.share, slope = more.DEFAULT_RULES.C14.flag;
     const f10 = (log, sev, value, se) => f({ module: 'more', id: 'F10', severity: sev, axis: 'yaw', log, value, se, unit: 'fraction', threshold: `D share - 2 SE > ${share} (yaw; roll and pitch are judged by C11)`, text: `yaw axisD power above 30 Hz ${value * 100} %` });
     // one flight flags (0.75 +- 0.10), the other does not (0.30 +- 0.05): pooled 0.39 +- 0.23, below 0.5 by 2 SE
-    const w = only(run([f10(5, 'flag', 0.75, 0.10), f10(6, 'ok', 0.30, 0.05)]), 'F10:yaw_d_gain');
-    assert.deepEqual([w.severity, w.cli], ['watch', []]);
-    assert.match(w.caveats.join(' '), new RegExp(`Check F10 gives 0\\.39 ± 0\\.225 \\(2 logs\\)\\. This is not more than ${share} by 2 SE`));
-    assert.deepEqual(only(run([f10(5, 'flag', 0.75, 0.05), f10(6, 'flag', 0.8, 0.05)]), 'F10:yaw_d_gain').cli, ['profile 0', 'set yaw_d_gain = 4'], 'both flights flag: the pooled share clears');
+    const w = only(run([f10(5, 'flag', 0.75, 0.10), f10(6, 'ok', 0.30, 0.05)]), 'F10');
+    assert.deepEqual([w.severity, w.cli], ['info', []]);
+    assert.deepEqual(only(run([f10(5,'flag',.75,.05),f10(6,'flag',.8,.05)]),'F10').cli,[]);
     const c14 = (log, sev, value) => f({ module: 'more', id: 'C14', severity: sev, axis: 'pitch', log, value, se: 4, gainChange: value, gainChangeSe: 4, unit: 'per 1000 collective',
         threshold: `|slope| - 2 SE > ${slope}, a gain change >= 10, the fast coupling not of the other sign by 2 SE`, text: `pitch I + O ${value} +- 4 per 1000 collective` });
     const cw = only(run([c14(5, 'flag', 30), c14(6, 'note', 5)]), 'C14');            // pooled 17.5 +- 12.5 against 20
@@ -779,14 +718,15 @@ test('analysis errors become one check', () => {
 
 const C3UP = f({ id: 'C3', axis: 'roll', value: 0.15, se: 0.02, gyroRatio: { mean: 1, se: 0.01 }, text: 'FF too low (raise F)' });
 
-test('guard 1: filters first blocks loop gain raises, not lowers; a D raise also waits for the C11 flag of its axis', () => {
-    const r = only(run([C3UP, f({ module: 'setup', id: 'F5', value: 3.789, text: 'line at 3.789 x rotor (284 Hz, prominence 400): nearest notch roll none, pitch none, yaw none' })], { cli: CLI }), 'C3');
-    assert.deepEqual(r.blockedBy, ['Check F5 shows a filter problem. TUNE puts correct filters before you increase the gains.']);
-    assert.deepEqual(r.cli, []);
-    const low = only(run([f({ id: 'C3', axis: 'roll', value: -0.3, se: 0.05, gyroRatio: { mean: 1, se: 0.01 }, text: 'FF too high' }), f({ module: 'setup', id: 'F5', value: 3.789, text: 'line at 3.789 x rotor (1 Hz, prominence 9): x' })], { cli: CLI }), 'C3');
-    assert.equal(low.cli.length, 2);
-    const d = only(run([f({ id: 'C11', axis: 'roll', value: 0.8, se: 0.02, text: 'roll D noise' })], { decisions: [decision({ axis: 'roll', changes: [{ gain: 'D', multiplier: 1.2, from: 10, to: 12 }] })], header: Object.assign({}, HEADER, { rollPID: [50, 100, 10, 100, 0] }) }), 'C7');
-    assert.deepEqual(d.blockedBy, ['Check C11 (roll) shows a filter problem. TUNE puts correct filters before you increase the gains.']);
+test("Measured attenuation faults block gain increases; filter guidance alone does not", () => {
+    const bad=f({module:'setup',id:'F6',value:4,se:.5});
+    assert.deepEqual(only(run([C3UP,bad]),'C3').cli,[]);
+    const low=only(run([f({id:'C3',axis:'roll',value:-.3,se:.05,gyroRatio:{mean:1,se:.01},text:'FF too high'}),bad]),'C3');
+    assert.equal(low.cli.length,2);
+    for(const id of ['F1','F5','C11','F10']) {
+        const out=run([C3UP,f({id,value:.97,se:.005,axis:'roll'})]);
+        assert.deepEqual(only(out,'C3').blockedBy,[],id);
+    }
 });
 
 test('guard 1: an F6 flag that stands (below 10 dB by 2 SE) holds loop-gain raises and D cuts for noise; one that does not, nothing', () => {
@@ -796,9 +736,10 @@ test('guard 1: an F6 flag that stands (below 10 dB by 2 SE) holds loop-gain rais
     assert.equal(only(run([C3UP, f6(9, 2)]), 'C3').cli.length, 2, '9 +- 2 dB is not below 10 dB by 2 SE: a watch, which holds nothing');
     const d = only(run([f6(4, 0.5)], { decisions: [decision({ axis: 'roll', changes: [{ gain: 'D', multiplier: 1.2, from: 10, to: 12 }] })], header: Object.assign({}, HEADER, { rollPID: [50, 100, 10, 100, 0] }) }), 'C7');
     assert.deepEqual([d.blockedBy, d.cli], [['Check F6 shows a filter problem. TUNE puts correct filters before you increase the gains.'], []]);
-    const yawD = only(run([f6(4, 0.5), f({ module: 'more', id: 'F10', axis: 'yaw', value: 0.97, se: 0.005, threshold: 'D share - 2 SE > 0.5 (yaw; roll and pitch are judged by C11)', text: 'yaw axisD power above 30 Hz 97 %' })]), 'F10:yaw_d_gain');
+    const yawD = only(run([f6(4, 0.5), f({ module: 'more', id: 'F10', axis: 'yaw', value: 0.97, se: 0.005, threshold: 'D share - 2 SE > 0.5 (yaw; roll and pitch are judged by C11)', text: 'yaw axisD power above 30 Hz 97 %' })]), 'F10');
     assert.deepEqual(yawD.cli, []);
-    assert.match(yawD.blockedBy.join(' '), /Check F6 shows a filter problem\. The filter change comes first.*Decrease yaw_d_gain only if/);
+    assert.equal(yawD.severity,'info');
+    assert.equal(yawD.to,null);
 });
 
 test('guard 2: a G12 or G1 flag blocks governor and RPM-notch changes', () => {
@@ -830,10 +771,11 @@ test('guard 3: an axis at its output limit gets "authority, not gains" and no ra
     assert.deepEqual([down.severity, down.blockedBy, down.cli], ['action', [], []]);
     assert.match(down.caveats.join(' '), /Gains cannot increase the output range/);
     assert.deepEqual(down.causes.map(c => [c.rule, c.ids, c.holds]), [['K6', ['T8'], true]]);
-    // a decrease with no K rule to T8 keeps its CLI: the yaw D cut for gyro noise, on the tail at its limit
-    const yawD = only(run([t8, f({ module: 'more', id: 'F10', axis: 'yaw', value: 0.8, se: 0.05, threshold: 'D share - 2 SE > 0.5', text: 'f10' })]), 'F10:yaw_d_gain');
-    assert.deepEqual(yawD.cli, ['profile 0', 'set yaw_d_gain = 4']);
-    assert.match(yawD.caveats.join(' '), /The yaw output was at its limit for 4 s in 1 result \(check T8\)\. Gains cannot increase the output range/);
+    // An output limit also invalidates a fitted model decrease (K21).
+    const yawD=only(run([t8],{decisions:[decision({axis:'yaw',bin:2250,changes:[{gain:'D',multiplier:.8,from:14,to:11.2}]})]}),'C7');
+    assert.deepEqual(yawD.cli,[]);
+    assert.ok(yawD.causes.some(c=>c.rule==='K21'&&c.holds));
+    assert.match(yawD.caveats.join(' '),/Gains cannot increase the output range/);
     const roll = only(run([f({ id: 'C2', value: 1, text: '3 episodes, 1.00 s at an output limit (mixer[1]), longest 0.1 s' }), C3UP]), 'C3');
     assert.equal(roll.cli.length, 2, 'a pitch-only limit leaves roll alone');
 });
@@ -934,7 +876,7 @@ test('guard 8: no governor gain change where G0 says DIRECT/LIMIT, or the CLI sa
 test('guard 9: D2 stalls and F5 lines that a tail notch of unknown order may cover are never actions', () => {
     const out = run([f({ module: 'setup', id: 'D2', profile: null, value: 0, text: '0 logging gaps in the log; in this segment 0 time jumps (0 frames missing, by loopIteration), 1 loop stalls' }),
         f({ module: 'setup', id: 'F5', value: 4.061, text: 'line at 4.061 x rotor (155.7 Hz, prominence 394.5): nearest notch roll 14 at 4 (1.5 %), pitch 14 at 4 (1.5 %), yaw 12 at 2 (103.0 %)' })]);
-    for (const id of ['D2', 'F5']) assert.equal(only(out, id).severity, 'check', id);
+    for (const id of ['D2', 'F5']) assert.equal(only(out, id).severity, id==='F5'?'info':'check', id);
 });
 
 test('guard 10: wag_report section 8 is never used', () => {
@@ -956,9 +898,13 @@ test('guard 11: tuning order prerequisites, filters, governor, cyclic, tail; pit
     assert.deepEqual(out.recommendations.map(r => r.order), ids.map((_, i) => i + 1));
 });
 
-// the clivalue table of the firmware (release/4.6.0), as the peer session copied it; the macros as in pid.h and sensors/gyro.h
-const SETTINGS_FILE = path.join(ROOT, 'analysis/gaui-x4/verify/PITCH-GAINS-EQUAL_semantics/fw/settings.c');
-const SETTINGS = fs.existsSync(SETTINGS_FILE) ? fs.readFileSync(SETTINGS_FILE, 'utf8') : null;
+// Unmodified clivalue table from official firmware 118e9120260bb33f46df4f92052fb0e9fd4e9ebc.
+// SHA-256: 2d011d02fc3e5cace3ff2e22001e2bb9ebe589263af4c0820711b4928c8ba173.
+// The macros below are from pid.h and sensors/gyro.h.
+const SETTINGS_FILE = path.join(__dirname, 'fixtures/rotorflight-4.6.0-settings.c');
+const SETTINGS = fs.readFileSync(SETTINGS_FILE, 'utf8');
+assert.equal(require('node:crypto').createHash('sha256').update(SETTINGS).digest('hex'),
+    '2d011d02fc3e5cace3ff2e22001e2bb9ebe589263af4c0820711b4928c8ba173', 'Pinned official firmware settings source');
 const MACRO = { PID_GAIN_MAX: 1000, LPF_MAX_HZ: 1000, DYN_LPF_MAX_HZ: 1000, DYN_NOTCH_COUNT_MAX: 8 };   // flight/dyn_notch_filter.h:29
 function settingRange(name) {
     const line = SETTINGS.split('\n').find(l => l.includes(`"${name}"`) || l.includes(`PARAM_NAME_${name.toUpperCase()},`)); if (!line) return null;
@@ -967,7 +913,7 @@ function settingRange(name) {
     return [m[1], m[2]].map(x => /^\d+$/.test(x) ? +x : MACRO[x]);
 }
 
-test('guard 5: every RANGE is the firmware range of settings.c (release/4.6.0)', { skip: !SETTINGS }, () => {
+test('guard 5: every RANGE is the firmware range of settings.c (release/4.6.0)', () => {
     for (const [name, lim] of Object.entries(advice.RANGE)) assert.deepEqual(settingRange(name), lim, name);
 });
 
@@ -1109,14 +1055,14 @@ test('sequence: a gate holds a recommendation if and only if the diagram (hierar
     assert.match(g2.blockedBy.join(' '), /^The prerequisite "Mechanical parts" has a problem \(check C15\)\. Correct it before you tune this tuning block\.$/);
     assert.equal(H.status([c3(1), c3(2), c15], two.recommendations, { profile: 1 }).nodes.cyclic.status === 'blocked', false);
     // the RPM signal gates only the RPM notch filters (scope of the gate): a low-pass filter change keeps its CLI text
-    const g1f = f({ module: 'gov', id: 'G1', profile: null, value: 2, text: 'g1' }), f1 = f({ module: 'setup', id: 'F1', profile: null, value: 0, text: 'f1' }), f5 = f({ module: 'setup', id: 'F5', value: 3.789, text: 'line at 3.789 x rotor (284 Hz, prominence 400): nearest notch roll none, pitch none, yaw none' });
+    const g1f = f({ module: 'gov', id: 'G1', profile: null, value: 2, text: 'g1' }), f1 = f({ module: 'setup', id: 'F1', profile: null, value: 0, text: 'f1' }), f5 = f({ module: 'setup', id: 'F6', value: 4, se: .5 });
     const hdr = Object.assign({}, HEADER, { gyro_soft_type: 0, gyro_lowpass_hz: 0, gyro_soft2_type: 0, gyro_lowpass2_hz: 0, gyro_lowpass_dyn_hz: [0, 0], features: RPMF });
     const lone = run([g1f, f1], { cli: CLI, header: hdr }), lpf = only(lone, 'F1');
-    assert.deepEqual([lpf.gate, lpf.cli.length > 0], [null, true], 'F1 alone: the filters block is not blocked by the RPM signal');
+    assert.deepEqual([lpf.gate, lpf.cli.length > 0], [null, false], 'F1 is reference information, with no CLI');
     assert.notEqual(H.status([g1f, f1], lone.recommendations, {}).nodes.filters.status, 'blocked');
     const both = run([g1f, f1, f5], { cli: CLI, header: hdr }), lpf2 = only(both, 'F1'), st2 = H.status([g1f, f1, f5], both.recommendations, {});
     assert.deepEqual([st2.nodes.filters.status, st2.nodes.filters.blockedBy], ['blocked', ['rpm']], 'an RPM notch problem: blocked by the RPM signal');
-    assert.deepEqual([lpf2.gate.by, lpf2.gate.held, lpf2.cli.length > 0], [['rpm'], [], true]); assert.match(lpf2.caveats.join(' '), /It holds only the changes of checks F3, F5, F6 and F9\./);
+    assert.deepEqual([lpf2.gate.by, lpf2.gate.held, lpf2.cli.length > 0], [['rpm'], [], false]); assert.match(lpf2.caveats.join(' '), /It holds only the changes of checks F3, F5, F6 and F9\./);
     // the copy of the gate table in advice gives the same gates when hierarchy.cjs does not load
     const src = fs.readFileSync(path.join(ROOT, 'tools/autotune/advice.cjs'), 'utf8'), bare = { exports: {} };
     new Function('require', 'module', 'exports', src)((m) => { if (/hierarchy|catalog/.test(m)) throw new Error(`Cannot find module '${m}'`); return require(path.join(ROOT, 'tools/autotune', m)); }, bare, bare.exports);
@@ -1334,8 +1280,8 @@ const flat = (text) => text.replace(/\n#(?:   | )(?=[^\n])/g, ' ');
 const T5F = (o = {}) => f(Object.assign({ id: 'T5', value: 2, se: 0.2, larger: 'ccw', text: 's' }, o));
 
 test('script: the CLI file with the default picks: batch start, profile sets, global sets, save; nothing without actions', () => {
-    const out = run([C3UP, f({ module: 'setup', id: 'F1', profile: null, value: 0, text: 'no LPF' })], { header: Object.assign({}, HEADER, { gyro_soft_type: 0, gyro_lowpass_hz: 0 }) });
-    assert.deepEqual(commands(advice.script(out.recommendations)), ['batch start', 'set gyro_lpf1_type = FIRST_ORDER', 'set gyro_lpf1_static_hz = 100', 'save'], 'the F raise waits for the filter change');
+    const out=run([f({module:'setup',id:'D1',profile:null,value:500})],{header:{...HEADER,frameIntervalPDenom:4}});
+    assert.deepEqual(commands(advice.script(out.recommendations)),['batch start','set blackbox_rate_denom = 2','save']);
     const two = commands(advice.script(run([T5F(), T5F({ profile: 2 })], { cli: CLI }).recommendations));
     assert.deepEqual(two, ['batch start', 'profile 0', 'set yaw_ccw_stop_gain = 72', 'profile 1', 'set yaw_ccw_stop_gain = 72', 'save']);
     assert.equal(advice.script(run([]).recommendations), '');
@@ -1389,7 +1335,7 @@ test('exportScript: the picks decide; checks, watches and blocked changes never 
     assert.deepEqual(commands(none), [], 'no pick: comments only, no batch and no save');
     assert.match(none, /# This file has no commands\./);
     // a change that a gate holds (blockedBy) has no CLI text, and a forced pick of it is refused with the reason
-    const held = run([C3UP, f({ module: 'setup', id: 'F5', value: 3.789, text: 'line at 3.789 x rotor (284 Hz, prominence 400): nearest notch roll none, pitch none, yaw none' })], { cli: CLI });
+    const held = run([C3UP, f({ module: 'setup', id: 'F6', value: 4, se: .5, text: 'line at 3.789 x rotor (284 Hz, prominence 400): nearest notch roll none, pitch none, yaw none' })], { cli: CLI });
     const c3 = only(held, 'C3'), forced = Object.assign({}, c3, { cli: ['profile 0', 'set roll_f_gain = 115'] });
     assert.match(flat(advice.exportScript([forced], [c3.id], {})), /# Not in the file: .*A step before it in the tuning sequence has a problem\. Correct that step first\./);
 });
@@ -1520,39 +1466,31 @@ test('A9: R1 in a log with rate profile changes (rateChanges of the worker) says
 });
 
 test('C1: a change from the log header has base "log header", and the H staleness test reads every name that it sets', () => {
-    const f1 = f({ module: 'setup', id: 'F1', profile: null, value: 0, text: 'no LPF' }), noLpf = Object.assign({}, HEADER, { gyro_soft_type: 0, gyro_lowpass_hz: 0 });
-    const fresh = only(run([f1], { header: noLpf, headerLog: 6 }), 'F1');
-    assert.deepEqual([fresh.severity, fresh.fromSource, fresh.cli.length], ['action', 'log header', 2]);
-    // the pilot changed gyro_soft_type after the analysed log (log 5): its header is not the configuration at this time
-    const h = f({ module: 'setup', id: 'H', severity: 'note', log: 6, profile: 'global', value: '1', text: 'gyro_soft_type: 0 -> 1 (since log 5, global)' });
-    const old = only(run([f1, h], { header: noLpf, headerLog: 5 }), 'F1');
-    assert.deepEqual([old.severity, old.cli, old.to], ['check', [], null]);
-    assert.match(old.caveats.join(' '), /The values come from the log header of log 5\. The value of gyro_soft_type changed between logs \(from 0 to 1 in log 6\)\. Thus, the log header can have values that are different from the values at this time\./);
-    // F5 (s5.cjs of the review): the notch arrays of an old header give no CLI text
-    const f5 = f({ module: 'setup', id: 'F5', profile: null, log: 5, value: 3, text: 'line at 3 x rotor (115 Hz, prominence 40, rotor-locked): nearest notch roll none, pitch none, yaw 12 at 2 (50.0 %)' });
-    const hn = f({ module: 'setup', id: 'H', severity: 'note', log: 5, profile: 'global', value: '11,12,13,14,21', text: 'gyro_rpm_notch_source_roll: 11,12,14,21 -> 11,12,13,14,21 (since log 4, global)' });
-    const logs = [{ log: 4, start: '2026-10-03T10:00:00', flown: false, flyingS: 0, profileSeconds: {}, targetOf: {} }].concat(LOGS);
-    const notch = only(run([f5, hn], { cli: CLI, logs, headerLog: 4 }), 'F5');
-    assert.deepEqual([notch.cli, notch.fromSource], [[], 'log header']);
-    assert.match(notch.caveats.join(' '), /The value of gyro_rpm_notch_source_roll changed between logs/);
-    // a header of a bench run, with flight logs in the file (the Gaui file scope: log 0, RF 4.4.0): no CLI text, and SETUP is information
-    const benchLogs = [Object.assign({}, logs[0], { logClass: 'bench' })].concat(LOGS.map(l => Object.assign({}, l, { logClass: 'flight' })));
-    const bench = run([f1], { header: Object.assign({}, noLpf, { rates_type: 4 }), logs: benchLogs, headerLog: 4, logBase: 1 });
-    assert.deepEqual([only(bench, 'F1').cli, only(bench, 'F1').severity, only(bench, 'SETUP:rates_type').severity], [[], 'check', 'info']);
-    assert.match(only(bench, 'SETUP:rates_type').caveats.join(' '), /The values come from the log header of log 5, a bench run with no flight\./);
+    const d1=f({module:'setup',id:'D1',profile:null,value:500}),slow={...HEADER,frameIntervalPDenom:4};
+    const fresh=only(run([d1],{header:slow,headerLog:6}),'D1');
+    assert.deepEqual([fresh.severity,fresh.fromSource,fresh.cli.length],['action','log header',1]);
+    const h=f({module:'setup',id:'H',severity:'note',log:6,profile:'global',value:'2',text:'frameIntervalPDenom: 4 -> 2 (since log 5, global)'});
+    const old=only(run([d1,h],{header:slow,headerLog:5}),'D1');
+    assert.deepEqual([old.severity,old.cli,old.to],['check',[],null]);
+    assert.match(old.caveats.join(' '),/frameIntervalPDenom changed between logs/);
+    const benchLogs=[{log:4,flown:false,logClass:'bench'}].concat(LOGS);
+    const bench=run([d1],{header:{...slow,rates_type:4},logs:benchLogs,headerLog:4,logBase:1});
+    assert.equal(only(bench,'D1').cli.length,0);
+    assert.equal(only(bench,'SETUP:rates_type').severity,'info');
     // a relative change (no value at this time) measured before a change of its parameter: measure again (SPEC2 D-LOW)
     const hy = f({ module: 'setup', id: 'H', severity: 'note', log: 6, profile: 'start profile 2', value: '120,90', text: 'yaw_stop_gain: 120,80 -> 120,90 (since log 5, start profile 2)' });
     const rel = only(run([T5F({ profile: 2 }), hy]), 'T5');
     assert.deepEqual([rel.severity, rel.title, rel.direction], ['check', 'Measure yaw_ccw_stop_gain again', 'check']);
     assert.match(rel.text, /Record a new log with the values at this time, and then do the analysis again\./);
+
 });
 
 test('C2: causes, gates and the CLI read every evidence row; the list is cut to 20 only in the output (s3.cjs: 25 logs)', () => {
     const logs = Array.from({ length: 25 }, (_, i) => ({ log: i + 1, start: `2026-10-04T${String(10 + Math.floor(i / 6)).padStart(2, '0')}:${String((i % 6) * 10).padStart(2, '0')}:00`, flown: true, flyingS: 100, profileSeconds: { 1: 100 }, targetOf: { 1: 2300 } }));
     const d1 = logs.map(l => f({ module: 'setup', id: 'D1', log: l.log, profile: null, value: 500, text: 'logging 500 Hz nominal' }));
-    const f10 = f({ module: 'more', id: 'F10', axis: 'yaw', log: 23, profile: 1, value: 0.8, se: 0.05, threshold: 'D share - 2 SE > 0.5', unit: 'fraction', text: 'yaw axisD power above 30 Hz 80 %' });
+    const f10 = f({ module: 'more', id: 'F11', axis: 'yaw', log: 23, profile: 1, value: 6, se: .1, threshold: 'D share - 2 SE > 0.5', unit: 'fraction', text: 'yaw axisD power above 30 Hz 80 %' });
     const out = run(d1.concat([f10]), { logs, header: Object.assign({}, HEADER, { frameIntervalPDenom: 4 }), headerLog: 25 });
-    const d = only(out, 'D1'), yaw = only(out, 'F10:yaw_d_gain');
+    const d = only(out, 'D1'), yaw = only(out, 'F11');
     assert.equal(d.evidence.length, 20);
     assert.match(d.caveats.join(' '), /There are 25 results, and the list shows the first 20\./);
     assert.deepEqual(yaw.causes.map(c => [c.rule, c.holds]), [['K19', true]], 'the D1 flag of log 23 is the 23rd row of D1');
@@ -1587,26 +1525,23 @@ test('C4: the header is no from-value when the CLI dump gives another value (s4.
     const r = only(run([d4, T5F()], { cli }), 'T5');
     assert.deepEqual([r.from, r.cli], [80, []]);
     assert.match(r.caveats.join(' '), /The log header gives yaw_ccw_stop_gain 80, but the CLI dump gives 120 \(check D4\)\. The app cannot find which value is correct at this time\. Thus, there is no CLI text\./);
-    // a header-derived filter change: the same rule (fromHeader)
-    const f2 = f({ module: 'setup', id: 'F2', profile: null, value: 40, text: 'lowest gyro LPF cutoff 40 Hz.' });
-    const d4g = Object.assign({}, d4, { fid: 'd4g', text: 'header vs CLI (dump, CLI profile 0, chosen by fewest mismatches): 1 of 80 values differ: gyro_lowpass_hz 40 vs gyro_lpf1_static_hz 90. Trust the log header for header keys.' });
-    const lpf = only(run([d4g, f2], { cli, header: Object.assign({}, HEADER, { gyro_lowpass_hz: 40 }) }), 'F2');
-    assert.deepEqual(lpf.cli, []);
-    assert.match(lpf.caveats.join(' '), /The CLI dump and the log header have different values of gyro_lpf1_static_hz \(check D4\)/);
+    const d1=f({module:'setup',id:'D1',profile:null,value:500});
+    const d4g={...d4,fid:'d4g',text:'header vs CLI: frameIntervalPDenom 4 vs blackbox_rate_denom 2. Trust the log header for header keys.'};
+    const r1=only(run([d4g,d1],{cli,header:{...HEADER,frameIntervalPDenom:4}}),'D1');
+    assert.deepEqual(r1.cli,[]);assert.match(r1.caveats.join(' '),/different values of blackbox_rate_denom/);
 });
 
 test('C6: the CLI file gives the previous value of every name that a change sets, else "The previous value is unknown"', () => {
-    const out = run([f({ module: 'setup', id: 'F1', profile: null, value: 0, text: 'no LPF' })], { header: Object.assign({}, HEADER, { gyro_soft_type: 0, gyro_lowpass_hz: 0 }) });
-    const r = only(out, 'F1');
-    assert.deepEqual(r.fromSets, { gyro_lpf1_type: 'NONE', gyro_lpf1_static_hz: 0 });
-    const text = advice.exportScript(out.recommendations, null, {});
-    assert.match(text, /#   `gyro_lpf1_type`: from NONE to FIRST_ORDER \(the value at this time is from the log header\)\./);
-    assert.match(text, /#   `gyro_lpf1_static_hz`: from 0 to 100 \(the value at this time is from the log header\)\./);
-    const main = run([f({ module: 'setup', id: 'F5', value: 3, text: 'line at 3 x rotor (115 Hz, prominence 40, rotor-locked): nearest notch roll none, pitch none, yaw 12 at 2 (50.0 %)' })], { cli: CLI });
-    const t5 = advice.exportScript(main.recommendations, null, {});
-    assert.match(t5, new RegExp(`#   \`gyro_rpm_notch_preset\`: from 1 to 0 .*\\n#   \`gyro_rpm_notch_source_roll\`: from ${pad([11, 12, 14, 21]).join(',')} to ${pad([11, 12, 14, 21, 13]).join(',')}`));
-    const bare = { id: 'x', severity: 'action', scope: 'global', title: 'X', cli: ['set dyn_notch_q = 20'], evidence: [], blockedBy: [], causes: [] };
-    assert.match(advice.exportScript([bare], ['x'], {}), /#   `dyn_notch_q`: set to 20\. The previous value is unknown\./);
+    const rows=[{scope:'global',name:'gyro_lpf1_type',from:'NONE',to:'FIRST_ORDER',source:'header'},
+        {scope:'global',name:'gyro_lpf1_static_hz',from:0,to:100,source:'header'}];
+    const recs=advice.filterRecommendations({version:2,model:{passed:true},recommended:{status:'recommended',fullRows:rows,rows}},{});
+    const r=recs[0];assert.deepEqual(r.fromSets,{gyro_lpf1_type:'NONE',gyro_lpf1_static_hz:0});
+    const text=advice.exportScript(recs,null,{});
+    assert.match(text,/from NONE to FIRST_ORDER/);assert.match(text,/from 0 to 100/);
+    assert.match(text,/the value at this time is from the log header/);
+    const bare={id:'x',severity:'action',scope:'global',title:'X',cli:['set dyn_notch_q = 20'],evidence:[],blockedBy:[],causes:[]};
+    assert.match(advice.exportScript([bare],['x'],{}),/The previous value is unknown/);
+
 });
 
 test('C8: a comment of the CLI file has printable ASCII and ± × ° µ only (the CLI tab sends the low 8 bits of a character): the others become "_"', () => {
@@ -1621,37 +1556,9 @@ test('C8: a comment of the CLI file has printable ASCII and ± × ° µ only (th
     assert.match(text, /#   Rule: Rule 1 ± 2 °, 5 µs/);
 });
 
-test('C9, C10: F5 RPM notch changes say that the gear ratios are correct; RPM notch arrays have exactly 16 values', () => {
-    const main = only(run([f({ module: 'setup', id: 'F5', value: 3, text: 'line at 3 x rotor (115 Hz, prominence 40, rotor-locked): nearest notch roll none, pitch none, yaw none' })], { cli: CLI }), 'F5');
-    assert.equal(main.severity, 'action');
-    assert.match(main.text, /, main rotor harmonic 3\. The gear ratios in the configuration are correct\.\nAdd an RPM notch filter with source 13 and Q 4\.0 \(FILT\)/);
-    assert.match(main.rule, /The gear ratios in the configuration are correct\./);
-    // a header with 8 banks: no CLI text (cli.c sets all 16)
-    const short = Object.assign({}, HEADER, { gyro_rpm_notch_source_roll: [11, 12, 14, 21, 0, 0, 0, 0] });
-    const s = only(run([f({ module: 'setup', id: 'F5', value: 3, text: 'line at 3 x rotor (115 Hz, prominence 40, rotor-locked): nearest notch roll none, pitch 11 at 1 (0.5 %), yaw 11 at 1 (0.5 %)' })], { cli: CLI, header: short }), 'F5');
-    assert.deepEqual(s.cli, []);
-    assert.match(s.caveats.join(' '), /The log header gives 8 values of gyro_rpm_notch_source_roll, but the CLI must set 16 values\. Thus, there is no CLI text\./);
-    const f3 = only(run([f({ module: 'setup', id: 'F3', profile: null, value: 1.5, text: 'q' })], { header: Object.assign({}, HEADER, { gyro_rpm_notch_preset: 0, gyro_rpm_notch_q_roll: [80, 15, 60, 50] }) }), 'F3:gyro_rpm_notch_q_roll');
-    assert.deepEqual(f3.cli, []);
-    const g = { id: 'x', severity: 'action', scope: 'global', title: 'X', evidence: [], blockedBy: [], causes: [] };
-    assert.match(flat(advice.exportScript([Object.assign({ cli: [`set gyro_rpm_notch_q_roll = ${pad([80, 40]).slice(0, 15).join(',')}`] }, g)], ['x'], {})), /The value of `gyro_rpm_notch_q_roll` must have 16 numbers, one for each bank\./);
-    assert.equal(commands(advice.exportScript([Object.assign({ cli: [`set gyro_rpm_notch_q_roll = ${pad([80, 40]).join(',')}`] }, g)], ['x'], {})).length, 3);
-});
 
-test('D-H2: without a filter measurement and with unknown tail rotor harmonics, F5 asks for the measurement and never says "resonance"', () => {
-    const noTail = Object.assign({}, HEADER, { gyro_rpm_notch_source_roll: pad([11, 12, 14]), gyro_rpm_notch_source_pitch: pad([11, 12, 14]), gyro_rpm_notch_source_yaw: pad([11, 12]) });
-    const line = f({ module: 'setup', id: 'F5', log: 6, value: 4.061, text: 'line at 4.061 x rotor (155.7 Hz, prominence 394.5): nearest notch roll 14 at 4 (1.5 %), pitch 14 at 4 (1.5 %), yaw 12 at 2 (103.0 %)' });
-    const out = run([line], { header: noTail, logBase: 1 }), r = only(out, 'F5');
-    assert.deepEqual([r.severity, r.cli, r.title], ['check', [], 'Vibration line at 155.7 Hz: measure the filters at this line']);
-    assert.doesNotMatch(r.text + r.rule, /resonance/i);
-    assert.match(r.text, /It has no notch filter|with no notch filter on the yaw axis/);
-    assert.match(r.text, /The log does not record the frequencies of the tail rotor harmonics\. Thus, the app cannot find the cause of this line\. To measure the filters at this line, do the analysis of log 7 with "This log" in "Logs"\.$/);
-    assert.doesNotMatch(r.text, /CLI dump|diff all/, 'the log is the only necessary input (user rule 2026-10-06)');
-    noGearDoubt(out);
-    // with the measurement (filterPass), or with a CLI dump, the old texts
-    assert.equal(only(run([Object.assign({}, line, { filterPass: [{ hz: 155.7, roll: 0.3, pitch: 0.3, yaw: 0.3 }] })], { header: noTail }), 'F5').title, 'Resonance at 155.7 Hz with no notch filter');
-    assert.equal(only(run([line], { header: noTail, cli: CLI }), 'F5').title, 'Resonance at 155.7 Hz with no notch filter');
-});
+
+
 
 test('D-M1: an upstream flag whose times all lie in the times of the symptom is no cause (T8 in the T1 burst of the Fireball); K9 keeps T8 outside the hover windows', () => {
     const span = (t0, t1) => ({ spans: [{ log: 5, t0, t1 }] });
@@ -1674,67 +1581,14 @@ test('D-M1: an upstream flag whose times all lie in the times of the symptom is 
     assert.deepEqual(gaui.causes.map(c => [c.rule, c.ids]), [['K9', ['T8']]]);
 });
 
-test('D-M3: F5 handles the strongest line of each PID profile: a main rotor harmonic gets an RPM notch, the resonance a dynamic notch range for all PID profiles', () => {
-    // the Fireball: PID profile 1 has main rotor harmonic 3 first; PID profiles 1 to 3 have the resonance at 3.79 x
-    const seg = (o, hz, p) => `line at ${o} x rotor (${hz} Hz, prominence ${p}, rotor-locked): nearest notch roll 14 at 4 (5.3 %), pitch 14 at 4 (5.3 %), yaw 21 at 4 (5.3 %)`;
-    const p1 = f({ module: 'setup', id: 'F5', profile: 1, value: 2.9989, text: [seg(2.9989, 174.7, 54.6), seg(3.7881, 220.6, 52.8)].join('; '), filterPass: [{ hz: 174.7, roll: 0.92, pitch: 0.92, yaw: 0.94 }, { hz: 220.6, roll: 0.42, pitch: 0.42, yaw: 0.61 }] });
-    const p2 = f({ module: 'setup', id: 'F5', profile: 2, value: 3.7884, text: [seg(3.7884, 284.1, 141.9), seg(2.9992, 224.9, 33.6)].join('; '), filterPass: [{ hz: 284.1, roll: 0.56, pitch: 0.56, yaw: 0.72 }, { hz: 224.9, roll: 0.94, pitch: 0.94, yaw: 0.96 }] });
-    const p3 = f({ module: 'setup', id: 'F5', profile: 3, value: 3.7888, text: seg(3.7888, 315.6, 298.2), filterPass: [{ hz: 315.6, roll: 0.65, pitch: 0.65, yaw: 0.78 }] });
-    const out = run([p1, p2, p3], { cli: CLI }), rpm = only(out, 'F5:rpm'), res = out.recommendations.find(r => r.id === 'F5'), cliText = rpm.cli.join('\n');
-    assert.equal(recs(out, 'F5').length, 2);
-    assert.deepEqual([rpm.severity, rpm.title], ['action', 'RPM notch filter at main rotor harmonic 3']);
-    assert.ok(cliText.includes(`set gyro_rpm_notch_source_roll = ${pad([11, 12, 14, 21, 13]).join(',')}`), cliText);
-    assert.match(rpm.text, /is at `2\.9989 × rotor` \(174\.7 Hz, prominence 54\.6, log 5, PID profile 1\), main rotor harmonic 3\./);
-    assert.ok(rpm.caveats.includes('In the logs, the line at `2.9989 × rotor` is at 174.7 Hz (log 5, PID profile 1) and 224.9 Hz (log 5, PID profile 2).'), rpm.caveats.join('\n'));
-    assert.ok(rpm.caveats.includes('The gyro filters let 94 % to 96 % of harmonic 3 through.'));
-    assert.ok(rpm.caveats.includes('At 174.7 Hz, the nearest notch filters are source 14 (roll, 5.3 % from the line), source 14 (pitch, 5.3 % from the line) and source 21 (yaw, 5.3 % from the line).'), 'review D-M5a: each axis');
-    assert.deepEqual([res.severity, res.title], ['check', 'Resonance at 315.6 Hz with no notch filter']);
-    assert.match(res.text, /The dynamic notch filter is on, but its range \(20 Hz to 240 Hz\) does not contain the line in each log and PID profile \(220\.6 Hz to 315\.6 Hz\)\. A range that contains 220\.6 Hz to 315\.6 Hz can remove it/);
-    assert.match(res.caveats.join(' '), /Check F5 gives no SE for a prominence, because it calculates one spectrum for each log and PID profile \(10 windows\)\./, 'D-LOW: the reason for no SE');
-    noGearDoubt(out);
-});
 
-test('F5 on many logs: the caveat of a line gives the range of each PID profile (25 words or less), and the CLI file breaks no quote and no "notch filter"', () => {
-    // the Gaui X4 file 20261004_113720 (integration 2026-10-06): one line in 11 or more logs and PID profiles made a caveat of 30 words,
-    // and the 240-character break of the CLI file cut "notch | filter" and a quoted source in two
-    const seg = (o, hz, p) => `line at ${o} x rotor (${hz} Hz, prominence ${p}, rotor-locked): nearest notch roll 14 at 4 (25.3 %), pitch 14 at 4 (25.3 %), yaw 21 at 4 (25.3 %)`;
-    const base = { 1: 174.7, 2: 224.9, 3: 249.9, 4: 262.4, 5: 274.9 };
-    const lines = (profiles, logs) => profiles.flatMap(p => logs.map(L => {
-        const hz = +(base[p] + 0.1 * (L - 5)).toFixed(1);
-        return f({ module: 'setup', id: 'F5', log: L, profile: p, value: 2.9989, n: 12, text: seg(2.9989, hz, 60 - L - p), filterPass: [{ hz, roll: 0.92, pitch: 0.92, yaw: 0.94 }] });
-    }));
-    const logs = [5, 6, 7, 8].map(log => ({ log, start: `2026-10-04T1${log - 5}:00:00`, flown: true, flyingS: 100, profileSeconds: { 1: 20, 2: 20, 3: 20, 4: 20, 5: 20 }, targetOf: { 1: 3500, 2: 4500, 3: 5000, 4: 5250, 5: 5500 } }));
-    const act = (out) => { const xs = recs(out, 'F5').filter(r => r.cli && r.cli.length); assert.equal(xs.length, 1, out.recommendations.map(r => r.id).join(', ')); return xs[0]; };
-    const rpm = act(run(lines([1, 2, 3], [5, 6, 7, 8]), { cli: CLI, logs }));
-    const each = rpm.caveats.find(t => t.startsWith('In the logs, the line at'));
-    assert.equal(each, 'In the logs, the line at `2.9989 × rotor` is at 174.7 Hz to 175 Hz (PID profile 1, 4 results), 224.9 Hz to 225.2 Hz (PID profile 2, 4 results) '
-        + 'and 249.9 Hz to 250.2 Hz (PID profile 3, 4 results).');
-    const many5 = act(run(lines([1, 2, 3, 4, 5], [5, 6]), { cli: CLI, logs }));
-    assert.ok(many5.caveats.includes('In the logs, the line at `2.9989 × rotor` is at 174.7 Hz to 275 Hz (10 results in 5 PID profiles).'), many5.caveats.join('\n'));
-    const short = act(run(lines([1, 2], [5, 6, 7]), { cli: CLI, logs }));
-    assert.ok(short.caveats.includes('In the logs, the line at `2.9989 × rotor` is at 174.7 Hz (log 5, PID profile 1), 174.8 Hz (log 6, PID profile 1), 174.9 Hz (log 7, PID profile 1), '
-        + '224.9 Hz (log 5, PID profile 2), 225 Hz (log 6, PID profile 2) and 225.1 Hz (log 7, PID profile 2).'), 'up to 7 lines: each line (24 words)');
-    // the CLI file: no comment line has an odd number of quotation marks or backticks, and none ends in "notch". The two
-    // sentences of more than 240 characters are those of the Gaui file (the old break was after "no notch" and in the third quote)
-    const sources = 'Sources: "toolkit, no flight test", "firmware 4.6.0: the RPM notch filter sources 11 to 18 are the main rotor harmonics 1 to 8, and with a different source the helicopter does not arm" '
-        + 'and "toolkit rule, no flight test: a line in 1 % of an integer order of the rotor is a main rotor harmonic".';
-    const ev = { id: 'F5', fid: 'setup|F5|49|0|1||A|0', log: 49, profile: 1, display: { value: '28.2 x the median level at 7.05 x the rotor frequency, 73.8 % from the nearest roll notch filter',
-        bound: '5 x the median level or more, with no notch filter in ±2 % of its frequency' } };
-    const long = Object.assign({}, rpm, { rule: `Check F5 examines the gyroRAW lines. ${sources}`, evidence: [ev] });
-    const text = advice.script([long]), comments = text.split('\n').filter(l => l.startsWith('#'));
-    assert.ok(comments.includes('#   "toolkit rule, no flight test: a line in 1 % of an integer order of the rotor is a main rotor harmonic".'), text);
-    assert.ok(comments.includes('#   The limit is 5 x the median level or more, with no notch filter in ±2 % of its frequency.'), text); // the limit is a sentence of its own (STE Rule 6.3)
-    // the flights of a file with many logs (59 on the Gaui file): one sentence on each line under "Flights:", not 59 sentences in one paragraph
-    const flights = Array.from({ length: 12 }, (_, i) => `Log ${i + 1}: ${i === 10 ? '15.5 s to 74.2 s' : 'Bench run (no analysis)'}.`).join(' ');
-    const meta = advice.exportScript([long], null, { flights, logs: ['11'] }).split('\n');
-    assert.deepEqual(meta.slice(meta.indexOf('# Flights:'), meta.indexOf('# Flights:') + 3), ['# Flights:', '#   Log 1: Bench run (no analysis).', '#   Log 2: Bench run (no analysis).'], meta.join('\n'));
-    assert.ok(meta.includes('#   Log 11: 15.5 s to 74.2 s.') && meta.includes('# Logs: 11'));
-    for (const l of comments.concat(meta.filter(x => x.startsWith('#')))) {
-        assert.ok(l.length <= 256, l);
-        assert.equal((l.match(/"/g) || []).length % 2, 0, l);
-        assert.equal((l.match(/`/g) || []).length % 2, 0, l);
-        assert.doesNotMatch(l, /\bnotch$/, l);
-    }
+
+test("Many raw-line references retain complete evidence identifiers without CLI proposals", () => {
+    const findings=Array.from({length:25},(_,i)=>f({module:'setup',id:'F5',log:i+1,profile:i%3+1,value:3,n:10,text:`line at 3 x rotor (${100+i} Hz, prominence 40): nearest notch yaw none`}));
+    const out=run(findings,{logs:findings.map(f=>({log:f.log,flown:true})),cli:CLI}),r=only(out,'F5');
+    assert.equal(r.severity,'info');assert.equal(r.evidence.length,20);assert.equal(r.citedFids.length,25);
+    assert.deepEqual(r.cli,[]);assert.equal(advice.script(out.recommendations),'');
+    assert.match(r.caveats.join(' '),/25 results/);
 });
 
 test('D-M5: G6 states the rule that flagged; D6 explains the guard time; RANGE_FIRST does not claim a sufficient range; G9 below 2 SE claims no oscillation', () => {
@@ -1833,7 +1687,7 @@ test('real data, Gaui X4 (no CLI dump): no CLI for the D2 stalls, the F5 flags, 
     const out = advice.advise(realInput(GAUI, 'analysis/gaui-x4/tune/results.json', 58, null));
     const by = (id) => out.recommendations.filter(r => r.id.split(':')[0] === id);
     assert.equal(by('D2').length, 1); assert.equal(by('D2')[0].severity, 'check');
-    assert.equal(by('F5').length, 1); assert.equal(by('F5')[0].severity, 'check'); assert.equal(by('F5')[0].evidence.length, 8);
+    assert.equal(by('F5').length, 1); assert.equal(by('F5')[0].severity, 'info'); assert.equal(by('F5')[0].evidence.length, 8);
     for (const id of ['T5', 'T6']) { assert.equal(by(id).length, 1, id); assert.equal(by(id)[0].severity, 'watch', id); }
     assert.equal(out.recommendations.filter(r => r.cli.length).length, 0, out.recommendations.filter(r => r.cli.length).map(r => r.id).join(', '));
     assert.equal(by('T8')[0].severity, 'check');
@@ -1841,15 +1695,16 @@ test('real data, Gaui X4 (no CLI dump): no CLI for the D2 stalls, the F5 flags, 
     assert.ok(by('C7').every(r => r.severity === 'info'));
 });
 
-test('real data, Fireball 2026-09-28: the LPF first; the report.cjs pitch F change waits for it; governor and tail raises get no CLI', { skip: !fs.existsSync(path.join(ROOT, FIRE, 'health.json')) }, () => {
+test('real data, Fireball 2026-09-28: filter references do not block; profile, RPM and output-limit checks remain', { skip: !fs.existsSync(path.join(ROOT, FIRE, 'health.json')) }, () => {
     const out = advice.advise(realInput(FIRE, 'analysis/fireball-0928/tune/results.json', 18, null));
     for (const r of out.recommendations.filter(x => x.cli.length)) {
         assert.equal(r.severity, 'action', r.id); assert.deepEqual(r.blockedBy, [], r.id);
         assert.ok(r.cli.every(l => /^(profile \d|set \w+ = [\w,]+)$/.test(l)), r.cli.join('; '));
     }
-    assert.deepEqual(commands(advice.script(out.recommendations)), ['batch start', 'set gyro_lpf1_type = FIRST_ORDER', 'set gyro_lpf1_static_hz = 100', 'save']);
+    assert.deepEqual(commands(advice.script(out.recommendations)), []);
+    assert.equal(only(out,'F1').severity,'info');
     const c7 = out.recommendations.find(r => r.id === 'C7:pitch_f_gain:p2');   // 4500 rpm = PID profile 2; the header holds PID profile 1: from the calculated F 100 (D12)
-    if (c7) { assert.deepEqual([c7.severity, c7.from, c7.to, c7.cli], ['action', 100, 80, []]); assert.match(c7.blockedBy.join(' '), /The filter change with CLI text comes first in the tuning sequence\./); }
+    if (c7) { assert.deepEqual([c7.severity, c7.from, c7.to, c7.cli], ['action', 100, 80, []]); assert.deepEqual(c7.blockedBy,[]);assert.match(c7.caveats.join(' '),/PID profile 2 is unknown/); }
     assert.ok(out.recommendations.filter(r => r.area === 'governor').every(r => !r.cli.length), 'G1 FALLBACK flags block governor changes');
     assert.ok(out.recommendations.filter(r => r.area === 'tail' && r.direction === 'raise').every(r => !r.cli.length), 'T8 tail-limit flags block tail raises');
 });
@@ -1858,7 +1713,7 @@ test('real data, Fireball 2026-09-28: the LPF first; the report.cjs pitch F chan
 // 3.79 x resonance of its log and PID profile still gets the RPM notch filter (rotor-locked, prominence 5 or more, no notch
 // filter at 2 % or less on an axis, the gyro filters pass 50 % or more there). The lines at 1 x rotor from the resonance
 // (2.79 x, 4.79 x) are a part of it: no RPM notch filter
-test('F5: a weaker main rotor harmonic gets the RPM notch filter; the lines beside a resonance do not (Fireball 2026-10-05 log 16)', () => {
+test('F5: Fireball 2026-10-05 log 16 retains both profiles and measured line attenuation without untested notch proposals', () => {
     const P2 = 'line at 3.7879 x rotor (284.1 Hz, prominence 136.8, rotor-locked): nearest notch roll 14 at 4 (5.3 %), pitch 14 at 4 (5.3 %), yaw 12 at 2 (89.4 %); line at 2.7884 x rotor (209.1 Hz, prominence 24, rotor-locked): nearest notch roll 14 at 4 (30.3 %), pitch 14 at 4 (30.3 %), yaw 12 at 2 (39.4 %); line at 2.9988 x rotor (224.9 Hz, prominence 21.3, rotor-locked): nearest notch roll 14 at 4 (25.0 %), pitch 14 at 4 (25.0 %), yaw 12 at 2 (49.9 %); line at 4.7876 x rotor (359.1 Hz, prominence 16.6, rotor-locked): nearest notch roll 14 at 4 (19.7 %), pitch 14 at 4 (19.7 %), yaw 12 at 2 (139.4 %); line at 3.9992 x rotor (300 Hz, prominence 10.3, rotor-locked): nearest notch roll 14 at 4 (0.0 %), pitch 14 at 4 (0.0 %), yaw 12 at 2 (100.0 %); line at 5.7872 x rotor (434.1 Hz, prominence 9.3): nearest notch roll 14 at 4 (44.7 %), pitch 14 at 4 (44.7 %), yaw 12 at 2 (189.4 %); line at 4.5772 x rotor (343.3 Hz, prominence 7.5, rotor-locked): nearest notch roll 14 at 4 (14.4 %), pitch 14 at 4 (14.4 %), yaw 12 at 2 (128.9 %); line at 4.923 x rotor (369.2 Hz, prominence 7.4, rotor-locked): nearest notch roll 14 at 4 (23.1 %), pitch 14 at 4 (23.1 %), yaw 12 at 2 (146.2 %); line at 4.9982 x rotor (374.9 Hz, prominence 5.5, rotor-locked): nearest notch roll 14 at 4 (25.0 %), pitch 14 at 4 (25.0 %), yaw 12 at 2 (149.9 %)';
     const PASS2 = [{ hz: 284.1, roll: 0.5584, pitch: 0.5584, yaw: 0.7157 }, { hz: 209.1, roll: 0.9397, pitch: 0.9402, yaw: 0.9471 }, { hz: 224.9, roll: 0.942, pitch: 0.9433, yaw: 0.9537 }, { hz: 359.1, roll: 0.9533, pitch: 0.9475, yaw: 0.9646 },
         { hz: 300, roll: 0.1591, pitch: 0.1064, yaw: 0.2106 }, { hz: 434.1, roll: 0.8806, pitch: 0.91, yaw: 0.8821 }, { hz: 343.3, roll: 0.8976, pitch: 0.915, yaw: 0.935 }, { hz: 369.2, roll: 0.9763, pitch: 0.9568, yaw: 0.9772 }, { hz: 374.9, roll: 0.9678, pitch: 0.9717, yaw: 0.9735 }];
@@ -1867,22 +1722,10 @@ test('F5: a weaker main rotor harmonic gets the RPM notch filter; the lines besi
         { hz: 333.1, roll: 0.0037, pitch: 0.0056, yaw: 0.0203 }, { hz: 298.1, roll: 0.6932, pitch: 0.7859, yaw: 0.854 }, { hz: 70, roll: 0.8226, pitch: 0.9245, yaw: 0.9416 }, { hz: 416.4, roll: 0.9734, pitch: 0.9387, yaw: 0.988 }];
     const F = [f({ module: 'setup', id: 'F5', log: 15, profile: 2, pidProfile: 2, value: 3.7879, n: 36, text: P2, filterPass: PASS2 }), f({ module: 'setup', id: 'F5', log: 15, profile: 3, pidProfile: 3, value: 3.7879, n: 89, text: P3, filterPass: PASS3 })];
     const out = run(F, { cli: CLI, logs: [{ log: 15, flown: true, flyingS: 300, profileSeconds: { 2: 150, 3: 150 }, targetOf: { 2: 4500, 3: 5000 } }], headerLog: 15, logBase: 1 });
-    const rpm = only(out, 'F5:rpm'), res = out.recommendations.find(r => r.id === 'F5'), n = () => pad([11, 12, 14, 21, 13, 15]).join(',');
-    assert.deepEqual([rpm.severity, rpm.title], ['action', 'RPM notch filters at main rotor harmonics 3 and 5']);
-    assert.match(rpm.text.split('\n')[1], /^A vibration line with no notch filter on the roll, pitch and yaw axes is at `2\.9988 × rotor` \(224\.9 Hz, prominence 21\.3, log 16, PID profile 2\), main rotor harmonic 3\./);
-    assert.match(rpm.text, /The gear ratios in the configuration are correct\./, 'the gear sentence stays');
-    assert.ok(rpm.cli.includes(`set gyro_rpm_notch_source_roll = ${n()}`) && rpm.cli.includes(`set gyro_rpm_notch_source_pitch = ${n()}`), rpm.cli.join('\n'));
-    assert.ok(rpm.cli.includes(`set gyro_rpm_notch_source_yaw = ${pad([11, 12, 21, 13, 15]).join(',')}`), rpm.cli.join('\n'));
-    assert.match(rpm.caveats.join(' '), /In the logs, the line at `2\.9988 × rotor` is at 224\.9 Hz \(log 16, PID profile 2\) and 249\.9 Hz \(log 16, PID profile 3\)\./);
-    assert.match(rpm.caveats.join(' '), /The gyro filters let 95 % to 96 % of harmonic 3 through\./);
-    assert.match(rpm.rule, /A weaker harmonic gets an RPM notch filter if the gyro filters let 50 % or more of it through\./);
-    // the 3.79 x line is a resonance; the 2.79 x and 4.79 x lines beside it are a part of it, never an RPM notch filter
-    assert.deepEqual([res.severity, res.title, res.cli], ['check', 'Resonance at 315.6 Hz with no notch filter', []]);
-    assert.match(res.caveats.join(' '), /The lines at `2\.79 × rotor` and `4\.79 × rotor` are 1 × rotor from this resonance\. They are a part of the resonance, not rotor harmonics\. Thus, the app gives no RPM notch filter for them\./);
-    for (const l of rpm.cli) assert.doesNotMatch(l, /,1[78],|,1[78]$/, 'no source for 2.79 x or 4.79 x (they are no harmonic)');
-    // without the measured pass, or when the gyro filters remove most of it (< 50 %), the weaker harmonic waits for the measurement
-    const unmeasured = run(F.map(x => Object.assign({}, x, { filterPass: undefined })), { cli: CLI, headerLog: 15 });
-    assert.equal(recs(unmeasured, 'F5:rpm').length, 0, unmeasured.recommendations.map(r => r.id).join(' '));
+    const r=only(out,'F5');
+    assert.equal(r.severity,'info');assert.deepEqual(r.cli,[]);assert.equal(r.evidence.length,2);
+    assert.deepEqual(r.evidence.map(e=>e.filterPass),[PASS2,PASS3]);
+    assert.deepEqual(r.evidence.map(e=>e.profile),[2,3]);noGearDoubt(out);
 });
 
 // review V3: no developer reference (file, line, section, rule number of the app, community thread) in the text that the pilot
@@ -1938,22 +1781,16 @@ test('review V4: the confidence of a recommendation is "measured" when a measure
 // review V11: the previous value of a global setting names the CLI dump when the loaded dump gives the same value; a value
 // that the dump does not have, or a different value (D4), stays "log header"
 test('review V11: the CLI file says that a previous value comes from the CLI dump when the loaded dump agrees with the log header', () => {
-    const F1 = [f({ module: 'setup', id: 'F1', profile: null, value: 0 })], head = Object.assign({}, HEADER, { gyro_soft_type: 0, gyro_lowpass_hz: 0 });
-    const same = setup.parseCli('dump\n# master\nset gyro_lpf1_type = NONE\nset gyro_lpf1_static_hz = 0\n');
-    const a = only(run(F1, { header: head, cli: same, cliName: 'fireball_cli_dump.txt' }), 'F1');
-    assert.equal(a.fromSource, 'CLI dump "fireball_cli_dump.txt", the same as the log header');
-    const text = advice.exportScript([a], [a.id], {});
-    assert.match(text, /#   `gyro_lpf1_type`: from NONE to FIRST_ORDER \(the value at this time is from the CLI dump "fireball_cli_dump\.txt", the same as the log header\)\./);
-    assert.match(text, /#   `gyro_lpf1_static_hz`: from 0 to 100 \(the value at this time is from the CLI dump "fireball_cli_dump\.txt", the same as the log header\)\./);
-    // one value in the dump, one not: each line names its own source
-    const half = only(run(F1, { header: head, cli: setup.parseCli('dump\n# master\nset gyro_lpf1_type = NONE\n'), cliName: 'x.txt' }), 'F1');
-    assert.deepEqual(half.fromSources, { gyro_lpf1_type: 'CLI dump "x.txt", the same as the log header', gyro_lpf1_static_hz: 'log header' });
-    assert.match(advice.exportScript([half], [half.id], {}), /`gyro_lpf1_static_hz`: from 0 to 100 \(the value at this time is from the log header\)\./);
-    // no CLI dump: the log header
-    assert.equal(only(run(F1, { header: head }), 'F1').fromSource, 'log header');
+    const findings=[f({module:'setup',id:'D1',profile:null,value:500})],head={...HEADER,frameIntervalPDenom:4};
+    const same=setup.parseCli('dump\n# master\nset blackbox_rate_denom = 4\n');
+    const a=only(run(findings,{header:head,cli:same,cliName:'fireball_cli_dump.txt'}),'D1');
+    assert.equal(a.fromSource,'CLI dump "fireball_cli_dump.txt", the same as the log header');
+    assert.match(advice.exportScript([a],[a.id],{}),/from 4 to 2/);
+    assert.equal(only(run(findings,{header:head}),'D1').fromSource,'log header');
     // a PID profile value of the confirmed arming profile that the CLI section gives with the same value
     const t5 = only(run([f({ id: 'T5', value: 2, se: 0.1, larger: 'ccw' })], { cli: setup.parseCli('dump\n# master\nset gov_mode = ELECTRIC\nprofile 0\nset yaw_ccw_stop_gain = 80\n'), cliName: 'c.txt' }), 'T5');
     assert.equal(t5.fromSource, 'CLI dump "c.txt", section `profile 0`, the same as the log header');
+
 });
 
 // review V5: D2 gives the number of loop stalls and the longest, when the loop stalls are the cause of the flag

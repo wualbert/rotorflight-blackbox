@@ -9,7 +9,7 @@ function session(file, progress = () => {}, observeReconstruction = null, restor
     let resolve, reject;
     let sequence=0, pending=false;
     const local = url => { const f = path.resolve(js, url); if (!f.startsWith(root + path.sep)) throw Error('Worker file outside the project'); return f; };
-    Object.assign(ctx, { setTimeout, console: { log() {}, info() {}, warn() {}, debug() {}, error() {} },
+    Object.assign(ctx, { setTimeout, performance: require('node:perf_hooks').performance, console: { log() {}, info() {}, warn() {}, debug() {}, error() {} },
         importScripts: (...urls) => urls.forEach(url => { const f = local(url); run(fs.readFileSync(f, 'utf8'), f); }),
         fetch: async url => { const f = local(url); return {ok:fs.existsSync(f),status:fs.existsSync(f)?200:404,text:async()=>{
             let source=fs.readFileSync(f,'utf8');

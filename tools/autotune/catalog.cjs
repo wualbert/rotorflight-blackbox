@@ -150,16 +150,16 @@ X('D4', { noun: 'CLI dump values', unit: '', scale: 1, tab: 'checks', module: 's
     evidence: ev('header', [], { kind: 'table' }, { expected: () => 'The log header and the CLI dump have the same values.' }) });
 X('F1', { noun: 'gyro low-pass filter', unit: '', scale: 1, tab: 'filters', module: 'setup',
     say: (f, v) => f.severity === 'flag' ? 'The log header shows 0 gyro low-pass filters and 1 or more RPM notch filters.' : f.severity === 'note' ? 'The log header shows 0 gyro low-pass filters.' : `${v.val} gyro low-pass filter${f.value === 1 ? ' is' : 's are'} on.`,
-    limit: () => 'One gyro low-pass filter is necessary with the RPM filters.', bound: () => '1 gyro low-pass filter or more with the RPM filters',
+    limit: () => 'The reference configuration has one gyro low-pass filter with the RPM filters.', bound: () => 'reference configuration: 1 gyro low-pass filter or more with the RPM filters',
     value: (f, v) => v.val === null ? null : many(f.value, 'gyro low-pass filter'),
     evidence: ev('header', [], { kind: 'table', keys: ['gyro_soft_type', 'gyro_lowpass_hz', 'gyro_soft2_type', 'gyro_lowpass2_hz', 'gyro_lowpass_dyn_hz'] }, { expected: () => 'One gyro low-pass filter is on at approximately 100 Hz.' }) });
 X('F2', { noun: 'low-pass cutoff', unit: 'Hz', scale: 1, tab: 'filters', module: 'setup',
     say: (f, v) => `The lowest gyro low-pass filter cutoff is ${v.value}.`,
-    limit: (f, v, R) => num(R.flagHz) === null ? null : `The minimum is ${R.flagHz} Hz.` + (num(R.noteHz) !== null ? ` At less than ${R.noteHz} Hz, the result is "Monitor".` : ''),
+    limit: (f, v, R) => num(R.flagHz) === null ? null : `The reference minimum is ${R.flagHz} Hz.`,
     evidence: ev('header', [], { kind: 'table', keys: ['gyro_soft_type', 'gyro_lowpass_hz', 'gyro_soft2_type', 'gyro_lowpass2_hz', 'gyro_lowpass_dyn_hz'] }, { expected: () => 'The lowest gyro cutoff is 80 Hz or more.' }) });
 X('F3', { noun: 'notch filter Q', unit: '', scale: 1, tab: 'filters', module: 'setup',
     say: (f, v) => f.severity === 'note' ? 'The log header has no RPM notch filter.' : `The lowest Q of the ${v.n} RPM notch filters is ${v.val}.`,
-    limit: (f, v, R) => T.min(R.minQ, ''), value: (f, v) => v.val === null ? null : `Q ${v.val}`,
+    limit: (f, v, R) => num(R.minQ) === null ? null : `The reference value is Q ${R.minQ} or more.`, value: (f, v) => v.val === null ? null : `Q ${v.val}`,
     evidence: ev('header', [], { kind: 'table', keys: ['gyro_rpm_notch_q_roll', 'gyro_rpm_notch_q_pitch', 'gyro_rpm_notch_q_yaw', 'dyn_notch_q'] }, { expected: () => 'The Q of each notch filter is 2 or more.' }) });
 X('F4', { noun: 'D-term cutoff', unit: 'Hz', scale: 1, tab: 'filters', module: 'setup',
     say: (f, v) => `The ${ax(v)} D-term cutoff is ${v.value}.`,
@@ -169,7 +169,7 @@ X('F4', { noun: 'D-term cutoff', unit: 'Hz', scale: 1, tab: 'filters', module: '
 X('F5', { noun: 'notch filter position', unit: 'x', scale: 1, tab: 'filters', module: 'setup', nOf: 'periods of 256 rotor turns', min: (R) => R.minWindows,
     say: (f, v, x) => f.severity === 'flag' ? `${v.In}the raw gyro has a peak at ${v.value} the rotor frequency${x.hz ? ` (${fmt(x.hz)} Hz)` : ''}${num(x.prominence) !== null ? `, ${fmt(x.prominence)} x the median level` : ''}. ${notchAxes(x)}` : `${v.In}each strong peak of the raw gyro has a notch filter near it.`,
     // review V5: a description of the rule, not an instruction (an Information row is no problem), and the rule's quantities
-    limit: (f, v, R) => num(R.minProminence) === null ? null : `A peak of ${R.minProminence} x the median level or more with no notch filter in ±${fmt(R.maxDistance * 100)} % of its frequency is a problem.`,
+    limit: (f, v, R) => num(R.minProminence) === null ? null : `The reference range has an RPM notch filter in ±${fmt(R.maxDistance * 100)} % of each peak at ${R.minProminence} x the median level or more.`,
     bound: (f, v, R) => num(R.minProminence) === null ? null : `${R.minProminence} x the median level or more, with no notch filter in ±${fmt(R.maxDistance * 100)} %`,
     value: (f, v, x) => { if (f.severity !== 'flag') return null; const far = Array.isArray(x.axes) ? x.axes.filter(q => q && !q.near && num(q.distance) !== null).sort((a, b) => a.distance - b.distance)[0] : null;
         const at = v.value === null ? '' : ` at ${v.value} the rotor frequency`;
@@ -332,8 +332,8 @@ X('C10', { noun: 'I-term decrease', unit: 's', scale: 1, tab: 'checks', module: 
     evidence: ev('runs', [[G.I], [G.sp], ['mixer[3]'], ['headspeed']], { kind: 'time', snippet: { fields: [G.I, 'mixer[3]'] } }, { expected: () => 'In flight, the I-term decreases slowly, with the airborne time constant.' }) });
 X('C11', { noun: 'D-term noise', unit: '%', scale: 100, tab: 'filters', module: 'loop', nOf: 'periods of 1 s', min: (R) => R.minWindows,
     say: (f, v) => `${v.In}${v.value} of the ${ax(v)} D-term power is at more than 30 Hz.`,
-    limit: (f, v, R) => T.plain(pc(R.share), '%'),
-    evidence: ev('windows', [[G.D], [G.gy, G.raw]], { kind: 'spectrum', curve: 'more.dterm.{axis}' }, { analyser: 'axisD[{a}]', expected: () => 'Less than 50 % of the D-term power is at more than 30 Hz.' }) });
+    limit: (f, v, R) => `The reference power percentage is ${pc(R.share)} %. It is not a limit on D-term RMS.`,
+    evidence: ev('windows', [[G.D], [G.gy, G.raw]], { kind: 'spectrum', curve: 'more.dterm.{axis}' }, { analyser: 'axisD[{a}]', expected: () => 'Compare the D-term power percentage with its RMS value and the replay change.' }) });
 X('T2', { noun: 'slow tail oscillation', unit: 'x', scale: 1, tab: 'curves', module: 'loop', nOf: 'stable periods of 4 s', min: (R) => R.minWindows,
     say: (f, v) => `${v.In}when the sticks do not move, the yaw rate has a peak${num(f.hz) !== null ? ` at ${fmt(f.hz)} Hz` : ''}. The peak is ${v.value} the median level of the band.`,
     limit: (f, v, R) => T.plain(R.prominence, 'x'),
@@ -396,9 +396,9 @@ X('F10', { noun: 'D-term noise', unit: '%', scale: 100, tab: 'filters', module: 
     noteStatus: (f) => f.axis === 'yaw' && !isThin(f) && num(f.se) !== null ? 'monitor' : 'information',
     say: (f, v) => f.axis !== 'yaw' && f.unit === 'permille' ? `${v.In}at more than 30 Hz, the ${ax(v)} mixer output has an RMS value of ${pair(f.value, f.se, '‰')}.`
         : `${v.In}${v.value} of the yaw D-term power is at more than 30 Hz.`,
-    limit: (f, v, R) => f.axis !== 'yaw' && f.unit === 'permille' ? T.report() : T.sigma(pc(R.share), '%'),
+    limit: (f, v, R) => f.axis !== 'yaw' && f.unit === 'permille' ? T.report() : `The reference power percentage is ${pc(R.share)} %. It is not a limit on D-term RMS.`,
     unitOf: (f) => f.axis !== 'yaw' && f.unit === 'permille' ? '‰' : '%', scaleOf: (f) => f.axis !== 'yaw' && f.unit === 'permille' ? 1 : 100,
-    evidence: ev('windows', [[G.D], [G.mix], [G.gy, G.raw]], { kind: 'spectrum', curve: 'more.dterm.{axis}' }, { analyser: 'axisD[{a}]', expected: () => 'Less than 50 % of the D-term power is at more than 30 Hz.' }) });
+    evidence: ev('windows', [[G.D], [G.mix], [G.gy, G.raw]], { kind: 'spectrum', curve: 'more.dterm.{axis}' }, { analyser: 'axisD[{a}]', expected: () => 'Compare the D-term power percentage with its RMS value and the replay change.' }) });
 X('F11', { noun: 'filter time delay', unit: 'ms', scale: 1, tab: 'filters', module: 'more', note: 'information', nOf: 'periods of 1 s of flight', min: (R) => R.minWindows,
     say: (f, v) => `The gyro filters cause a time delay of ${v.value} in the ${ax(v)} gyro at 8 to 16 Hz.`, limit: (f, v, R) => T.sigma(R.flagMs, 'ms'),
     after: (f) => num(f.logOffsetMs) > 0 ? `The analysis decreases the measured time delay by ${pair(f.logOffsetMs, null, 'ms')}, because the log records gyroRAW 1 gyro sample after the filter input.` : null, // firmware 4.6.0 core.c (filter_tune.cjs parity)
@@ -657,7 +657,7 @@ const LEAD = {
     C8: { info: 'This check measures the roll movement when the pitch stick moves.', why: 'The cross-coupling compensation decreases this roll movement.' },
     C9: { info: 'This check compares the pitch error at positive and at negative collective.', why: 'The high speed integral (O gain) corrects this difference in fast flight.' },
     C10: { sym: (f, v) => !f.axis ? null : `In flight, the ${axIs(v)} I-term decreases fast, as on the ground.`, why: (f) => !f.axis ? null : 'Then the firmware possibly does not know that the helicopter is airborne.' },
-    C11: { sym: (f, v) => `Much of the ${axIs(v)} D-term signal is vibration, not movement of the helicopter.`, why: 'This vibration goes to the servos. It can cause damage to the servos, and it limits the D gain.' },
+    C11: { sym: (f, v) => `The ${axIs(v)} D-term power percentage is a reference value.`, why: 'Compare the power percentage with the RMS value and replay change.' },
     T2: { sym: 'When the sticks do not move, the tail moves slowly from side to side.', why: 'A slow oscillation can come from the control loop, the load or the governor.' },
     T4: { sym: 'The tail oscillation stays at the same frequency when the gains change.', why: 'A frequency that does not change with the gains shows a possible mechanical cause, for example a loose linkage.' },
     T5: { sym: 'The tail stops are not the same on the two sides.', why: 'The stop gains set the yaw stop on each side. A larger overshoot on one side can show a stop-gain difference.' },
@@ -671,7 +671,7 @@ const LEAD = {
     T12: { info: 'This check measures the time delay from the setpoint to the yaw rate.', sym: 'The tail has a slow response to the stick.', why: 'A long time delay makes the response slow. The filters, the servo and the B gain change it.' },
     R1: { info: (f, v) => `This check measures the time delay from the stick to the ${axIs(v)} setpoint.`, sym: (f, v) => `The ${axIs(v)} setpoint follows the stick with a long time delay.`, why: 'The response time and the acceleration limit of the rates set this time delay.' },
     D6: { sym: (f) => f.severity === 'flag' ? 'Failsafe is on while the helicopter is airborne.' : null, why: (f) => f.severity === 'flag' ? 'Failsafe in flight shows that the receiver did not get the signal of the transmitter.' : null },
-    F10: { sym: (f, v) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'Much of the yaw D-term signal is vibration, not movement of the helicopter.', why: (f) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'This vibration goes to the tail servo or the tail motor, and it limits the yaw D gain.' },
+    F10: { sym: (f, v) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'The yaw D-term power percentage is a reference value.', why: (f) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'Compare the power percentage with the RMS value and replay change.' },
     F11: { sym: 'The gyro filters cause a long time delay in the gyro signal.', why: 'A long filter time delay makes the loop less stable. Then the gains must be lower.' },
     T13: { sym: 'In hover, the yaw I-term must hold a large tail offset.', why: 'Then the I-term has less range to correct other errors. The tail center trim can supply this offset.' },
     C14: { sym: 'When the collective changes, the helicopter pitches, and the pitch I-term must correct it.', why: 'The I-term corrects slowly. Thus, the helicopter pitches for a short time after each collective change.',
@@ -770,6 +770,12 @@ for (const [id, c] of Object.entries(CHECKS)) {
     c.phases = PHASES[id] || (c.evidence.source === 'header' ? null : /^G\d/.test(id) ? ALL_PHASES : ['flight']);
     for (const k of ['sym', 'why', 'good', 'info']) if (LEAD[id] && LEAD[id][k] !== undefined && c[k] === undefined) c[k] = LEAD[id][k];
 }
+// The hierarchy also reads statusOf when deciding whether a flag can block
+// another tuning step. Configuration guides and power fractions are not faults.
+for(const id of ['F1','F2','F3','F4','F5','C11','F10']) {
+    const original=CHECKS[id].statusOf;
+    CHECKS[id].statusOf=f=>!isThin(f)&&MOD.setup&&MOD.setup.filterGuidance(f)?'information':original?original(f):null;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Formatting, status, summary
@@ -808,6 +814,7 @@ function status(f) {
     if (!f) return 'notMeasured';
     if (f.severity === 'error') return 'error';
     if (f.severity === 'skipped') return 'notMeasured';
+    if (!isThin(f) && MOD.setup && MOD.setup.filterGuidance(f)) return 'information';
     const c = CHECKS[f.id], own = c && typeof c.statusOf === 'function' ? c.statusOf(f) : null;
     if (own) return own;
     if (f.severity === 'flag') return f.explained ? 'information' : Array.isArray(f.resultOf) && f.resultOf.length ? 'monitor' : 'problem';
@@ -839,12 +846,15 @@ function summary(f) {
     if (/\b(null|undefined|NaN)\b|\[object/i.test(say)) say = 'The result has no value. The toolkit text gives the result.'; // a value of a type that the template does not know
     const own = MOD[c.module] && MOD[c.module].DEFAULT_RULES && MOD[c.module].DEFAULT_RULES[f.id]; // without the module's rules, its threshold text is quoted
     // SPEC3 F: what the helicopter does, why it matters, then the number against its limit (the 2-SE rule is in the details)
+    const guidance = MOD.setup && MOD.setup.filterGuidance(f);
+    if (guidance) return [guidance, [say,lim,after].filter(Boolean).join(' ')].join('\n');
     const st = status(f), [lead, why] = leadOf(c, f, v, x, st), short = typeof lim === 'string' ? lim.replace(` ${SE_NOTE}`, '').replace(SE_NOTE, '').trim() : lim;
     const first = [lead, why].filter(Boolean).join(' '), second = [say, short || (c.limit && c.module && !own ? quoted(f) : null), after, resultSay(f)].filter(Boolean).join(' ');
     return [first, second].filter(Boolean).join('\n');
 }
 // the lead sentences of a summary for the status st: [symptom or what the result shows, why it matters] (SPEC3 F)
 function leadOf(c, f, v, x, st) {
+    if(MOD.setup&&MOD.setup.filterGuidance(f))return [MOD.setup.filterGuidance(f),null];
     const get = (k) => { const t = c[k]; try { return typeof t === 'function' ? t(f, v, x) : t || null; } catch (e) { return null; } };
     const ok = (t) => typeof t === 'string' && t && !/\b(null|undefined|NaN)\b|\[object/.test(t) ? cap(t) : null;
     if (st === 'problem') return [ok(get('sym')) || ok(get('info')), ok(get('why'))];

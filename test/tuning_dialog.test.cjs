@@ -488,7 +488,7 @@ test('a result renders every tab, plots and tables, with log-derived text escape
 
     const o = app.pane('overview');
     assert.match(o, /Log 2 of 3: 16 results, 9 recommendations\. 2 changes to do, 1 change that must wait\./, 'a blocked change is not one to do now');
-    assert.match(o, /Analysis error 1 · Problem 6 · Monitor 2 · Not sufficient data 1 · Not measured 1 · Satisfactory 2 · Information 3/);
+    assert.match(o, /Analysis error 1 · Problem 4 · Monitor 2 · Not sufficient data 1 · Not measured 1 · Satisfactory 2 · Information 5/);
     assert.doesNotMatch(o, /<h5[^>]*>(Areas|Before you tune|Start here|First recommendations)<\/h5>/, 'the overview has no duplicate summaries');
     assert.doesNotMatch(o, /class="tuning-(cards|start-list|top-recs)"/);
     assert.match(o, /class="tuning-tab-link" data-tab="checks"/, 'all checks remain accessible');
@@ -592,11 +592,13 @@ test('SPEC3 B: the tuning steps are parameters only: Filters, Governor, then the
     const cells = [...o.matchAll(/<div class="tuning-flow-(cell|arrow)" style="grid-column: (\d+); grid-row: ([^"]+)"/g)].map((m) => `${m[1]} ${m[2]} ${m[3]}`);
     assert.deepEqual(cells, ['cell 1 1 / span 2', 'arrow 2 1 / span 2', 'cell 3 1 / span 2', 'arrow 4 1', 'arrow 4 2', 'cell 5 1', 'cell 5 2', 'arrow 6 1', 'arrow 6 2', 'cell 7 1', 'cell 7 2']);
     // a step: number, title, "Start here" number, condition with the checks that have a problem, parameters, checks
-    assert.match(o, /data-node="filters" tabindex="0" role="button" aria-label="Step 1, Filters: Start here 1"><div class="tuning-block-head"><span class="tuning-block-no">1<\/span><span class="tuning-block-title">Filters<\/span><span class="tuning-start-badge" title="Start here">1<\/span><\/div><div class="tuning-block-status"><span class="tuning-badge st-start">Start here 1<\/span> <span class="tuning-block-ids">F5, F1<\/span><\/div>/);
+    assert.match(o, /data-node="filters" tabindex="0" role="button" aria-label="Step 1, Filters: Start here 1"><div class="tuning-block-head"><span class="tuning-block-no">1<\/span><span class="tuning-block-title">Filters<\/span><span class="tuning-start-badge" title="Start here">1<\/span><\/div><div class="tuning-block-status"><span class="tuning-badge st-start">Start here 1<\/span><\/div>/);
     assert.match(o, /data-node="filters"[^]*?<div class="tuning-label">Parameters<\/div><div class="tuning-block-params"><span class="tuning-param" title="gyro_lpf1_type">Gyro low-pass filter 1 type<\/span> <span class="tuning-param" title="gyro_lpf1_static_hz">Gyro low-pass filter 1 constant frequency<\/span> [^]*?<span class="tuning-param" title="dyn_notch_q">Dynamic notch filter Q<\/span> <span class="tuning-muted tuning-block-more">2 more parameters<\/span><\/div>/,
         '8 parameter labels in the box, the others in the side panel');
-    assert.match(o, /data-node="filters"[^]*?<div class="tuning-label">Checks<\/div><ul class="tuning-block-checks"><li class="st-problem" title="Problem"><span class="tuning-dot st-problem"><\/span><span class="tuning-block-check">F1<\/span> <span class="tuning-block-check-st">Problem<\/span><\/li><li class="st-problem" title="Problem"><span class="tuning-dot st-problem"><\/span><span class="tuning-block-check">F5<\/span> <span class="tuning-block-check-st">Problem<\/span><\/li><\/ul><div class="tuning-block-group st-satisfactory"><span class="tuning-dot st-satisfactory"><\/span>Satisfactory: <span class="tuning-block-check">F8<\/span><\/div><div class="tuning-muted tuning-block-none">No result: F2, F3, F6, F9, F10, F11, F4, C11\.<\/div>/,
-        'the checks to act on one in each row, worst first, then in the sequence of the step; the others in one row for each condition; the checks without a result');
+    assert.match(o, /data-node="filters"[^]*?Information: <span class="tuning-block-check">F1<\/span>, <span class="tuning-block-check">F5<\/span>/,
+        'setup references stay visible as information');
+    assert.match(o, /Satisfactory: <span class="tuning-block-check">F8<\/span>/);
+    assert.match(o, /No result: F2, F3, F6, F9, F10, F11, F4, C11/);
     assert.match(o, /data-node="cyclic"[^]*?<li class="st-monitor" title="Monitor"><span class="tuning-dot st-monitor"><\/span><span class="tuning-block-check">C12<\/span> <span class="tuning-block-check-st">Monitor<\/span><\/li>/, 'a value to monitor has its own row');
     assert.match(o, /data-node="cyclic"[^]*?<span class="tuning-badge st-blocked">Blocked<\/span> <span class="tuning-block-ids">C5 roll<\/span><\/div><div class="tuning-block-wait">Correct first: Filters, Blackbox log\.<\/div>/, 'what a step waits for: steps and items, no link in a box');
     assert.match(o, /data-node="tailcomp"[^]*?<span class="tuning-block-no">4b<\/span><span class="tuning-block-title">Tail compensation and output range<\/span><span class="tuning-start-badge" title="Start here">2<\/span>/);
@@ -1595,7 +1597,7 @@ test('a flag the advice explains (all its recommendations information) is report
     app.tab('overview');
     const block = app.pane('overview').split('data-node="filters"')[1].split('</li>')[0];
     assert.doesNotMatch(block, /tuning-block-ids">F5/, 'the explained flag is not listed as a problem');
-    assert.match(app.pane('overview'), /Information: <span class="tuning-block-check">F5<\/span>/, 'the step keeps the explained flag as information');
+    assert.match(app.pane('overview'), /Information: <span class="tuning-block-check">F1<\/span>, <span class="tuning-block-check">F5<\/span>/, 'the step keeps the explained flag as information');
     const alone = synthResult({ findings: [Object.assign({}, f5)] }), one = analysed({ result: alone });
     assert.match(one.pane('overview'), /<div class="tuning-muted">Information 1<\/div>/, 'an explained flag alone contributes no problem to the summary');
 });
@@ -1837,9 +1839,9 @@ test('filters, sorting, copy and save', async () => {
         '### 3. Increase the yaw collective precompensation <b>!</b> (Change)', '### 4. Examine the tail center trim of PID profile 1 (Check)', '### 6. Increase the roll P gain (Change, blocked)',
         '### 9. Examine the roll tracking error (Check, possible result)', '- Possible result of: K5 Tracking error. Examine: Correct C5 first. Then fly again.',
         'A new digital twin result', '## Gain analysis',
-        '| Problem | F5 | 2 | PID profile 1 | 4.061 (22 values) |', '| Monitor | C12 | 2 | PID profile 1 roll | 0.310 ± 0.030 fraction (12 values) | 0.3 | pipeline, unvalidated | In PID profile 1 the roll tracking error is 31 ± 3 % of the setpoint. | tracking error |',
+        '| Information | F5 | 2 | PID profile 1 | 4.061 (22 values) |', '| Monitor | C12 | 2 | PID profile 1 roll | 0.310 ± 0.030 fraction (12 values) | 0.3 | pipeline, unvalidated | In PID profile 1 the roll tracking error is 31 ± 3 % of the setpoint. | tracking error |',
         '## Before the first flight', '| Item | Condition | Checks with a problem | Checks |', '| Blackbox log | Problem | D1, D2 | D1, D2, D3, D4, H |', '| Power | No data |  | D5, G13, G11 |',
-        '## Tuning steps', '| 1 | Filters | Start here | 1 | F5, F1 | gyro_lpf1_type, gyro_lpf1_static_hz,', '| 3a | Cyclic gains | Blocked |  | C5 roll | {pitch,roll}_{d,p,i,f,o,b}_gain |',
+        '## Tuning steps', '| 1 | Filters | Start here | 1 |  | gyro_lpf1_type, gyro_lpf1_static_hz,', '| 3a | Cyclic gains | Blocked |  | C5 roll | {pitch,roll}_{d,p,i,f,o,b}_gain |',
         '| 4b | Tail compensation and output range | Start here | 2 | T8 | yaw_collective_ff_gain, yaw_cw_stop_gain, gov_tta_gain |',
         '## Parameter groups', '| Group | Area | Status | Checks | Parameters | Data |', '| Area 0 | Area 0 | Result | C5, C7 | roll_p_gain, pitch_p_gain |', '| Group 1 | Area 1 | Measured | C5, C7 |',
         '## Detailed analysis report', 'The toolkit report.',
@@ -2033,14 +2035,14 @@ test('V4: a recommendation from the rule of a check (advice.cjs "advisory") has 
 // --- V10: the diagram status text fits its box; a compare plot of one PID profile shows its periods only -------------------
 
 test('V10: a step lists the checks with a problem in its condition line, 6 at most and "+N"; a check with more results has its count', () => {
-    const r = synthResult(), c11 = ['roll', 'pitch', 'yaw'].map((a) => ({ module: 'loop', id: 'C11', severity: 'flag', log: 1, profile: 1, pidProfile: 1, axis: a, value: 0.7,
-        threshold: 0.5, text: 'D-term', times: [], fid: 'loop|C11|1|0|1|' + a + '|0', node: 'filters', noun: 'D-term noise' }));
-    const f10 = ['roll', 'pitch', 'yaw'].map((a) => ({ module: 'more', id: 'F10', severity: 'flag', log: 1, profile: 1, axis: a, value: 0.6, threshold: 0.5, text: 'D', times: [],
-        fid: 'more|F10|1|0|1|' + a + '|0', node: 'filters', noun: 'D-term noise' }));
-    r.findings = r.findings.concat(c11, f10);
+    const r = synthResult(), c11 = ['roll', 'pitch', 'yaw'].map((a) => ({ module: 'loop', id: 'F6', severity: 'flag', log: 1, profile: 1, pidProfile: 1, axis: a, value: 0.7,
+        threshold: 0.5, text: 'D-term', times: [], fid: 'setup|F6|1|0|1|' + a + '|0', node: 'filters', noun: 'Vibration decrease' }));
+    const f10 = ['roll', 'pitch', 'yaw'].map((a) => ({ module: 'more', id: 'F11', severity: 'flag', log: 1, profile: 1, axis: a, value: 0.6, threshold: 0.5, text: 'D', times: [],
+        fid: 'more|F11|1|0|1|' + a + '|0', node: 'filters', noun: 'Vibration decrease' }));
+    r.findings = r.findings.map(f=>f.id==='F5'?{...f,id:'F6',noun:'Vibration decrease'}:f.id==='F1'?{...f,id:'F11'}:f).concat(c11, f10);
     const app = analysed({ result: r }), o = app.pane('overview');
-    assert.match(o, /data-node="filters"[^]*?<span class="tuning-badge st-start">Start here 1<\/span> <span class="tuning-block-ids">F5, F1, C11 roll, C11 pitch, C11 yaw, F10 roll \+2<\/span>/);
-    assert.match(o, /<li class="st-problem" title="Problem, 3 results"><span class="tuning-dot st-problem"><\/span><span class="tuning-block-check">C11<\/span> D-term noise <span class="tuning-block-check-st">Problem ×3<\/span><\/li>/,
+    assert.match(o, /data-node="filters"[^]*?<span class="tuning-badge st-start">Start here 1<\/span> <span class="tuning-block-ids">F6, F11, F6 roll, F6 pitch, F6 yaw, F11 roll \+2<\/span>/);
+    assert.match(o, /<li class="st-problem" title="Problem, 4 results"><span class="tuning-dot st-problem"><\/span><span class="tuning-block-check">F6<\/span> Vibration decrease <span class="tuning-block-check-st">Problem ×4<\/span><\/li>/,
         'one row for each check, with its noun and the number of results');
     assert.deepEqual(app.errors, []);
 });
@@ -4573,7 +4575,7 @@ test('parameter continuity is explicit, exact-file scoped, persisted and invalid
     const storage={getItem:k=>data.get(k)||null,setItem:(k,v)=>data.set(k,v),removeItem:k=>data.delete(k)};
     const webCrypto={subtle:{digest:async(name,bytes)=>Uint8Array.from(crypto.createHash('sha256').update(bytes).digest()).buffer}};
     const app=analysed({result:controlResult(),webCrypto,storage});app.tab('cyclic');await tick();
-    assert.match(app.pane('cyclic'),/Parameter history/);
+    assert.match(app.pane('cyclic'),/Parameters in selected logs/);
     app.jq.fire('click','.tuning-ct-start');assert.deepEqual(plain(controlRequest(app).options.parameterContinuity),[]);
     answerControl(app);await tick();
     app.jq.fire('change','.tuning-ct-evidence-from',{}, {value:'2'});

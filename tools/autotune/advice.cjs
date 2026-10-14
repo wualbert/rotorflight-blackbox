@@ -476,7 +476,7 @@ const pmPct = (v, se, d = 1) => num(v) === null ? 'unknown' : `${(100 * v).toFix
 const arr = (v) => Array.isArray(v) ? v : v === null || v === undefined ? null : [v];
 const pick = (v, i) => v === undefined || v === null ? null : i === null || i === 'all' ? v : (arr(v)[i] === undefined ? null : arr(v)[i]);
 const sum = (list) => list.reduce((s, f) => s + (num(f.value) || 0), 0);
-const isFlag = (f) => f.severity === 'flag';
+const isFlag = (f) => f.severity === 'flag'&&!setup.filterGuidance(f);
 const thin = (f) => !!f.thin || /^no (?:finding|result)/i.test(String(f.text || ''));   // SPEC2 D5: our modules mark thin data, the others still write "no finding"
 const measured = (f) => (f.severity === 'flag' || f.severity === 'ok' || f.severity === 'note') && !thin(f);
 const logsOf = (f) => Array.isArray(f.log) ? f.log : f.log === null || f.log === undefined ? [] : [f.log];
@@ -943,252 +943,12 @@ const GEN = {
                 + 'Mode 4 changes the units of the axis error, of the roll and pitch B and D gains, and of the yaw precompensation cutoff. The other modes use only the F-term. Make sure that the mode is correct before you change a gain on these PID profiles.' }));
         return out;
     },
-    F1(L, c) {
-        const bad = L.filter(isFlag), none = L.filter(f => f.severity === 'note'); if (!bad.length && !none.length) return [];
-        const h = c.header, act = lpfStages(h), base = { id: 'F1', area: 'filters', rule: 'Check F1 has a problem if no gyro low-pass filter is on when the RPM filters are on.', sources: ['Configurator help text of the gyro low-pass filter'] };
-        if (h.gyro_soft_type === undefined) return noHeader('F1', 'filters', bad.concat(none), c);
-        if (act.length) return one(bad.concat(none), Object.assign(base, { severity: 'info', title: 'No gyro low-pass filter in previous logs', text: `In ${logsText(bad.concat(none), c)}, no gyro low-pass filter was on. The selected log has ${and(act.map(s => `${s.name} at ${s.hz} Hz`))}.` }));
-        c.filterIssues.add('F1');
-        if (!bad.length) return one(none, Object.assign(base, { title: 'No gyro low-pass filter', text: `There is no gyro low-pass filter and no RPM filter. The Configurator help text gives: "Without them, two second order filters are required". With a dynamic notch filter, one filter at approximately ${RULES.lpfHz} Hz is sufficient.` }));
-        const sets = (h.gyro_soft_type > 0 ? [] : [['gyro_lpf1_type', 'FIRST_ORDER']]).concat([['gyro_lpf1_static_hz', RULES.lpfHz]]);
-        const typeName = num(h.gyro_soft_type) !== null ? setup.LPF_TYPES[h.gyro_soft_type] || String(h.gyro_soft_type) : null;
-        return one(bad, Object.assign(base, { severity: 'action', title: `Add a gyro low-pass filter at ${RULES.lpfHz} Hz`, parameter: 'gyro_lpf1_static_hz', scope: 'global', from: num(h.gyro_lowpass_hz), to: RULES.lpfHz, direction: 'set', sets,
-            fromSets: { gyro_lpf1_type: typeName, gyro_lpf1_static_hz: num(h.gyro_lowpass_hz) },
-            rule: `${base.rule} The cutoff is ${RULES.lpfHz} Hz.`, sources: base.sources.concat(RULES.source.lpfHz), text: `No gyro low-pass filter is on, but the RPM filters are on. Only the PID bandwidth filter changes the gyro signal before the P-term.`,
-            setText: `Set the ${h.gyro_soft_type > 0 ? typeName : 'FIRST_ORDER'} low-pass filter cutoff to ${RULES.lpfHz} Hz.`, setNote: `The estimated ${h.gyro_soft_type > 0 ? typeName : 'FIRST_ORDER'} low-pass filter cutoff is ${RULES.lpfHz} Hz.`,
-            caveats: ['This filter adds a time delay. After the change, checks C11 and F10 and the checks of the tracking error give new values.'] }))
-            .map(r => fromHeader(r, c, [['gyro_soft2_type', 'global'], ['gyro_lowpass2_hz', 'global'], ['gyro_lowpass_dyn_hz', 'global'], ['features', 'global']], true));
-    },
-    F2(L, c) {
-        const bad = L.filter(isFlag), mild = L.filter(f => f.severity === 'note'); if (!bad.length && !mild.length) return [];
-        if (c.header.gyro_soft_type === undefined) return noHeader('F2', 'filters', bad.concat(mild), c);
-        const st = lpfStages(c.header).sort((a, b) => a.hz - b.hz)[0], rule = `Check F2 has a problem if the lowest cutoff of the gyro low-pass filters is less than ${RULES.minLpfHz} Hz. It gives a value to monitor if the cutoff is less than ${RULES.noteLpfHz} Hz.`, sources = [RULES.source.minLpfHz, RULES.source.noteLpfHz];
-        if (st && st.hz < RULES.minLpfHz) { c.filterIssues.add('F2');
-            return one(bad.concat(mild), { id: `F2:${st.param}`, area: 'filters', severity: 'action', title: `Increase the ${st.name} cutoff to ${RULES.minLpfHz} Hz`, parameter: st.param, scope: 'global', from: st.hz, to: RULES.minLpfHz, direction: 'raise',
-                sets: [[st.param, RULES.minLpfHz]], rule: rule + ' The new value is the minimum of the documentation, not a percentage step.', sources, text: `The ${st.name} cutoff is ${st.hz} Hz, which is less than the minimum of the documentation, ${RULES.minLpfHz} Hz. A low cutoff gives more time delay and lower gains (FILT).`,
-                fromSets: { [st.param]: st.hz }, caveats: ['A higher cutoff lets more vibration through. After the change, checks F5, F6 and the D-term checks give new values.'] })
-                .map(r => fromHeader(r, c, [['gyro_soft_type', 'global'], ['gyro_lowpass_hz', 'global'], ['gyro_soft2_type', 'global'], ['gyro_lowpass2_hz', 'global'], ['gyro_lowpass_dyn_hz', 'global']], true)); }
-        if (st && st.hz < RULES.noteLpfHz) return one(bad.concat(mild), { id: 'F2', area: 'filters', severity: 'watch', title: `Gyro low-pass filter at ${st.hz} Hz`, rule, sources,
-            text: `The lowest cutoff of the gyro low-pass filters is ${st.hz} Hz (${st.name}), which is between ${RULES.minLpfHz} Hz and ${RULES.noteLpfHz} Hz. This value is correct, but FILT: "better if this cutoff is high".` });
-        return one(bad.concat(mild), { id: 'F2', area: 'filters', severity: 'info', title: 'Low gyro low-pass filter in previous logs', rule, sources,
-            text: `In ${logsText(bad.concat(mild), c)}, a gyro low-pass filter had a cutoff of less than ${RULES.noteLpfHz} Hz. The selected log has ${st ? `${st.name} at ${st.hz} Hz` : 'no gyro low-pass filter (refer to check F1)'}.` });
-    },
-    F3(L, c) {
-        const bad = L.filter(isFlag); if (!bad.length) return [];
-        if (c.header.dyn_notch_q === undefined && !lib.AXES.some(ax => c.header[`gyro_rpm_notch_q_${ax}`])) return noHeader('F3', 'filters', bad, c);
-        const h = c.header, q = Math.round(RULES.minNotchQ * 10), out = [], base = { area: 'filters', evidence: bad.map(evidence), rule: `Check F3 has a problem if the Q of a notch filter is less than ${RULES.minNotchQ.toFixed(1)}.`, sources: [RULES.source.minNotchQ] };
-        if (feature(h, 'DYN_NOTCH') && num(h.dyn_notch_q) !== null && h.dyn_notch_q < q)
-            out.push(fromHeader(rec(Object.assign({ id: 'F3:dyn_notch_q', severity: 'action', title: `Set the Q of the dynamic notch filter to ${RULES.minNotchQ.toFixed(1)}`, parameter: 'dyn_notch_q', scope: 'global', from: h.dyn_notch_q, to: q, direction: 'raise', sets: [['dyn_notch_q', q]],
-                fromSets: { dyn_notch_q: h.dyn_notch_q },
-                text: `dyn_notch_q is ${h.dyn_notch_q}, which is a Q of ${h.dyn_notch_q / 10} (dyn_notch_q is the Q multiplied by 10). The Configurator help text gives: a Q of less than ${RULES.minNotchQ.toFixed(1)} "will greatly increase filter delay".` }, base)), c, [['features', 'global']], true));
-        for (const ax of lib.AXES) { const n = notchArrays(h, ax); if (!n.source || !n.q) continue;
-            const low = n.q.map((v, i) => n.source[i] > 0 && v > 0 && v < q); if (!low.some(Boolean)) continue;
-            // the CLI sets a whole bank array of RPM_FILTER_BANK_COUNT values (cli.c): a header array of another length gives no CLI text
-            const custom = h.gyro_rpm_notch_preset === 0, whole = n.q.length === BANKS && n.source.length === BANKS, to = n.q.map((v, i) => low[i] ? q : v).join(',');
-            const r = fromHeader(rec(Object.assign({ id: `F3:gyro_rpm_notch_q_${ax}`, severity: custom ? 'action' : 'check', parameter: `gyro_rpm_notch_q_${ax}`, scope: 'global', from: n.q.join(','), to, direction: 'raise',
-                title: custom ? `Set the Q of the ${ax} RPM notch filters to ${RULES.minNotchQ.toFixed(1)}` : `Q of less than ${RULES.minNotchQ.toFixed(1)} in the ${ax} RPM notch filters of a preset`,
-                sets: custom && whole ? [[`gyro_rpm_notch_q_${ax}`, to]] : null, fromSets: { [`gyro_rpm_notch_q_${ax}`]: n.q.join(',') },
-                text: `The ${ax} RPM notch filters in bank ${and(low.map((v, i) => v ? String(i) : null).filter(Boolean))} have a Q of less than ${RULES.minNotchQ.toFixed(1)} (values ${and(n.q.filter((v, i) => low[i]).map(String))}, the Q multiplied by 10).`
-                    + (custom ? '' : ' At the start, the firmware replaces the banks that you set with the banks of the preset. Thus, a change of these banks is possible only with gyro_rpm_notch_preset 0.') }, base)),
-                c, [['gyro_rpm_notch_preset', 'global'], [`gyro_rpm_notch_source_${ax}`, 'global']], true);
-            if (custom && !whole) r.caveats.push(BANK_TEXT(`gyro_rpm_notch_q_${ax}`, n.q.length));
-            out.push(r);
-        }
-        if (out.length) c.filterIssues.add('F3');
-        return out.length ? out : one(bad, { id: 'F3', area: 'filters', severity: 'info', title: `Notch filter Q of less than ${RULES.minNotchQ.toFixed(1)} in previous logs`, rule: base.rule, sources: base.sources,
-            text: `In ${logsText(bad, c)}, a notch filter had a Q of less than ${RULES.minNotchQ.toFixed(1)}. The selected log has no notch filter with this Q.` });
-    },
-    F4(L) {
-        return [...group(L.filter(f => f.severity === 'note'), f => f.profile)].map(([ax, list]) => { const v = list[list.length - 1].value;
-            return rec({ id: `F4:${ax}_d_cutoff`, area: 'filters', severity: 'info', axis: ax, title: `${cap(ax)} D-term cutoff at ${v} Hz`, parameter: `${ax}_d_cutoff`, evidence: list.map(evidence),
-                rule: `Check F4 compares the D-term cutoff with ${SR.F4.targetHz} ± ${SR.F4.toleranceHz} Hz. It gives information only.`, sources: ['Rotorflight documentation, "Profiles tab": "around 20Hz"', 'toolkit rule: the tolerance of check F4'],
-                text: `The ${ax} D-term cutoff is ${v} Hz, and PROF gives approximately ${SR.F4.targetHz} Hz. The logs do not show that a change is necessary.` + (ax === 'yaw' ? ' If the yaw has an oscillation that decreases after a CCW stop, a lower value is possible (20 Hz to 15 Hz, a recommendation from other pilots).' : '') }); });
-    },
-    F5(L, c) {
-        const bad = L.filter(isFlag); if (!bad.length) return [];
-        // the tail rotor harmonics: from the CLI dump, else from the notch orders that the log shows (c.gear, basis 'log notch')
-        const h = c.header, gear = gearOf(c.cli) || c.gear || null, tail = tailOrders(gear), tol = SR.F5.maxDistance;
-        const tailUnknown = !c.cli && !(tail && tail.length) && lib.AXES.some(ax => (notchArrays(h, ax).source || []).some(s => s >= 21 && s <= 28));
-        // every line of every flag (health_setup F5: the lines of one log and PID profile, strongest first), with the axes
-        // that have no notch filter at 2 % or less from it, and what the gyro filters pass of it (the worker's filterPass:
-        // gyroRAW to gyroADC at the line, in a log with curves)
-        const maxPass = (q) => q && lib.AXES.every(ax => num(q[ax]) !== null) ? Math.max(...lib.AXES.map(ax => q[ax])) : null;
-        const lines = bad.flatMap(f => Array.isArray(f.lines) ? f.lines.filter(l => num(l.order) !== null && num(l.hz) !== null && num(l.prominence) !== null).map((l, i) => {
-            const axes = (l.axes || []).map(a => ({ axis: a.axis, code: a.nearestNotch ? num(a.nearestNotch.code) : null, distance: a.nearestNotch ? num(a.nearestNotch.distance) : null }));
-            const pass = Array.isArray(f.filterPass) ? f.filterPass.find(q => Math.abs(q.hz - l.hz) < 0.5) || null : null;
-            return { f, seg: '', first: i === 0, order: l.order, hz: l.hz, prominence: l.prominence, locked: l.rotorLocked === true,
-                uncovered: axes.filter(a => a.code === null || a.distance === null || a.distance > tol).map(a => a.axis), axes, pass, passMax: maxPass(pass) };
-        }) : String(f.text).split('; ').map((seg, i) => {
-            const m = /^line at ([\d.]+) x rotor \(([\d.]+) Hz, prominence ([\d.]+)/.exec(seg); if (!m) return null;
-            const uncovered = lib.AXES.filter(ax => { const a = new RegExp(`\\b${ax} (?:\\d+ at [\\d.]+ \\(([\\d.]+) %\\)|none)`).exec(seg); return a && (a[1] === undefined || +a[1] > tol * 100); });
-            const pass = Array.isArray(f.filterPass) ? f.filterPass.find(q => Math.abs(q.hz - +m[2]) < 0.5) || null : null;
-            const axes = [...seg.matchAll(/\b(roll|pitch|yaw) (?:(\d+) at [\d.]+ \(([\d.]+) %\)|none)/g)].map(a => ({ axis: a[1], code: a[2] === undefined ? null : +a[2], distance: a[3] === undefined ? null : +a[3] / 100 }));
-            const locked = /\brotor-locked\)/.test(seg) && !/not rotor-locked/.test(seg);   // health_setup: the same order at another headspeed
-            return { f, seg, first: i === 0, order: +m[1], hz: +m[2], prominence: +m[3], locked, uncovered, axes, pass, passMax: maxPass(pass) };
-        })).filter(Boolean);
-        for (const f of bad) { const own = lines.filter(l => l.f === f); own.forEach(l => { l.first = false; }); if (!own.length) continue;
-            const top = own.reduce((a, l) => l.prominence > a.prominence ? l : a); top.first = true;
-            // the evidence of the worker (evidence.cjs facts.axes, review D-M5a) gives the axes of the strongest line that have a peak
-            const fx = f.evidence && f.evidence.facts && Array.isArray(f.evidence.facts.axes) ? f.evidence.facts.axes.filter(a => a && lib.AXES.includes(a.axis)) : null;
-            if (fx && fx.length && num(f.value) !== null && Math.abs(f.value / top.order - 1) < 1e-3) { top.axes = fx.map(a => ({ axis: a.axis, code: num(a.code), distance: num(a.distance) })); top.uncovered = fx.filter(a => !a.near).map(a => a.axis); } }
-        // each axis of a line (review D-M5a): its nearest notch filter and the distance
-        const axisNote = (l) => l.axes.length ? `At ${l.hz} Hz, the nearest notch filters are ${and(l.axes.map(a => `${a.code !== null ? `source ${a.code}` : 'none'} (${a.axis}${a.distance !== null ? `, ${pct(a.distance, 1)} from the line` : ''})`))}.` : null;
-        const cite = (qs) => bad.filter(f => qs.some(q => q.lines.some(l => l.f === f))).map(evidence);   // the flags that hold the lines of qs
-        // one line in each PID profile: the same rotor order within the harmonic tolerance of check G12 (a rotor-locked line
-        // keeps its order when the headspeed changes). A line that is the strongest of a flag is handled; a weaker line is
-        // left to the low-pass filter (RPMF: each notch filter adds a time delay), unless checks C11 and F10 show a problem
-        const clusters = [];
-        for (const l of lines.slice().sort((a, b) => b.prominence - a.prominence)) { const q = clusters.find(x => Math.abs(l.order / x.order - 1) <= GR.G12.tolerance); if (q) q.lines.push(l); else clusters.push({ order: l.order, lines: [l] }); }
-        for (const q of clusters) { const k = Math.max(1, Math.round(q.order)), passes = q.lines.map(l => l.passMax);
-            Object.assign(q, { k, top: q.lines[0], handled: q.lines.some(l => l.first), harmonic: Math.abs(q.order / k - 1) <= RULES.harmonicTol, measured: passes.every(v => v !== null),
-                removed: passes.every(v => v !== null) && Math.max(...passes) < RULES.filteredPass, uncovered: lib.AXES.filter(ax => q.lines.some(l => l.uncovered.includes(ax))) });
-            q.main = q.harmonic && k <= RULES.maxMainHarmonic;
-            // a tail rotor harmonic j (in RULES.harmonicTol of j x the tail rotor order: the CLI dump, else the notch orders that the
-            // log shows) is a rotor harmonic, not a resonance: an RPM notch filter with source 20 + j follows it (rpm_filter.c)
-            const th = !q.harmonic && tail && tail.length ? tail.map(({ k: j, o }) => ({ j, d: Math.abs(q.order / o - 1) })).sort((a, b) => a.d - b.d)[0] : null;
-            q.tailK = th && th.d <= RULES.harmonicTol ? th.j : null; }
-        const topC = clusters[0] || null, top = topC ? topC.top : null; c.topLine = top;
-        if (!top) return [rec({ id: 'F5', area: 'filters', title: 'Vibration line with no notch filter', evidence: bad.map(evidence), rule: `Check F5 examines the gyroRAW lines with a prominence of ${SR.F5.minProminence} or more.`, sources: [src(SR.F5.source)],
-            text: `${bad.length === 1 ? '1 result shows' : `${bad.length} results show`} a strong vibration line with no notch filter at ${tol * 100} % or less from it.` })];
-        const at = (l) => `(${l.hz} Hz, prominence ${l.prominence}, ${whereOf(l.f, c)})`, axesText = (ax) => `the ${and(ax)} ${ax.length === 1 ? 'axis' : 'axes'}`;
-        // where one line is in each PID profile, and the reason that its prominence has no SE. A caveat is a description of 25
-        // words or less (STE Rule 6.3): each line of a short list, else the range of each PID profile, else one range of all
-        const each = (q) => {
-            if (q.lines.length < 2) return '';
-            const ls = q.lines.slice().sort((a, b) => a.hz - b.hz), head = `In the logs, the line at ${order(q.top.order)} is at`;
-            if (EACH_LIST.fixed + 2 * ls.length <= EACH_LIST.words) return `${head} ${and(ls.map(l => `${l.hz} Hz (${whereOf(l.f, c)})`))}.`;
-            const one = (xs) => xs[0].hz === xs[xs.length - 1].hz, range = (xs) => one(xs) ? `${xs[0].hz} Hz` : `${xs[0].hz} Hz to ${xs[xs.length - 1].hz} Hz`, by = new Map();
-            for (const l of ls) { const p = num(profileOf(l.f)) > 0 ? num(profileOf(l.f)) : 0; (by.get(p) || by.set(p, []).get(p)).push(l); }
-            const groups = [...by].sort((a, b) => (a[0] || 7) - (b[0] || 7));
-            if (EACH_LIST.fixed + groups.reduce((s, [, xs]) => s + (one(xs) ? 2 : 4), 0) > EACH_LIST.words) return `${head} ${range(ls)} (${many(ls.length, 'result')} in ${many(groups.length, 'PID profile')}).`;
-            return `${head} ${and(groups.map(([p, xs]) => `${range(xs)} (${prof(p)}, ${many(xs.length, 'result')})`))}.`;
-        };
-        const wins = [...new Set(bad.map(f => num(f.n)).filter(v => v !== null))].sort((x, y) => x - y);
-        const noSe = `Check F5 gives no SE for a prominence, because it calculates one spectrum for each log and PID profile${wins.length ? ` (${wins.length === 1 ? wins[0] : `${wins[0]} to ${wins[wins.length - 1]}`} windows)` : ''}.`;
-        const rule = `Check F5 examines the gyroRAW lines with a prominence of ${SR.F5.minProminence} or more. It has a problem if the nearest notch filter is more than ${tol * 100} % from a line on 1 or more axes.`, sources = [src(SR.F5.source)];
-        const out = [], handled = clusters.filter(q => q.handled), open = handled.filter(q => !q.removed);
-        // a main rotor harmonic that is weaker than the strongest line of its log and PID profile (review: Fireball 2026-10-05
-        // log 16, harmonic 3 at 224.9 Hz under the 3.79 x resonance) gets an RPM notch filter too, on each axis where it is
-        // rotor-locked, has a prominence of minProminence or more, has no notch filter at 2 % or less, and the gyro filters let
-        // RULES.weakPass or more of it through (measured). A line at 1 x rotor from a resonance is a part of that resonance (the
-        // 2.79 x and 4.79 x lines beside 3.79 x), not a harmonic: it never gets an RPM notch filter
-        const resonances = handled.filter(q => !q.harmonic && !q.tailK).map(q => q.order);
-        const besideOf = (o, ro) => [ro - 1, ro + 1].some(s => s > 0 && Math.abs(o / s - 1) <= RULES.harmonicTol);
-        const weakAxes = (l) => l.locked && l.prominence >= SR.F5.minProminence && !resonances.some(ro => besideOf(l.order, ro))
-            ? l.uncovered.filter(ax => l.pass && num(l.pass[ax]) !== null && l.pass[ax] >= RULES.weakPass) : [];
-        const weak = clusters.filter(q => !q.handled && q.main).map(q => { const ok = q.lines.filter(l => weakAxes(l).length);
-            return ok.length ? Object.assign(q, { lines: ok, top: ok[0], weak: true, measured: true, uncovered: lib.AXES.filter(ax => ok.some(l => weakAxes(l).includes(ax))) }) : null; }).filter(Boolean);
-        if (open.length || weak.length) c.filterIssues.add('F5');
-        // the strongest line, when the gyro filters remove it in every log where it is (measured): no filter problem
-        if (topC.removed) {
-            const pass = top.pass, passes = Array.isArray(top.f.filterPass) ? top.f.filterPass : [];
-            const through = passes.filter(q => q !== pass && maxPass(q) !== null && maxPass(q) >= RULES.filteredPass).sort((a, b) => maxPass(b) - maxPass(a));
-            out.push(rec({ id: 'F5', area: 'filters', severity: 'info', title: through.length ? 'The filters remove the strongest vibration line' : 'The filters remove the vibration line', evidence: cite([topC]),
-                rule: `Check F5 has a problem, but the gyro filters let less than ${RULES.filteredPass * 100} % of its strongest line through.`, sources: sources.concat(RULES.source.filteredPass),
-                text: `The strongest vibration line is at ${order(top.order)} ${at(top)}.${topC.uncovered.length ? ` It has no notch filter at ${tol * 100} % or less on ${axesText(topC.uncovered)}.` : ''} `
-                    + `But the gyro filters let only ${and(lib.AXES.map(ax => `${fmt(pass[ax] * 100, 1)} %`))} of it through (roll, pitch and yaw, from gyroRAW to gyroADC). Thus, a notch filter is not necessary. `
-                    + (through.length ? `Only the low-pass filter decreases ${many(through.length, 'weaker line')} (${through.slice(0, 4).map(q => `${q.hz} Hz, up to ${fmt(maxPass(q) * 100, 0)} %`).join(', ')}${through.length > 4 ? ' and more' : ''}). ` : '')
-                    + 'A line this strong is a cause to examine the balance, the blade tracking and the bearings.',
-                caveats: (through.length ? ['Each notch filter adds a time delay (RPMF). Thus, the app adds no notch filter for the weaker lines if checks C11 and F10 show no problem.'] : []).concat([axisNote(top), noSe].filter(Boolean)) }));
-        }
-        // a line that the filters do not remove, with a tail rotor notch filter whose frequency the log does not record (no CLI
-        // dump): possibly that notch filter is on the line (guard 9): a check, before any filter change
-        if ((open.length || weak.length) && tailUnknown) { const q = open[0] || weak[0];
-            const r = rec({ id: q === topC ? 'F5' : 'F5:tail', area: 'filters', title: 'Vibration line with no notch filter', evidence: cite(open.concat(weak)), rule, sources, caveats: [noSe],
-                text: `${bad.length === 1 ? '1 result shows' : `${bad.length} results show`} a strong vibration line with no notch filter at ${tol * 100} % or less from it. The strongest of these lines is at ${order(q.top.order)} ${at(q.top)}. `
-                    + 'The log does not record the frequency of the tail rotor notch filters. Thus, the analysis cannot find if a tail rotor notch filter is on this line.'
-                    + (q.measured || !(q.top && q.top.f) ? '' : `\nTo measure the filters at this line, do the analysis of ${logsText([q.top.f], c)} with "This log" in "Logs".`) });
-            r.caveats.unshift('A tail rotor notch filter (source 21 to 28) is in the configuration. The log does not record its frequency. Possibly, it is on this line.');
-            return out.concat(r); }
-        // main rotor harmonics 1-8 that the filters do not remove: RPM notch filters, source 10 + k (rpm_filter.c), Q 4.0
-        // (FILT), in the first free bank of each axis with no notch filter for the line; one recommendation, because each
-        // CLI line sets a whole bank array. A tail rotor harmonic j: source 20 + j, the same way
-        const mains = open.filter(q => q.main || q.tailK).concat(weak);
-        const hname = (q) => q.tailK ? `tail rotor harmonic ${q.tailK}` : `main rotor harmonic ${q.k}`, hsrc = (q) => q.tailK ? 20 + q.tailK : 10 + q.k, hshort = (q) => q.tailK ? hname(q) : `harmonic ${q.k}`;
-        if (mains.length) {
-            const arrays = {}; let why = null;
-            for (const ax of lib.AXES) { const n = notchArrays(h, ax); arrays[ax] = n.source && n.q && n.center ? { n, source: n.source.slice(), q: n.q.slice(), center: n.center.slice() } : null; }
-            for (const q of mains) for (const ax of q.uncovered) { const a = arrays[ax];
-                if (!a) { why = why || `The log header does not have the RPM notch banks of the ${ax} axis. Thus, there is no CLI text.`; continue; }
-                if (a.source.length !== BANKS || a.q.length !== BANKS || a.center.length !== BANKS) { why = why || BANK_TEXT(`gyro_rpm_notch_source_${ax}`, a.source.length); continue; }
-                const i = a.source.indexOf(0); if (i < 0) { why = why || `All ${BANKS} RPM notch banks of the ${ax} axis are in use. Thus, there is no CLI text.`; continue; }
-                a.source[i] = hsrc(q); a.q[i] = 40; a.center[i] = 0; }
-            const axes = lib.AXES.filter(ax => mains.some(q => q.uncovered.includes(ax))), fromSets = {};
-            let sets = h.gyro_rpm_notch_preset === 0 ? [] : [['gyro_rpm_notch_preset', 0]]; if (h.gyro_rpm_notch_preset !== 0) fromSets.gyro_rpm_notch_preset = num(h.gyro_rpm_notch_preset);
-            for (const ax of axes) { const a = arrays[ax]; if (!a) continue;
-                for (const k of ['source', 'q', 'center']) { sets.push([`gyro_rpm_notch_${k}_${ax}`, a[k].join(',')]); fromSets[`gyro_rpm_notch_${k}_${ax}`] = a.n[k].join(','); } }
-            if (why) sets = null;
-            const ks = mains.map(q => q.k), one1 = mains.length === 1, q0 = mains[0], tails = mains.filter(q => q.tailK), passText = (q) => q.measured ? `The gyro filters let ${fmt(Math.min(...q.lines.map(l => l.passMax)) * 100, 0)} % to ${fmt(Math.max(...q.lines.map(l => l.passMax)) * 100, 0)} % of ${hshort(q)} through.` : '';
-            const r = rec({ id: mains.includes(topC) ? 'F5' : 'F5:rpm', area: 'filters', severity: 'action', title: one1 ? `RPM notch filter at ${hname(q0)}` : tails.length ? `RPM notch filters at ${and(mains.map(hname))}` : `RPM notch filters at main rotor harmonics ${and(ks.map(String))}`,
-                parameter: axes.length ? `gyro_rpm_notch_source_${axes[0]}` : null, scope: 'global', direction: 'set', sets: axes.length ? sets : null, fromSets, evidence: cite(mains),
-                rule: `${rule} The gear ratios in the configuration are correct. RPM notch filters follow the main rotor harmonics 1 to ${RULES.maxMainHarmonic}${tails.length ? ' and the tail rotor harmonics 1 to 8' : ''}.`
-                    + (weak.length ? ` A weaker harmonic gets an RPM notch filter if the gyro filters let ${RULES.weakPass * 100} % or more of it through.` : ''),
-                sources: sources.concat(RULES.source.maxMainHarmonic, weak.length || tails.length ? [RULES.source.harmonicTol] : [], weak.length ? [RULES.source.weakPass] : []),
-                text: mains.map(q => `${q === topC ? 'The strongest vibration line' : 'A vibration line'} with no notch filter on ${axesText(q.uncovered)} is at ${order(q.top.order)} ${at(q.top)}, ${hname(q)}.`).join(' ')
-                    + ' The gear ratios in the configuration are correct.',
-                setText: `${mains.map(q => `Add an RPM notch filter with source ${hsrc(q)} and Q 4.0 (FILT) on ${axesText(q.uncovered)}.`).join(' ')}`,
-                setNote: `${mains.map(q => `An RPM notch filter with source ${hsrc(q)} and Q 4.0 (FILT) on ${axesText(q.uncovered)} can remove ${hshort(q)}.`).join(' ')}`,
-                caveats: [noSe, 'Each notch filter adds a time delay (RPMF). After the change, checks F11, C13 and T12 give new values.', 'Banks that you set are possible only with gyro_rpm_notch_preset 0, and the CLI text keeps the banks of the preset from the log header.']
-                    .concat(mains.map(each).filter(Boolean), mains.map(passText).filter(Boolean), mains.map(q => axisNote(q.top)).filter(Boolean)).concat(why ? [why] : []) });
-            out.push(fromHeader(r, c, [['gyro_rpm_notch_preset', 'global']].concat(axes.map(ax => [`gyro_rpm_notch_q_${ax}`, 'global'])), false));
-        }
-        // the other lines that the filters do not remove: no RPM notch source follows them. The dynamic notch filter, or a static
-        // notch filter at one frequency, with the range of the strongest of them in each PID profile
-        const rest = open.filter(q => !q.main && !q.tailK);
-        if (rest.length) {
-            const q = rest[0], hzs = q.lines.map(l => l.hz), lo0 = Math.min(...hzs), hi0 = Math.max(...hzs), span = lo0 === hi0 ? `${lo0} Hz` : `${lo0} Hz to ${hi0} Hz`;
-            const the = lo0 === hi0 ? `the line at ${span}` : `the line in each log and PID profile (${span})`;
-            const lo = num(h.dyn_notch_min_hz), hi = num(h.dyn_notch_max_hz), dyn = feature(h, 'DYN_NOTCH'), inside = dyn === true && lo !== null && hi !== null && lo0 >= lo && hi0 <= hi;
-            const ways = inside ? `The dynamic notch filter is on, and its range (${lo} Hz to ${hi} Hz) contains ${the}. Make sure that dyn_notch_count gives a notch filter for it.`
-                : hi0 > 500 ? `${hi0} Hz is more than the maximum dyn_notch_max_hz (500 Hz in the firmware). Thus, the dynamic notch filter cannot remove ${lo0 === hi0 ? 'it' : 'all of it'}.`
-                : dyn === true ? `The dynamic notch filter is on, but its range (${lo} Hz to ${hi} Hz) does not contain ${the}. A range that contains ${span} can remove it (dyn_notch_min_hz and dyn_notch_max_hz, the CLI range of the maximum is 100 to 500).`
-                : dyn === false ? `The dynamic notch filter is off (the bit of \`feature DYN_NOTCH\` in the log header is 0). If you turn it on with a range that contains ${span} (dyn_notch_min_hz, dyn_notch_max_hz), it can remove this line.`
-                : `The log header does not show if the dynamic notch filter is on (\`feature DYN_NOTCH\`). With a range that contains ${span}, it can remove this line. The firmware turns it off when the PID loop rate is less than 1 kHz (F8).`;
-            const STATIC = 'A static notch filter (gyro_notch1_hz, gyro_notch1_cutoff) has one frequency, and it is correct for one headspeed only.';
-            const head = `${q === topC ? 'The strongest vibration line' : 'A strong vibration line'} with no notch filter on ${axesText(q.uncovered)} is at ${order(q.top.order)} ${at(q.top)}.`;
-            const more = rest.length > 1 ? [`${cap(many(rest.length - 1, 'other line'))} with no notch filter ${rest.length > 2 ? 'are' : 'is'} the strongest line of a log and PID profile: ${rest.slice(1, 4).map(x => `${order(x.top.order)} at ${x.top.hz} Hz`).join(', ')}.`] : [];
-            const id = q === topC ? 'F5' : 'F5:resonance';
-            // the lines at 1 x rotor from the resonance: a part of it, not rotor harmonics, with no RPM notch filter
-            // (a line at a tail rotor harmonic is not a part of the resonance: it gets its RPM notch filter above)
-            const tailHarmonic = (o) => !!(tail && tail.some(t => Math.abs(o / t.o - 1) <= RULES.harmonicTol));
-            const beside = [...new Map(lines.filter(l => !q.harmonic && besideOf(l.order, q.order) && !tailHarmonic(l.order)).map(l => [fmt(l.order, 2), l.order])).values()].sort((x, y) => x - y);
-            const besideText = beside.length ? [`The ${beside.length === 1 ? 'line' : 'lines'} at ${and(beside.map(o => order(fmt(o, 2))))} ${beside.length === 1 ? 'is' : 'are'} 1 × rotor from this resonance. `
-                + `${beside.length === 1 ? 'It is' : 'They are'} a part of the resonance, not rotor harmonics. Thus, the app gives no RPM notch filter for ${beside.length === 1 ? 'it' : 'them'}.`] : [];
-            const r = rec({ id, area: 'filters', title: `Vibration line at ${q.top.hz} Hz with no notch filter`, evidence: cite(rest), rule, sources, caveats: [noSe].concat(each(q) ? [each(q)] : [], axisNote(q.top) ? [axisNote(q.top)] : [], more, besideText) });
-            const tailKnown = !!gear && (gear.motorisedTail || !!(tail && tail.length));
-            if (q.harmonic) {  // main-rotor harmonic k > 8: no RPM notch source exists for it
-                Object.assign(r, { title: `Vibration at main rotor harmonic ${q.k}: an RPM notch filter is not possible`, rule: r.rule + ` The gear ratios in the configuration are correct. RPM notch filters follow only the main rotor harmonics 1 to ${RULES.maxMainHarmonic}.`, sources: sources.concat(RULES.source.maxMainHarmonic) });
-                r.text = `${head} It is main rotor harmonic ${q.k}, but an RPM notch filter can follow only harmonics 1 to ${RULES.maxMainHarmonic} (sources 11 to 18). The gear ratios in the configuration are correct. ${ways} Examine the blade tracking and the balance first (FILT).`;
-                r.caveats.push(STATIC);
-            } else if (!q.measured && !tailKnown) {
-                // D-H2: the filters were not measured at this line and the tail rotor harmonics are unknown: no claim that it is a
-                // resonance, a check that asks for the measurement
-                Object.assign(r, { title: `Vibration line at ${q.top.hz} Hz: measure the filters at this line` });
-                r.text = `${head} The analysis did not measure the part of this line that the gyro filters let through, because the results of ${logsText(q.lines.map(l => l.f), c)} have no spectra. `
-                    + `The log does not record the frequencies of the tail rotor harmonics. Thus, the app cannot find the cause of this line. `
-                    + `To measure the filters at this line, do the analysis of ${logsText([q.top.f], c)} with "This log" in "Logs".`;
-            } else {
-                // not a rotor harmonic. The gear ratios in the configuration are correct (CLAUDE.md, SPEC2 section 6): the line is a
-                // resonance, a filter target and a mechanical vibration to examine, never a sign of an incorrect ratio
-                const near = tail && tail.length ? tail.map(({ k: j, o }) => ({ k: j, o, d: Math.abs(q.top.order / o - 1) })).sort((a, b) => a.d - b.d)[0] : null;
-                Object.assign(r, { title: `Resonance at ${q.top.hz} Hz with no notch filter`, rule: r.rule + ' The gear ratios in the configuration are correct. Thus, a line that is not a rotor harmonic is a resonance.' });
-                r.text = head + (near ? ` It is not a main rotor harmonic or a tail rotor harmonic (the nearest tail rotor harmonic is harmonic ${near.k}, at ${order(fmt(near.o, 4))}, ${pct(near.d, 1)} from the line).`
-                        : gear && gear.motorisedTail ? ` It is not a main rotor harmonic, and on a motorized tail (tail_rotor_mode ${gear.mode}) the tail rotor speed does not follow the main rotor.` : ' It is not a main rotor harmonic.')
-                    + ' Because the gear ratios in the configuration are correct, this line is a resonance of a part of the helicopter. ' + ways
-                    + ' Also examine the bearings, the frame, the tail boom and the blade grips for the cause of the vibration.';
-                if (!q.measured) r.caveats.push('The analysis did not measure the part of this line that the gyro filters let through. The analysis of one log ("This log" in "Logs") measures it.');
-                r.caveats.push(`${bad.length === 1 ? '1 result shows' : `${bad.length} results show`} a strong vibration line with no notch filter at ${tol * 100} % or less from it.`, STATIC);
-            }
-            out.push(r);
-        }
-        return out;
-    },
     F6(L, c) {
         const bad = L.filter(isFlag); if (!bad.length) return [];
         const r = rec({ id: 'F6', area: 'filters', title: `RPM notch filter that decreases its line by less than ${SR.F6.minDb} dB`, evidence: bad.map(evidence), rule: `Check F6 has a problem if an RPM notch filter decreases its line by less than ${SR.F6.minDb} dB.`, sources: [src(SR.F6.source)],
             text: [`${bad.length === 1 ? '1 result shows' : `${bad.length} results show`} that an RPM notch filter decreases its line by less than ${SR.F6.minDb} dB.`, range('decrease', bad, 'dB')].filter(Boolean).join(' ') + ' '
                 + `Possibly, the line is not at the frequency of the notch filter, or the Q of the notch filter is too high. The gear ratios in the configuration are correct. If check G12 shows a problem, motor_poles or the RPM sensor can be the cause. `
-                + `If not, a different center (gyro_rpm_notch_center_*) or a lower Q, but not less than ${RULES.minNotchQ.toFixed(1)}, can correct it.` });
+                + `If not, a different center (gyro_rpm_notch_center_*) or a lower Q can change the decrease of vibration.\nAutotune tests gyro noise and time delay together.` });
         if (bad.every(f => clears({ value: f.value, se: f.se }, SR.F6.minDb, -1) === false)) r.sig = `No result of check F6 is less than ${SR.F6.minDb} dB by ${RULES.sigmas} SE.`;
         if (!r.sig) c.filterIssues.add('F6');   // guard 1: a flag that stands (clears 2 SE, or has no SE) holds the gain raises
         return [r];
@@ -1206,15 +966,7 @@ const GEN = {
         return one(sel, { id: 'F9', area: 'filters', severity: 'info', title: 'Notch filters with a frequency that is too high or unknown', rule: 'Check F9 compares the frequency of each notch filter with the Nyquist frequency of the log and with `0.45 × filter rate` (the app calculates them).',
             text: `Some notch filters have a frequency that is unknown or more than the Nyquist frequency of the log (${logsText(sel, c)}).${c.cli ? '' : ' The log does not record the frequency of a tail rotor notch filter.'}` });
     },
-    F10(L, c) {
-        const yaw = L.filter(f => axisOf(f) === 'yaw'), bad = yaw.filter(isFlag); if (bad.length) c.filterIssues.add('F10 yaw');
-        const hz = MRULE.noise ? MRULE.noise.hz : null, rule = `Check F10 has a problem if more than ${pct(SIGMA.F10[0])} of the yaw D-term power is at more than ${fmt(hz, 0)} Hz, by ${RULES.sigmas} SE.`, sources = [ruleSrc(MR, 'F10')];
-        return one(bad, { id: 'F10', area: 'filters', axis: 'yaw', title: 'Gyro noise in the yaw D-term', rule, sources: sources.concat(RULES.source.community),
-            text: `Most of the yaw D-term power is at more than ${fmt(hz, 0)} Hz (${logsText(bad, c)}). Examine the tail notch filters first (checks F5 and F6). A recommendation from other pilots is: "keep D at 0 until RPM filters work".` })
-            .concat(perProfile(yaw, c, 'F10', { area: 'tail', axis: 'yaw', rule: `${rule} The estimate uses all measured logs of the PID profile. The step is ${RULES.tailDStep}.`, sources: sources.concat(RULES.source.tailDStep),
-                size: () => ({ parameter: 'yaw_d_gain', add: -RULES.tailDStep, direction: 'lower', title: 'Decrease the yaw D gain', text: 'The yaw D-term contains high frequency vibration. A smaller D gain can decrease this vibration. The measurement does not show the change of damping.',
-                    caveats: ['It is better to correct the filters first. A lower D gain gives less damping to the tail.'] }) }));
-    },
+
     F7: diag('F7', 'filters', 'The vibration level changed', 'Check F7 has a problem if the ratio of the gyroRAW vibration levels of 2 groups of flights is 2 or more.',
         'Examine the blade tracking and the balance first (FILT: "Check them first"). Then examine the notch filters.', { sources: ['toolkit rule. The documentation gives no number'] }),
     F11: diag('F11', 'filters', 'Large time delay in the gyro filters', `Check F11 has a problem if the measured time delay from gyroRAW to gyroADC at ${MRULE.delay ? MRULE.delay.band.join(' Hz to ') : 'unknown'} Hz is more than ${fmt(ruleNum(MR, 'F11', 'flagMs'))} ms by ${RULES.sigmas} SE.`,
@@ -1392,9 +1144,7 @@ const GEN = {
             .concat(one(moving, { id: 'C10:landed', severity: 'info', title: 'Slow liftoff after the spool-up', rule, sources, caveats: [REFUTED.C10],   // SPEC3 F: information only
                 text: `For ${fmt(sum(moving), 1)} s, the rotor turned at flight speed while the firmware showed "landed" (${logsText(moving, c)}). This is not a problem. The helicopter only becomes airborne slowly after the spool-up.` }));
     },
-    C11: (L, c) => perAxis('C11', 'filters', 'gyro noise in the D-term', `Check C11 has a problem if more than ${pct(LR.C11.share)} of the D-term power is at more than 30 Hz.`,
-        'The filters come before the D gain. TUNE: "If you do not have filters enabled ... do not use Derivative". The Configurator help text gives: D "magnifies by 10x to 100x" the high-frequency vibration.', { noun: 'D-term power at more than 30 Hz', unit: 'fraction', sources: [src(LR.C11.source)] })(L, c)
-        .map(r => sigAny(r, L.filter(f => axisOf(f) === r.axis), 'C11')),
+
     C12: (L, c) => tracking(L, 'C12', 'cyclic', c),
     T11: (L, c) => tracking(L, 'T11', 'tail', c),
     C13: (L, c) => lag(L, 'C13', 'cyclic', c),
@@ -2320,10 +2070,20 @@ function advise(input) {
         const lid = axis === 'yaw' ? 'L4' : 'L3', lf = flags(lid).filter(f => same(f) && (lid === 'L4' ? f.channel === 'tail' : f.channel === axis || f.channel === 'ring'));
         return lf.length ? { id: lid, s: sum(lf), n: lf.length } : null; };
     c.g1Overload = g1Overload(F, flags);
+    // Keep line-location information independent of recommendations. F5 is a
+    // raw-line/RPM-location reference, not proof of insufficient total filtering.
+    const rawLines=F.filter(f=>f.id==='F5'&&measured(f)).flatMap(f=>Array.isArray(f.lines)?f.lines:
+        [...String(f.text).matchAll(/line at ([\d.]+) x rotor \(([\d.]+) Hz, prominence ([\d.]+)/g)]
+            .map(m=>({order:+m[1],hz:+m[2],prominence:+m[3]})));
+    c.topLine=rawLines.filter(l=>num(l.hz)!==null&&num(l.prominence)!==null).sort((a,b)=>b.prominence-a.prominence)[0]||null;
+
 
     // generators in GEN order (filters before the guards read c.filterIssues), then the report.cjs decisions
-    const byId = group(F.filter(f => f.severity !== 'error'), f => f.id), known = new Set(Object.keys(GEN).concat(['C7', 'C8', 'C9', 'G7', 'G20'])); // C7: decisions; C8, C9 report only; G7 a diagnostic note
+    const byId = group(F.filter(f => f.severity !== 'error'&&!setup.filterGuidance(f)), f => f.id), known = new Set(Object.keys(GEN).concat(['F1','F2','F3','F4','F5','F10','C11','C7', 'C8', 'C9', 'G7', 'G20'])); // C7: decisions; C8, C9 report only; G7 a diagnostic note
     let recs = [];
+    for(const [id,list] of group(F.filter(f=>setup.filterGuidance(f)&&measured(f)),f=>f.id))
+        recs.push(...one(list,{id,area:'filters',severity:'info',title:'Filter reference values',rule:setup.filterGuidance(list[0]),
+            text:'These measurements give information about the recorded filters. Use Autotune to test filter changes with replay.'}));
     for (const [id, gen] of Object.entries(GEN)) if (byId.has(id) || gen.always) recs.push(...gen(byId.get(id) || [], c));
     recs.push(...decisionRecs(decisions, c));
     const errors = F.filter(f => f.severity === 'error');
@@ -2581,7 +2341,7 @@ function filterReplayRule(res) {
         + `The maximum added time delay is ${limit} ms.\nThe control-band gain must not decrease by more than 0.5 dB. `
         + 'The gyro vibration on each axis must not increase by more than 0.25 dB.\n'
         + 'If the recorded data has filter problems, the replay must correct or decrease one or more. It must give no new filter problem.\n'
-        + 'The filter parameter checks must be satisfactory. A previous filter problem must not increase by more than the measurement uncertainty.\n'
+        + 'The values must be in their firmware ranges. A previous filter problem must not increase by more than the measurement uncertainty.\n'
         + (res.mode==='simulation' ? 'The replay checks the changed values on the recorded flight periods.'
             : (corrective ? 'The vibration must decrease by more than 2 SE. ' : 'The vibration must decrease by 3 dB or more, and by more than 2 SE. ')
             + 'The analysis keeps some flight periods for a different test. The selected values must decrease vibration in 80 % of those periods.');
@@ -2997,4 +2757,4 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
 // the CLI file with the default picks and no meta, or '' when no recommendation has CLI text (TuningResult advice.script)
 function script(recommendations) { return defaultPicks(recommendations).length ? exportScript(recommendations, null, {}) : ''; }
 
-module.exports = { RULES, PARAMS, RANGE, COVERAGE, CHECKS: Object.keys(GEN), DS_RULES, FEATURE_NAMES, advise, comparisons, filterRecommendations, script, exportScript, defaultPicks, floorsOk, configurationBases };
+module.exports = { RULES, PARAMS, RANGE, COVERAGE, CHECKS: Object.keys(GEN).concat(['F1','F2','F3','F4','F5','F10','C11']), DS_RULES, FEATURE_NAMES, advise, comparisons, filterRecommendations, script, exportScript, defaultPicks, floorsOk, configurationBases };
