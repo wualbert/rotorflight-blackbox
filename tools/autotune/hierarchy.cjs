@@ -11,8 +11,8 @@
  *   isPrereq(id), isBlock(id)    the kind of an item id
  *   gateUpstream(nodeId)         the items that gate this one, along gate edges, transitive
  *   causesOf(target, findings)   the K rules that make a finding or a recommendation a possible result of upstream flags
- *   status(findings, recs, opts) { nodes: { id: { status, fids, recs, blockedBy, possible, reason, profiles, ... } }, startHere
- *                                (block ids only), prereqProblems (prerequisite ids with a problem), profile, bench, profiles,
+ *   status(findings, recs, opts) { nodes: { id: { status, fids, recs, blockedBy, gatedBy, possible, reason, profiles, ... } },
+ *                                startHere (block ids only), prereqProblems (prerequisite ids with a problem), profile, bench, profiles,
  *                                byProfile }: all PID profiles together, and each one alone; opts.profile gives one PID
  *                                profile only. The results of a bench run (D7) do not count
  *   graph()                      { prereq, blocks, edges, rules, nodes }: the diagram (K1); nodes is every item in one list
@@ -503,7 +503,7 @@ function statusOne(findings, recs, opts, want) {
     };
     const d1 = new Set(); for (const f of F) if (f.id === 'D1' && f.severity === 'flag') for (const l of logsOf(f)) d1.add(l);
     const nodes = {};
-    for (const n of NODES) nodes[n.id] = { kind: n.kind, status: null, problem: false, number: null, fids: [], recs: [], findings: 0, blockedBy: [], possible: [], reason: '' };
+    for (const n of NODES) nodes[n.id] = { kind: n.kind, status: null, problem: false, number: null, fids: [], recs: [], findings: 0, blockedBy: [], gatedBy: [], possible: [], reason: '' };
     const byNode = new Map(NODES.map(n => [n.id, []]));
     // the item of a finding: its node when the worker set a new id, else its home (an old id of round 1 goes through LEGACY)
     const nodeOf = (x) => { const n = BY_ID.has(x.node) ? x.node : LEGACY[x.node] && homeOf(x.id, axisOf(x)) === null ? LEGACY[x.node] : null; return n || homeOf(x.id, axisOf(x)); };
@@ -564,6 +564,11 @@ function statusOne(findings, recs, opts, want) {
         if (N.status === 'blocked') continue;
         if (N.possible.length) N.status = 'possible';
     }
+    // gatedBy: the gates of a CHANGE of the values of a block, also when the block has no problem (the filter autotune proposes
+    // changes with no filter problem). The first problems upstream along the gate edges, fromChecks applied. A scope is not
+    // applied here: the caller applies it to the values that it changes (rpm > filters: the values that the RPM signal drives)
+    for (const n of BLOCKS) { const up = gateUpstream(n.id).filter(u => P.has(u) && (!fromChecksOf(u, n.id) || idsOf(u).some(x => fromChecksOf(u, n.id).includes(x))));
+        nodes[n.id].gatedBy = up.filter(u => !gateUpstream(u).some(v => up.includes(v) && v !== u)); }
     // "Start here" (coordinator rule, round 2): a block with a problem, not blocked and not a possible result, whose blocks before
     // it in the sequence (BEFORE: filters, governor, then its lane) have no problem and no gate upstream with a problem. Never a
     // later block when an earlier one waits: that one gets 'problem' and after = the items to correct first

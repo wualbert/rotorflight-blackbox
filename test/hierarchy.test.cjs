@@ -569,6 +569,11 @@ test('round 2: D2 is a logging problem only for a loss of 1 % of the frames; the
     assert.deepEqual(st([g1, f1]).startHere, ['filters']);
     const b = st([g1, f1, f5]); assert.deepEqual([b.nodes.filters.status, b.nodes.filters.blockedBy, b.startHere], ['blocked', ['rpm'], []]);
     assert.deepEqual(H.scopeOf('rpm', 'filters'), ['F3', 'F5', 'F6', 'F9']); assert.equal(H.scopeOf('filters', 'cyclic'), null);
+    // gatedBy: the gates of a change of the values (the filter autotune), also with no problem in the block, without the scope
+    assert.deepEqual([st([g1, f1]).nodes.filters.gatedBy, st([g1]).nodes.filters.gatedBy, st([g1]).nodes.filters.status], [['rpm'], ['rpm'], 'notMeasured']);
+    assert.deepEqual([st([f1]).nodes.filters.gatedBy, st([g1, f5]).nodes.cyclic.gatedBy, st([g1]).nodes.cyclic.gatedBy], [[], ['rpm'], ['rpm']], 'the first problem upstream');
+    const t4 = { fid: 't', id: 'T4', severity: 'flag', log: 1, profile: 1 };
+    assert.deepEqual([st([t4]).nodes.tail.gatedBy, st([t4]).nodes.cyclic.gatedBy, st([t4]).nodes.tail.status], [['mechanics'], [], 'notMeasured'], 'fromChecks: a loose tail linkage holds the tail gains only');
 });
 
 test('round 2: a gate of a prerequisite holds only for its checks (fromChecks): a ground resonance holds the cyclic gains, a loose tail linkage the tail gains', () => {

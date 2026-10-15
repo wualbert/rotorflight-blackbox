@@ -5938,11 +5938,12 @@ var TuningDialog = (function () {
             ft.failure = ft.cancelled = null;
             var source = ftSource(), list = [{log:source.log,flight:source.flight}], w,
                 h = shown && shown.fileKey === info.key ? hierFor(shown.result,'all','all') : null;
-            // the gates of the Filters step in the diagram (hierarchy.nodes.filters.blockedBy): the changes wait for them
+            // the gates of the Filters step in the diagram (hierarchy.nodes.filters.blockedBy, and gatedBy: a gate of a change also when the
+            // filters have no problem): the changes wait for them
             var states = filterBaseline(shown.result,source).map(function(q){return shown.result.hierarchy && shown.result.hierarchy.byDataset && shown.result.hierarchy.byDataset[q.id];}).filter(Boolean);
             if (!states.length) states=[h];
             var gates=[];
-            states.forEach(function(state){((state && state.nodes && state.nodes.filters && state.nodes.filters.blockedBy) || []).forEach(function(g){if(gates.indexOf(String(g))<0)gates.push(String(g));});});
+            states.forEach(function(state){var F=state && state.nodes && state.nodes.filters;((F && (F.blockedBy || []).concat(F.gatedBy || [])) || []).forEach(function(g){if(gates.indexOf(String(g))<0)gates.push(String(g));});});
             if (!isNum(ftLimit()) || ftLimit() < 0 || ftLimit() > 20) { ft.failure = {key:key,detail:"The maximum added time delay must be a number from 0 to 20 ms."}; ftRefresh(); return false; }
             var draft = ft.drafts[sourceKey], previous = ftModel().result;
             var values = {};

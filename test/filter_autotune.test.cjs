@@ -182,8 +182,8 @@ test('recorded replay text distinguishes the baseline, manual changes and failed
 test('a delay increase in one profile is not concealed by another profile',()=>{
     function entry(id,profile,delay,power){
         const N=1024, rate=1000, K=N/2+1;
-        const S={raw:new Float64Array(K).fill(power),y:new Float64Array(K).fill(power),re:new Float64Array(K),im:new Float64Array(K)};
-        for(let k=0;k<K;k++){const ph=-2*Math.PI*k*rate/N*delay;S.re[k]=power*Math.cos(ph);S.im[k]=power*Math.sin(ph);}
+        const S={raw:new Float64Array(K).fill(power),y:new Float64Array(K).fill(power),re:new Float64Array(K),im:new Float64Array(K),Y:{re:new Float64Array(K),im:new Float64Array(K)}};
+        for(let k=0;k<K;k++){const ph=-2*Math.PI*k*rate/N*delay;S.re[k]=power*Math.cos(ph);S.im[k]=power*Math.sin(ph);S.Y.re[k]=Math.sqrt(power)*Math.cos(ph);S.Y.im[k]=Math.sqrt(power)*Math.sin(ph);}
         const w={id,profile,unit:String(profile),rate,N,seg:{firstProfile:0,cfg:{pid:{cli:{},header:Object.fromEntries(['roll','pitch','yaw'].map(ax=>[ax,{gyro_cutoff:80,d_cutoff:35,P:50,D:15}]))}}}};
         return {w,m:Array.from({length:3},()=>({power:1,pidPower:1,S,PS:S,DS:S}))};
     }
@@ -191,6 +191,46 @@ test('a delay increase in one profile is not concealed by another profile',()=>{
     const c=A.compare(cand,base); assert.equal(c.valid,false); assert.equal(c.delay.at.profile,2); assert.ok(c.delay.maxAddMs>1.9);
 });
 
+// Synthetic windows for compare(): input X (real, amplitude amp), baseline output Yb = X, candidate output Yc = g X exp(-i 2 pi f d(f))
+// plus contamination of relative size noise (a part that is not a linear function of Yb). d: ms, or a function of the frequency (Hz)
+function delayWindow(id,{d=0,amp=1,noise=0,g=1,profile=1},cand){
+    const N=1024,rate=1000,K=N/2+1;let q=(id+1)*2654435761>>>0;const rnd=()=>((q=(q*1664525+1013904223)>>>0)/4294967296)*2-1;
+    const S={raw:new Float64Array(K),y:new Float64Array(K),re:new Float64Array(K),im:new Float64Array(K),Y:{re:new Float64Array(K),im:new Float64Array(K)}};
+    for(let k=0;k<K;k++){const f=k*rate/N,ms=typeof d==='function'?d(f):d,ph=cand?-2*Math.PI*f*ms/1000:0,n=cand?(typeof noise==='function'?noise(f):noise):0;
+        const yr=(cand?g:1)*amp*Math.cos(ph)+n*amp*rnd(),yi=(cand?g:1)*amp*Math.sin(ph)+n*amp*rnd();
+        S.raw[k]=amp*amp;S.y[k]=yr*yr+yi*yi;S.re[k]=amp*yr;S.im[k]=amp*yi;S.Y.re[k]=yr;S.Y.im[k]=yi;}
+    const w={id,profile,unit:'u'+(id>>2),rate,N,seg:{firstProfile:0,cfg:{pid:{cli:{},header:Object.fromEntries(['roll','pitch','yaw'].map(ax=>[ax,{gyro_cutoff:80,d_cutoff:35,P:50,D:15}]))}}}};
+    return {w,m:Array.from({length:3},()=>({power:1,pidPower:1,S,PS:S,DS:S}))};
+}
+const delayRun=(wins,limit=.5)=>A.compare({results:wins.map((o,i)=>delayWindow(i,o,true))},{results:wins.map((o,i)=>delayWindow(i,o,false))},{maxAddMs:limit});
+test('time delay rule: the mean of the windows, each window the same; no allowance for the spread between windows',()=>{
+    // a fixed change: every window gives the same delay, the mean decides
+    const fixed=delayRun(Array(6).fill({d:.6}));
+    assert.equal(fixed.valid,false);assert.ok(Math.abs(fixed.delay.maxAddMs-.6)<.03&&fixed.constraints[0]>.07,JSON.stringify(fixed.delay));
+    assert.deepEqual([fixed.delay.at.windows,fixed.delay.at.rangeMs[0]===fixed.delay.at.rangeMs[1]],[6,true]);
+    assert.match(A.limitTexts({...fixed,db:-5},{maxAddMs:.5})[0],/^The set with the lowest vibration \(-5 dB\) adds 0\.6\d* ms of filter time delay at \d+ Hz \(roll, (gyro|P-term|D-term), PID profile 1\)\. It is the mean of 6 periods of 1 s, from 0\.6\d* to 0\.6\d* ms\. The limit is 0\.5 ms\.$/);
+    assert.equal(delayRun(Array(6).fill({d:.45})).valid,true);
+    // one window with most of the band power does not decide (Fireball 2026-10-05, roll, PID profile 1, 30 Hz): 0.57 ms in the strong
+    // window and 0.33 to 0.47 ms in eight weak windows. The mean of the windows is 0.43 ms; a power-weighted mean would be 0.53 ms
+    const strong=delayRun([{d:.57,amp:1}].concat([.38,.34,.39,.33,.47,.46,.47,.42].map(d=>({d,amp:.2}))));
+    assert.equal(strong.valid,true,JSON.stringify(strong.delay));assert.ok(Math.abs(strong.delay.maxAddMs-.443)<.03,JSON.stringify(strong.delay));
+    // a real excess in some windows is not forgiven (2 of 10 windows at 2 ms: mean 0.64 ms)
+    assert.equal(delayRun(Array(8).fill({d:.3}).concat([{d:2},{d:2}])).valid,false);
+    // monotone: a larger delay in one window, strong or weak, never turns a rejected set into a valid one
+    for(const amp of [1,.3,.05])for(const x of [.6,1,2.6,5,10]){const c=delayRun(Array(9).fill({d:.55}).concat([{d:x,amp}]));assert.equal(c.valid,false,`one window (amp ${amp}) at ${x} ms`);}
+    let last=-Infinity;for(const x of [0,.5,1,2,4,8]){const c=delayRun([{d:.66},{d:.66},{d:x,amp:.3}]);assert.ok(c.delay.maxAddMs>=last-1e-9,`${x} ms`);last=c.delay.maxAddMs;}
+    // contamination does not give an allowance
+    assert.equal(delayRun(Array(6).fill({d:.6,noise:.4})).valid,false);
+    // gain loss: the mean of the windows (a fixed gain of 0.8 decreases the signal by 1.94 dB)
+    const loss=delayRun(Array(6).fill({d:0,g:.8}));
+    assert.equal(loss.valid,false);assert.ok(Math.abs(loss.delay.maxLossDb-1.938)<.01&&loss.constraints[1]>1.4&&loss.delay.lossAt.windows===6,JSON.stringify(loss.delay));
+    assert.match(A.limitTexts({...loss,db:-5},{maxAddMs:.5}).join(' '),/decreases the (gyro|P-term|D-term) signal by 1\.94 dB at \d+ Hz \(roll, (gyro|P-term|D-term), PID profile 1\)\. It is the mean of 6 periods of 1 s, from 1\.938 to 1\.938 dB\. The limit is 0\.5 dB\./);
+    assert.equal(delayRun(Array(6).fill({d:0,g:.97})).valid,true,'0.26 dB');
+    assert.equal(delayRun([{d:0,g:.9},{d:0,g:.9},{d:0,g:.2,amp:.3}]).valid,false,'a weak window with a larger gain loss increases the mean');
+    // the delay text names the band with the largest delay and its windows
+    assert.match(A.texts({recommended:{status:'not recommended',reasons:[],delay:strong.delay,rows:[]},model:{passed:true},limits:{maxAddMs:.5}}).delay,
+        /^The largest increase in filter time delay is 0\.4\d+ ms at \d+ Hz \(roll, (gyro|P-term|D-term), PID profile 1\)\. It is the mean of 9 periods of 1 s, from 0\.3\d* to 0\.5\d* ms\. The limit is 0\.5 ms\.$/);
+});
 test('baseline delay compares recorded and replayed outputs directly, including a rejected phase error',()=>{
     const it=fixture(); it.w.flight.header.gyro_soft_type=0;
     it.w.gyro=[0,1,2].map(a=>Float64Array.from({length:it.w.n},(_,i)=>10*Math.sin(2*Math.PI*17*i/1000+a)));
@@ -426,9 +466,41 @@ test('measured noise improvement can pass search and export without turning guid
     const excessive=A.tune([],{gear,prepared:P,simulate:{gyro_lpf1_type:1,gyro_lpf1_static_hz:170},maxAddMs:.1,curves:false});
     assert.equal(excessive.recommended.status,'not recommended');
     assert.ok(excessive.recommended.validation.holdout.delay.maxAddMs>.1);
-    assert.match(excessive.recommended.reasons.join(' '),/flight periods for the last test, added filter time delay is .* ms\. The limit is 0\.1 ms/);
+    assert.match(excessive.recommended.reasons.join(' '),/flight periods for the last test, the set adds [\d.]+ (\u00b1 [\d.e-]+ )?ms of filter time delay at \d+ Hz \((roll|pitch|yaw), (gyro|P-term|D-term), PID profile 2\)\. It is the mean of \d+ periods of 1 s, from [\d.]+ to [\d.]+ ms\. The limit is 0\.1 ms\./);
 });
 
+test('no finalist in the limits: the reasons give the limit that stopped the set with the lowest vibration',()=>{
+    // the constraints of compare(): [largest delay - limit, largest gain loss - limit, roll, pitch, yaw noise change - 0.25 dB], unrounded;
+    // delay.at and delay.lossAt: the band of the largest mean, with the number of its windows and their range
+    const where={axis:'pitch',profile:1,hz:25,path:'gyro',windows:9,rangeMs:[.35,1.006]};
+    const sc={db:-10.2041,delay:{checks:74,maxAddMs:0.593886,maxLossDb:0.149,at:where,lossAt:{...where,rangeDb:[0,.3]}},
+        axes:[{axis:'roll',db:-11.6},{axis:'pitch',db:0.31},{axis:'yaw',db:-12.9}],constraints:[0.093886,-0.351,-11.85,0.06,-13.15]};
+    assert.deepEqual(A.limitTexts(sc,{maxAddMs:.5}),['The set with the lowest vibration (-10.2 dB) adds 0.594 ms of filter time delay at 25 Hz (pitch, gyro, PID profile 1). It is the mean of 9 periods of 1 s, from 0.35 to 1.006 ms. The limit is 0.5 ms.',
+        'The set with the lowest vibration (-10.2 dB) increases the pitch vibration by 0.31 dB. The limit is 0.25 dB.']);
+    // just over a limit: the decision from the unrounded constraint, printed with the decimals that show it; one window, no range
+    const yaw={axis:'yaw',profile:0,hz:10,path:'D',windows:1,rangeMs:[.5004,.5004],rangeDb:[.5002,.5002]};
+    const near={db:0.199,delay:{checks:2,maxAddMs:.5004,maxLossDb:.5002,at:yaw,lossAt:yaw},
+        axes:[{axis:'roll',db:.2541},{axis:'pitch',db:-1},{axis:'yaw',db:-1}],constraints:[.0004,.0002,.0041,-1.25,-1.25]};
+    assert.deepEqual(A.limitTexts(near,{maxAddMs:.5}),['The set with the lowest vibration (0.2 dB) has less than 3 time delay measurements.',
+        'The set with the lowest vibration (0.2 dB) adds 0.5004 ms of filter time delay at 10 Hz (yaw, D-term, PID profile unknown). It is the mean of 1 period of 1 s. The limit is 0.5 ms.',
+        'The set with the lowest vibration (0.2 dB) decreases the D-term signal by 0.5002 dB at 10 Hz (yaw, D-term, PID profile unknown). It is the mean of 1 period of 1 s. The limit is 0.5 dB.',
+        'The set with the lowest vibration (0.2 dB) increases the roll vibration by 0.254 dB. The limit is 0.25 dB.']);
+    // tune(): a 0 ms limit leaves only sets that add no time delay; the selected set changes no value. A finalist passed, so the SE and
+    // holdout reasons stay (with several recorded configurations, a set with no rows can still change the older logs). The reasons
+    // of the rejected finalists come only when no finalist passes (the Fireball file of 2026-10-05, test/tuning_worker.test.cjs)
+    const it=correctionFixture(187);it.w.flight.header.features=0;   // its RPM banks are empty: no RPM filter, only the PID cutoffs to change
+    const P=A.prepare([it],{gear}),raw=[0,1,2].map(a=>it.w.extra['gyroRAW['+a+']']);
+    for(const w of P.windows)w.input={start:w.st-w.lead,end:w.st+w.N,factor:1,raw:raw.map(x=>x.slice(w.st-w.lead,w.st+w.N)),native:raw.map(x=>x.slice(w.st-w.lead,w.st+w.N))};
+    P.reconstructed=true;
+    const none=A.tune([],{gear,prepared:P,maxCandidates:24,budgetMs:8000,maxAddMs:0,curves:false,optimizerEvaluations:12}),why=none.recommended.reasons;
+    assert.deepEqual([none.recommended.status,none.recommended.rows,none.cliFile],['not recommended',[],'']);
+    assert.ok(none.search.finalistCount>0&&why.includes('No filter set in the analysis decreases vibration by 3 dB or more in the replay limits.'),JSON.stringify(why));
+    assert.ok(!why.some(t=>/^The set with the lowest vibration/.test(t)),'a finalist passed: no limit text of a rejected finalist');
+    const db=none.search.rejected.map(r=>r.db);assert.deepEqual(db,db.slice().sort((x,y)=>x-y),'rejected: lowest vibration first');
+    // the RPM-driven values: with the dynamic LPF1 recorded on, its type and base cutoff too
+    assert.deepEqual([A.rpmDriven([{name:'gyro_lpf1_static_hz'}]),A.rpmDriven([{name:'gyro_lpf1_static_hz'}],{gyro_lpf1_dyn_min_hz:0}),A.rpmDriven([{name:'gyro_lpf1_static_hz'}],{gyro_lpf1_dyn_min_hz:60}),
+        A.rpmDriven([{name:'gyro_lpf1_type'}],{gyro_lpf1_dyn_min_hz:60}),A.rpmDriven([{name:'gyro_lpf2_static_hz'}],{gyro_lpf1_dyn_min_hz:60})],[false,false,true,true,false]);
+});
 test('repair proposals combine the missing LPF and missing rotor harmonics without assigning resonances to RPM sources',()=>{
     const C=require('../tools/autotune/filter_checklist.cjs'),it=fixture(),h=it.w.flight.header;
     h.gyro_soft_type=0;h.features=1<<30;h.gyro_rpm_notch_preset=0;

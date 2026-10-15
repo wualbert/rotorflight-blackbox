@@ -172,7 +172,9 @@ function spectrum(x, y, start, N, rate) {
     return { raw: Float64Array.from(xr, (v, k) => (v * v + xi[k] ** 2) * norm),
         y: Float64Array.from(yr, (v, k) => (v * v + yi[k] ** 2) * norm),
         re: Float64Array.from(xr, (v, k) => (v * yr[k] + xi[k] * yi[k]) * norm),
-        im: Float64Array.from(xr, (v, k) => (v * yi[k] - xi[k] * yr[k]) * norm) };
+        im: Float64Array.from(xr, (v, k) => (v * yi[k] - xi[k] * yr[k]) * norm),
+        // the complex output spectrum up to 33 Hz, unnormalized: compare() relates the candidate output to the baseline output
+        Y: { re: yr.slice(0, Math.min(K, Math.ceil(33 * N / rate) + 2)), im: yi.slice(0, Math.min(K, Math.ceil(33 * N / rate) + 2)) } };
 }
 function measurement(w, result, baseline = false) {
     const df = w.rate / w.N, lo = Math.ceil(RULES.noiseHz / df), hi = Math.floor(w.N / 2 * RULES.nyquistShare);
@@ -258,34 +260,47 @@ function compare(candidate, base, limits = RULES) {
                 const ck = `${r.w.profile}:${path}:${a}`;
                 let A = control.get(ck);
                 if (!A) control.set(ck, A = { axis: AXES[a], path: ['gyro', 'P', 'D'][path], profile: r.w.profile,
-                    ...Object.fromEntries(['re', 'im', 'br', 'bi', 'xx', 'yy', 'by'].map(k => [k, new Float64Array(5)])) });
+                    ...Object.fromEntries(['br', 'bi', 'xx', 'by'].map(k => [k, new Float64Array(5)])), wins: [[], [], [], [], []] });
                 for (let j = 0; j < 5; j++) {
-                const center = 10 + j * 5, df = r.w.rate / r.w.N;
+                const center = 10 + j * 5, df = r.w.rate / r.w.N, h = [0, 0, 0, 0];
                 for (let k = Math.ceil((center - 2) / df); k <= Math.floor((center + 2) / df); k++) {
-                    A.re[j] += cs.re[k]; A.im[j] += cs.im[k]; A.br[j] += bs.re[k]; A.bi[j] += bs.im[k];
-                    A.xx[j] += bs.raw[k]; A.yy[j] += cs.y[k]; A.by[j] += bs.y[k];
+                    // the excitation of the band in the recorded configuration: gyroRAW against the baseline replay
+                    A.br[j] += bs.re[k]; A.bi[j] += bs.im[k]; A.xx[j] += bs.raw[k]; A.by[j] += bs.y[k];
+                    // this window: the baseline output against the candidate output, conj(Yb) Yc, |Yb|^2, |Yc|^2
+                    const yr = bs.Y.re[k], yi = bs.Y.im[k], cr = cs.Y.re[k], ci = cs.Y.im[k];
+                    h[0] += yr * cr + yi * ci; h[1] += yr * ci - yi * cr; h[2] += yr * yr + yi * yi; h[3] += cr * cr + ci * ci;
                 }
+                A.wins[j].push(h);
                 }
             }
         }
     }
-    let maxAddMs = -Infinity, maxLossDb = 0, checks = 0, at = null;
+    // Each band: the added delay (ms) and the gain loss (dB) of each 1 s window, from the response Sbc / Sbb of that window from the
+    // baseline replay output to the candidate replay output (the same input), and their mean over the windows: each window counts
+    // the same (user decision 2026-10-15). The replays are deterministic, so a window's response is exact for a fixed change, and the
+    // windows differ only where the filters change with the flight (RPM notches with the headspeed, the dynamic notch). A mean
+    // weighted by the band power let one window decide: Fireball 2026-10-05, PID profile 1, roll, 30 Hz was 0.513 ms with 68 % of
+    // the power in one window at 3184 rpm (0.57 ms) and eight windows of 0.33 to 0.47 ms. The mean is monotone: a larger delay in
+    // any window never decreases it. No error allowance: the spread between windows is real, not noise (two reviews, 2026-10-14).
+    let maxAddMs = -Infinity, maxLossDb = 0, checks = 0, at = null, lossAt = null;
+    const span = (list) => [Math.min(...list), Math.max(...list)];
     control.forEach(A => { for (let j = 0; j < 5; j++) {
-        const coh = (A.re[j] ** 2 + A.im[j] ** 2) / Math.max(1e-30, A.xx[j] * A.yy[j]);
         const coh0 = (A.br[j] ** 2 + A.bi[j] ** 2) / Math.max(1e-30, A.xx[j] * A.by[j]);
-        if (coh < RULES.minCoherence || coh0 < RULES.minCoherence || A.xx[j] < 1e-6) continue;
-        const re = A.re[j] * A.br[j] + A.im[j] * A.bi[j], im = A.im[j] * A.br[j] - A.re[j] * A.bi[j];
-        const delay = -1000 * Math.atan2(im, re) / (2 * Math.PI * (10 + 5 * j));
-        const loss = -db(A.re[j] ** 2 + A.im[j] ** 2, A.br[j] ** 2 + A.bi[j] ** 2);
-        if (delay > maxAddMs) { maxAddMs = delay; at = { axis: A.axis, profile: A.profile, hz: 10 + j * 5, path: A.path }; }
-        maxLossDb = Math.max(maxLossDb, loss); checks++;
+        if (coh0 < RULES.minCoherence || A.xx[j] < 1e-6) continue;
+        const f = 10 + 5 * j, per = A.wins[j].filter(h => h[2] > 0 && h[3] > 0);
+        if (!per.length) continue;
+        const d = per.map(h => -1000 * Math.atan2(h[1], h[0]) / (2 * Math.PI * f)), l = per.map(h => -db(h[0] ** 2 + h[1] ** 2, h[2] ** 2));
+        const delay = mean(d), loss = mean(l), where = { axis: A.axis, profile: A.profile, hz: f, path: A.path, windows: per.length };
+        if (delay > maxAddMs) { maxAddMs = delay; at = { ...where, rangeMs: span(d).map(x => round(x)) }; }
+        if (loss > maxLossDb) { maxLossDb = loss; lossAt = { ...where, rangeDb: span(l).map(x => round(x)) }; }
+        checks++;
     } });
     const values = [...byUnit.values()].map(u => db(u.c, u.b)), st = stats(values);
     const delta = axes.slice(0, 3).map((a, i) => ({ axis: AXES[i], db: db(a.c, a.b), pidDb: db(a.pc, a.pb), se: null }));
     const valid = checks >= 3 && maxAddMs <= limits.maxAddMs && maxLossDb <= RULES.maxControlLossDb && delta.every(a => a.db <= RULES.maxAxisWorseDb);
     return { db: st.mean, se: st.se, axes: delta, units: values, n: values.length, valid,
         constraints:[maxAddMs-limits.maxAddMs,maxLossDb-RULES.maxControlLossDb,...delta.map(a=>a.db-RULES.maxAxisWorseDb)],
-        delay: { maxAddMs: round(maxAddMs,6), maxLossDb: round(maxLossDb), checks, at, f11BaseMs: null, f11MaxMs: null } };
+        delay: { maxAddMs: round(maxAddMs,6), maxLossDb: round(maxLossDb), checks, at, lossAt, f11BaseMs: null, f11MaxMs: null } };
 }
 
 function parity(base, P) {
@@ -550,6 +565,12 @@ function validCliValue(r) {
     const range = FT.FW_RANGE[r.name] || (/^gyro_lpf1_dyn_(min|max)_hz$/.test(r.name) ? [0, 1000] : /^(roll|pitch|yaw)_(gyro|d)_cutoff$/.test(r.name) ? [0, 250] : null);
     return !!range && Number.isInteger(r.to) && r.to >= range[0] && r.to <= range[1] && (r.scope !== 'profile' || Number.isInteger(r.profile) && r.profile >= 1 && r.profile <= 6);
 }
+// The values that the RPM signal drives: the RPM notch banks, the dynamic LPF1 (headspeed ratio) and the motor RPM smoothing.
+// The scope of the rpm > filters gate (hierarchy.cjs) for a proposed change: other filter changes do not wait for the RPM signal.
+// s: the recorded settings. With the dynamic LPF1 recorded on, its type and base cutoff also set the RPM-driven cutoff
+// (clamp(ratio x gyro_lpf1_static_hz, min, max), filter_replay.cjs), and a change can turn it off.
+const rpmDriven = (rows, s) => (rows || []).some(r => r && (/^(feature RPM_FILTER|gyro_rpm_notch_\w+|gyro_lpf1_dyn_(min|max)_hz|motor_rpm_lpf)$/.test(r.name)
+    || /^gyro_lpf1_(type|static_hz)$/.test(r.name) && !!s && s.gyro_lpf1_dyn_min_hz > 0));
 function validCliRow(r) {
     if (!r || !['global', 'profile'].includes(r.scope) || !['header', 'cli'].includes(r.source) || r.from === null || r.from === undefined) return false;
     const profileValue = /^(roll|pitch|yaw)_(gyro|d)_cutoff$/.test(r.name);
@@ -785,6 +806,26 @@ function manualChanges(P, supplied) {
     return Object.assign({},P.ref.s,P.targetProfiles,changes);
 }
 
+// The replay limits that a filter set does not satisfy (compare() score), in STE: the reasons when no finalist passes. The
+// decision comes from the unrounded constraints; a value prints with the decimals that show that it is over its limit
+const pidText = p => p > 0 ? `PID profile ${p}` : 'PID profile unknown';
+const PATH_TEXT = { gyro: 'gyro', P: 'P-term', D: 'D-term' };
+const over = (v, lim, k) => { while (k < 6 && !(round(v, k) > lim)) k++; return round(v, k); };
+// where a band is and the windows of its mean, in STE: "at 25 Hz (pitch, gyro, PID profile 1). It is the mean of 9 periods of 1 s, from 0.35 to 1 ms."
+function bandText(b, range, unit) {
+    const n = b.windows, r = range && range.every(Number.isFinite) && n > 1 ? `, from ${range[0]} to ${range[1]} ${unit}` : '';
+    return `at ${b.hz} Hz (${b.axis}, ${PATH_TEXT[b.path] || b.path}, ${pidText(b.profile)}).` + (n ? ` It is the mean of ${n === 1 ? '1 period' : `${n} periods`} of 1 s${r}.` : '');
+}
+function limitTexts(sc, limits) {
+    const c = sc.constraints || [], d = sc.delay, out = [];
+    const signal = b => b.path === 'gyro' ? 'the gyro signal' : `the ${PATH_TEXT[b.path] || b.path} signal`;
+    const head = Number.isFinite(sc.db) ? `The set with the lowest vibration (${round(sc.db, 2)} dB)` : 'The set with the lowest vibration';
+    if (d.checks < 3) out.push(`${head} has less than 3 time delay measurements.`);
+    if (c[0] > 0 && d.at) out.push(`${head} adds ${over(d.maxAddMs, limits.maxAddMs, 3)} ms of filter time delay ${bandText(d.at, d.at.rangeMs, 'ms')} The limit is ${limits.maxAddMs} ms.`);
+    if (c[1] > 0 && d.lossAt) out.push(`${head} decreases ${signal(d.lossAt)} by ${over(d.maxLossDb, RULES.maxControlLossDb, 2)} dB ${bandText(d.lossAt, d.lossAt.rangeDb, 'dB')} The limit is ${RULES.maxControlLossDb} dB.`);
+    sc.axes.forEach((a, i) => { if (c[2 + i] > 0) out.push(`${head} increases the ${a.axis} vibration by ${over(a.db, RULES.maxAxisWorseDb, 2)} dB. The limit is ${RULES.maxAxisWorseDb} dB.`); });
+    return out;
+}
 function tune(items, opts = {}) {
     const started = Date.now(), progress = (text, fraction) => { if (opts.progress) opts.progress(text, fraction); };
     progress('The app prepares the flight samples.', 0.02);
@@ -881,14 +922,16 @@ function tune(items, opts = {}) {
     for (let r = 0; r <= 3; r++) addFull(ordered.find(q => q.round === r));
     for (const family of new Set(ordered.map(q => q.family))) addFull(ordered.find(q => q.family === family));
     for (const q of ordered) addFull(q);
+    const rejected = [];   // finalists out of the replay limits on all training windows (24 windows can miss the binding band)
     for (const q of full) {
         const ev = evaluate(P, q.changes, training, true, true), sc = judge(ev, baseTrain);
         if (sc.valid) {
             const checks=checklist.assess(checklist.compare(trainP,q.changes,{app:opts.app,baseline:trainingBaseline,outputs:ev.outputs}));
             const candidate={...q,score:sc,checks}; ranked.push(candidate);
             if (!bestFull || rankCandidates(candidate,bestFull)<0)bestFull={...candidate,ev};
-        }
+        } else rejected.push({ family: q.family, score: sc });
     }
+    rejected.sort((a, b) => (Number.isFinite(a.score.db) ? a.score.db : Infinity) - (Number.isFinite(b.score.db) ? b.score.db : Infinity));
     ranked.sort(rankCandidates);
     let selection=null;
     if(!manual&&ranked.length) {
@@ -926,11 +969,19 @@ function tune(items, opts = {}) {
     if (!par.every(p => p.passed)) reasons.push('The recorded filter configuration does not agree with the replay on all axes.');
     if (P.units.length < RULES.minUnits || heldout.length < RULES.minWindows) reasons.push('There are not sufficient flight periods to select the values and test them with different data.');
     const corrective=chosen.checks&&chosen.checks.passed&&chosen.checks.corrected>0;
+    // No finalist in the limits: the recorded values are compared with themselves, so the SE and holdout reasons say nothing.
+    // Give the limit that stopped the rejected finalist with the lowest vibration instead (the pilot can change the time delay
+    // limit). A selected set with no rows still changes the older logs when the logs have different recorded configurations.
+    const noFinalist = !manual && !ranked.length;
     if (!manual && !corrective && !(chosen.score.db <= -RULES.minReductionDb)) reasons.push('No filter set in the analysis decreases vibration by 3 dB or more in the replay limits.');
-    if (!manual && !(combined.se !== null && combined.db + 2 * combined.se < 0)) reasons.push('The decrease is not more than two standard errors across flight periods.');
-    if (!chosen.score.valid || !combined.valid) reasons.push('The replay is out of the time delay, control-band or vibration limits.');
-    if (manual ? !hold.valid : !holdPassed) {
-        if(hold.delay.maxAddMs>limits.maxAddMs)reasons.push(`In the flight periods for the last test, added filter time delay is ${round(hold.delay.maxAddMs)} ms. The limit is ${limits.maxAddMs} ms.`);
+    if (noFinalist && rejected.length) reasons.push(...limitTexts(rejected[0].score, limits));
+    if (!noFinalist && !manual && !(combined.se !== null && combined.db + 2 * combined.se < 0)) reasons.push('The decrease is not more than two standard errors across flight periods.');
+    if (!chosen.score.valid || !combined.valid) {
+        reasons.push('The replay is out of the time delay, control-band or vibration limits.');
+        if (!noFinalist) for (const t of limitTexts({ ...combined, db: null }, limits)) if (!reasons.includes(t)) reasons.push(t.replace(/^The set with the lowest vibration/, 'On all flight periods, this set'));
+    }
+    if (!noFinalist && (manual ? !hold.valid : !holdPassed)) {
+        if(hold.constraints[0]>0&&hold.delay.at)reasons.push(`In the flight periods for the last test, the set adds ${over(hold.delay.maxAddMs,limits.maxAddMs,3)} ms of filter time delay ${bandText(hold.delay.at,hold.delay.at.rangeMs,'ms')} The limit is ${limits.maxAddMs} ms.`);
         else reasons.push('The selected values do not give a satisfactory result in the different flight periods.');
     }
     const rows = rowsFor(P, chosen.changes), fullRows = rowsFor(P, chosen.changes, true);
@@ -945,6 +996,7 @@ function tune(items, opts = {}) {
         craft: P.segments[P.segments.length - 1].w.flight.craft || '', fileName: P.segments[P.segments.length - 1].file || '',
         firmware: P.segments[P.segments.length - 1].firmware, bootProfile: P.cli && P.cli.selectedProfile !== null ? P.cli.selectedProfile + 1 : opts.armingProfile || P.segments[P.segments.length - 1].firstProfile || null,
         search: { tested: tried.length, families: [...new Set(tried.map(t => t.family))], finalistCount: ranked.length, selection, optimizerRuns,
+            rejected: rejected.map(r => ({ family: r.family, db: round(r.score.db), delay: r.score.delay, axes: r.score.axes })),
             objectiveWindows:medium.map(w=>w.id),replayedSamples: P.samples, trainingWindows: training.length, heldoutWindows: heldout.length },
         current: { settings: ref.s, from: ref.from }, model: { ...result.model, passed: !unsupported && !P.excluded.length && par.every(p => p.passed), supported:!unsupported, parity: par,
             coverage, reconstructed, reconstructionMethod:'firmware multichannel reconstruction', continuousValidation:true, gear: ref.gear,
@@ -987,6 +1039,11 @@ function tune(items, opts = {}) {
     return result;
 }
 
+// the band with the largest added time delay (the mean of its windows), in STE
+function delayText(d, limit) {
+    if (!Number.isFinite(d.maxAddMs)) return '';
+    return `The largest increase in filter time delay is ${round(d.maxAddMs, 3)} ms` + (d.at ? ` ${bandText(d.at, d.at.rangeMs, 'ms')}` : '.') + ` The limit is ${limit} ms.`;
+}
 function texts(res) {
     const R = res.recommended, good = R.status === 'recommended', p = R.predicted || {}, h = R.validation && R.validation.holdout;
     const recordedOnly = res.mode === 'simulation' && R.params && !Object.keys(R.params).length;
@@ -998,9 +1055,9 @@ function texts(res) {
         recommendation: (good && recordedOnly ? 'Recorded filter replay. No filter values changed. Each interval uses its recorded configuration.' : good && res.mode === 'simulation' ? 'The changed values are in the replay limits. Examine the checks and signals before export.' : good ? `The recommended set decreases the vibration in the replay by ${round(-p.totalDb, 2)} ± ${round(p.se, 2)} dB. Examine all filter values below.` : R.reasons.join('\n')) +
             (good&&!recordedOnly&&R.validation&&R.validation.checks&&R.validation.checks.remaining?' Some filter problems are not corrected. Examine the filter checks.':''),
         parity: res.model.passed ? 'The recorded configuration agrees with the replay on all measured axes.' : 'The recorded configuration does not agree with the replay on all axes.',
-        delay: R.delay ? `The largest measured increase in filter time delay is ${R.delay.maxAddMs} ms. The limit is ${res.limits ? res.limits.maxAddMs : RULES.maxAddMs} ms.` : '',
+        delay: R.delay ? delayText(R.delay, res.limits ? res.limits.maxAddMs : RULES.maxAddMs) : '',
         validation: h && recordedOnly ? 'The replay uses all selected flight periods with their recorded values. No filter values changed.' : h && res.mode === 'simulation' ? 'The changed values use all selected flight periods. These periods do not give a different test after changes that you enter.' : h ? `The app uses ${h.blocks} flight periods only for the last test. It selects the values with the other periods. These values change vibration by ${h.meanDb} dB in those periods.` : '',
         why: R.reasons, rows };
 }
 
-module.exports = { RULES, tune, texts, delayLimit, parameterTable, manualChanges, prepare, paths, settings, evaluate, compare, parity, capabilities, candidates, repairCandidate, rankCandidates, selectFinalist, invalid, rowsFor, commands, cliFile, cliExportStatus, validCliRow };
+module.exports = { RULES, tune, texts, delayLimit, parameterTable, manualChanges, prepare, paths, settings, evaluate, compare, parity, capabilities, candidates, repairCandidate, rankCandidates, selectFinalist, invalid, rowsFor, commands, cliFile, cliExportStatus, validCliRow, rpmDriven, limitTexts };

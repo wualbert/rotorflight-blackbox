@@ -968,7 +968,12 @@ Status of a block (`status(findings, recommendations, { logs, coverage })`, for 
 
 `advice.cjs` takes `blockedBy` and `gate` from the same gate table, so the diagram and the list agree: a recommendation is
 blocked if and only if its node is Blocked (`test/hierarchy.test.cjs`, `test/advice.test.cjs`). A gate with a scope holds only the
-changes of its checks (a low-pass filter change keeps its CLI text with a G1 problem). `causesOf` gives the K rules that make a
+changes of its checks (a low-pass filter change keeps its CLI text with a G1 problem). `gatedBy` lists, for every block, the first
+problems upstream along the gate edges (`fromChecks` applied, scope not applied), also when the block itself has no problem: a
+proposed change still waits for them. The filter autotune sends the filters' `blockedBy` and `gatedBy`, and the worker applies the
+`rpm > filters` scope to the proposal: it waits for the RPM signal only when it changes an RPM-driven value (`rpmDriven` in
+`filter_autotune.cjs`: the RPM notch banks, the dynamic LPF1 and `motor_rpm_lpf`; with the dynamic LPF1 recorded on, also the
+LPF1 type and base cutoff). `causesOf` gives the K rules that make a
 finding or a recommendation a possible result of upstream flags (same log, compatible PID profile and axis). `LEGACY` maps the
 ids of round 1 (setup, servos, mixer, tailmech, rotor, rpm, gears, log, notches, lowpass, dnoise, govset, govgain, tta, rates,
 rescue, result) to the new ones.
@@ -1525,7 +1530,9 @@ retain committed samples and complete gyro-filter/SDFT state. Finalists preserve
 scored before downsampling to the Blackbox rate. Original-decimator inversion also
 permits testing new decimation cutoffs. Known motor-RPM and governor settings enable the corresponding upstream paths.
 For equally ranked filter checks, final selection prefers lower training delay among noise scores within one SE of the best training score. Reserved periods only accept or reject the frozen choice.
-It checks replay against recorded gyroADC before permitting export. See [Filter autotune](FILTER_AUTOTUNE.md)
+It checks replay against recorded gyroADC before permitting export. Each control-band delay and gain-loss band is the mean of its
+1 s windows (each window's baseline-to-candidate output response, each window counted the same), with no error allowance.
+See [Filter autotune](FILTER_AUTOTUNE.md)
 for the firmware path, literature, parameter coverage, assumptions, thresholds and tests.
 
 The result includes `text`, grouped `recommendations`, `model.parity`, `model.coverage`, `capabilities`, `search`,

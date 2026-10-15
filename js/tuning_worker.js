@@ -2627,13 +2627,15 @@ var TuningWorker = (function () {
             opts.tailFit=notchFit;
             J.notes.add('The replay uses the RPM notch filter frequencies from the analysis of this file.');
         }
-        // options.blockedBy: the ids of the steps that hold the filters (hierarchy nodes filters.blockedBy, for example 'rpm') or texts
-        const G = K.hierarchy && typeof K.hierarchy.graph === 'function' ? (() => { try { return K.hierarchy.graph(); } catch (e) { return null; } })() : null;
-        const titles = new Map(G ? [].concat((G.prereq || []).map(n => [n.id, { title: n.title, prereq: true }]), (G.blocks || []).map(n => [n.id, { title: n.title, prereq: false }])) : []);
-        const blockedBy = (Array.isArray(J.o.blockedBy) ? J.o.blockedBy : []).map(b => titles.has(b) ? `The ${titles.get(b).prereq ? 'prerequisite' : 'step'} "${titles.get(b).title}" has a problem.` : typeof b === 'string' && /\s/.test(b) ? b : null).filter(Boolean);
         if (num0(J.o.budgetMs) > 0) opts.budgetMs = +J.o.budgetMs;
         if (J.o.simulate !== undefined) opts.simulate=J.o.simulate;
         const res = FT.tune(items, opts);
+        // options.blockedBy: the ids of the steps that hold a change of the filters (hierarchy nodes filters.blockedBy and gatedBy, for
+        // example 'rpm') or texts. A gate with a scope (rpm > filters) holds the proposal only when it changes a value that the RPM signal drives
+        const G = K.hierarchy && typeof K.hierarchy.graph === 'function' ? (() => { try { return K.hierarchy.graph(); } catch (e) { return null; } })() : null;
+        const titles = new Map(G ? [].concat((G.prereq || []).map(n => [n.id, { title: n.title, prereq: true }]), (G.blocks || []).map(n => [n.id, { title: n.title, prereq: false }])) : []);
+        const scoped = (b) => typeof K.hierarchy.scopeOf === 'function' && !!K.hierarchy.scopeOf(b, 'filters'), driven = K.require('./filter_autotune.cjs').rpmDriven((res.recommended && res.recommended.rows) || [], res.current && res.current.settings);
+        const blockedBy = (Array.isArray(J.o.blockedBy) ? J.o.blockedBy : []).map(b => titles.has(b) ? (driven || !scoped(b) ? `The ${titles.get(b).prereq ? 'prerequisite' : 'step'} "${titles.get(b).title}" has a problem.` : null) : typeof b === 'string' && /\s/.test(b) ? b : null).filter(Boolean);
         res.configuration = J.o.configuration ? {id:J.o.configuration.id, pidProfile:J.o.configuration.pidProfile} : null;
         res.recordedConfigurations=items.flatMap(item=>runsOf(item.w,item.mask).map(span=>({
             ...(item.w.recordedConfiguration || {id:res.configuration && res.configuration.id || null,profile:item.armingProfile || 0,values:{},sources:{}}),

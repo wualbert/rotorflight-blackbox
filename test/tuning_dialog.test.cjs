@@ -3015,6 +3015,11 @@ test('SPEC3 G: the result of the worker: its STE texts in paragraphs, its recomm
     app.tab('filters');
     app.jq.fire('click', '.tuning-ft-start', {});
     eq(plain(ftWorker(app).sent[0].msg.options.blockedBy), ['rpm'], 'the gates of the Filters step go to the worker');
+    {   // gatedBy: the RPM signal holds a change of the filters also when the filters have no problem (F5 is information)
+        const r2 = synthResult(); r2.hierarchy.nodes.filters.blockedBy = []; r2.hierarchy.nodes.filters.gatedBy = ['rpm'];
+        const a2 = analysed({ result: r2 }); a2.tab('filters'); a2.jq.fire('click', '.tuning-ft-start', {});
+        eq(plain(ftWorker(a2).sent[0].msg.options.blockedBy), ['rpm'], 'gatedBy goes to the worker');
+    }
     const rec = (o) => Object.assign({ node: 'filters', area: 'filters', severity: 'action', scope: 'global', group: 'F:filters', groupSize: 2, blockedBy: [], caveats: [], evidence: [], confidence: 'predicted' }, o);
     const text = { status: 'recommended', summary: 'The app calculated the vibration for 40 sets of filter values on 600 s of flight in logs 6 and 11.\nThe recommended set decreases the vibration.',
         parity: 'The model agrees with the recorded gyroADC in all 2 flight logs.\nThe app does not use the model for these axes.', recommendation: 'The recommended set has 2 changes: `dyn_notch_count` 2 and `roll_d_cutoff` (PID profile 1) 25.',

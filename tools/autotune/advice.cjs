@@ -2339,6 +2339,7 @@ function filterReplayRule(res) {
     const corrective=checks&&checks.training&&checks.training.passed&&checks.training.corrected>0;
     return 'The replay must agree with the recorded gyro on all axes. '
         + `The maximum added time delay is ${limit} ms.\nThe control-band gain must not decrease by more than 0.5 dB. `
+        + 'For each frequency band, the time delay and the gain are the mean of its flight periods of 1 s.\n'
         + 'The gyro vibration on each axis must not increase by more than 0.25 dB.\n'
         + 'If the recorded data has filter problems, the replay must correct or decrease one or more. It must give no new filter problem.\n'
         + 'The values must be in their firmware ranges. A previous filter problem must not increase by more than the measurement uncertainty.\n'
