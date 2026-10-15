@@ -48,6 +48,13 @@ node --test test/ste_text.test.cjs        # ASD-STE100 lint of every text that t
 # then the saved workflow x4-new-dump interprets it against the previous dump
 bash analysis/gaui-x4/run_all.sh <dump.BBL> <out dir> [groups.json]
 
+# 6-DOF digital twin (tools/autotune/heli_twin.cjs model, twin_fit.cjs identification; DEVELOPMENT.md and docs/HELICOPTER_SYSID_MODEL.md)
+make test-control                                                          # model physics, identification, native firmware, closed loop
+node analysis/twin6dof/extract.cjs <out dir> <log file> [log indexes]      # logs -> float32 runs for development
+node analysis/twin6dof/dev.cjs <data dir> <out dir> --fit <stages.json>    # staged fit with a worker pool, held-out evaluation
+node analysis/twin6dof/closed.cjs <data dir> <model.json> <cli dump> <out.json>   # native controller flies the twin, held-out windows
+python plot.py <out dir>/eval_test.json <prefix>                          # prediction-quality figures (in analysis/twin6dof)
+
 # read the flash of a flight controller over USB, read-only (Configurator closed)
 python3 tools/flash_read.py /dev/cu.usbmodemXXXX --out log.bbl [--resume]
 ```

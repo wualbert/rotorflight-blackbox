@@ -266,8 +266,8 @@ test('T0: the worker is Chromium 99 syntax as written (esbuild chrome99 output e
 
 test('T0: the toolkit files the worker runs in Chromium 99 are Chromium 99 syntax and use no newer API', (t) => {
     const { dir, names, optional } = fetchedToolkit();
-    assert.equal(names.length, 37);
-    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline']);
+    assert.equal(names.length, 39);
+    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline']);
     let esbuild = null; try { esbuild = require(path.join(REPO, 'node_modules/esbuild')); } catch (e) { /* the API check still runs */ }
     for (const n of names) {
         const file = path.join(JS, `${dir}${n}.cjs`);
@@ -286,7 +286,7 @@ test('T0: every file the worker loads is a relative URL to a file that exists an
     const list = /(?:var distSources|APP_ASSET_SOURCES) = \[([\s\S]*?)\];/.exec(gulp)[1], quoted = (s) => [...s.matchAll(/'([^']+)'/g)].map(m => m[1]);
     const scripts = quoted(/importScripts\(([^)]*)\)/.exec(src)[1]).map(u => path.posix.join('js', u));
     const toolkit = names.map(n => path.posix.normalize(path.posix.join('js', `${dir}${n}.cjs`)));
-    assert.equal(scripts.length, 12); assert.equal(names.length, 37);
+    assert.equal(scripts.length, 12); assert.equal(names.length, 39);
     toolkit.forEach((f, i) => { if (optional.includes(names[i]) && !fs.existsSync(path.join(REPO, f))) { t.diagnostic(`${f} is not in the repo yet: an optional module`); toolkit[i] = null; } });
     for (const f of scripts.concat(toolkit.filter(Boolean))) {
         assert.ok(!/^\/|^[a-z]+:/i.test(f) && !f.startsWith('..'), `${f} relative to the app root`);
@@ -1134,11 +1134,11 @@ test('derive: init loads the toolkit once; derive never decodes, makes no fs cal
     assert.deepEqual(Object.keys(ready.result.modules), ['track', 'more', 'gov', 'catalog']);
     assert.ok(ready.result.modules.track && ready.result.modules.more && ready.result.modules.gov, J(ready.result));
     assert.equal(ready.result.modules.catalog, has('catalog.cjs'));
-    assert.equal(W.fetches.length, 37, 'each toolkit file fetched once');
+    assert.equal(W.fetches.length, 39, 'each toolkit file fetched once');
     const x = Float32Array.from(noise(4000, 1, 10));
     await W.derive('bandpass', { x }, 1000, { lo: 5, hi: 50 });
     await W.derive('window', { 'setpoint[0]': x, 'gyroADC[0]': x }, 1000, {});
-    assert.equal(W.fetches.length, 37, 'no fetch after init');
+    assert.equal(W.fetches.length, 39, 'no fetch after init');
     assert.equal((await TW.deriveKit()).calls.n, 0, 'no fs call');
     const bad = async (msg, text) => { const m = await W.post(Object.assign({ cmd: 'derive' }, msg)); assert.deepEqual([m.type, m.message], ['error', text]); };
     await bad({ kind: 'nope', rate: 1000, cols: { x } }, 'The function "nope" is unknown.');
@@ -1934,9 +1934,36 @@ test('flight selection (SPEC3 D): only the selected logs and flights; a log with
     const auto = await W.result({ cmd: 'analyseFile', fileName: 'two.bbl', selectedLog: 1, options: { curves: false, flights: [{ log: 1, flight: null }] } }, bytes);
     assert.deepEqual(auto.logs, [1]); assert.deepEqual(auto.flightRpm.logs, [1], 'the flight rpm comes from the selected logs');
     assert.ok(!auto.records.some(l => l.log === 0));
-    // a flight that the log does not have, and a log that the file does not have: notes
-    const bad = await run([{ log: 0, flight: 3 }, { log: 9, flight: 0 }]);
-    assert.ok(bad.notes.some(t => /does not use the selected flight 4/.test(t)) && bad.notes.some(t => /flight selection/.test(t)), J(bad.notes));
+    // An explicit request with no matching flight must not expand to the whole log.
+    const bad = await W.send({cmd:'analyseFile',fileName:'two.bbl',selectedLog:1,
+        options:{flightRpm:TRUTH.rpm,curves:false,flights:[{log:0,flight:3},{log:9,flight:0}]}},bytes);
+    assert.equal(bad.type,'error');assert.match(bad.message,/does not contain a selected flight/);
+});
+
+test('invalid flight selections fail closed in file analysis and digital twin input selection',async()=>{
+    const echo=`module.exports={identify(input){return {logs:[...new Set(input.items.map(item=>item.source.logIndex))]};}};`;
+    const W=worker({'control_pipeline.cjs':echo}),bytes=bbl.encode([0,1].map(i=>bbl.simulateFlight({seconds:35,
+        seed:72+i,airborne:[5,31],start:`2026-10-0${i+1}T00:00:00.000Z`,profiles:[{from:0,profile:1,target:2500}]}))).bytes;
+    W.ctx.crypto=require('node:crypto').webcrypto;
+    const analysis=await W.result({cmd:'analyseFile',fileName:'two.bbl',selectedLog:0,
+        options:{flightRpm:TRUTH.rpm,curves:false,gains:false,cliText:CLI}},bytes),configuration=analysis.datasets.datasets.find(d=>d.analysedFlightSeconds>0).id;
+    for(const cmd of ['analyseFile','systemIdentify']){
+        const send=options=>W.send({cmd,fileName:'two.bbl',selectedLog:0,configuration,analysis,
+            options:{flightRpm:TRUTH.rpm,curves:false,gains:false,cliText:CLI,...options}},bytes);
+        for(const flights of [[{log:99,flight:null}],[{log:-1,flight:0}],[{log:0,flight:-1}]]){
+            const reply=await send({flights});assert.equal(reply.type,'error');assert.match(reply.message,/selection has no correct log or flight number/);
+        }
+        const missingFlight=await send({flights:[{log:1,flight:99}]});
+        assert.equal(missingFlight.type,'error');assert.match(missingFlight.message,/Log 2 does not contain a selected flight/);
+        const withoutPhases=await send({phases:false,flights:[{log:1,flight:0}]});
+        assert.equal(withoutPhases.type,'error');assert.match(withoutPhases.message,/without flight phase data/);
+        const selected=await send({flights:[{log:1,flight:null}]});
+        assert.notEqual(selected.type,'error',selected.message);assert.deepEqual(selected.result.logs,[1]);
+        const partial=await send({flights:[{log:99,flight:null},{log:1,flight:0}]});
+        assert.notEqual(partial.type,'error',partial.message);assert.deepEqual(partial.result.logs,[1],'a valid request remains confined to the selected log');
+        const all=await send({flights:[]});
+        assert.notEqual(all.type,'error',all.message);assert.deepEqual(all.result.logs,[0,1],'the existing empty-array convention still selects all logs');
+    }
 });
 
 // round 2 (SPEC3 A, I; coordinator): the new modules in the worker on real flight logs. The Gaui X4 records Vbat as 0 (no voltage

@@ -412,6 +412,8 @@ function dist() {
         './tools/autotune/control_tune.cjs',
         './tools/autotune/control_pipeline.cjs',
         './tools/autotune/helicopter_model.cjs',
+        './tools/autotune/heli_twin.cjs',
+        './tools/autotune/twin_fit.cjs',
         './tools/autotune/system_id.cjs',
         './tools/autotune/firmware_controller.cjs',
         './tools/autotune/firmware_sensor.cjs',

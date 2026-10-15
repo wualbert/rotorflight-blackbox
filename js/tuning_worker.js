@@ -123,7 +123,7 @@ var TuningWorker = (function () {
         hierarchy: 'the tuning sequence', evidence: 'the part of the log that gave each result', datasets: 'the configurations of the flights',
         epochs: 'the parts of the log in which the values are possibly not the values of the log header' }; // without that module
     const ON_DEMAND = ['filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune',
-        'helicopter_model', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline'];
+        'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline'];
     const CORE = ['setup', 'gov', 'loop'];                                 // health.cjs MODULES, in its order
     const JUDGED = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power']; // the new modules, judged after health_report.cjs
     const ALL_PHASE = new Set(['rescue', 'limits', 'config', 'power']);    // modules that use all phases of a flight log, rescue included, with no guard time
@@ -2421,24 +2421,26 @@ var TuningWorker = (function () {
         for (const q of list) { const l = q && Number.isInteger(q.log) ? q.log : NaN, all = !!q && (q.flight === null || q.flight === undefined), f = all ? ALL : q && Number.isInteger(q.flight) ? q.flight : NaN;
             if (!(l >= 0 && l < count) || !(all || f >= 0)) { bad.push(q); continue; } if (!m.has(l)) m.set(l, new Set()); m.get(l).add(f); }
         if (bad.length) J.notes.add(`The app does not use ${bad.length === 1 ? '1 entry' : `${bad.length} entries`} of the flight selection, because the log or the flight is not in the file.`);
+        if (!m.size) throw new Error('The flight selection has no correct log or flight number. Select a log or flight in this file.');
         J.selection = { flights: [], windows: [], all: new Set() };
-        return m.size ? m : null;
+        return m;
     }
     // the segments of log li that the selected flights keep (want: Set of flight indices), cut by sample
     const ALL = 'all';
     function selectFlights(J, d, li, want) {
         const K = J.K, live = d.segs.filter(w => !w.skipped);
         if (want.has(ALL)) { J.selection.all.add(li); for (const w of live) { const at = frameOf(w); J.selection.windows.push({ log: li, t0: at(0), t1: at(w.n) }); } return d.segs; } // the flights: from the records (finish)
-        if (!phasesOn(J, K)) { J.notes.add('The flight selection uses the flight phases of "health_phase.cjs", and they are not available. Thus, the app uses all of the selected logs.', li); return d.segs; }
+        if (!phasesOn(J, K)) throw new Error('The app cannot identify the selected flights without flight phase data. Select a complete log.');
         const airborneEvents = live.some(w => w.airborneAt.some(v => !v)), found = [];
         live.forEach((w, k) => { const p = prepare(K, w, { segment: k, cli: null, cliParsed: null, phases: true, airborneEvents }, J), P = p.ph && p.ph.P;
             for (const q of (P && Array.isArray(P.flights) ? P.flights : [])) found.push({ w, k, i0: q.i0, i1: q.i1 }); });
         found.sort((a, b) => a.k - b.k || a.i0 - b.i0);
         const idx = [...want].sort((a, b) => a - b), ok = idx.filter(f => f < found.length), lost = idx.filter(f => f >= found.length);
         if (lost.length) J.notes.add(`Log ${li + 1} has ${found.length === 1 ? '1 flight' : `${found.length} flights`}. Thus, the app does not use the selected flight${lost.length > 1 ? 's' : ''} ${and(lost.map(f => String(f + 1)))}.`, li);
+        if (!ok.length) throw new Error(`Log ${li + 1} does not contain a selected flight. Select a flight in this log.`);
         for (const f of ok) { const q = found[f], at = frameOf(q.w); J.selection.flights.push({ log: li, flight: f, t0: at(q.i0), t1: at(q.i1) }); }
         const whole = found.length <= 1 || ok.length === found.length;
-        if (whole || !ok.length) { if (whole) for (const w of live) { const at = frameOf(w); J.selection.windows.push({ log: li, t0: at(0), t1: at(w.n) }); } return whole ? d.segs : []; }
+        if (whole) { for (const w of live) { const at = frameOf(w); J.selection.windows.push({ log: li, t0: at(0), t1: at(w.n) }); } return d.segs; }
         const cuts = new Map(); // segment -> [[a, b]]
         for (const f of ok) { const q = found[f], prev = found[f - 1], next = found[f + 1];
             const a = prev && prev.w === q.w ? prev.i1 : 0, b = next && next.w === q.w ? next.i0 : q.w.n;
@@ -3018,7 +3020,7 @@ var TuningWorker = (function () {
         const extra = [...new Set(K.extraAll.concat(K.phase.EXTRA || [], K.more.EXTRA || [],
             ['time', 'govRequest', 'tailspeed', 'motor[0]', 'mixer[3]', 'axisO[0]', 'axisO[1]', 'axisO[2]',
                 'gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'servo[0]', 'servo[1]', 'servo[2]', 'servo[3]',
-                'rcCommand[0]', 'rcCommand[1]', 'rcCommand[2]', 'rcCommand[3]',
+                'rcCommand[0]', 'rcCommand[1]', 'rcCommand[2]', 'rcCommand[3]', 'rcCommand[4]',
                 'Vbat', 'Ibat', 'altitude', 'vario', 'attitude[0]', 'attitude[1]', 'attitude[2]']))];
         for (const [k, li] of logs.entries()) {
             await checkpoint(J.id);

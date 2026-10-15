@@ -1,327 +1,165 @@
-# Helicopter rate digital twin
+# Helicopter six-degree-of-freedom digital twin
 
-`tools/autotune/system_id.cjs` identifies a reusable plant from logged mixer
-commands, collective and headspeed. `helicopter_model.cjs` replays that plant
-without a controller. The controller and gyro filter chain belong outside this
-module. Controller changes require a separately validated firmware execution
-path and an independent closed-loop test.
+`tools/autotune/heli_twin.cjs` is the plant: a stateful six-degree-of-freedom helicopter model with position, velocity,
+attitude, body rates, rotor flapping, rotor speed and actuator states. `tools/autotune/twin_fit.cjs` identifies its
+parameters from flight logs and tests it on reserved flights. `system_id.cjs` selects the log data and calls them, and
+`control_pipeline.cjs` closes the loop with the native Rotorflight 4.6 controller (`firmware_controller.cjs`, the pinned
+C source compiled to WebAssembly) for closed-loop identification and the gain search.
 
-The model predicts three angular-rate sensor channels. It does not predict
-position, attitude, acceleration, motor current or headspeed. Headspeed and
-collective are measured external inputs. Consequently this model cannot tune
-the governor. The output is the conditional rate response to the recorded
-commands. Unmeasured gusts and structural vibration are residual disturbances,
-not regenerated copies of measured noise.
+It replaces the rate-only "rotational-rotor-body" surrogate (twin file version 1). That model replayed recorded commands
+open loop for 16 s windows and was never accepted on real flights. Reasons, from the Codex work log of 2026-10-13/14 and
+this rewrite: an open-loop helicopter diverges over seconds, a plain prediction-error fit of feedback data lowers the
+control power (the disturbances correlate with the feedback commands), and a rate-only model has no place for attitude,
+speed, rotor speed or barometer data.
 
-The collective plant input is logged `mixer[3]` in firmware permille units.
-Pilot `setpoint[3]` is retained separately as `pilotColl` for identification
-instruments. This preserves the same boundary used by controller simulation,
-which supplies the firmware's collective mixer output multiplied by 1000.
-The artifact records `collectiveField`. A missing mixer collective permits
-an explicitly labelled `setpoint[3]` identification proxy, but disables control
-tuning. Mixed collective input fields cannot be pooled.
+## Boundary
 
-## Model and scope
+- **Plant input** is the stabilized mixer command that every flight-controller law produces: `mixer[0..2]` (roll, pitch,
+  yaw; logged value / 1000) and `mixer[3]` (collective / 1000). One unit is 12 degrees of main blade pitch and 24 degrees
+  of tail pitch (Rotorflight 4.6). The logged mixer is after the PID, feedforward, B and O terms, yaw stop gains, cyclic
+  and collective precompensation, cross-coupling, swash ring and mixer limits. Swash mixing and servo geometry are inside
+  the fitted actuator lag and delays.
+- **Other inputs**: throttle `motor[0]` / 1000 and battery voltage `Vbat` / 100. A log without battery voltage (or with
+  zeros) uses a constant 1: the motor gain is then per throttle unit.
+- **Closed loop**: the native controller gets the recorded pilot setpoints and collective and the twin gyro through the
+  native gyro filter chain, and its mixer output drives the twin. A check with recorded gyro shows that this controller
+  reproduces the logged mixer to 1-4 % relative error in most 10 s windows of the reserved Fireball flights.
+  Not executed: the stick-to-setpoint rate curves (the logged setpoint is used), rescue and level modes (excluded
+  periods). The governor runs in the loop only when its settings are known; else the recorded headspeed and throttle are
+  external inputs.
 
-Let $\omega\in\mathbb{R}^3$ be body angular rate in degrees per second and
-$\phi\in\mathbb{R}^3$ its effective rotor/body rate-derivative state in degrees
-per second squared. This second state represents a reduced rotor/body mode.
-It is not a measured blade-flapping angle. Let $K$ be a positive diagonal
-matrix of squared modal angular frequencies, $D$ a positive diagonal damping
-matrix, and $G$ a skew-symmetric matrix with one fitted cyclic coupling:
+## State
 
-$$
-\dot\omega=\phi,\qquad
-\dot\phi=-K\omega-D\phi+G\phi+K\rho.
-$$
+| States | Meaning |
+|---|---|
+| `x, y, z` | position, world north-west-up, m |
+| `vx, vy, vz` | velocity, world frame, m/s |
+| `qw..qz` | attitude quaternion body to world (body forward-left-up, the gyro frame) |
+| `p, q, r` | true body rate, rad/s |
+| `bx, by` | tip-path-plane tilt about body x and y, rad |
+| `omega`, `lambda` | main rotor speed rad/s, induced inflow ratio (dynamic inflow) |
+| `aLat, aLon, aTail, aColl` | actuator positions (first-order lag after the transport delays) |
+| `dMx, dMy, dMz`, `dFx, dFy, dFz` | moment and force disturbances (observer random walks, held during a prediction) |
+| `baroAlt, baroVario` | barometer filters: altitude lags height, vario lags the derivative of the filtered altitude |
+| `esc`, `hsSensor` | ESC response to throttle, headspeed measurement filter |
+| `gyroP, gyroQ, gyroR` | rate after the firmware gyro low-pass filter, the value the log records as `gyroADC` |
 
-Here $\rho\in\mathbb{R}^3$ is the equilibrium rate drive. The off-diagonal
-cyclic entries of $G$ are equal in magnitude and opposite in sign. They transfer
-energy between rotor states and therefore change cross-axis phase. A full
-input-gain matrix additionally represents cross-axis command response.
+The logged attitude is ZYX Euler (roll about +x, pitch about +y with nose down positive, yaw = -heading). A positive mixer
+command gives a positive gyro rate on each axis. These conventions were checked against the logs (kinematic residual of
+about 1 deg/s) and are tested in `test/heli_twin.test.cjs`.
 
-For each axis index $i$ in the set $\{1,2,3\}$, define $a_i\in\mathbb{R}^9$ as its
-filtered input feature vector and $\beta_i\in\mathbb{R}^9$ as its fitted gain
-vector. The nine features are the three mixer commands, signed collective,
-absolute collective, a constant, squared collective, squared headspeed and
-headspeed derivative. Collective and squared-headspeed features are centred on
-training means. The squared collective and headspeed features are normalized.
-Mixer features optionally have squared normalized-headspeed scaling. Features
-without training variation are omitted from estimation and get zero gains.
+## Equations
 
-$$
-\rho_i=\beta_i^{\mathsf T}a_i.
-$$
+Minimum-complexity model in the manner of Gavrilets (2001) and Mettler (2003), integrated with fourth-order Runge-Kutta at
+the sample rate (500 Hz for fitting, the gyro rate in the closed loop):
 
-Each axis has a fitted transport delay and a first-order effective command lag.
-This is part of the measured airframe input response. There is no separate
-physical servo, motor, linkage, swashplate or ESC dynamics model. The legacy
-parameter name `actuatorTauS` denotes this effective lag. The
-implementation first advances the lag recurrence, then holds its new
-value constant for the rotor/body state update. The rotor/body update uses an
-exact matrix exponential of the six-state linear system. It uses fractional
-sample interpolation for delays. All three outputs share the same coupled
-state transition. The zero-coupling model is an explicit nested candidate.
+```
+thrust      Ct = sa/2 (theta_c/3 (1 + 1.5 mu^2) - lambda/2),   T = rho pi R^2 (Omega R)^2 Ct
+            theta_c = 12 deg * aColl - th0,   lambda = w_body/(Omega R) + lambda_i,   lambda_i' = (Ct / (2 sqrt(mu^2 + lambda^2)) - lambda_i) / 0.05 s
+flapping    tau b' = -b + G R(phiU) (12 deg * [aLat, aLon]) - tau R(phiW) [p, q] + kmu [v, -u] / (Omega R),   tau = tauF Omega_ref/Omega
+force       F_body = T * tilt(b) + (0, tail force, 0) - drag;   v_world' = R F_body / m - g + dF
+moments     p' = lb n^2 bx + tail roll arm + gyroscopic + dMx,   q' = mb n^2 by + gyroscopic + dMy
+            r' = nt n^2 (24 deg * aTail - tht0) + nr n (v/l_t - r) + Q_motor / Izz + nc n^2 (aColl - c_ref) + ncd aColl' + dMz
+rotor       Omega' = (Q_motor - Q_aero) / I_r,   Q_motor = max(0, kmV esc Vbat - kmW Omega),   Q_aero = rho pi R^2 (Omega R)^2 R (cq0 (1 + 4.6 mu^2) + Ct lambda)
+sensors     gyro = first-order low-pass at the logged gyro filter cutoff, baroAlt' = (z - baroAlt)/tauB, baroVario' = (baroAlt' - baroVario)/tauV
+```
 
-Yaw also has a torque-balance candidate. Let $d\geq0$ be yaw damping in inverse
-seconds. Its yaw equation replaces the oscillator equation with
+`n` is rotor speed over the reference speed (the median of the fit data), so control power scales with rotor speed squared
+and the flapping time constant with the inverse of rotor speed. The body reaction torque is the motor torque, because the
+motor stator turns with the frame. Mass, rotor radius and roll/pitch inertia come from the craft geometry prior
+(`helicopter_model.craftPrior`); yaw and rotor inertia are fitted inside a factor of that prior.
 
-$$
-\dot\omega_3=-d\omega_3+\beta_3^{\mathsf T}a_3.
-$$
+## Observer
 
-For this family the gain vector produces angular acceleration, not equilibrium
-rate. Zero damping is an exact rate integrator. Positive damping gives a
-first-order rate response. Effective command lag and transport delay remain separate.
-This family does not force yaw to have a nonzero rotor/body stiffness. The
-export records the family and its gain units for each axis. The unused yaw
-rotor state is numerically inactive. The augmented matrix exponential handles
-constant-input forcing correctly even at zero damping.
+Predictions start from a state that only past measurements set. Attitude and headspeed replace the model values. Body rate,
+moment disturbance and the vertical channel use steady-state Kalman gains of two linear sub-models (rate and moment random
+walk per axis; height, vertical speed, force random walk and the two barometer filters). Flapping, inflow, horizontal
+velocity and actuators evolve with the model: no logged sensor measures them. A test changes every measurement after an
+origin and requires identical predictions.
 
-For the unforced continuous oscillator-family subsystem, define the nonnegative
-quadratic energy $E=(\phi^{\mathsf T}\phi+\omega^{\mathsf T}K\omega)/2$.
-Differentiate this definition and substitute both state equations above.
-The two mixed terms cancel because $K$ is symmetric. The term
-$\phi^{\mathsf T}G\phi$ vanishes because $G$ is skew-symmetric. Therefore
-$\dot E=-\phi^{\mathsf T}D\phi\leq0$. The stable model family is a deliberate
-identification constraint. A helicopter whose unstable modes require a more
-general model must fail this model's validation, rather than receive an
-unsupported control recommendation.
+## Identification
 
-This is a coupled rotational surrogate. It is not a complete six-degree-of-
-freedom fuselage model, an eight-degree-of-freedom helicopter model, a blade-
-element rotor solver or a simulator of arbitrary aerobatics. The architecture
-permits replacing the plant with a higher-order model while preserving logged
-input replay and independent validation. A good fitted response is evidence
-only within the recorded operating envelope and tested frequency range.
+`twin_fit.STAGES`, then the closed-loop stage of `control_pipeline.tune`:
 
-## Geometry and inertia prior
+1. **Rotor speed** (motor, rotor inertia, ESC and sensor lags) from headspeed predictions.
+2. **Vertical** (thrust, heave damping, barometer filters, collective delay) from altitude and vario predictions.
+3. **Frequency**: flapping, hub stiffness, cross-coupling, tail authority and damping, delays and actuator lag fitted to
+   the 3 x 3 actuator-to-rate frequency responses, estimated with the pilot setpoints as instruments
+   (H = S_yx S_ux^-1, Hann windows, log bins, weight from coherence). With feedback, a plain fit of rate to command lowers
+   the control power; the setpoint does not depend on the disturbances, so this estimate has no feedback bias (indirect
+   closed-loop identification, as in CIFER). One linearization of the nonlinear model gives the model responses.
+4. **Short-horizon joint**: all except the vertical parameters, from 0.01-0.2 s predictions, with the frequency term at a
+   high weight. Longer open-loop horizons are not used for fitting: the open-loop helicopter diverges and the cost becomes
+   too rough.
+5. **Rotor speed again**, then **yaw trim** (tail trim, collective torque terms, yaw inertia) with a penalty on the
+   observer moment disturbance: the trim must come from the model, else the closed loop runs away when the collective
+   changes.
+6. **Closed loop** (`control_pipeline.tune`, design periods only): the native controller flies the twin from the
+   recorded pilot inputs; the fit minimizes the low-passed gyro and the controller mixer errors together, with the
+   frequency term. Matching the mixer as well as the gyro is necessary: a wrong plant can track the setpoint.
 
-The [GAUI X4 II manufacturer manual](https://nexrc.com/image/data/Brand/Gaui/X4%20II/GAUI%20X4%20II%20Instruction%20Manual.pdf)
-gives 900 mm length, 320 mm height, 165 mm width and a rotor diameter of
-970–1040 mm. Its 1780 g mass does not establish the user's ready-to-fly mass.
-The prior assumes 2.3 kg with a broad 1.61–3.22 kg range.
+Fits are Levenberg-Marquardt with forward-difference Jacobians in log space, pseudo-Huber residuals and parameter bounds.
 
-The [SAB Fireball manufacturer manual](https://sabusa.com/pdf/GOBLIN_FIREBALL_280_MANUAL_RELEASE_1.0L.pdf)
-gives 580 mm length, 626 mm rotor diameter, 280 mm blades and 735 g excluding
-battery. The prior assumes 0.95 kg with a broad 0.665–1.33 kg range. Its 120 mm
-width and 190 mm height are modelling assumptions, not manufacturer
-measurements of this user's helicopter.
+## Checks on reserved flights
 
-Let $m$ denote assumed flight mass and $L,W,H$ the assumed bounding-box length,
-width and height. The prior inertia tensor $J$ is the diagonal uniform-box
-estimate:
+`twin_fit.assess` and the closed-loop agreement of `control_pipeline`:
 
-$$
-J=\frac{m}{12}\operatorname{diag}(W^2+H^2,L^2+H^2,L^2+W^2).
-$$
+- prediction error of each output at 0.01-1 s against holding the last value (roll and pitch rate at 0.1 s must be under
+  90 % of it, attitude at 0.2 s under it);
+- frequency response agreement on coherent bins (median magnitude error under 42 %, median phase error under 35 degrees);
+- closed-loop gyro and mixer agreement with the native controller.
 
-Each diagonal component has a range from 0.2 to 3 times its nominal value.
-This deliberately allows substantial uncertainty in battery position, rotor
-mass and the light tail boom. It is not a CAD mass model or an inertia
-measurement.
+Per axis: roll and pitch need the prediction and frequency checks, yaw the frequency check. The open-loop yaw prediction
+is shown but is not a gate: a replay of the recorded tail command integrates every torque disturbance that the command
+cancelled. A model that agrees on some axes only is "partial": it can test the control steps of those axes
+(`eligibleSteps`). Governor gains need governor parity.
 
-The estimate affects identification. A broad assumed rotor moment scale,
-0.3 times mass times gravity times rotor radius per unit command, is divided
-by inertia and modal damping to set the diagonal gain prior. A factor-20 gain
-spread and one equivalent sample make this a weak regularizer. Both the
-moment scale and damping conversion are modelling choices. Flight data
-dominates the fit. Unknown craft geometry disables this prior.
+## Results (2026-10-14)
 
-The identified command-to-rate or command-to-acceleration gain combines control torque and inertia.
-Angular-rate logs without independent torque measurements do not identify
-those two physical quantities separately. The exported artifact explicitly
-sets `physicalInertiaIdentified: false`.
+Fireball, log file `RTFL_BLACKBOX_LOG_SAB_Fireball_20261005_204823.BBL`, captures 6-16 (no parameter changes, user
+confirmed); fit 921 s, reserved captures 12 and 16 (525 s, 1015 prediction origins). Development harness
+`analysis/twin6dof/` with a worker pool; figures in `analysis/twin6dof/out/cfit4_eval/`.
 
-## Autonomous interval selection
+| Reserved flights, RMS error | 0.1 s model / hold | 0.5 s | 1 s |
+|---|---|---|---|
+| roll rate, deg/s | 24.1 / 29.2 | 32.1 / 55.8 | 43.1 / 56.7 |
+| pitch rate, deg/s | 17.8 / 30.1 | 35.6 / 79.1 | 50.4 / 89.0 |
+| yaw rate, deg/s | 35.2 / 28.0 | 285 / 67 | 596 / 71 |
+| roll / pitch angle, deg | 2.6 / 11.8, 1.2 / 6.9 | 25.4 / 35.8, 20.8 / 26.4 | 46.8 / 44.9, 33.1 / 32.4 |
+| altitude m, vario m/s | 0.28 / 0.51, 0.58 / 0.86 | 1.15 / 1.65, 2.04 / 2.65 | 2.08 / 2.69, 2.43 / 3.46 |
+| headspeed, RPM | 43 / 41 | 109 / 118 | 127 / 130 |
 
-`prepareSegments` requires an authoritative eligible-flight mask. The caller
-must derive that mask from complete flight-phase and mode information before
-cutting configurations. Rescue, level, failsafe and bench portions must not be
-passed as eligible. The backend additionally excludes rescue flags, nonfinite
-samples, explicitly supplied mixer bounds and control-limit masks, profile/configuration
-changes, and nonmonotonic or irregular sample clocks. It never joins gaps or
-separate source segments. Mixer values are firmware values divided by 1000.
-A magnitude of one is not assumed to be a mechanical or firmware limit.
-The source metadata records whether limits were known. Unknown physical servo
-limits are not silently treated as checked limits.
+Frequency responses on reserved flights: roll median magnitude error 12 %, phase 3 degrees; pitch 8 %, 5 degrees, also at
+5000 RPM, a headspeed with no frequency-fit data. Yaw: not enough coherent bins in the reserved flights.
+Closed loop with the native controller, 35 reserved 10 s windows: gyro RMS error roll 14.3, pitch 11.4, yaw 13.5 deg/s
+(medians 13.5, 11.1, 9.8; maximum 20.4, 16.9, 47.4), against 16.2, 15.8, 13.1 for the setpoint as the prediction.
+Controller output error over its standard deviation: median 0.55 roll, 0.63 pitch, 1.21 yaw.
 
-Repeated flash dumps are deduplicated before the fitting budget, random split
-and confidence calculation. A recorded log start time and craft name identify
-the physical flight independently of capture length or concatenated log index.
-Raw sample times align capture windows. Identical overlapping windows retain
-one observation. Shifted overlapping windows retain the first complete window
-and exclude the later window conservatively. Exact time matches with different
-data prevent identification. Each exclusion records both original sources.
-Different non-overlapping captures of the same flight remain in the same
-random-split group. If aligned sample times are missing, only one capture is
-retained for that flight. Missing recorded flight start times are explicitly
-reported; parser-generated captures with unknown starts are grouped together
-conservatively. Arbitrary caller-supplied flight identifiers without recorded
-start times cannot prove physical-flight independence.
+In-app identification (`system_id.fit`, one thread, the data selection of the app: 313 s of fit periods, 56 s reserved)
+on the same 9 Fireball logs takes 189 s and validates all three axes: 0.1 s rate error roll 25.4 / 38.2, pitch 20.7 /
+29.0, yaw 25.7 / 31.5 deg/s (model / hold); frequency agreement roll 26 % / 6.5 degrees, pitch 18 % / 7 degrees, yaw
+16 % / 15.6 degrees (3 bins). The frequency weight of each stage is limited to half the time-domain cost, so a small
+data set is not dominated by the frequency term.
 
-Each new valid run has a one-second settling exclusion. The default fitting
-windows are 8–16 seconds, with at most four windows per flight. The selector
-scans the entire flight before applying this budget. It greedily selects
-windows with diverse pilot-setpoint excitation, using only setpoint statistics
-and input eligibility. It does not prefer low prediction error or the first
-minute of the flight. Every rejected
-sample interval has a reason and exact source sample indices. Each window must
-contain pilot excitation and measurable input/output variation. Across the
-training windows, both command and pilot-input covariance must have adequate
-rank. Correlated inputs cannot establish independent axis
-dynamics merely by providing many samples.
+Gaui X4 II (external aircraft, own fit, no Fireball coefficients), dump `RTFL_BLACKBOX_LOG_20261004_233406.BBL` logs 38-49:
+pitch and yaw pass (yaw frequency 11 %, 16 degrees over 27 bins; yaw 0.1 s rate 32 against 54 deg/s), roll fails the
+0.1 s rate check (29 against 23 deg/s) while its frequency response agrees (13 %, 9 degrees): status partial before the
+closed-loop stage.
 
-The same physical craft may contribute several controller configurations when
-raw gyro is present. Configuration transitions remain boundaries, and each
-window retains its original configuration. Filtered gyro requires a single
-configuration because the identified plant then includes its sensor filtering.
-Different craft names are refused. The caller must keep physical modification
-epochs separate. A craft name alone cannot detect a changed blade or servo.
+## Limits
 
-Actual measured sample rates are preserved. Clock differences up to one percent
-between logs use the corresponding continuous-model discretization. Larger
-rate differences require separate identification. Controller-rate replay uses
-`atRate`; it does not add identified bandwidth above the logging bandwidth.
+- The yaw open-loop prediction is worse than holding the last value after about 0.1 s. The tail trim, the collective
+  torque and the low-frequency yaw damping are the weakest parts; the closed loop and the frequency check carry the yaw.
+- No logged sensor measures horizontal position or speed. The model estimates them; speed effects (blowback, drag, tail
+  inflow) are as good as that estimate.
+- Wind, vibration, servo motor dynamics, blade flexibility and ground effect are not modelled.
+- Thresholds are model-check limits of this app, not flight-safety limits. A new flight must test every gain change.
 
-## Estimation, model choice and final test
+## Files and commands
 
-The algorithm first searches bounded modal frequencies, damping, effective command lags
-and delays, including the separate tail torque-rate family. For each candidate
-it simulates unit-input response bases from the actual commands. Its
-coefficient fit uses two-stage instrumental-variable moments. The instruments
-are pilot setpoints at zero, 80 ms and 240 ms delay, plus available collective
-and RPM load features. This retains a command-to-gyro plant. It does not fit
-setpoint-to-gyro as a substitute for the plant. The regression uses simulated
-command-response bases, not measured gyro derivatives or previous measured
-gyro states. Rates are never injected into later predicted states.
-
-The centered fraction of each command-response basis explained by the
-instruments must exceed five percent. Direct command gains must be positive
-under the logged body-axis convention. These are explicit identification
-gates. Pilot inputs are not guaranteed exogenous: a pilot may react to
-disturbances. Thus this instrumental-variable construction reduces one source
-of feedback bias without proving that its independence assumption holds.
-
-The search ranks eligible candidates by free-running training error and retains
-a shortlist for each physical family. It chooses axis dynamics on
-selection flights, then fits and selects coupled cyclic-state candidates using
-the same training/selection separation. The final test flights are opened for
-scoring only after the model and plausible-model ensemble are fixed. With at
-least three flights the partition is a seeded random assignment of complete
-flights. Approximately 20 percent are final-test flights and 20 percent are
-selection flights, with at least one flight in each set. The remainder fits
-parameters. The artifact stores the seed, complete assignment, requested
-fraction and actual flight/sample fractions. The worker seeds this assignment
-from the source file hash unless another seed is supplied.
-
-With fewer than three flights, random non-overlapping intervals can produce a
-diagnostic model. One-second exclusions on both sides of every interval give
-at least a two-second temporal gap between neighbouring retained intervals.
-These intervals can still be statistically dependent. They receive lower
-confidence and cannot enable control tuning. Individual frames are never
-randomly mixed between fitting and validation.
-
-A one-second rollout warmup follows the single initial measured-rate state.
-Initial rotor states are zero. Each complete interval then runs freely. The
-initial-state assumption and excluded warmup are recorded in the result.
-The current fit does not estimate a disturbance innovation process. Weak or
-endogenous pilot instruments and RPM-dependent disturbances can still bias
-estimates. Reserved flights, residual tests and different controller
-configurations reduce the risk; they do not prove causal identification.
-
-The estimation and scoring filter both measured outputs and predicted bases with
-the same causal fourth-order Butterworth 20 Hz analysis filter. Its two
-biquad sections suppress rotor vibration before fitting-sample decimation.
-The initial homogeneous response receives the same filter. This filter is external to the exported
-plant and is never applied twice in controller simulation. Evaluation reports
-both full-band raw error (`axes`) and control-band error (`controlledAxes`).
-The latter contributes to rate-response eligibility. This filter
-does not eliminate all vibration above its cutoff, and its cutoff does not prove
-identification throughout 0–20 Hz. Full-band error is retained even when structural
-vibration lies outside the controllable response. No stochastic noise
-realization is presented as a prediction of the actual logged vibration.
-
-An independent spectral check divides reserved flights into non-overlapping
-four-second Hann windows. At fixed frequencies it measures pilot-to-command
-and pilot-to-gyro coherence, pilot excitation power, approximate relative
-uncertainty and agreement between measured and predicted pilot cross-spectra.
-Only individually passing frequencies enter `validatedFrequenciesHz`.
-`validatedBandHz` stores their minimum and maximum when at least two common
-frequencies pass. It does not certify gaps between these points. Rejected
-models have no validated band. Control eligibility additionally requires two
-frequencies supported on all axes. These spectral checks are diagnostic
-evidence under the stated instrument assumptions, not guaranteed causal
-frequency-response confidence bounds.
-
-Final checks apply per axis: normalized RMS error, bias, residual correlation
-with every control input, and residual correlation at a 100 ms lag. Correlation
-gates are inactive below 0.5 degrees per second RMS, where blackbox integer
-quantization dominates interpretation. Thresholds are engineering acceptance
-rules in `RULES`; they are not flight-safety guarantees.
-
-The confidence result reports measured held-out error per axis and a 95-percent
-bootstrap interval. With at least three held-out flights, entire flights are
-the resampling units. Otherwise contiguous held-out intervals are the units,
-and the result states their possible dependence. Fewer than two units cannot
-give an error interval. The normalized interval divides by the observed
-held-out output standard deviation; uncertainty in that denominator is not
-included. These are empirical error intervals conditional on the selected
-flight portions, not a probability that the model is correct.
-
-High confidence requires at least three test flights, at least six retained
-test intervals, error intervals within the declared limits and frequency
-coverage on every axis. Moderate confidence requires whole-flight separation,
-at least three error resampling units and error intervals within the limits.
-Failed model checks yield low confidence when errors were measured. Missing
-model output yields unavailable confidence. The reasons and sample counts
-remain explicit rather than being replaced with an arbitrary numeric score.
-
-The ensemble contains three selection-ranked parameter models. Its range is
-model-choice sensitivity, not a statistical confidence interval. It does not
-cover unmodelled instability, unseen mechanical changes or arbitrary operating
-conditions. A robust tuning search must check every ensemble member, preserve
-the observed input envelope, and forbid relying on response above the
-validated band.
-
-## Reusable artifact and APIs
-
-The model stores craft identity, geometry assumptions, model parameters,
-parameter ranges, input/output units, native sample rate, source flights,
-configuration/sample ranges, operating envelope and final validation. Optional
-prediction records include the actual mixer, headspeed and collective inputs,
-measured outputs and complete predicted traces. The parent twin artifact also
-contains firmware provenance and its parity evidence.
-
-- `prepareSegments(input)` returns normalized windows and an exclusion audit.
-- `splitSegments(windows)` returns training, selection and final-test windows.
-- `fit(input)` returns the model, ensemble, independent scores and eligibility.
-- `evaluate(model, windows)` replays new logs without fitting parameters.
-- `createState`, `step` and `rollout` run the plant with no Node dependency.
-- `serialize` and `deserialize` validate reusable model parameters.
-- `atRate` changes numerical integration rate while retaining identified rate.
-
-Raw gyro is necessary for control eligibility. A `gyroADC` fallback is labelled
-an identification-only sensor-output proxy. It cannot be placed before the
-firmware gyro filters because that would count those filters twice.
-
-Development uses Fireball logs. GAUI X4 logs are reserved for an external test
-of the frozen identification procedure. A Fireball parameter artifact is not
-a GAUI model. Successful external validation requires fitting a separate GAUI
-artifact using the frozen algorithm and its predeclared data split.
-
-## Verification coverage
-
-`test/system_id.test.cjs` checks synthetic parameter recovery, cross-axis
-response, independent partitions, absence of measured-output feedback, interval
-exclusions, rank deficiency, corrupt artifacts and filtered-output restrictions.
-Regression checks also cover repeated and partial captures, confidence sample
-counts, conflicting copies, missing clocks, and the mixer collective boundary.
-These tests establish implementation behaviour, not real-airframe accuracy.
-Real-flight reports must retain failed checks rather than turn a failed twin
-into a proposed gain change.
-
-`HELICOPTER_SYSID_NOTATION.json` registers all mathematical quantities and
-indices in this document. The notation checker checks declared symbol roles
-and component notation. It does not verify the model's physical adequacy or
-prove the identification assumptions.
+- `tools/autotune/heli_twin.cjs`: model, observer, linearization (`frequencyResponseMatrix`).
+- `tools/autotune/twin_fit.cjs`: runs, prediction errors, instrumented responses, fit stages, `identify`, `validate`, `assess`.
+- `test/heli_twin.test.cjs`: frames, hover, signs, linearization against a simulated sine, causality, observer stability,
+  instrumented responses under feedback.
+- `analysis/twin6dof/`: `extract.cjs` (logs to float32 runs), `dev.cjs` (staged fit with a worker pool), `closedfit.cjs`
+  (closed-loop stage), `closed.cjs` (closed-loop check), `parity.cjs` (controller reproduces the logged mixer), `plot.py`.

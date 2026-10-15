@@ -3990,11 +3990,246 @@ var TuningDialog = (function () {
     function acceptedControlResult(model, configuration, step) {
         var r=model && model.result, c=r && r.controller, t=r && r.twin;
         return !!(model && model.state==='done' && r && r.version===2 && r.status==='flight-test-required' &&
-            r.configuration===configuration && r.step===step && t && t.schema==='rotorflight-digital-twin' && t.version===1 &&
-            t.status==='validated' && t.controlEligible===true && c && c.compatibility && c.compatibility.supported===true &&
+            r.configuration===configuration && r.step===step && t && t.schema==='rotorflight-digital-twin' && twinIsCurrent(t) &&
+            t.model && t.model.kind==='heli-6dof' &&
+            (t.status==='validated' || t.status==='partial' && Array.isArray(t.eligibleSteps) && t.eligibleSteps.indexOf(step)>=0) &&
+            t.controlEligible===true && c && c.compatibility && c.compatibility.supported===true &&
+            // sensorParity: pass true and available false when the log has no gyroRAW (no filter reference, not a failure)
             c.parity && c.parity.pass===true && c.sensorParity && c.sensorParity.pass===true &&
             Array.isArray(c.closedLoopParity) && c.closedLoopParity.length>0 && c.closedLoopParity.every(function (q) {return q.pass===true;}) &&
             r.search && r.search.holdout && r.search.holdout.pass===true);
+    }
+
+    // ---- The six-degree-of-freedom digital twin (twin version 2, tools/autotune/heli_twin.cjs and twin_fit.cjs) ----
+    // Pure functions: plot items and table rows from the twin object of control_pipeline.makeTwin. The DOM code is in
+    // twinSectionHtml.
+    var TWIN_OUTPUTS = [
+        { title: "Roll rate", label: "angular rate", unit: "deg/s", field: "gyroADC[0]" },
+        { title: "Pitch rate", label: "angular rate", unit: "deg/s", field: "gyroADC[1]" },
+        { title: "Yaw rate", label: "angular rate", unit: "deg/s", field: "gyroADC[2]" },
+        { title: "Roll angle", label: "angle", unit: "deg", field: "attitude[0]" },
+        { title: "Pitch angle", label: "angle", unit: "deg", field: "attitude[1]" },
+        { title: "Heading", label: "angle", unit: "deg", field: "attitude[2]" },
+        { title: "Altitude", label: "altitude", unit: "m", field: "altitude" },
+        { title: "Vertical speed", label: "speed", unit: "m/s", field: "vario" },
+        { title: "Headspeed", label: "headspeed", unit: "rpm", field: "headspeed" }
+    ];
+    var TWIN_OUTPUT_FIELDS = ["gyroADC[0..2]", "attitude[0..2]", "altitude", "vario", "headspeed"];
+    var TWIN_AXES = ["roll", "pitch", "yaw"];
+    // The response pairs [rate axis, actuator axis] of the frequency plots: the three main axes, then the two cyclic cross terms
+    var TWIN_PAIRS = [[0, 0], [1, 1], [2, 2], [0, 1], [1, 0]];
+    var TWIN_MIN_COHERENCE = 0.5;
+    var TWIN_LOW_COH = "rgba(128,177,211,0.35)";
+
+    // Version 2 is the current file type. A version-2 twin with model null is a fit that did not give a model, not an old file.
+    function twinIsCurrent(t) {
+        return !!(t && t.version === 2);
+    }
+    // "PID profile N" or "PID profile unknown" of a twin period (profile: the number of the log, 1 to 6; 0 or null: unknown)
+    function twinProfile(p) {
+        return typeof p === "number" && p > 0 ? "PID profile " + p : "PID profile unknown";
+    }
+    // The PID profile of a frequency group: group.profile, else its key "profile N" of system_id.groupsOf
+    function twinGroupProfile(g) {
+        if (g && typeof g.profile === "number") return g.profile;
+        var m = g && /^profile (\d+)$/.exec(String(g.key || ""));
+        return m ? +m[1] : null;
+    }
+    // The PID profile and the start time of a closed-loop row: its own fields, else the selected period with the same id
+    function twinPeriodOf(twin, row) {
+        var list = twin && twin.coverage && Array.isArray(twin.coverage.intervals) ? twin.coverage.intervals : [];
+        var q = row && row.id !== undefined ? list.filter(function (s) { return s && s.id === row.id; })[0] : null;
+        return { profile: row && typeof row.profile === "number" ? row.profile : q && typeof q.profile === "number" ? q.profile : null,
+            fromS: row && isNum(row.fromS) ? row.fromS : q && isNum(q.fromS) ? q.fromS : null };
+    }
+    function twinHasData(a) {
+        return Array.isArray(a) && a.some(isNum);
+    }
+    function twinNums(a) { // numbers, else NaN: null breaks the plot line
+        return Array.isArray(a) ? a.map(function (v) { return isNum(v) ? v : NaN; }) : [];
+    }
+    function twinChannel(twin, ch) {
+        var names = twin && twin.channels && twin.channels.outputs, o = TWIN_OUTPUTS[ch] || { title: "Output " + (ch + 1), label: "value", unit: "", field: "" };
+        return names && names[ch] && ch < 6 && /^gyroADC|^attitude/.test(names[ch]) ? Object.assign({}, o, { field: names[ch] }) : o;
+    }
+
+    // b) the RMS prediction error against the time ahead: the model and "Hold the last value" (validation.prediction)
+    function twinHorizonItems(twin) {
+        var p = twin && twin.validation && twin.validation.prediction, out = [];
+        if (!p || !Array.isArray(p.points) || !Array.isArray(p.rmse)) return out;
+        var check = twin.validation.assessment && twin.validation.assessment.check;
+        p.rmse.forEach(function (row, ch) {
+            var hold = p.persistence && p.persistence[ch];
+            if (!twinHasData(row) && !twinHasData(hold)) return;
+            var o = twinChannel(twin, ch), unit = (p.units && p.units[ch]) || o.unit;
+            var mark = check && (ch < 3 ? check.ratePoint : ch < 5 ? check.attitudePoint : null);
+            out.push({ channel: ch, item: item({ title: o.title + ": model error", x: { label: "time after start", unit: "s", log: true },
+                y: { label: "RMS error", unit: unit === "RPM" ? "rpm" : unit, min: 0 },
+                vlines: isNum(mark) ? [{ x: mark, color: C.ref, label: "Check time" }] : [],
+                series: [line("Model", p.points, twinNums(row), C.orange, { points: true }),
+                    line("Hold the last value", p.points, twinNums(hold), C.grey, { points: true, dash: [4, 3] })] }) });
+        });
+        return out;
+    }
+
+    // c) recorded and calculated outputs of one reserved period (twin.predictions[k], from twin_fit.trace)
+    function twinTraceItems(twin, p) {
+        if (!p || !Array.isArray(p.measured) || !Array.isArray(p.predicted) || !isNum(p.rate) || p.rate <= 0) return [];
+        var from = isNum(p.fromS) ? p.fromS : 0, n = Math.max.apply(null, p.measured.map(function (a) { return a ? a.length : 0; }).concat([0]));
+        var t = []; for (var i = 0; i < n; i++) t.push(from + i / p.rate);
+        var marks = (p.segmentStarts || []).filter(isNum).map(function (s) { return { x: from + s, color: C.ref }; });
+        var raw = p.raw && p.raw.gyro;
+        return p.measured.map(function (rec, ch) {
+            var calc = p.predicted[ch], o = twinChannel(twin, ch);
+            if (!twinHasData(rec) && !twinHasData(calc)) return null;
+            var series = [];
+            if (ch < 3 && raw && twinHasData(raw[ch])) series.push(line("Recorded, without filter", t, twinNums(raw[ch]), "rgba(217,217,217,0.35)", { width: 1 }));
+            series.push(line("Recorded", t, twinNums(rec), C.blue), line("Calculated", t, twinNums(calc), C.orange));
+            return { channel: ch, item: item({ title: o.title, x: { label: "time", unit: "s" }, y: { label: o.label, unit: o.unit }, vlines: marks, series: series }) };
+        }).filter(Boolean);
+    }
+
+    function twinPhase(z) { return Math.atan2(z[1], z[0]) * 180 / Math.PI; }
+    function twinComplexOk(z) { return Array.isArray(z) && isNum(z[0]) && isNum(z[1]); }
+    // The coherence of a bin for the pair [a, b]: the smallest of the setpoint-to-actuator and setpoint-to-rate coherences of
+    // the axes a and b
+    function twinCoherence(bin, a, b) {
+        var v = [bin.cohU && bin.cohU[a], bin.cohY && bin.cohY[a], bin.cohU && bin.cohU[b], bin.cohY && bin.cohY[b]].filter(isNum);
+        return v.length ? Math.min.apply(null, v) : NaN;
+    }
+
+    // d) magnitude and phase of the recorded (reserved flights) and model responses of one operating point
+    function twinFrequencyItems(group) {
+        var bins = (group && group.bins || []).filter(function (b) { return isNum(b.f) && b.f > 0; }), out = [];
+        if (!bins.length) return out;
+        var f = bins.map(function (b) { return b.f; });
+        TWIN_PAIRS.forEach(function (pair) {
+            var a = pair[0], b = pair[1], name = a === b ? cap(TWIN_AXES[a]) : cap(TWIN_AXES[b]) + " input to " + TWIN_AXES[a] + " rate";
+            function part(src, k) {
+                var z = src && src[a] && src[a][b];
+                if (!twinComplexOk(z)) return NaN;
+                return k === "mag" ? Math.hypot(z[0], z[1]) : twinPhase(z);
+            }
+            ["mag", "phase"].forEach(function (k) {
+                var good = [], low = [], model = [];
+                bins.forEach(function (bin) {
+                    var v = part(bin.measured, k), strong = twinCoherence(bin, a, b) >= TWIN_MIN_COHERENCE;
+                    good.push(strong ? v : NaN); low.push(strong ? NaN : v); model.push(part(bin.model, k));
+                });
+                if (!good.concat(low, model).some(isNum)) return;
+                out.push({ pair: pair, kind: k, item: item({ title: name + (k === "mag" ? ": amplitude" : ": phase"),
+                    x: { label: "frequency", unit: "Hz", log: true },
+                    y: k === "mag" ? { label: "amplitude", unit: "rad/s", log: true } : { label: "phase", unit: "deg", min: -180, max: 180 },
+                    series: [line("Recorded", f, good, C.blue, { points: true }),
+                        low.some(isNum) ? line("Recorded, coherence less than 0.5", f, low, TWIN_LOW_COH, { points: true, width: 0 }) : null,
+                        line("Model", f, model, C.orange)].filter(Boolean) }) });
+            });
+        });
+        return out;
+    }
+
+    // e) the rows of validation.assessment (twin_fit.assess) and STE text for each check that failed. The axis result is
+    // assessment.axes[a].pass. A prediction row with gating false (the yaw rate without the control loop) shows its numbers
+    // but is not a check. The amplitude error is the median absolute amplitude error that the frequency check uses.
+    function twinAssessment(twin) {
+        var v = twin && twin.validation, s = v && v.assessment;
+        if (!s) return null;
+        var check = s.check || {}, p = v.prediction, reasons = [];
+        var rows = TWIN_AXES.map(function (axis, a) {
+            var pr = (s.prediction || [])[a] || {}, fr = (s.frequency || [])[a] || {}, ax = (s.axes || [])[a] || {};
+            var gating = pr.gating !== false, ratePass = typeof pr.pass === "boolean" ? pr.pass : null;
+            var error = isNum(fr.medianLogMagnitude) ? 100 * (Math.exp(fr.medianLogMagnitude) - 1) : null;
+            if (gating && ratePass === false) reasons.push(cap(axis) + ": at " + num(isNum(pr.horizonS) ? pr.horizonS : check.ratePoint) + " s, the model rate error is not less than " +
+                Math.round(100 * (check.rateSkill || 0.9)) + "% of the error when the app holds the last value.");
+            if (fr.measured === false) reasons.push(cap(axis) + ": the pilot inputs in the test flights do not give a response at " + (check.minBins || 3) + " or more frequencies.");
+            else if (fr.pass === false) reasons.push(cap(axis) + ": the frequency response of the model does not agree with the test flights.");
+            var axisPass = typeof ax.pass === "boolean" ? ax.pass : null;
+            return { axis: axis, horizonS: isNum(pr.horizonS) ? pr.horizonS : check.ratePoint, model: isNum(pr.rmse) ? pr.rmse : null,
+                hold: isNum(pr.persistence) ? pr.persistence : null, ratePass: ratePass, gating: gating,
+                magnitudeError: error, phase: isNum(fr.medianPhaseDeg) ? fr.medianPhaseDeg : null,
+                bins: isNum(fr.bins) ? fr.bins : null, frequencyPass: typeof fr.pass === "boolean" ? fr.pass : null, pass: axisPass };
+        });
+        var k = p && Array.isArray(p.points) ? p.points.indexOf(check.attitudePoint) : -1;
+        if (k >= 0) [[3, "Roll"], [4, "Pitch"]].forEach(function (q) {
+            var m = p.rmse && p.rmse[q[0]] && p.rmse[q[0]][k], h = p.persistence && p.persistence[q[0]] && p.persistence[q[0]][k];
+            if (isNum(m) && isNum(h) && m > h) reasons.push(q[1] + " angle: at " + num(check.attitudePoint) + " s, the model error is more than the error when the app holds the last value.");
+        });
+        return { status: s.status, rows: rows, reasons: reasons, check: check, eligibleSteps: Array.isArray(s.eligibleSteps) ? s.eligibleSteps.slice() : null };
+    }
+    // The STE texts that system_id.assessmentReasons adds to twin.reasons: the check table and its list show them
+    var TWIN_CHECK_REASON = /^(Roll|Pitch|Yaw): the (model rate error after|model attitude error after|pilot inputs do not measure the frequency response|model frequency response does not agree)/;
+
+    // f) one closed-loop check of control_pipeline.tune (controller.closedLoopParity[k].trace): setpoint, recorded and
+    // calculated gyro of each axis, recorded and calculated mixer outputs (in log units)
+    function twinClosedItems(row) {
+        var tr = row && row.trace;
+        if (!tr || !isNum(tr.rate) || tr.rate <= 0) return [];
+        var out = [], time = function (a) { var t = []; for (var i = 0; i < (a ? a.length : 0); i++) t.push(i / tr.rate); return t; };
+        // before predictionStartS the calculated lines are the recorded prefix (the observer and controller start)
+        var marks = isNum(tr.predictionStartS) && tr.predictionStartS > 0 ? [{ x: tr.predictionStartS, color: C.ref, label: "Model start" }] : [];
+        TWIN_AXES.forEach(function (axis, a) {
+            var rec = tr.measuredGyro && tr.measuredGyro[a], calc = tr.predictedGyro && tr.predictedGyro[a], sp = tr.setpoint && tr.setpoint[a];
+            var t = time(rec || calc || sp);
+            if (!t.length) return;
+            out.push({ kind: "gyro", axis: a, item: item({ title: cap(axis) + " rate, closed control loop", x: { label: "time", unit: "s" }, y: { label: "angular rate", unit: "deg/s" }, vlines: marks,
+                series: [line("Setpoint", t, twinNums(sp), C.grey, { dash: [4, 3] }), line("Recorded gyro", t, twinNums(rec), C.blue), line("Calculated gyro", t, twinNums(calc), C.orange)] }) });
+        });
+        var names = ["Roll mixer output", "Pitch mixer output", "Yaw mixer output", "Collective mixer output"];
+        var all = [].concat.apply([], (tr.measuredMixer || []).concat(tr.predictedMixer || []).map(function (a) { return Array.isArray(a) ? a : []; })).filter(isNum);
+        var scale = all.length && Math.max.apply(null, all.map(Math.abs)) <= 2 ? 1000 : 1; // mixer/1000 in the twin runs
+        names.forEach(function (name, a) {
+            var rec = tr.measuredMixer && tr.measuredMixer[a], calc = tr.predictedMixer && tr.predictedMixer[a], t = time(rec || calc);
+            if (!t.length) return;
+            var s = function (x) { return twinNums(x).map(function (v) { return v * scale; }); };
+            out.push({ kind: "mixer", axis: a, item: item({ title: name, x: { label: "time", unit: "s" }, y: { label: "mixer output", unit: "" }, vlines: marks,
+                series: [line("Recorded", t, s(rec), C.blue), line("Calculated", t, s(calc), C.orange)] }) });
+        });
+        // with the governor in the closed loop: the headspeed of the model and the governor throttle against the log
+        var g = row.governor && row.governor.trace;
+        if (g && isNum(g.rate) && g.rate > 0) {
+            var gt = function (a) { var t = []; for (var i = 0; i < (a ? a.length : 0); i++) t.push(i / g.rate); return t; };
+            [["headspeed", "Headspeed, closed control loop", "headspeed", "rpm", g.measuredHeadspeed, g.predictedHeadspeed, 1],
+                ["throttle", "Throttle, closed control loop", "throttle", "%", g.measuredThrottle, g.predictedThrottle, 100]].forEach(function (q) {
+                var t = gt(q[4] || q[5]);
+                if (!t.length) return;
+                var s = function (x) { return twinNums(x).map(function (v) { return v * q[6]; }); };
+                out.push({ kind: q[0], axis: null, item: item({ title: q[1], x: { label: "time", unit: "s" }, y: { label: q[2], unit: q[3] }, vlines: marks,
+                    series: [line("Recorded", t, s(q[4]), C.blue), line("Calculated", t, s(q[5]), C.orange)] }) });
+            });
+        }
+        return out;
+    }
+
+    // The texts of the closed loop of a twin: the closed-loop fit (twin.validation.closedLoopFit of control_pipeline.tune),
+    // the governor path (twin.governor) and the outputs that the log records for position and speed (twin.channels.outputs).
+    // Returns { fit: [sentences], rows: [[axis, before, after]] (closed-loop gyro RMS error of the fit periods, deg/s),
+    // governor: [sentences], governorReasons: [texts], position: sentence }.
+    function twinLoopNotes(twin) {
+        var v = twin && twin.validation, fit = v && v.closedLoopFit, gov = twin && twin.governor, out = { fit: [], rows: [], governor: [], governorReasons: [], position: "" };
+        if (fit && fit.applied && fit.design && fit.design.before && fit.design.after) {
+            var count = fit.windows && isNum(fit.windows.count) ? fit.windows.count : null;
+            out.fit.push("The closed-loop fit changed the model." + (count === null ? "" : " In " + plural(count, "period") +
+                " of the fit flights, the flight controller code flies the model with the recorded pilot inputs."));
+            out.fit.push("The app changed the model parameters to decrease the errors of the gyro and of the mixer outputs in these periods.");
+            out.fit.push("The test flights are not in this fit. The model checks on the test flights use the changed model.");
+            var b = fit.design.before.gyroRmse, a = fit.design.after.gyroRmse;
+            if (Array.isArray(b) && Array.isArray(a)) out.rows = TWIN_AXES.map(function (axis, k) { return [cap(axis), b[k], a[k]]; });
+        } else if (fit) {
+            out.fit.push("The closed control loop did not change the model." + (fit.error ? " The closed loop stopped before the end of the fit." :
+                fit.windows && fit.windows.count === 0 ? " The fit periods are too short." : " The errors in the fit periods did not decrease."));
+        }
+        if (gov) {
+            out.governor.push(gov.active ? "The closed loop calculates the governor. The governor throttle sets the rotor speed of the model." :
+                "The closed loop does not calculate the governor. It uses the recorded throttle and the recorded headspeed.");
+            if (!gov.active) out.governorReasons = (gov.reasons || []).filter(function (t) { return typeof t === "string" && t; });
+        }
+        var outputs = twin && twin.channels && Array.isArray(twin.channels.outputs) ? twin.channels.outputs : null,
+            alt = !outputs || outputs.indexOf("altitude") >= 0, vario = !outputs || outputs.indexOf("vario") >= 0;
+        out.position = alt && vario ? "For position and speed, the log records only the altitude and the vertical speed. The log has no sensor for the other directions." :
+            alt ? "For position and speed, the log records only the altitude. The log has no sensor for the vertical speed and the other directions." :
+            vario ? "For position and speed, the log records only the vertical speed. The log has no sensor for the altitude and the other directions." :
+            "The log has no sensor for position and speed.";
+        return out;
     }
 
     function flightPlanHtml(plan) {
@@ -4096,15 +4331,45 @@ var TuningDialog = (function () {
         if (res) html += '<p role="status">' + esc(res.reason) + '</p>';
         else if (!disabled && !running) html += '<p class="tuning-muted">Start autotune to make a helicopter model from selected flight data. The app tests control values with this model.</p>';
         if (res && res.twin) {
-            var twin=res.twin, validation=twin.validation && twin.validation.test, coverage=twin.coverage || {},
+            var twin=res.twin, current=twinIsCurrent(twin), validation=twin.validation && twin.validation.test, coverage=twin.coverage || {},
                 excluded=coverage.excluded || [], accepted=coverage.intervals || [];
-            html += '<section class="tuning-ct-section"><h6 class="tuning-h">Digital twin</h6>' +
+            var twinPick=function(key,length){var v=view.ctTwin && view.ctTwin[step+':'+key];return isNum(v) && v>=0 && v<length ? v : 0;};
+            var twinSelect=function(key,label,list,value){return list.length>1 ? '<div class="tuning-plot-toolbar"><label>' + esc(label) +
+                ' <select class="form-control input-sm tuning-ct-twin-select" data-twin="' + esc(key) + '">' + options(list.map(function(t,i){return [String(i),t];}),String(value)) + '</select></label></div>' : '';};
+            var codes=function(list){return list.map(function(f){return '<code>' + esc(f) + '</code>';}).join(', ');};
+            // the inputs as the pipeline gives them (it names the recorded collective field): no default list
+            var channels=twin.channels || {}, inputs=Array.isArray(channels.inputs) ? channels.inputs.filter(function(f){return typeof f==='string' && f;}) : [],
+                outputs=Array.isArray(channels.outputs) && channels.outputs.length ? channels.outputs : TWIN_OUTPUT_FIELDS;
+            var stepTitle=function(k){var t=TABS.filter(function(q){return q.key===k;})[0];return t ? t.title : k;};
+            var eligible=Array.isArray(twin.eligibleSteps) ? twin.eligibleSteps.filter(function(k){return CONTROL_STEPS.indexOf(k)>=0;}) : [];
+            var loop=twinLoopNotes(twin);
+            var statusText=twin.status === 'validated' ? 'Model checks satisfactory.' : twin.status === 'partial' ? 'Model checks satisfactory for some axes only.' : 'Model checks not satisfactory.';
+            html += '<section class="tuning-ct-section tuning-ct-twin"><h6 class="tuning-h">Digital twin</h6>' +
                 '<p>A digital twin is a model of this helicopter. Its parameters come from recorded inputs and sensor outputs.</p>' +
-                '<p><strong>' + esc(twin.status === 'validated' ? 'Model checks satisfactory.' : 'Model checks not satisfactory.') + '</strong> ' +
-                '<span data-ste="quoted">' + esc(twin.craft && twin.craft.craft || 'Craft unknown') + '</span></p>' +
-                '<p>The model calculates angular rates. Headspeed and collective are recorded inputs. It does not calculate position or acceleration.</p>' +
-                '<p>' + esc('Selected periods: ' + accepted.length + '. Periods not used: ' + excluded.length + '.') + '</p>' +
-                '<button type="button" class="btn btn-default btn-sm tuning-ct-save-model">Save helicopter model</button>';
+                '<p><strong>' + esc(statusText) + '</strong> ' +
+                '<span data-ste="quoted">' + esc(twin.craft && twin.craft.craft || 'Craft unknown') + '</span></p>';
+            if (twin.status === 'partial') html += '<p class="tuning-ct-twin-steps">' + esc(eligible.length ?
+                'The model can test changes in these control steps only: ' + eligible.map(stepTitle).join(', ') + '.' :
+                'The model cannot test changes in a control step.') +
+                (eligible.length && eligible.indexOf(step)<0 ? ' ' + esc('The model cannot test changes in this step.') : '') + '</p>';
+            if (current && !twin.model) html += '<p class="tuning-na">The model fit did not make a helicopter model. The list "Model limits" gives the causes.</p>';
+            if (current) html += '<p>The model calculates the position, the speed, the attitude and the angular rates of the helicopter. ' +
+                    'It also calculates the movement of the main rotor blades, the rotor speed and the time delays of the servos and the ESC.</p>' +
+                (inputs.length ? '<p>Model inputs from the log: ' + codes(inputs) + '.</p>' : '') +
+                '<p>Model outputs that the app compares with the log: ' + codes(outputs) + '.</p>' +
+                '<p>' + esc(loop.position) + ' Thus, the model calculates these values from the other data.</p>' +
+                '<p>The model does not include the movement of the servo motors or the movement of the air.</p>' +
+                (loop.governor.length ? '<p class="tuning-ct-governor">' + esc(loop.governor.join(' ')) + '</p>' : '') +
+                bulletList(loop.governorReasons.map(esc),'Causes','is-caveat') +
+                (loop.fit.length ? '<div class="tuning-ct-closed-fit"><h6>Closed-loop fit</h6>' + loop.fit.map(function(t){return '<p>' + esc(t) + '</p>';}).join('') +
+                    (loop.rows.length ? '<div class="tuning-table-wrap"><table class="table table-condensed"><thead><tr><th>Axis</th><th>Gyro RMS error before (deg/s)</th><th>Gyro RMS error after (deg/s)</th></tr></thead><tbody>' +
+                        loop.rows.map(function(q){return '<tr><td>' + esc(q[0]) + '</td><td>' + num(q[1]) + '</td><td>' + num(q[2]) + '</td></tr>';}).join('') +
+                        '</tbody></table></div><p class="tuning-muted">The table uses the fit periods only. The gyro has a low-pass filter at 20 Hz.</p>' : '') + '</div>' : '');
+            else html += '<p class="tuning-na">The saved model has a previous file type. Start autotune again to make a new model.</p>';
+            var sensorParity=res.controller && res.controller.sensorParity;
+            if (sensorParity && sensorParity.available === false) html += '<p class="tuning-muted tuning-ct-gyro-raw">The gyro filter check is not available: the log does not record <code>gyroRAW</code>.</p>';
+            html += '<p>' + esc('Selected periods: ' + accepted.length + '. Periods not used: ' + excluded.length + '.') + '</p>' +
+                (current && !twin.model ? '' : '<button type="button" class="btn btn-default btn-sm tuning-ct-save-model">Save helicopter model</button>');
             if (twin.mechanicalCohort) {
                 var cohort=twin.mechanicalCohort, files=cohort.sources || [];
                 html += '<h6>Model flight files</h6><p>Selected files supply the model data.</p><ul>' +
@@ -4131,8 +4396,10 @@ var TuningDialog = (function () {
                     '<tr><td>Total main rotor pitch</td><td>' + (limits.totalMainPitch && isNum(limits.totalMainPitch.degrees) ? num(limits.totalMainPitch.degrees) : 'Not available') +
                     '</td></tr></tbody></table></div><p>The tail angles are changes from the center trim. Servo motor dynamics are not in this model.</p>';
             });
-            if (validation && validation.axes) {
-                html += '<p>' + (twin.validation.split && twin.validation.split.independentFlights ? 'The table uses different test flights.' : 'The table uses different test periods from the same flight logs.') +
+            if (!current && validation && validation.axes) {
+                html += '<p>' + (twin.validation.split && twin.validation.split.independentFlights ?
+                    twin.validation.split.groupingBasis === 'source-capture-groups' ? 'The table uses different test log groups.' : 'The table uses different test flights.' :
+                    'The table uses different test periods from the same flight logs.') +
                     ' Raw error includes vibration that the model does not calculate.</p>' +
                     '<div class="tuning-table-wrap"><table class="table table-condensed"><thead><tr><th>Axis</th><th>Raw RMS error (deg/s)</th><th>Filtered RMS error (deg/s)</th><th>Filtered error (%)</th><th>Mean error (deg/s)</th></tr></thead><tbody>' +
                     validation.axes.map(function(a,i){var filtered=validation.controlledAxes && validation.controlledAxes[i];
@@ -4140,19 +4407,90 @@ var TuningDialog = (function () {
                     }).join('') + '</tbody></table></div>' +
                     '<p>The same low-pass filter applies to the two signals for the filtered error. Other checks examine the frequency range.</p>';
             }
-            if ((twin.reasons || []).length || (twin.controlReasons || []).length || (res.controller && res.controller.reasons || []).length) html +=
-                bulletList((twin.reasons || []).concat(twin.controlReasons || [],res.controller && res.controller.reasons || []).map(esc), 'Model limits', 'is-caveat');
+            var assessment=current ? twinAssessment(twin) : null;
+            if (assessment) {
+                var ck=assessment.check, pass=function(v){return v===true ? 'Yes' : v===false ? 'No' : 'Not measured';};
+                var magLimit=isNum(ck.maxLogMagnitude) ? Math.round(100*(Math.exp(ck.maxLogMagnitude)-1)) : null, phaseLimit=isNum(ck.maxPhaseDeg) ? ck.maxPhaseDeg : null;
+                var openLoop=assessment.rows.filter(function(q){return !q.gating;});
+                html += '<h6>Model checks on the test flights</h6>' +
+                    '<p>' + esc((twin.validation.split && twin.validation.split.independentFlights ? 'The test flights are not in the model fit.' : 'The test periods are not in the model fit.') +
+                        ' The rate check compares the model with the hold of the last value.') + '</p>' +
+                    '<div class="tuning-table-wrap"><table class="table table-condensed tuning-ct-twin-checks"><thead><tr><th>Axis</th><th>Model RMS error (deg/s)</th><th>Hold the last value (deg/s)</th><th>Rate check</th>' +
+                    '<th>' + esc('Median amplitude error (%)' + (magLimit === null ? '' : ', limit ' + magLimit)) + '</th><th>' + esc('Median phase error (deg)' + (phaseLimit === null ? '' : ', limit ' + num(phaseLimit))) + '</th>' +
+                    '<th>Frequencies</th><th>Frequency check</th><th>Axis result</th></tr></thead><tbody>' +
+                    assessment.rows.map(function(q){return '<tr><td>' + esc(cap(q.axis)) + '</td><td>' + num(q.model) + '</td><td>' + num(q.hold) + '</td><td>' + (q.gating ? pass(q.ratePass) : 'Not a check') + '</td>' +
+                        '<td>' + num(q.magnitudeError === null ? null : Math.round(q.magnitudeError)) + '</td><td>' + num(q.phase === null ? null : Math.round(q.phase)) + '</td><td>' + num(q.bins) + '</td><td>' + pass(q.frequencyPass) + '</td>' +
+                        '<td>' + (q.pass===true ? 'Satisfactory' : q.pass===false ? 'Not satisfactory' : 'Not measured') + '</td></tr>';}).join('') +
+                    '</tbody></table></div>' +
+                    (isNum(ck.ratePoint) && isNum(ck.rateSkill) ? '<p class="tuning-muted">' + esc('Rate check: at ' + num(ck.ratePoint) + ' s, the model error must be less than ' +
+                        Math.round(100*ck.rateSkill) + '% of the error when the app holds the last value.') + '</p>' : '') +
+                    (openLoop.length ? '<p class="tuning-muted">' + esc(openLoop.map(function(q){return cap(q.axis);}).join(', ') + ': the model calculates this rate without the control loop. ' +
+                        'The table shows this error, but it is not a check. The closed control loop check examines this axis.') + '</p>' : '') +
+                    (isNum(ck.minBins) && isNum(ck.minCoherence) && magLimit !== null && phaseLimit !== null ? '<p class="tuning-muted">' + esc('Frequency check: use ' +
+                        ck.minBins + ' or more frequencies with a coherence of ' + num(ck.minCoherence) + ' or more. The median amplitude error must be ' +
+                        magLimit + '% or less. The median phase error must be ' + num(phaseLimit) + ' deg or less.') + '</p>' : '') +
+                    bulletList(assessment.reasons.map(esc),'Model checks that are not satisfactory','is-caveat');
+            }
+            // twin.reasons has STE copies of the failed checks (system_id). The check table and its list show them.
+            var limits=(twin.reasons || []).filter(function(t){return !(assessment && TWIN_CHECK_REASON.test(String(t)));})
+                .concat(twin.limitations || [],twin.controlReasons || [],res.controller && res.controller.reasons || [])
+                .filter(function(t,i,all){return typeof t==='string' && t && all.indexOf(t)===i;});
+            if (limits.length) html += bulletList(limits.map(esc), 'Model limits', 'is-caveat');
             html += detail('model-inputs','Selected flight periods and periods not used',function(){
                 return '<p>The saved model includes each selected period. It also records why other periods are not used.</p><pre>' +
                     esc(JSON.stringify({used:accepted,excluded:excluded},null,2)) + '</pre>';
             });
-            var prediction=twin.predictions && twin.predictions[0];
-            if (prediction && prediction.predicted && prediction.measured) html += detail('model-signals','Recorded and calculated sensor outputs',function(){
-                var t=prediction.predicted[0].map(function(_,i){return prediction.fromS+i/prediction.rate;});
-                return '<p>These calculations use recorded control inputs. Only the first gyro sample sets the initial model values.</p>' +
-                    ['roll','pitch','yaw'].map(function(a,i){return plot(item({title:cap(a)+' model check',
-                        x:{label:'time',unit:'s'},y:{label:'angular rate',unit:'deg/s'},series:[
-                            line('Recorded',t,prediction.measured[i],C.blue),line('Calculated',t,prediction.predicted[i],C.orange)]}));}).join('');
+            var horizon=current ? twinHorizonItems(twin) : [];
+            if (horizon.length) html += detail('twin-horizon','Model error at each time after the start',function(){
+                var pv=twin.validation.prediction;
+                return '<p>' + esc('Each plot gives the RMS error of the model on the test flights' + (isNum(pv.origins) ? ' (' + plural(pv.origins,'start point') + ')' : '') + '.') + '</p>' +
+                    '<p>At each start point, the model starts from its condition at that time. Then it uses only the recorded control inputs. ' +
+                    'The second line holds the value at the start point. A good model has a smaller error than this line.</p>' +
+                    horizon.map(function(q){return plot(q.item);}).join('');
+            });
+            var traces=current && Array.isArray(twin.predictions) ? twin.predictions.filter(function(p){return p && Array.isArray(p.measured) && Array.isArray(p.predicted);}) : [];
+            if (traces.length) html += detail('twin-signals','Recorded and calculated outputs',function(){
+                var k=twinPick('prediction',traces.length), p=traces[k];
+                var label=function(q,i){var from=isNum(q.fromS) ? q.fromS : 0, n=q.measured[0] ? q.measured[0].length : 0;
+                    return 'Period ' + (i+1) + ', ' + twinProfile(q.profile) + ': ' + secs(from) + ' to ' + secs(from + (isNum(q.rate) && q.rate>0 ? n/q.rate : 0));};
+                var items=twinTraceItems(twin,p);
+                return twinSelect('prediction','Test period',traces.map(label),k) +
+                    '<p>' + esc('Each calculated segment starts at a vertical line' + (isNum(p.horizonS) ? ' and continues for ' + num(p.horizonS) + ' s' : '') + '.') +
+                    ' At the line, the model condition comes from the sensor data before the line. After the line, the model uses only the recorded control inputs.</p>' +
+                    '<p>The recorded angular rates have the low-pass filter of the model checks. The gray line is the gyro without this filter.</p>' +
+                    (items.length ? items.map(function(q){return plot(q.item);}).join('') : '<p class="tuning-na">Not available: the period has no data.</p>');
+            });
+            var groups=current && twin.validation && Array.isArray(twin.validation.frequency) ? twin.validation.frequency.filter(function(g){return g && Array.isArray(g.bins) && g.bins.length;}) : [];
+            if (groups.length) html += detail('twin-frequency','Frequency response',function(){
+                var k=twinPick('frequency',groups.length), g=groups[k], op=g.op || {}, items=twinFrequencyItems(g);
+                // the start time: the group's fromS, else the first test period of the same PID profile
+                var startOf=function(q){var p=twinGroupProfile(q);if (isNum(q.fromS)) return q.fromS;
+                    var t=(twin.predictions || []).filter(function(r){return r && isNum(r.fromS) && (r.profile===p || !(r.profile>0) && !(p>0));}).map(function(r){return r.fromS;});
+                    return t.length ? Math.min.apply(null,t) : null;};
+                var label=function(q,i){var from=startOf(q);return 'Operating point ' + (i+1) + ', ' + twinProfile(twinGroupProfile(q)) + (from === null ? '' : ', from ' + secs(from)) +
+                    (q.op && isNum(q.op.rpm) ? ': ' + Math.round(q.op.rpm) + ' rpm' : '') + (isNum(q.seconds) ? ', ' + secs(q.seconds) + ' of data' : '');};
+                return twinSelect('frequency','Operating point',groups.map(label),k) +
+                    '<p>' + esc('Recorded data: ' + (isNum(g.seconds) ? secs(g.seconds) : 'unknown time') + ' of the test flights' + (isNum(op.rpm) ? ' at ' + Math.round(op.rpm) + ' rpm' : '') + '.') + '</p>' +
+                    '<p>The recorded response uses the pilot setpoints as the reference signal. The model response is at the same operating point.</p>' +
+                    '<p>The amplitude is the angular rate for one unit of mixer input. One unit is 1000 in the log.</p>' +
+                    '<p>The second recorded series shows the frequencies with a coherence less than 0.5. The frequency check does not use them. ' +
+                    'For the two cyclic cross terms, the plot uses the lower coherence of the two axes.</p>' +
+                    (items.length ? items.map(function(q){return plot(q.item);}).join('') : '<p class="tuning-na">Not available: the test flights have no frequency response.</p>');
+            });
+            var closed=res.controller && Array.isArray(res.controller.closedLoopParity) ? res.controller.closedLoopParity.filter(function(q){return q && q.trace;}) : [];
+            if (closed.length) html += detail('twin-closed','Closed control loop',function(){
+                var k=twinPick('closed',closed.length), row=closed[k], items=twinClosedItems(row);
+                var label=function(q,i){var at=twinPeriodOf(twin,q);return 'Check ' + (i+1) + ', ' + twinProfile(at.profile) + (at.fromS === null ? '' : ' at ' + secs(at.fromS)) +
+                    (q.pass === true ? ': satisfactory' : q.pass === false ? ': not satisfactory' : '');};
+                var start=row.trace && isNum(row.trace.predictionStartS) && row.trace.predictionStartS > 0 ? row.trace.predictionStartS : null;
+                return twinSelect('closed','Closed loop check',closed.map(label),k) +
+                    (closed.length === 1 ? '<p>' + esc(label(row,0)) + '</p>' : '') +
+                    '<p>The flight controller code calculates the mixer outputs from the recorded setpoints. The model calculates the gyro from these outputs.</p>' +
+                    (row.governor ? '<p>The governor code calculates the throttle. The model calculates the headspeed from this throttle.</p>' : '') +
+                    (start === null ? '' : '<p>' + esc('The time starts at the start of the period. Before the vertical line at ' + secs(start) +
+                        ', all lines show recorded data. After the line, the model calculates the gyro and the mixer outputs.') + '</p>') +
+                    '<p>A small gyro error is not sufficient. The control loop can hide a model error. Thus, the calculated mixer outputs must also agree with the recorded outputs.</p>' +
+                    (items.length ? items.map(function(q){return plot(q.item);}).join('') : '<p class="tuning-na">Not available: the check has no data.</p>');
             });
             html += '</section>';
         }
@@ -5483,7 +5821,7 @@ var TuningDialog = (function () {
         }
         function ctSaveModel() {
             var model=ctModel(view.tab), twin=model && model.result && model.result.twin;
-            if (!twin || model.stale) return;
+            if (!twin || !twin.model || model.stale) return;
             pickSaveFile({suggestedName:baseName(shown)+'-helicopter-model.json',description:'Helicopter model',mimeType:'application/json',extension:'.json'}).then(function(target){
                 if (target) return target.write(new Blob([JSON.stringify(twin,function(k,v){return ArrayBuffer.isView(v)?Array.from(v):v;},2)],{type:'application/json'}));
             }).catch(function(error){reportSaveError(error);});
@@ -6606,6 +6944,10 @@ var TuningDialog = (function () {
             if (!view.ctReference) view.ctReference={};
             view.ctReference[view.tab]=this.value; renderPane(view.tab);
         }));
+        dialog.on('change', '.tuning-ct-twin-select', deferredSelectChange(function () {
+            if (!view.ctTwin) view.ctTwin={};
+            view.ctTwin[view.tab+':'+this.getAttribute('data-twin')]=+this.value; renderPane(view.tab);
+        }));
         dialog.on('click', '.tuning-ct-details summary[data-ct-detail]', function () {
             if (!view.ctDetails) view.ctDetails={};
             view.ctDetails[this.getAttribute('data-ct-detail')]=!this.parentNode.open;
@@ -6919,6 +7261,8 @@ var TuningDialog = (function () {
     // Pure pieces, for test/tuning_dialog.test.cjs
     TuningDialog.internals = {
         automaticControlChange: automaticControlChange, acceptedControlResult: acceptedControlResult,
+        twinIsCurrent: twinIsCurrent, twinProfile: twinProfile, twinGroupProfile: twinGroupProfile, twinPeriodOf: twinPeriodOf, twinHorizonItems: twinHorizonItems, twinTraceItems: twinTraceItems, twinFrequencyItems: twinFrequencyItems,
+        twinAssessment: twinAssessment, twinClosedItems: twinClosedItems, twinLoopNotes: twinLoopNotes, TWIN_OUTPUTS: TWIN_OUTPUTS,
         tabStatus: tabStatus, filterTabStates: filterTabStates,
         controlWorkspaceHtml: controlWorkspaceHtml, controlPairs: controlPairs, flightPlanHtml: flightPlanHtml,
         esc: esc, parameterLabel: parameterLabel, parameterHtml: parameterHtml, num: num, valueSe: valueSe, threshold: threshold, logLabel: logLabel, paramText: paramText, findingStatus: findingStatus,

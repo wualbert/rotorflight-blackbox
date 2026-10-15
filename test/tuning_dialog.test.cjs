@@ -4018,7 +4018,7 @@ function answerControl(app,q=controlRequest(app)) {
 function acceptedControlFixture(out) {
     if (out.status !== 'flight-test-required') return out;
     return {...out,version:2,status:'flight-test-required',
-        twin:{schema:'rotorflight-digital-twin',version:1,id:'ui-fixture',status:'validated',controlEligible:true},
+        twin:{schema:'rotorflight-digital-twin',version:2,id:'ui-fixture',status:'validated',controlEligible:true,model:{kind:'heli-6dof',version:2}},
         controller:{compatibility:{supported:true},parity:{pass:true},sensorParity:{pass:true},closedLoopParity:[{pass:true}]},
         search:{holdout:{pass:true}}};
 }
@@ -4339,7 +4339,7 @@ test('aircraft digital twin shows independent errors, saved artifact and real-in
             controlReasons:['The model uses flight periods with unknown PID gains. Control changes are not available.'],
             confidence:{level:'low',reasons:['The model error is more than the limit.'],axes:axes.map(a=>({...a,rmseInterval95:[8,12]}))},
             pitchLimits:{collective:{degrees:[-15,15]},roll:{degrees:[-15,15]},pitch:{degrees:[-15,15]},tail:{degrees:null},totalMainPitch:{degrees:23}},
-            validation:{split:{independentFlights:true},test:{axes,controlledAxes:axes}},coverage:{intervals:[{id:'used'}],excluded:[{reason:'ground'}]},
+            validation:{split:{independentFlights:true,groupingBasis:'source-capture-groups',physicalFlightIndependenceProven:false},test:{axes,controlledAxes:axes}},coverage:{intervals:[{id:'used'}],excluded:[{reason:'ground'}]},
             reasons:['The model needs more usable flight data.'],predictions:[{rate:100,fromS:12,
                 measured:[[0,1,2],[2,3,4],[4,5,6]],predicted:[[0,.9,1.8],[2,2.9,3.8],[4,4.9,5.8]]}]}};
     controlWorker(app).reply({type:'controlTuned',result:out},request.id);await tick();
@@ -4349,12 +4349,222 @@ test('aircraft digital twin shows independent errors, saved artifact and real-in
     assert.match(html,/Model flight files/);assert.match(html,/latest-flight.BBL<\/span>: Selected/);
     assert.match(html,/old-flight.BBL<\/span>: Not used/);assert.match(html,/unknown PID gains/);
     assert.match(html,/Raw RMS error/);assert.match(html,/Filtered RMS error/);
+    assert.match(html,/The table uses different test log groups/);assert.doesNotMatch(html,/The table uses different test flights/);
     assert.match(html,/Save helicopter model/);assert.doesNotMatch(html,/tuning-ct-trial/);
-    app.detail('cyclic:model-signals');assert.match(app.pane('cyclic'),/Only the first gyro sample/);
+    assert.match(html,/The saved model has a previous file type/,'a version-1 twin gives a short note');
+    assert.doesNotMatch(html,/data-tuning-detail-key="cyclic:(model-signals|twin-signals|twin-horizon|twin-frequency)"/,'no plots of the new format for an old twin');
     app.detail('cyclic:pitch-limits');assert.match(app.pane('cyclic'),/-15 to 15/);
     assert.match(app.pane('cyclic'),/Servo motor dynamics are not in this model/);
     assert.equal(controlWorker(app).terminated,true,'a completed identification releases its worker');
     assert.deepEqual(app.errors,[]);
+});
+
+// A version-2 twin (control_pipeline.makeTwin with heli_twin.cjs and twin_fit.cjs): the CONTRACT fields of the digital twin
+function twin6dof(opts={}) {
+    const points=[0.01,0.02,0.05,0.1,0.2,0.35,0.5,0.75,1], units=['deg/s','deg/s','deg/s','deg','deg','deg','m','m/s','RPM'];
+    const channels=['p','q','r','roll','pitch','heading','altitude','vario','headspeed'];
+    const rmse=channels.map((_,ch)=>ch===6?points.map(()=>null):points.map(t=>+(2+10*t+ch).toFixed(3)));
+    const persistence=channels.map((_,ch)=>ch===6?points.map(()=>null):points.map(t=>+(1+40*t+ch).toFixed(3)));
+    const c=(re,im)=>[re,im], H=(g)=>[0,1,2].map(i=>[0,1,2].map(j=>i===j?c(g,-g/2):c(g/10,g/20)));
+    const bins=[0.7,1.2,2,3.4,5.8,9.9].map((f,k)=>({f,measured:H(10/(1+f)),model:H(11/(1+f)),cohU:[k?0.9:0.2,0.8,0.7],cohY:[0.9,0.6,0.3],averages:12}));
+    const n=300, wave=(a,ph=0)=>Array.from({length:n},(_,i)=>+(a*Math.sin(i/15+ph)).toFixed(3));
+    const measured=channels.map((_,ch)=>ch===6?Array(n).fill(null):wave(10+ch)), predicted=channels.map((_,ch)=>ch===6?Array(n).fill(null):wave(10+ch,0.1).map((v,i)=>i<200?null:v));
+    // twin_fit.assess: yaw has gating false (its rate without the control loop is shown, not a check), the axis result in axes
+    const assessment={status:'partial',reasons:['yaw: the model frequency response does not agree with the reserved flights.'],
+        prediction:['roll','pitch','yaw'].map((axis,a)=>({axis,horizonS:0.1,rmse:3+a,persistence:a===2?3:10,pass:a!==2,...(a===2?{gating:false}:{})})),
+        frequency:['roll','pitch','yaw'].map((axis,a)=>({axis,bins:a===2?4:5,medianLogMagnitude:a===2?0.6:0.1,medianPhaseDeg:a===2?50:12,measured:true,pass:a!==2,
+            rows:[{f:1,logMagnitude:0.1,phaseDeg:10},{f:2,logMagnitude:-0.05,phaseDeg:-12},{f:3,logMagnitude:0.2,phaseDeg:14}]})),
+        check:{ratePoint:0.1,rateSkill:0.9,attitudePoint:0.2,minBins:3,minCoherence:0.5,maxLogMagnitude:0.35,maxPhaseDeg:35},
+        axes:['roll','pitch','yaw'].map((axis,a)=>({axis,pass:a!==2})),eligibleSteps:['cyclic','cycomp']};
+    const flight='flight:2026-10-05T10:00:00.000Z:fireball';
+    return {schema:'rotorflight-digital-twin',version:2,id:'twin-v2',status:'partial',eligibleSteps:['cyclic','cycomp'],craft:{craft:'Fireball'},
+        model:{kind:'heli-6dof',version:2,params:{}},ensemble:[{kind:'heli-6dof',version:2}],
+        validation:{split:{independentFlights:true},prediction:{points,channels,units,rmse,persistence,samples:channels.map(()=>points.map(()=>40)),origins:40},
+            frequency:[{key:'profile 2',seconds:84,op:{rpm:4500,coll:0.1,tail:0.05,thr:0.6,vbat:24},bins},{key:'profile unknown',seconds:61,op:{rpm:5000},bins:bins.slice(0,4)}],
+            assessment,training:{prediction:{points}},history:[{stage:'rates',free:8,cost:1.2,iterations:20}]},
+        predictions:[{id:'run-1',flight,profile:2,fromS:40,rate:100,horizonS:1,segmentStarts:[2,2.5],measured,predicted,raw:{gyro:[wave(12),wave(13),wave(14)]},inputs:{}},
+            {id:'run-2',flight,profile:0,fromS:10,rate:100,horizonS:1,segmentStarts:[2],measured,predicted,raw:{gyro:[]},inputs:{}}],
+        confidence:{level:'low',reasons:['The model error is more than the limit.']},
+        channels:{inputs:['mixer[0]','mixer[1]','mixer[2]','setpoint[3]','motor[0]','Vbat'],outputs:['gyroADC[0..2]','attitude[0..2]','altitude','vario','headspeed'],
+            unmodeled:['horizontal position and velocity sensors (not recorded; estimated by the model)','servo motor dynamics','wind']},
+        controlEligible:false,controlReasons:[],reasons:['Yaw: the model frequency response does not agree with the test flights.'],
+        limitations:['The helicopter dimensions are unknown. The model uses the inertia of a small helicopter.'],
+        coverage:{intervals:[{id:flight+'::1',flight,profile:2,fromS:12},{id:flight+'::2',flight,profile:null,fromS:30}],excluded:[]},...opts};
+}
+function closedRows() {
+    const t=Array.from({length:100},(_,i)=>i/50), s=(a,ph=0)=>t.map(x=>+(a*Math.sin(2*x+ph)).toFixed(2));
+    const flight='flight:2026-10-05T10:00:00.000Z:fireball';
+    return [{id:flight+'::1',pass:false,trace:{rate:50,predictionStartS:0.5,setpoint:[s(50),s(40),s(30)],measuredGyro:[s(45),s(38),s(28)],predictedGyro:[s(44,0.1),s(37,0.1),s(20,0.2)],
+        measuredMixer:[s(0.1),s(0.1),s(0.05),s(0.02)],predictedMixer:[s(0.12),s(0.1),s(0.07),s(0.02)]}},
+        {id:flight+'::2',pass:true,trace:{rate:50,setpoint:[s(10)],measuredGyro:[s(9)],predictedGyro:[s(9)],measuredMixer:[s(0.03)],predictedMixer:[s(0.03)]}}];
+}
+async function twinApp(twin,controller) {
+    const app=analysed({result:controlResult()});app.tab('cyclic');app.jq.fire('click','.tuning-ct-start');
+    const request=controlRequest(app);
+    const out={configuration:request.configuration,step:request.step,status:'model-rejected',rows:[],recommendations:[],
+        reason:'The model did not pass the flight data checks.',twin,controller};
+    controlWorker(app).reply({type:'controlTuned',result:out},request.id);await tick();
+    return app;
+}
+
+test('six-degree-of-freedom twin: description, check table, prediction error, outputs, frequency response and closed loop',async()=>{
+    const app=await twinApp(twin6dof(),{closedLoopParity:closedRows()}), html=app.pane('cyclic');
+    assert.match(html,/movement of the main rotor blades/);assert.match(html,/The log has no sensor for the other directions/);
+    assert.doesNotMatch(html,/It does not calculate position or acceleration|previous file type/);
+    for(const f of ['mixer[0]','mixer[1]','mixer[2]','setpoint[3]','motor[0]','Vbat','gyroADC[0..2]','attitude[0..2]','altitude','vario','headspeed']) assert.ok(html.includes('<code>'+f+'</code>'),f);
+    assert.ok(!html.includes('<code>mixer[3]</code>'),'the inputs are the list of the pipeline, not a default list');
+    assert.match(html,/Model checks satisfactory for some axes only\./);
+    assert.match(html,/The model can test changes in these control steps only: Cyclic gains, Cyclic compensation\./);
+    assert.doesNotMatch(html,/The model cannot test changes in this step/,'cyclic is an eligible step');
+    const table=html.split('tuning-ct-twin-checks')[1].split('</table>')[0];
+    assert.match(table,/Median amplitude error \(%\), limit 42/);assert.match(table,/Median phase error \(deg\), limit 35/);
+    assert.match(table,/<td>Yaw<\/td><td>5<\/td><td>3<\/td><td>Not a check<\/td><td>82<\/td><td>50<\/td><td>4<\/td><td>No<\/td><td>Not satisfactory<\/td>/,
+        'yaw: model, hold, no rate check, median absolute amplitude error 100*(exp(0.6)-1), phase, bins, axis result');
+    assert.match(table,/<td>Roll<\/td><td>3<\/td><td>10<\/td><td>Yes<\/td><td>11<\/td><td>12<\/td><td>5<\/td><td>Yes<\/td><td>Satisfactory<\/td>/);
+    assert.doesNotMatch(html,/Yaw: at 0.1 s, the model rate error/,'a row with gating false is not a failed check');
+    assert.match(html,/Yaw: the model calculates this rate without the control loop/);
+    assert.match(html,/Yaw: the frequency response of the model does not agree/);
+    assert.doesNotMatch(html,/Yaw: the model frequency response does not agree with the test flights/,'the check list shows the failed check once');
+    assert.match(html,/The helicopter dimensions are unknown/,'twin.limitations are in "Model limits"');
+    assert.match(html,/The median amplitude error must be 42% or less/);
+    assert.doesNotMatch(html,/hold-last-value|Text of the model check/,'no list of the texts of assess()');
+    assert.match(html,/Save helicopter model/);
+    const before=app.plots.length;
+    app.detail('cyclic:twin-horizon');
+    const horizon=app.plots.slice(before);
+    assert.equal(horizon.length,8,'eight channels with data, altitude has none');
+    assert.ok(horizon.every(p=>p.spec.x.log && p.spec.series.map(s=>s.name).join()==='Model,Hold the last value'));
+    assert.ok(!horizon.some(p=>/Altitude/.test(p.spec.title)));
+    assert.equal(horizon[0].spec.vlines[0].x,0.1);assert.equal(horizon[3].spec.vlines[0].x,0.2);
+    assert.match(app.pane('cyclic'),/40 start points/);
+    const n1=app.plots.length;app.detail('cyclic:twin-signals');
+    const signals=app.plots.slice(n1);
+    assert.equal(signals.length,8);
+    assert.deepEqual(Array.from(signals[0].spec.series.map(s=>s.name)),['Recorded, without filter','Recorded','Calculated']);
+    assert.deepEqual(Array.from(signals[0].spec.vlines.map(v=>v.x)),[42,42.5],'segment starts are marks at fromS + start');
+    assert.equal(signals[0].spec.series[1].x[0],40);assert.ok(Number.isNaN(signals[0].spec.series[2].y[0]),'a null gap breaks the calculated line');
+    assert.match(app.pane('cyclic'),/the model uses only the recorded control inputs/);
+    assert.match(app.pane('cyclic'),/Period 1, PID profile 2: 40.0 s to 43.0 s/);assert.match(app.pane('cyclic'),/Period 2, PID profile unknown: 10.0 s to 13.0 s/);
+    const noPre=()=>app.pane('cyclic').replace(/<pre>[\s\S]*?<\/pre>/g,'');
+    assert.doesNotMatch(noPre(),/flight:2026|flight 3/,'no raw flight identity in a label');
+    app.jq.fire('change','.tuning-ct-twin-select',{'data-twin':'prediction'},{value:'1'});await new Promise(r=>setTimeout(r,5));
+    const p2=app.plots.filter(p=>p.spec.title==='Roll rate').at(-1);
+    assert.equal(p2.spec.series[0].name,'Recorded','the second period has no raw gyro');assert.equal(p2.spec.series[0].x[0],10);
+    const n2=app.plots.length;app.detail('cyclic:twin-frequency');
+    const freq=app.plots.slice(n2);
+    assert.equal(freq.length,10,'magnitude and phase of roll, pitch, yaw and the two cyclic cross terms');
+    assert.ok(freq.every(p=>p.spec.x.log));
+    const rollMag=freq.find(p=>p.spec.title==='Roll: amplitude');
+    assert.ok(rollMag.spec.y.log);assert.deepEqual(Array.from(rollMag.spec.series.map(s=>s.name)),['Recorded','Recorded, coherence less than 0.5','Model']);
+    assert.ok(Number.isNaN(rollMag.spec.series[0].y[0])&&rollMag.spec.series[1].y[0]>0,'the low-coherence bin is drawn light, not as a recorded point');
+    assert.ok(freq.some(p=>p.spec.title==='Pitch input to roll rate: amplitude')&&freq.some(p=>p.spec.title==='Roll input to pitch rate: phase'));
+    assert.match(app.pane('cyclic'),/frequencies with a coherence less than 0.5/);
+    assert.match(app.pane('cyclic'),/Operating point 1, PID profile 2, from 40.0 s: 4500 rpm, 84.0 s of data/);
+    assert.match(app.pane('cyclic'),/Operating point 2, PID profile unknown, from 10.0 s: 5000 rpm, 61.0 s of data/);
+    const n3=app.plots.length;app.detail('cyclic:twin-closed');
+    const loop=app.plots.slice(n3);
+    assert.equal(loop.length,7,'three gyro plots and four mixer plots');
+    assert.deepEqual(Array.from(loop[0].spec.series.map(s=>s.name)),['Setpoint','Recorded gyro','Calculated gyro']);
+    assert.ok(Math.abs(loop[3].spec.series[0].y.reduce((m,v)=>Math.max(m,Math.abs(v)),0)-100)<1,'mixer/1000 shows in log units');
+    assert.match(app.pane('cyclic'),/Check 1, PID profile 2 at 12.0 s: not satisfactory/);
+    assert.match(app.pane('cyclic'),/Check 2, PID profile unknown at 30.0 s: satisfactory/);
+    assert.ok(loop.every(p=>p.spec.vlines.length===1&&p.spec.vlines[0].x===0.5),'a mark at predictionStartS on each closed-loop plot');
+    assert.match(app.pane('cyclic'),/Before the vertical line at 0.5 s, all lines show recorded data/);
+    assert.doesNotMatch(noPre(),/flight:2026/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('six-degree-of-freedom twin: missing fields do not throw and give no empty plots',async()=>{
+    const I=setup().internals;
+    for(const out of [I.twinHorizonItems({}),I.twinTraceItems({},null),I.twinFrequencyItems(null),I.twinClosedItems({}),I.twinClosedItems({trace:{rate:50}}),
+        I.twinHorizonItems({validation:{prediction:{points:[1,2],rmse:[[null,null]],persistence:[[null,null]]}}})]) assert.equal(out.length,0);
+    assert.equal(I.twinAssessment({validation:{}}),null);
+    assert.equal(I.twinIsCurrent({version:2,model:{kind:'heli-6dof'}}),true);assert.equal(I.twinIsCurrent({version:1,model:{}}),false);
+    const sparse=twin6dof();delete sparse.channels;delete sparse.predictions;delete sparse.validation.frequency;delete sparse.validation.prediction;
+    sparse.validation.assessment={status:'rejected',reasons:['A new reason.'],prediction:[],frequency:[]};
+    let app=await twinApp(sparse);let html=app.pane('cyclic');
+    assert.match(html,/<code>gyroADC\[0\.\.2\]<\/code>/,'default output names');
+    assert.doesNotMatch(html,/Model inputs from the log/,'no input list that the pipeline did not give');
+    assert.doesNotMatch(html,/data-tuning-detail-key="cyclic:twin-(horizon|signals|frequency|closed)"/);
+    assert.doesNotMatch(html,/A new reason/,'the texts of assess() are not a second list');
+    assert.match(html,/<td>Roll<\/td><td><\/td><td><\/td><td>Not measured<\/td>/);
+    assert.deepEqual(app.errors,[]);
+    const bare=twin6dof({validation:{split:{}},predictions:[{measured:[[1,2]],predicted:[[1,2]]}]});
+    app=await twinApp(bare,{closedLoopParity:[{pass:true}]});html=app.pane('cyclic');
+    assert.doesNotMatch(html,/twin-checks|data-tuning-detail-key="cyclic:twin-closed"/);
+    app.detail('cyclic:twin-signals');assert.match(app.pane('cyclic'),/Not available: the period has no data/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('six-degree-of-freedom twin: a refused fit, the gyro filter check without gyroRAW and partial status of another step',async()=>{
+    const I=setup().internals;
+    assert.equal(I.twinIsCurrent({version:2,model:null}),true,'a version-2 twin without a model is a refused fit, not an old file');
+    assert.equal(I.twinProfile(2),'PID profile 2');assert.equal(I.twinProfile(0),'PID profile unknown');assert.equal(I.twinProfile(null),'PID profile unknown');
+    assert.equal(I.twinGroupProfile({key:'profile 3'}),3);assert.equal(I.twinGroupProfile({key:'profile unknown'}),null);
+    assert.deepEqual({...I.twinPeriodOf({coverage:{intervals:[{id:'a',profile:4,fromS:7}]}},{id:'a'})},{profile:4,fromS:7});
+    assert.deepEqual({...I.twinPeriodOf({},{id:'a'})},{profile:null,fromS:null});
+    let app=await twinApp(twin6dof({model:null,ensemble:[],status:'rejected',eligibleSteps:[],reasons:['The fit has too few flight periods.']}),{sensorParity:{pass:true,available:false,rows:[]}});
+    let html=app.pane('cyclic');
+    assert.doesNotMatch(html,/previous file type/);assert.doesNotMatch(html,/Save helicopter model/,'no model to save');
+    assert.match(html,/The model fit did not make a helicopter model/);assert.match(html,/The fit has too few flight periods/);
+    assert.match(html,/The gyro filter check is not available: the log does not record <code>gyroRAW<\/code>\./);
+    assert.deepEqual(app.errors,[]);
+    app=await twinApp(twin6dof({status:'partial',eligibleSteps:['tail','tailcomp']}),{sensorParity:{pass:true,available:true}});html=app.pane('cyclic');
+    assert.match(html,/these control steps only: Tail gains, Tail compensation and authority\. The model cannot test changes in this step\./);
+    assert.doesNotMatch(html,/gyro filter check is not available/);
+    assert.deepEqual(app.errors,[]);
+});
+
+test('six-degree-of-freedom twin: the closed-loop fit, the governor path and the recorded position outputs',async()=>{
+    const I=setup().internals;
+    const fit={applied:true,windows:{count:27,windowS:8,prefixS:2},design:{before:{cost:2.3e5,gyroRmse:[16.19,16.39,17.87]},after:{cost:2.0e5,gyroRmse:[15.12,15.68,16.98]}},
+        stages:[{stage:'closed-loop yaw'},{stage:'closed-loop cyclic and yaw'}],testPeriodsUsed:false};
+    const reasons=['The log does not record the throttle stick ("rcCommand[4]"). The governor must have it.'];
+    const twin=twin6dof({validation:{...twin6dof().validation,closedLoopFit:fit},governor:{active:false,reasons,text:'x'},
+        channels:{...twin6dof().channels,outputs:['gyroADC[0]','gyroADC[1]','gyroADC[2]','attitude[0]','attitude[1]','attitude[2]','headspeed']}});
+    const notes=I.twinLoopNotes(twin);
+    assert.match(notes.fit.join(' '),/In 27 periods of the fit flights/);assert.match(notes.fit.join(' '),/The test flights are not in this fit/);
+    assert.equal(JSON.stringify(notes.rows.map(r=>r[0])),'["Roll","Pitch","Yaw"]');assert.equal(notes.rows[2][2],16.98);
+    assert.equal(notes.position,'The log has no sensor for position and speed.');
+    assert.equal(JSON.stringify(notes.governorReasons),JSON.stringify(reasons));
+    let app=await twinApp(twin,{closedLoopParity:closedRows()}),html=app.pane('cyclic');
+    assert.match(html,/Closed-loop fit/);assert.match(html,/The closed-loop fit changed the model\./);
+    assert.match(html,/<td>Yaw<\/td><td>17\.87<\/td><td>16\.98<\/td>/);
+    assert.match(html,/The closed loop does not calculate the governor\. It uses the recorded throttle and the recorded headspeed\./);
+    assert.match(html,/Causes<\/div><ul><li>The log does not record the throttle stick/);assert.match(html,/rcCommand\[4\]/);
+    assert.match(html,/The log has no sensor for position and speed\. Thus, the model calculates these values/);
+    assert.doesNotMatch(html,/records only the altitude and the vertical speed/);
+    assert.deepEqual(app.errors,[]);
+    // the governor in the loop: its text, and the headspeed and throttle plots of the closed-loop check
+    const rows=closedRows(),t=Array.from({length:100},(_,i)=>i);
+    rows[0].governor={pass:true,trace:{rate:50,measuredHeadspeed:t.map(()=>3500),predictedHeadspeed:t.map(i=>3500+i/10),measuredThrottle:t.map(()=>.6),predictedThrottle:t.map(()=>.61)}};
+    app=await twinApp(twin6dof({governor:{active:true,reasons:[]},validation:{...twin6dof().validation,closedLoopFit:{applied:false,windows:{count:12},design:{before:{},after:{}}}}}),{closedLoopParity:rows});
+    html=app.pane('cyclic');
+    assert.match(html,/The closed loop calculates the governor\. The governor throttle sets the rotor speed of the model\./);
+    assert.match(html,/The closed control loop did not change the model\. The errors in the fit periods did not decrease\./);
+    assert.match(html,/records only the altitude and the vertical speed/);
+    const n=app.plots.length;app.detail('cyclic:twin-closed');const loop=app.plots.slice(n);
+    assert.equal(loop.length,9,'three gyro, four mixer, the headspeed and the throttle');
+    assert.equal(loop[7].spec.title,'Headspeed, closed control loop');assert.ok(Math.abs(loop[8].spec.series[1].y[0]-61)<1e-9,'the throttle in percent');
+    assert.match(app.pane('cyclic'),/The governor code calculates the throttle/);
+    assert.deepEqual(app.errors,[]);
+    // a stopped fit and periods that are too short
+    for(const [closedLoopFit,text] of [[{applied:false,error:'The simulated rate is more than the model limit.'},/The closed loop stopped before the end of the fit\./],
+        [{applied:false,windows:{count:0}},/The fit periods are too short\./]]) {
+        app=await twinApp(twin6dof({validation:{...twin6dof().validation,closedLoopFit}}),{closedLoopParity:closedRows()});
+        assert.match(app.pane('cyclic'),text);assert.deepEqual(app.errors,[]);
+    }
+});
+
+test('control success accepts a sensor check without gyroRAW and a partial twin only for its eligible steps',()=>{
+    const I=setup().internals,base=acceptedControlFixture({version:2,status:'flight-test-required',configuration:'C',step:'cyclic'});
+    const ok=(mutate,step='cyclic')=>{const r=structuredClone(base);r.step=step;mutate(r);return I.acceptedControlResult({state:'done',result:r},'C',step);};
+    assert.equal(ok(r=>{r.controller.sensorParity={pass:true,available:false};}),true,'no gyroRAW: the filter check is not available, not failed');
+    assert.equal(ok(r=>{r.controller.sensorParity={pass:false,available:true};}),false);
+    assert.equal(ok(r=>{r.twin.status='partial';r.twin.eligibleSteps=['cyclic','cycomp'];}),true);
+    assert.equal(ok(r=>{r.twin.status='partial';r.twin.eligibleSteps=['cyclic','cycomp'];},'tail'),false);
+    assert.equal(ok(r=>{r.twin.status='partial';}),false,'partial without eligibleSteps');
+    assert.equal(ok(r=>{r.twin.model=null;}),false,'a refused fit has no model');
 });
 
 test('large control results keep closed checks and secondary plots out of the tab', () => {
@@ -4531,7 +4741,7 @@ test('all five control steps exclude unvalidated gain commands while retaining d
 test('control success requires the complete current digital twin and actual firmware replay contract',async()=>{
     const I=setup().internals,base=acceptedControlFixture({version:2,status:'flight-test-required',configuration:'C',step:'cyclic'});
     assert.equal(I.acceptedControlResult({state:'done',result:base},'C','cyclic'),true);
-    const variants=[['version'],['status'],['configuration'],['step'],['twin','schema'],['twin','version'],['twin','status'],['twin','controlEligible'],
+    const variants=[['version'],['status'],['configuration'],['step'],['twin','schema'],['twin','version'],['twin','model'],['twin','status'],['twin','controlEligible'],
         ['controller','compatibility','supported'],['controller','parity','pass'],['controller','sensorParity','pass'],['controller','closedLoopParity'],['search','holdout','pass']];
     for(const path of variants){
         const result=structuredClone(base);let at=result;for(const k of path.slice(0,-1))at=at[k];delete at[path.at(-1)];

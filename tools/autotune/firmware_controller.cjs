@@ -127,7 +127,8 @@ function compatibility(config={}, context={}) {
     if(config.stale) reasons.push('The flight controller values can be different from the values in the log.');
     if((config.modes||[]).some(m=>m!=='acro'&&m!=='rate')) reasons.push('The app cannot use this flight mode.');
     if((config.mixerRules||[]).length) reasons.push('The app cannot use mixer rules that you set.');
-    if(v.tail_rotor_mode!==0) reasons.push('The app cannot use a motorized tail.');
+    // an unknown tail mode is already an unknown value above; only a known motorized mode gets this reason
+    if(numeric(v.tail_rotor_mode)&&v.tail_rotor_mode!==0) reasons.push('The app cannot use a motorized tail.');
     if((context.step==='gov'||context.step==='governor')&&!config.executeGovernor) reasons.push('The governor control loop is not active.');
     if(config.executeGovernor&&![0,1,2,3,4].includes(v.gov_mode)) reasons.push('The app cannot use this governor mode.');
     // Header loop time remains the C PID timebase. Logged timestamps measure

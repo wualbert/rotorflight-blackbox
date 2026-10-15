@@ -748,6 +748,7 @@ markup, PR #84) stays byte-identical to upstream and is not used. Only its toolb
 | `tools/autotune/control_tune.cjs` | Offline control proposals from configuration-specific advice, atomic gain groups, exact model estimates and parameter-specific flight maneuvers for Export |
 | `tools/autotune/system_id.cjs`, `helicopter_model.cjs` | Automatic interval selection, pilot-instrumented plant identification, physical priors, independent validation and serializable aircraft dynamics |
 | `tools/autotune/control_pipeline.cjs`, `firmware_controller.cjs`, `firmware/` | Native Rotorflight replay and artifact verification, digital-twin lifecycle, controller parity, closed-loop candidate search and refusal gates |
+| `tools/autotune/heli_twin.cjs`, `twin_fit.cjs` | Six-degree-of-freedom helicopter twin (state, equations, observer, linearization) and its identification, instrumented frequency responses, reserved-flight checks |
 | `tools/autotune/control_validate.cjs`, `twin_replay.cjs` | Production-worker real-log validation with resource hashes, and frozen saved-model replay |
 | `docs/STE_GLOSSARY.md`, `test/ste/vocabulary.json`, `test/ste_text.test.cjs` | The STE rules, words and lint |
 
@@ -1325,12 +1326,14 @@ The Governor, Cyclic gains, Tail gains, Cyclic compensation and Tail compensatio
 Each problem shows its explanation, measured value and limit, configuration, PID profile, log, available time spans and
 evidence links. The first four results stay visible; the complete checks load when their disclosure opens.
 
-Control autotune builds an aircraft-specific, serializable rotational digital twin before searching controller values.
+Control autotune builds an aircraft-specific, serializable six-degree-of-freedom digital twin before searching controller values.
 The result shows independent prediction errors, recorded/predicted traces, usable intervals and exclusion reasons.
 The saved JSON contains the model, physical prior, model ensemble, configuration provenance, validation and replay inputs.
 A failed model remains downloadable as a diagnostic artifact but cannot produce a gain recommendation.
-This is a conditional rate-response model: headspeed and collective are recorded external inputs. Translation, position,
-motor/rotor-speed dynamics and flight outside the measured input envelope remain unsupported. See the
+The twin (`heli_twin.cjs`, file version 2) has position, velocity, attitude, body rates, rotor flapping, rotor speed,
+inflow, actuator, disturbance and sensor-filter states. Its input is the stabilized mixer that the flight-controller laws
+produce, plus throttle and battery voltage. No logged sensor measures horizontal position or speed: the model estimates
+them. Flight outside the measured input envelope remains unsupported. See the
 [research survey](HELICOPTER_SYSID_SURVEY.md), [model specification](HELICOPTER_SYSID_MODEL.md) and
 [compiled firmware boundary](../tools/autotune/firmware/README.md).
 
@@ -1350,7 +1353,7 @@ Firmware calendar timestamps cannot select the newest source; uptime resets do n
 boots. Repeated and overlapping captures are grouped before splitting. Exclusion records preserve source identity
 so duplicate files cannot increase the apparent validation sample size.
 
-The control workspace's **Parameter history** panel accepts an explicit, one-based log range and a confirmation that
+The control workspace's **Parameters in selected logs** panel accepts an explicit, one-based log range and a confirmation that
 parameters did not change. The confirmation applies separately to each PID profile and requires an original-header
 donor for that profile. It does not supply missing gains or certify unchanged mechanics. The browser persists this
 evidence under the full file SHA-256, and the worker independently verifies the hash and zero-based local log indexes.
@@ -1359,12 +1362,17 @@ values remain hypotheses; they cannot overwrite historical header gains. API cal
 `options.parameterContinuity` assertions or an explicit `parameterContinuityRequest`; results return the verified
 assertions and source files even when model validation fails.
 
-`system_id.cjs` fits the coupled rotor/body plant in `helicopter_model.cjs`. It uses recorded mixer inputs, RPM and
-actual collective mixer output, with pilot commands as instruments to reduce closed-loop disturbance bias. A missing
-collective mixer channel permits diagnostic fitting from its setpoint but cannot qualify control tuning. Geometry supplies broad inertia
-regularization, not measured inertia. The same initial measured rate starts each rollout; subsequent measured gyro
-samples never correct the predicted trajectory. Raw errors and identically low-pass-filtered errors are both reported.
-The low-pass cutoff is an evaluation choice, not proof of an identified frequency range.
+`system_id.cjs` selects the data and calls `twin_fit.identify`: staged Levenberg-Marquardt fits of rotor speed, the
+vertical channel, the fast dynamics against the 3 x 3 setpoint-instrumented frequency responses (no feedback bias),
+short-horizon (0.2 s) predictions and the yaw trim. Each prediction starts from a steady-state Kalman observer that
+uses only measurements before its origin; after the origin only recorded control inputs enter. `twin_fit.validate`
+scores 0.01-1 s predictions of gyro, attitude, altitude, vario and headspeed against holding the last value, and the
+frequency responses of the reserved flights. `twin_fit.assess` gives per-axis results and the control steps
+(`eligibleSteps`) that a "partial" model can test. `tune()` then refines the twin in closed loop on the design periods
+with the native controller (gyro and mixer agreement) before the gain search. A missing collective mixer channel permits
+diagnostic fitting from its setpoint but cannot qualify control tuning. Geometry supplies the mass and inertia prior.
+Model, equations, stages and the 2026-10-14 results are in [HELICOPTER_SYSID_MODEL.md](HELICOPTER_SYSID_MODEL.md);
+the development harness is `analysis/twin6dof/`.
 
 The visible model-confidence level uses held-out prediction accuracy, supported excitation frequencies and independence
 of the validation data. Per-axis filtered RMS error includes an empirical 95% interval, resampling flights when enough
@@ -1384,13 +1392,25 @@ agreement before candidate search. The pinned Rotorflight 4.6 source implements 
 the capability manifest identifies hardware adapters and external paths. A separate WebAssembly artifact executes
 the pinned gyro, RPM-notch and dynamic-notch source with its own parity gate. Scheduler phase distinguishes the
 recorded raw sample from the filtered value held at the PID tick. Autonomous simulation advances at the gyro rate;
-offline recorded-sample interpolation is never used to insert future measured gyro into a prediction.
+the new actuator command starts at the firmware servo-output tick. For PID denominator 2, that tick coincides with
+the logger tick, after gyro acquisition. For denominators 4–8, it precedes logging by one or two gyro ticks.
+The recorded prefix uses the same command timing. Native PID/mixer evaluation remains batched, using the held
+filtered gyro; its output is withheld from the physical model until the scheduled actuator tick.
+Offline recorded-sample interpolation is never used to insert future measured gyro into a prediction.
 Unknown active settings, unsupported modes and unsupported firmware
 prevent control recommendations. Governor source execution alone does not identify motor dynamics, so this rate twin
 cannot tune governor gains.
 
 Changed controller outputs drive the predicted plant, whose sensors feed the controller. Recorded actuator outputs
-are used only for plant identification, controller parity and initialization. Candidate gains are bounded and tested
+are used only for plant identification, controller parity and initialization. A two-second recorded prefix warms the
+native sensor and PID filters, and the twin observer sets its states from the prefix measurements. After that boundary,
+measured gyro, attitude, barometer, PID states, mixer, servo and motor outputs cannot enter the generated trajectory.
+Throttle and headspeed are recorded external inputs unless the native governor runs in the loop.
+The artifact identifies this initialization interval separately from the scored forecast. Regression tests mutate
+future measured feedback and actuator channels while preserving external inputs and require identical predictions.
+Native-controller replay uses the same prefix boundary for I/O initialization; it still uses measured gyro as its
+explicit replay input. Unknown post-update controller state remains a documented approximation.
+Candidate gains are bounded and tested
 against the model ensemble; a candidate is frozen before independent flight scenarios are evaluated. Prerequisites,
 saturation, extrapolation, cross-axis regression and insufficient independent evidence can each reject a candidate.
 The result is a simulated prediction pending a new flight. It never clears a measured problem.
@@ -1488,8 +1508,8 @@ selection/fit results and errors. Develop the procedure on Fireball, freeze it, 
 model as an external aircraft evaluation. Do not transfer fitted Fireball coefficients to Gaui.
 
 `node tools/autotune/twin_replay.cjs model.json replay.json` executes a saved model against its embedded reserved inputs
-without refitting. An optional third argument supplies a JSON array of new native-rate segments with `u`, `y`, `hs`,
-`coll`, `rate` and `n`. New observations are for scoring and first-sample initialization only. A replay does not change
+without refitting. An optional third argument supplies a JSON array of new twin runs (`twin_fit` run format). New
+observations set the observer before each origin and score the predictions only. A replay does not change
 the artifact's validation status or authorize gain export.
 
 ### The filter search

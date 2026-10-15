@@ -1,26 +1,27 @@
 {
   "version": 1,
-  "documents": ["HELICOPTER_SYSID_MODEL.md"],
-  "scopes": [{
-    "name": "Helicopter rotational digital twin",
-    "files": ["HELICOPTER_SYSID_MODEL.md"],
-    "strict_components": true,
-    "component_carriers": ["\\omega", "\\phi", "\\rho", "a", "\\beta", "J"],
-    "symbols": [
-      {"tex": ["i"], "role": "index", "meaning": "body-axis coordinate", "space": "1,2,3"},
-      {"tex": ["\\omega"], "role": "quantity", "meaning": "body angular rates", "space": "R3, degrees/s"},
-      {"tex": ["\\phi"], "role": "quantity", "meaning": "effective rotor/body derivative state", "space": "R3, degrees/s2"},
-      {"tex": ["K"], "role": "quantity", "meaning": "positive modal stiffness matrix", "space": "R3x3, 1/s2"},
-      {"tex": ["D"], "role": "quantity", "meaning": "positive diagonal modal damping", "space": "R3x3, 1/s"},
-      {"tex": ["G"], "role": "quantity", "meaning": "skew cyclic rotor coupling", "space": "R3x3, 1/s"},
-      {"tex": ["\\rho"], "role": "quantity", "meaning": "equilibrium rate drive", "space": "R3, degrees/s"},
-      {"tex": ["a"], "role": "quantity", "meaning": "axis-specific filtered input features", "space": "R9 per axis"},
-      {"tex": ["\\beta"], "role": "quantity", "meaning": "fitted input gain vector", "space": "R9 per axis, mixed feature units"},
-      {"tex": ["d"], "role": "quantity", "meaning": "yaw torque-rate damping", "space": "nonnegative real, 1/s"},
-      {"tex": ["E"], "role": "quantity", "meaning": "quadratic rotor/body Lyapunov energy", "space": "nonnegative real"},
-      {"tex": ["m"], "role": "quantity", "meaning": "assumed ready-to-fly mass", "space": "positive real, kg"},
-      {"tex": ["L", "W", "H"], "role": "quantity", "meaning": "bounding-box length, width and height", "space": "positive real, m"},
-      {"tex": ["J"], "role": "quantity", "meaning": "inertia tensor prior", "space": "positive diagonal R3x3, kg m2"}
-    ]
-  }]
+  "documents": [
+    "HELICOPTER_SYSID_MODEL.md",
+    "HELICOPTER_SYSID_SURVEY.md"
+  ],
+  "scopes": [
+    {
+      "name": "Helicopter six-degree-of-freedom digital twin",
+      "files": [
+        "HELICOPTER_SYSID_MODEL.md"
+      ],
+      "strict_components": true,
+      "component_carriers": [],
+      "symbols": []
+    },
+    {
+      "name": "Helicopter survey and empirical evidence",
+      "files": [
+        "HELICOPTER_SYSID_SURVEY.md"
+      ],
+      "strict_components": true,
+      "component_carriers": [],
+      "symbols": []
+    }
+  ]
 }
