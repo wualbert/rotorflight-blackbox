@@ -5,7 +5,7 @@ const schemaModule = require('./firmware/schema.cjs');
 const SCHEMA = schemaModule.fields;
 const COMMIT = '118e9120260bb33f46df4f92052fb0e9fd4e9ebc';
 const AXES = ['roll','pitch','yaw'];
-const ARTIFACT = 'd1aa792dad08bb1ae68fd8128f4493667dcd4ea97db758570fcaec6d3091022e';
+const ARTIFACT = '20e593e358ee34ffe14a9843b591039cfcd55951f281708421b7957db215f37a';
 const CAPABILITIES = Object.freeze({engine:'upstream-c-wasm',version:'4.6.0',commit:COMMIT,pidModes:[0,3,4],
     direct:['rate PID','PID filters','I-term relax','HSI offset','error decay','yaw stop gains','cross coupling','collective and inertia compensation','mixer limits','swash mixer','governor PID','governor state machine','torque assist'],
     external:['gyro sensor filter','rate shaping','actuator dynamics'],
@@ -15,6 +15,22 @@ const CAPABILITIES = Object.freeze({engine:'upstream-c-wasm',version:'4.6.0',com
 const own=(o,k)=>o!=null&&Object.prototype.hasOwnProperty.call(o,k);
 const numeric=x=>typeof x==='number'&&Number.isFinite(x);
 function defaults() {return Object.fromEntries(SCHEMA.map(f=>[f.name,f.default]));}
+// Firmware time (bridge rf_time): whole microseconds as two exact 16-bit halves (input[34] high, input[43] low); no time
+// adds one PID loop. The host millis() is this uint32 microsecond count / 1000, so it must not wrap: the firmware ms clock
+// wraps after 49.7 days. Only time differences reach the governor (cmp32), so a first time after 1000 s moves the origin
+// to 1000 s before it. A time before the previous time, or 2^32 us after the origin, is an error.
+function clockOf(iv,looptime) {
+    let origin=null,last=0;
+    return {reset(){origin=null;last=0;},set(t){
+        if(t==null){iv[34]=-1;last+=looptime;return;}
+        if(!numeric(t)||t<0)throw Error('The time of the step is not correct: '+t+'.');
+        const us=Math.round(t*1e6);if(origin===null)origin=Math.max(0,us-1e9);
+        const x=us-origin;
+        if(x<last)throw Error('The time of the step is before the time of the previous step: '+t+' s.');
+        if(x>=4294967296)throw Error('The time of the step is out of the range of the firmware clock: '+t+' s.');
+        last=x;iv[34]=Math.floor(x/65536);iv[43]=x%65536;
+    }};
+}
 const SERVO_FIELDS=['mid','min','max','rneg','rpos','rate','speed','flags'];
 function servoConfig(values={},sources={}) {
     const indexes=[...new Set(Object.keys(values).map(k=>/^servo (\d+) /.exec(k)).filter(Boolean).map(m=>+m[1]))].sort((a,b)=>a-b);
@@ -52,7 +68,7 @@ function fromHeader(header={}, values={}, context={}) {
     for(const f of SCHEMA) if(hasHeader(f.name)) put(f.name,header[f.name],'log header');
     // The yaw O term does not exist in the pinned controller.
     put('yaw_o_gain',0,'firmware source');
-    const enums={pid_mode:{PASSTHROUGH:0},iterm_relax_type:{OFF:0,RP:1,RPY:2},main_rotor_dir:{CW:0,CCW:1},tail_rotor_mode:{VARIABLE:0,MOTORIZED:1,BIDIRECTIONAL:2},swash_type:{NONE:0,PASSTHROUGH:1,THRU:1,CPPM:1,'120':2,CP120:2,'135':3,CP135:3,'140':4,CP140:4,'90L':5,CP90L:5,FP90L:5,'90V':6,CP90V:6,FP90V:6},gov_mode:{NONE:0,LIMIT:1,DIRECT:2,ELECTRIC:3,NITRO:4},gov_throttle_type:{NORMAL:0,SWITCH:1,FUNCTION:2},voltage_meter:{NONE:0,ADC:1,ESC:2}};
+    const enums={pid_mode:{PASSTHROUGH:0},iterm_relax_type:{OFF:0,RP:1,RPY:2},main_rotor_dir:{CW:0,CCW:1},tail_rotor_mode:{VARIABLE:0,MOTORIZED:1,BIDIRECTIONAL:2},swash_type:{NONE:0,PASSTHROUGH:1,THRU:1,CPPM:1,'120':2,CP120:2,'135':3,CP135:3,'140':4,CP140:4,'90L':5,CP90L:5,FP90L:5,'90V':6,CP90V:6,FP90V:6},gov_mode:{NONE:0,OFF:0,LIMIT:1,DIRECT:2,ELECTRIC:3,NITRO:4},gov_throttle_type:{NORMAL:0,SWITCH:1,FUNCTION:2},voltage_meter:{NONE:0,ADC:1,ESC:2}};
     function getValue(name) {
         let x=values[name];
         const ma=/^(\w+)\[(\d+)\]$/.exec(name);
@@ -61,12 +77,13 @@ function fromHeader(header={}, values={}, context={}) {
         if(x==null&&mi) x=values['mixer input '+mi[1].toUpperCase()+' '+mi[2]];
         if(x==null&&/^swash_trim/.test(name)) x=values[['swash_roll_trim','swash_pitch_trim','swash_collective_trim'][+ma[2]]];
         if(x==null&&/^gov_(yaw|cyclic|collective)_weight$/.test(name)) x=values[name.replace('_weight','_ff_weight')];
+        if(x==null&&name==='voltage_meter') x=values.battery_meter; // CLI name of the voltage source
         if(x!=null&&enums[name]&&own(enums[name],String(x).toUpperCase())) x=enums[name][String(x).toUpperCase()];
         return x==null?null:Number(x);
     }
     function sourceOf(name) {
         const s=context.valueSources||{},array=/^(\w+)\[(\d+)\]$/.exec(name),mixer=/^mixer_(\w+)_(min|max|rate)$/.exec(name);
-        return s[name]||(array&&s[array[1]])||(mixer&&s['mixer input '+mixer[1].toUpperCase()+' '+mixer[2]])||'recorded configuration';
+        return s[name]||(array&&s[array[1]])||(mixer&&s['mixer input '+mixer[1].toUpperCase()+' '+mixer[2]])||(name==='voltage_meter'&&s.battery_meter)||'recorded configuration';
     }
     const loggedParameters=new Set(Object.keys(v));
     for(const f of SCHEMA) {
@@ -78,6 +95,8 @@ function fromHeader(header={}, values={}, context={}) {
     }
     const flagFields={gov_use_fallback_precomp:2,gov_use_voltage_comp:3,gov_use_pid_spoolup:4,gov_use_dyn_min_throttle:6};
     if(Object.keys(flagFields).every(k=>own(values,k))) {let flags=0;for(const [name,bit] of Object.entries(flagFields))if(values[name]===true||values[name]===1||values[name]==='ON')flags|=1<<bit;put('gov_flags',flags,'recorded configuration');}
+    // battery_cell_count 0 is the firmware auto rule: with a rest voltage, the cell count that the firmware calculates
+    if(v.battery_cell_count===0&&numeric(context.restVoltage)){const c=govCells({cellCount:0,restVoltage:context.restVoltage,...cellLimits(header,values)});if(c.cells)put('battery_cell_count',c.cells,c.source);}
     const unknown=SCHEMA.filter(f=>!own(v,f.name)).map(f=>f.name);
     const revision=context.firmwareRevision||(hasHeader('firmwareRevision')?header.firmwareRevision:hasHeader('Firmware revision')?header['Firmware revision']:hasHeader('firmwareHash')?header.firmwareHash:'');
     return {firmwareVersion:context.firmwareVersion||header.firmwareVersion||'',firmwareRevision:revision,
@@ -170,6 +189,7 @@ async function create(options={}) {
     }
     SCHEMA.forEach((f,i)=>{if(!numeric(v[f.name])||!Number.isInteger(v[f.name])||v[f.name]<f.min||v[f.name]>f.max)throw Error('Invalid controller parameter: '+f.name);cv[i]=v[f.name];});
     cv[255]=config.executeGovernor?1:0;e.rf_reset();
+    const clock=clockOf(iv,v.pid_looptime);
     function vector(x,name,size) {if(!x||x.length!==size||Array.from(x).some(y=>!numeric(y)))throw Error('Invalid controller input: '+name);return x;}
     function step(sample) {
         if(sample.mode&&sample.mode!=='acro'&&sample.mode!=='rate')throw Error('Unsupported flight mode.');
@@ -181,13 +201,13 @@ async function create(options={}) {
         iv[9]=sample.airborne?1:0;iv[10]=sample.spooledUp?1:0;iv[13]=sample.gyroOverflow?1:0;
         if(sample.previousMixer){iv[14]=1;iv.set(vector(sample.previousMixer,'previousMixer',4),15);iv.set(vector(sample.saturation,'saturation',3),19);}
         if(sample.rcDeflection)iv.set(vector(sample.rcDeflection,'rcDeflection',4),24);
-        if(numeric(sample.timeS))iv[34]=sample.timeS;
         iv[35]=sample.armed===false?1:0;
         if(config.executeGovernor) {
             for(const [name,index] of [['rawMotorRpm',36],['batteryVoltage',37],['throttleCommand',38]]){if(!numeric(sample[name]))throw Error('Missing governor input: '+name);iv[index]=sample[name];}
             if(typeof sample.throttleOff!=='boolean'||typeof sample.armed!=='boolean'||!sample.rcDeflection)throw Error('The governor condition is missing.');
             iv[39]=sample.throttleOff?1:0;iv[40]=sample.govBypass?1:0;iv[41]=sample.govSuspend?1:0;iv[42]=sample.govFallback?1:0;
         }
+        clock.set(numeric(sample.timeS)?sample.timeS:null);
         e.rf_step();
         const terms={}; ['P','I','D','F','B','O','sum','gyro','axisError','axisOffset','saturation'].forEach((name,k)=>terms[name]=[ov[5+k],ov[16+k],ov[27+k]]);
         const governor={};['P','I','D','F','sum','targetHS','requestHS','currentHeadSpeed','state','ttaIncrease','spoolUpRatio','spooledUp','throttle'].forEach((name,k)=>governor[name]=ov[46+k]);
@@ -201,7 +221,7 @@ async function create(options={}) {
         iv[18]=sample.collective;iv[19]=sample.throttle||0;iv[35]=0;e.rf_map_mixer();
         return {servo:Array.from(ov.slice(38,46)),servoPwm:servo?Array.from(ov.slice(64,64+servo.count)):null};
     }
-    return {step,seed,mapMixer,reset:()=>e.rf_reset(),status,capabilities:CAPABILITIES,config,artifactSha256:ARTIFACT};
+    return {step,seed,mapMixer,reset:()=>{clock.reset();e.rf_reset();},status,capabilities:CAPABILITIES,config,artifactSha256:ARTIFACT};
 }
 async function replay(options) {const runtime=await create(options);if(options.initialState)runtime.seed(options.initialState);return {status:runtime.status,outputs:options.samples.map(s=>runtime.step(s)),capabilities:CAPABILITIES};}
 // Finite-grid identification of unrecorded controller settings. Every candidate
@@ -305,5 +325,107 @@ async function calibrate(options={}) {
         channels,training:tested.parts[0],selection:tested.parts[1],test:{...test,passed:testPassed},
         rule:'The selected value must give an error change of more than two standard errors between periods. All PID term checks on the last period must agree.'};
 }
-module.exports={SCHEMA,COMMIT,ARTIFACT,CAPABILITIES,defaults,servoConfig,SERVO_FIELDS,fromHeader,pitchLimits,requiredFields,compatibility,create,replay,calibrate};
+// ---- Native governor alone (SPEC docs/GOVERNOR_AUTOTUNE.md 6): rf_gov_step at the recorded stabilized mixer boundary ----
+// battery_cell_count 0 = auto (firmware battery.c, health_power.autoCells) on the rest voltage at connection, in V per cell.
+// An unknown count gives 0. govCreate refuses it when the voltage compensation is active (flight_governor.c:495).
+function govCells({cellCount,restVoltage,minCell=3.3,maxCell=4.3}={}) {
+    if(Number.isInteger(cellCount)&&cellCount>0)return {cells:cellCount,source:'configuration',note:null};
+    const k=numeric(restVoltage)?require('./health_power.cjs').autoCells(restVoltage,minCell,maxCell):null;
+    if(k)return {cells:k,source:'calculated from the log: the firmware cell rule at a rest voltage of '+restVoltage.toFixed(2)+' V',note:null};
+    return {cells:0,source:'unknown',note:'The battery cell count is unknown. Thus, the governor model cannot calculate the voltage compensation.'};
+}
+// cell voltage limits for govCells (health_power.limitsOf: 0.01 V or 0.1 V units, the log header first, then the CLI, then
+// the release default). A header value that the log did not record is a parser default (flightlog_parser.js:217), not used.
+function cellLimits(header={},values={}) {
+    const logged=!Array.isArray(header.loggedHeaderFields)||header.loggedHeaderFields.includes('vbatcellvoltage');
+    const l=require('./health_power.cjs').limitsOf(logged?header:{},{global:values});
+    return {minCell:l.min,maxCell:l.max};
+}
+// governor + rotor direction (TTA sign), tail mode (meaning of mixer[2]), gear, cells, voltage meter
+const GOV_NAMES=['pid_looptime','main_rotor_dir','tail_rotor_mode',...SCHEMA.slice(schemaModule.governorStart).map(f=>f.name)];
+const GOV_PROFILE=SCHEMA.map((f,i)=>i).filter(i=>SCHEMA[i].member.startsWith('profile.governor.')); // config[115..135], rf_gov_profile
+const GOV_PROFILE_NAMES=new Set(GOV_PROFILE.map(i=>SCHEMA[i].name));
+const GOV_RANGE=Object.fromEntries(SCHEMA.map(f=>[f.name,f.name==='battery_cell_count'?[0,24]:[f.min,f.max]])); // cells 0 = unknown (settings.c 0-24)
+const govKnown=(v,n)=>numeric(v[n])&&!(n==='battery_cell_count'&&v[n]===0);
+// TTA (govInitTTA, flight_governor.c:1525) and the yaw that the governor reads (FF :479, TTA :516). Unknown counts as active.
+const govTta=v=>v.gov_tta_gain>0&&v.gov_tta_limit!==0&&![0,1,4].includes(v.gov_mode);
+const govYaw=v=>v.gov_f_gain!==0&&v.gov_yaw_weight!==0||govTta(v);
+// Values that the firmware does not read with these settings: the bypass curve (BYPASS only, step checks it), the TTA values
+// and the rotor direction without TTA, the tail mode when the governor does not read the yaw, and the voltage compensation
+// inputs without the flag, the ADC meter and the ELECTRIC mode (:1556).
+function govRequiredFields(values={}) {
+    const inactive=SCHEMA.filter(f=>/^gov_bypass_throttle\[/.test(f.name)).map(f=>f.name);
+    if(!(values.gov_tta_gain>0)||[0,1,4].includes(values.gov_mode))inactive.push('gov_tta_limit');
+    if(!govTta(values))inactive.push('gov_tta_filter','main_rotor_dir');
+    if(!govYaw(values))inactive.push('tail_rotor_mode');
+    if(!(values.gov_flags&8)||numeric(values.gov_mode)&&values.gov_mode!==3)inactive.push('gov_pwr_filter','battery_cell_count','voltage_meter');
+    else if(numeric(values.voltage_meter)&&values.voltage_meter!==1)inactive.push('gov_pwr_filter','battery_cell_count');
+    return {required:GOV_NAMES.filter(n=>!inactive.includes(n)),inactive};
+}
+function govCheck(v,names) {
+    for(const n of names){const [lo,hi]=GOV_RANGE[n],x=v[n];
+        if(!numeric(x)||!Number.isInteger(x)||x<lo||x>hi)throw Error('The governor value '+n+' is out of its range ('+lo+' to '+hi+'): '+x+'.');}
+    // a motorized tail: the log records the tail motor throttle as mixer[2] (flight_mixer.c:391, after governorUpdate :542)
+    if(govYaw(v)&&v.tail_rotor_mode!==0)throw Error('The governor model cannot use a motorized tail when the governor uses the yaw. The log records the tail motor throttle, not the yaw.');
+}
+// govCreate({values, gear:[n,d], cells, restVoltage, minCell, maxCell, voltageSource, pidHz, bytes}): values use the schema
+// names. PID values take the release defaults and the governor step never executes them. An unknown gear ratio gives 1:1:
+// then rawMotorRpm is the headspeed, which gives the same governor result (the glitch limits scale with the same ratio).
+async function govCreate(options={}) {
+    const notes=[],v={...(options.values||{})};
+    if(options.pidHz!=null){const t=1e6/options.pidHz;if(!numeric(t)||Math.abs(t-Math.round(t))>1e-6)throw Error('The app cannot use this PID loop rate: '+options.pidHz+' Hz.');v.pid_looptime=Math.round(t);}
+    let gear=options.gear!=null?options.gear:numeric(v['main_rotor_gear_ratio[0]'])&&numeric(v['main_rotor_gear_ratio[1]'])?[v['main_rotor_gear_ratio[0]'],v['main_rotor_gear_ratio[1]']]:null;
+    if(!gear){gear=[1,1];notes.push('The main rotor gear ratio is not available. Thus, the governor model uses the headspeed as the motor speed. This does not change the governor result.');}
+    if(!Array.isArray(gear)||gear.length!==2)throw Error('The gear ratio must have two values: '+gear+'.');
+    v['main_rotor_gear_ratio[0]']=gear[0];v['main_rotor_gear_ratio[1]']=gear[1];
+    if(options.voltageSource!=null)v.voltage_meter=typeof options.voltageSource==='string'?{NONE:0,ADC:1,ESC:2}[options.voltageSource.toUpperCase()]:options.voltageSource;
+    const cellCount=options.cells!=null?options.cells:v.battery_cell_count;
+    v.battery_cell_count=cellCount==null||cellCount===0?govCells({cellCount,restVoltage:options.restVoltage,minCell:options.minCell,maxCell:options.maxCell}).cells:cellCount;
+    const D=defaults(),scope=govRequiredFields(v),assumed=new Set();
+    for(const n of scope.inactive)if(!numeric(v[n])){v[n]=D[n];assumed.add(n);}
+    const missing=scope.required.filter(n=>!govKnown(v,n));
+    if(missing.length)throw Error('The governor values are unknown: '+missing.join(', ')+'.');
+    govCheck(v,GOV_NAMES);
+    const bytes=await bytesOf(options); await checkArtifact(bytes);
+    const {instance}=await WebAssembly.instantiate(bytes,{}),e=instance.exports;
+    if(e._initialize)e._initialize();
+    const cv=new Float32Array(e.memory.buffer,e.rf_config(),256),iv=new Float32Array(e.memory.buffer,e.rf_input(),64),ov=new Float32Array(e.memory.buffer,e.rf_output(),80);
+    const base=Object.fromEntries(GOV_NAMES.map(n=>[n,v[n]])),bypassUnknown=[...assumed].some(n=>n.startsWith('gov_bypass_throttle')),clock=clockOf(iv,base.pid_looptime);
+    const load=x=>{SCHEMA.forEach((f,i)=>{cv[i]=own(x,f.name)?x[f.name]:D[f.name];});cv[255]=1;};
+    const reset=()=>{load(base);iv.fill(0);clock.reset();e.rf_reset();};
+    reset();
+    // A PID profile change (pid.c:709): all governor values of the new PID profile, the global values stay, and the governor
+    // state stays (stateResetReq). A value that the new profile does not read may be absent: it gets the release default.
+    function profile(values={}) {
+        for(const n of GOV_NAMES)if(!GOV_PROFILE_NAMES.has(n)&&own(values,n)&&values[n]!==base[n])throw Error('A PID profile change cannot change the global value '+n+'.');
+        const next={...base};for(const n of GOV_PROFILE_NAMES)next[n]=values[n];
+        const scope=govRequiredFields(next);
+        for(const n of scope.inactive)if(GOV_PROFILE_NAMES.has(n)&&!numeric(next[n]))next[n]=D[n];
+        const unknown=scope.required.filter(n=>GOV_PROFILE_NAMES.has(n)?!numeric(next[n]):assumed.has(n)||!govKnown(base,n));
+        if(unknown.length)throw Error('The governor values are unknown: '+unknown.join(', ')+'.');
+        govCheck(next,[...GOV_PROFILE_NAMES]);
+        for(const i of GOV_PROFILE)cv[i]=next[SCHEMA[i].name];
+        e.rf_gov_profile();
+    }
+    function step(s) {
+        if(!numeric(s.rawMotorRpm)||!numeric(s.batteryVoltage)||!numeric(s.throttleCommand))throw Error('Missing governor input: rawMotorRpm, batteryVoltage or throttleCommand.');
+        if(typeof s.throttleOff!=='boolean'||typeof s.armed!=='boolean')throw Error('The governor condition is missing.');
+        const m=s.mixer;if(!m||m.length!==4||!numeric(m[0])||!numeric(m[1])||!numeric(m[2])||!numeric(m[3]))throw Error('The mixer input of the governor is not correct.');
+        // the bypass curve uses the collective stick (getRcDeflection, flight_governor.c:417), not the mixer
+        const rc=s.rcDeflection;
+        if(rc!=null&&(rc.length!==4||!Array.from(rc).every(numeric)))throw Error('The stick input of the governor is not correct.');
+        if(s.govBypass&&bypassUnknown)throw Error('The values of "gov_bypass_throttle" are unknown.');
+        if(s.govBypass&&rc==null)throw Error('The collective stick input "rcDeflection" is necessary for "govBypass".');
+        clock.set(s.timeS==null?null:s.timeS);
+        iv[15]=m[0];iv[16]=m[1];iv[17]=m[2];iv[18]=m[3];
+        for(let a=0;a<4;a++)iv[24+a]=rc?rc[a]:0;
+        iv[35]=s.armed?0:1;iv[36]=s.rawMotorRpm;iv[37]=s.batteryVoltage;iv[38]=s.throttleCommand;iv[39]=s.throttleOff?1:0;
+        iv[40]=s.govBypass?1:0;iv[41]=s.govSuspend?1:0;iv[42]=s.govFallback?1:0;
+        e.rf_gov_step();
+        return {P:ov[46],I:ov[47],D:ov[48],F:ov[49],sum:ov[50],targetHS:ov[51],requestHS:ov[52],currentHeadSpeed:ov[53],state:ov[54],ttaIncrease:ov[55],spoolUpRatio:ov[56],spooledUp:ov[57],throttle:ov[58]};
+    }
+    // values: the known values only, so that {...values, ...changes} for profile() does not make an assumed value known
+    return {step,profile,reset,values:Object.fromEntries(Object.entries(base).filter(([n])=>!assumed.has(n))),assumed:[...assumed],required:scope.required,notes,artifactSha256:ARTIFACT};
+}
+module.exports={SCHEMA,COMMIT,ARTIFACT,CAPABILITIES,defaults,servoConfig,SERVO_FIELDS,fromHeader,pitchLimits,requiredFields,compatibility,create,replay,calibrate,govCreate,govCells,govRequiredFields};
 if(require.main!==module)return;

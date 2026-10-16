@@ -42,6 +42,8 @@ const RULES = {
     G11: { perPack: 5, minBlocks: 10, source: 'pipeline, unvalidated' },
     G12: { tolerance: 0.005, minProminence: 3, source: 'pipeline, unvalidated' },
     G13: { minCell: 3.3, source: 'pipeline, unvalidated' },
+    G21: { minSpikes: 3, maxP: 0.001, rateRatio: 10, margin: 3, minOkS: 12,
+        source: 'pipeline, unvalidated; the logs of one helicopter (2026-09 and 2026-10): 19 of 21 sudden changes at 99.5 % throttle or more, in 1.2 % of the time' },
     // cyclic (health_loop)
     C1: { level: 0.95, minS: 0.2, source: 'firmware', note: 'limit from firmware (pid.c:1156-1166); 95 % and 0.2 s are pipeline, unvalidated' },
     C2: { minEpisodes: 1, source: 'firmware', note: 'limits enforced by the firmware; detected from the data (RULE.limitSamples, pipeline)' },
@@ -80,6 +82,7 @@ const MEASURED = [
     ['gov', 'step', 'collective events: |collective| / one-sided travel, min step and bins (G3, G4, G5)', (M) => M.gov.RULE.step],
     ['gov', 'unsat.vcompOffShare', 'G7 takes voltage compensation as off when this share of unsaturated motor[0]/govSum is 1', (M) => M.gov.RULE.unsat.vcompOffShare],
     ['gov', 'vbat.startCell', 'cell count inferred from the resting voltage when the CLI gives none; ambiguous = no per-cell verdict (D5, G13)', (M) => M.gov.RULE.vbat.startCell],
+    ['gov', 'g21', 'G21 sudden changes of the headspeed signal: window, rate floor, acceleration factor and quantile, minimum step, the episode gap and length, the throttle maximum band and pile rule', (M) => M.gov.RULE.g21],
     ['loop', 'limitSamples', 'an extreme reached this often is an output limit (C2, T8)', (M) => M.loop.RULE.limitSamples],
     ['loop', 'dNoise.hz', 'C11 measures the share of axisD power above this frequency', (M) => M.loop.RULE.dNoise.hz],
     ['loop', 'flight', 'C10 landed-while-moving windows: fallback when health.json has no gate (health.cjs passes its own)', (M) => M.loop.RULE.flight],

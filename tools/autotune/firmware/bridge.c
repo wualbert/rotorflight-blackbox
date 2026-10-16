@@ -156,8 +156,11 @@ void rf_reset(void) {
 void rf_seed(void) {
  for(int a=0;a<3;a++) {pid.data[a].axisError=input[28+a];pid.data[a].axisOffset=input[31+a];}
 }
+/* Time: input[34] < 0 adds one PID loop. Else input[34] and input[43] are the high and the low 16 bits of the time in
+   microseconds, exact in float32. millis() is this count / 1000, so firmware_controller.clockOf keeps it below 2^32. */
+static void rf_time(void) {hostTimeUs = input[34]>=0 ? (uint32_t)input[34]*65536u+(uint32_t)input[43] : hostTimeUs+gyro.targetLooptime;}
 void rf_step(void) {
- hostTimeUs = input[34]>=0 ? (uint32_t)(input[34]*1000000) : hostTimeUs+gyro.targetLooptime;
+ rf_time();
  for(int a=0;a<3;a++) gyro.gyroADCf[a]=input[3+a];
  if(input[14]!=0) {
   for(int a=0;a<4;a++) mixer.input[1+a]=input[15+a];
@@ -191,4 +194,38 @@ void rf_map_mixer(void) {
  for(int a=0;a<5;a++)mixer.input[1+a]=input[15+a];
  mixerUpdateSwash();mixerUpdateRules();if(executeServo)servoUpdate();
  for(int a=0;a<8;a++){output[38+a]=mixerGetServoOutput(a);output[64+a]=executeServo?getServoOutput(a):0;}
+}
+/* Governor only, at the recorded stabilized mixer boundary: no PID and no mixer update. */
+void rf_gov_step(void) {
+ rf_time();
+ for(int a=0;a<4;a++) mixer.input[1+a]=input[15+a];
+ mixer.cyclicTotal=sqrtf(input[15]*input[15]+input[16]*input[16]);
+ fw_governorUpdate();
+ float g[13]={gov.P,gov.I,gov.D,gov.F,gov.pidSum,gov.targetHeadSpeed,gov.requestedHeadSpeed,gov.currentHeadSpeed,(float)gov.state,gov.ttaAdd,fw_getSpoolUpRatio(),(float)fw_isSpooledUp(),gov.throttleOutput};
+ for(int a=0;a<13;a++)output[46+a]=g[a];
+}
+/* PID profile change (pid.c:709): new governor profile values, governor state kept. */
+void rf_gov_profile(void) {
+ profile.governor.flags = config[115];
+ profile.governor.headspeed = config[116];
+ profile.governor.min_throttle = config[117];
+ profile.governor.max_throttle = config[118];
+ profile.governor.gain = config[119];
+ profile.governor.p_gain = config[120];
+ profile.governor.i_gain = config[121];
+ profile.governor.d_gain = config[122];
+ profile.governor.f_gain = config[123];
+ profile.governor.p_limit = config[124];
+ profile.governor.i_limit = config[125];
+ profile.governor.d_limit = config[126];
+ profile.governor.f_limit = config[127];
+ profile.governor.tta_gain = config[128];
+ profile.governor.tta_limit = config[129];
+ profile.governor.yaw_weight = config[130];
+ profile.governor.cyclic_weight = config[131];
+ profile.governor.collective_weight = config[132];
+ profile.governor.collective_curve = config[133];
+ profile.governor.fallback_drop = config[134];
+ profile.governor.dyn_min_throttle = config[135];
+ fw_governorInitProfile(&profile);
 }

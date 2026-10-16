@@ -1,8 +1,13 @@
 'use strict';
 
 /**
- * Governor, ESC and power checks (docs/TUNING_KNOWLEDGE.md sections 3, 6 and 10.2): D5, G0 to G13, and the governor
+ * Governor, ESC and power checks (docs/TUNING_KNOWLEDGE.md sections 3, 6 and 10.2): D5, G0 to G13, G21, and the governor
  * state accounting of a whole log.
+ *
+ *   G21  the sudden changes of the headspeed signal (faster than a rotor can change speed) in each throttle band, against the
+ *        time at the throttle maximum (analysis/rpm-spikes: on the Fireball, 19 of 21 at 99.5 % throttle or more, in 1.2 % of the
+ *        time). The detector (spikeScan) is the one of health_rescue.cjs G20 and gov_tune.cjs; the test (g21Test, g21Pool) is the
+ *        one of gov_tune.cjs and gov_scenarios.cjs. advice.cjs gives a lower gov_max_throttle for a problem
  *
  *   analyse(w, ctx)          measurements of one whole-log segment (lib.segments with whole: true); no verdicts
  *   judge(flights, RULES)    findings from those measurements against the thresholds in RULES (DEFAULT_RULES)
@@ -40,6 +45,28 @@ const RULE = {
     g10: { N: 2048, wagBand: [5, 16] },
     g11: { blockS: 2, cover: 0.9 },
     g12: { perRev: 32, revolutions: 1024, headspeed: lib.FLIGHT_RPM, from: 0.5, to: 4.5, search: [0.6, 1.6], harmonic: 0.005, lines: 8 },
+    // G21, the sudden changes of the headspeed signal (analysis/rpm-spikes, 2026-10-15): a change of the logged headspeed over windowS
+    // that is faster than the rotor can change speed. The rate limit of a flight is max(minRate, accelFactor x the accelQ quantile of
+    // the rotor acceleration in ACTIVE: |difference of the means of two adjacent accelBlockS blocks| / accelBlockS, without the
+    // blocks that hold a change faster than minRate), rpm/ms; the change must also be minStep of the target or more, so that noise
+    // cannot count. One sudden change is one episode (review 2026-10-15: the binomial test needs independent trials, and one glitch
+    // burst of 200 ms to 400 ms has pulses every 10 ms to 60 ms): the samples that change faster than minRate (not the limit of the
+    // flight, so that a higher limit cannot give more changes) with gaps of episodeS or less, at most maxEpisodeS long (episodeS: the
+    // 200 ms FALLBACK detect delay of governor.c and 100 ms). An episode counts when one of its samples is over the two limits; its
+    // pulses: the runs of such samples, joined when closer than mergeS. Samples: the governor in states (RECOVERY, ACTIVE, FALLBACK),
+    // the motor on and the headspeed more than minHeadspeed x the governor request. The start of an episode: its first sample. The
+    // sign of a change: the sign at its start. The throttle of a change: the maximum of motor[0] in fallbackS before the start (as for a
+    // FALLBACK entry: after an increase of the signal the governor decreases the throttle at once); the throttle
+    // maximum: motor[0] at the ceiling - atMax counts or more (the ceiling: the CLI gov_max_throttle that the log does not contradict,
+    // else the pile of motor[0] while the governor command is more by pile.push counts (gov_params critique C8: pile.minSamples,
+    // pile.share, a whole percent), else 100 % when the throttle gets to 99.5 % (a whole percent of 10 to 100), else 100 % assumed).
+    // The governor command is govSum x the voltage compensation of its ratioS block (the median of motor[0] / govSum in ACTIVE with
+    // govSum of minSum counts or more). bands: the throttle bands under the maximum (counts); demand: the histogram of the governor
+    // command in ACTIVE (counts: from, to, step) for the cost of a lower maximum; fallbackS: the throttle before a FALLBACK entry;
+    // spikeBeforeS: a change at most this time before it
+    g21: { windowS: 0.003, minRate: 40, accelFactor: 10, accelBlockS: 0.1, accelQ: 0.999, minStep: 0.03, mergeS: 0.05, episodeS: 0.3, maxEpisodeS: 1, minHeadspeed: 0.2, states: [3, 4, 6],
+        atMax: 5, bands: [800, 900, 950], pile: { minSamples: 20, share: 0.9, push: 2, pushVcomp: 10 }, ratio: { blockS: 5, minSum: 100, minSamples: 50, range: [0.75, 1.25] },
+        demand: { from: 850, to: 1100, step: 5 }, fallbackS: 0.02, spikeBeforeS: 0.03, maxEvents: 200 },
 };
 
 // Thresholds (section 10). source: firmware | doc | community | pipeline, unvalidated
@@ -60,6 +87,14 @@ const DEFAULT_RULES = {
     G11: { perPack: 5, minBlocks: 10, source: 'pipeline, unvalidated' },
     G12: { tolerance: 0.005, minProminence: 3, source: 'pipeline, unvalidated' },
     G13: { minCell: 3.3, source: 'pipeline, unvalidated' },
+    // G21 (analysis/rpm-spikes, the six Fireball dumps of 2026-09 and 2026-10: 19 of 21 sudden changes at 99.5 % throttle or more, in
+    // 1.2 % of the governed time; 0 in 54 s at 95-99.5 %. This detector, after the review of 2026-10-15, on the four governed dumps, 38
+    // unique flight logs: 17 of 19 at the maximum in 59.3 s of 5619 s, p = 4e-32, all upward; 0 in 47 s at 95-99.5 %; the two control
+    // dumps of 2026-09-19 and 20 have no sample in RECOVERY, ACTIVE or FALLBACK). margin: the decrease of gov_max_throttle that advice.cjs and gov_scenarios.cjs
+    // give for a problem (percentage points). minOkS: the time at the maximum for "no sudden change" (ok): at the rate of those dumps at
+    // the maximum (19 in 74.6 s, 0.255 /s), P(0 changes in 12 s) = exp(-3.06) = 0.047 < 0.05; with less time and no change, not measured
+    G21: { minSpikes: 3, maxP: 0.001, rateRatio: 10, margin: 3, minOkS: 12,
+        source: 'pipeline, unvalidated; the logs of one helicopter (2026-09 and 2026-10): 19 of 21 sudden changes at 99.5 % throttle or more, in 1.2 % of the time' },
 };
 
 const EXTRA = ['govTarget', 'govRequest', 'govSum', 'govP', 'govI', 'govD', 'govF', 'motor[0]', 'Vbat', 'mixer[3]', 'gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]'];
@@ -114,6 +149,179 @@ function bandPeak(p, k0, k1) {
 // runs of a predicate over [0, n): [[i0, i1), ...]
 function runs(n, on) { const out = []; for (let i = 0; i < n;) { if (!on(i)) { i++; continue; } let j = i; while (j < n && on(j)) j++; out.push([i, j]); i = j; } return out; }
 const header = (h, k) => { const v = h && h[k]; if (Array.isArray(v)) return v.map(Number); if (typeof v === 'string') return v.split(',').map(Number); return typeof v === 'number' ? [v] : null; };
+
+// ---------------------------------------------------------------------------------------------
+// G21: sudden changes of the headspeed signal (also for health_rescue.cjs G20 and gov_tune.cjs: one detector)
+// ---------------------------------------------------------------------------------------------
+
+// P(X >= k) for X ~ Binomial(N, s)
+function binomTail(k, N, s) {
+    if (!(N > 0) || k <= 0) return 1;
+    if (k > N || !(s > 0)) return 0;
+    if (s >= 1) return 1;
+    const lf = new Float64Array(N + 1); for (let i = 2; i <= N; i++) lf[i] = lf[i - 1] + Math.log(i);
+    const a = Math.log(s), b = Math.log1p(-s); let t = 0;
+    for (let j = k; j <= N; j++) t += Math.exp(lf[N] - lf[j] - lf[N - j] + j * a + (N - j) * b);
+    return Math.min(1, t);
+}
+
+// The voltage compensation of each RULE.g21.ratio.blockS block: the median of motor[0] / govSum in ACTIVE (1 when it is off: motor[0]
+// = govSum to within one count), the last known block for a block with too few samples. -> (i) => gain
+function vcompBlocks(o, P) {
+    const { motor: mot, sum, state: st, rate } = o, n = mot.length, B = Math.max(1, Math.round(P.ratio.blockS * rate)), nb = Math.ceil(n / B), out = new Float64Array(nb).fill(NaN);
+    if (!sum) return () => 1;
+    for (let b = 0; b < nb; b++) { const q = [];
+        for (let i = b * B; i < Math.min(n, (b + 1) * B); i += 2) if ((st ? st[i] === ACTIVE : !o.use || o.use[i]) && sum[i] >= P.ratio.minSum) { const x = mot[i] / sum[i]; if (x >= P.ratio.range[0] && x <= P.ratio.range[1]) q.push(x); }
+        if (q.length >= P.ratio.minSamples / 2) { q.sort((x, y) => x - y); out[b] = q[q.length >> 1]; } }
+    let last = NaN; for (let b = 0; b < nb; b++) { if (isNaN(out[b])) out[b] = last; else last = out[b]; }
+    last = 1; for (let b = nb - 1; b >= 0; b--) { if (isNaN(out[b])) out[b] = last; else last = out[b]; }
+    return (i) => out[Math.min(nb - 1, (i / B) | 0)];
+}
+
+// The throttle maximum of each profile label p: ctx.maxThrottle (CLI, %) when motor[0] does not go more than it, else the pile of
+// motor[0] while the governor command is more (critique C8), else 100 % when the throttle gets to 99.5 % (gov_max_throttle is a whole
+// percent of 10 to 100), else 100 % assumed. -> (p) => { value (counts), kind ('cli' | 'pile' | 'top' | 'assumed'), source, top }
+function ceilingsOf(o, P, cli, cliSource) {
+    const { motor: mot, state: st, profile: prof } = o, n = mot.length, vc = o.vc || (() => 1), by = new Map();
+    const at = (p) => by.get(p) || by.set(p, { top: -Infinity, hi: new Map(), nHi: 0 }).get(p);
+    for (let i = 0; i < n; i++) {
+        const gov = st ? P.states.includes(st[i]) : !o.use || o.use[i]; if (!gov || mot[i] <= RULE.firmware.zeroMotor) continue;
+        const q = at(prof ? prof[i] : 0); if (mot[i] > q.top) q.top = mot[i];
+        if (o.sum && (st ? st[i] === ACTIVE : true)) { const g = vc(i), push = Math.abs(g - 1) < 0.002 ? P.pile.push : P.pile.pushVcomp;
+            if (o.sum[i] * g >= mot[i] + push) { q.nHi++; q.hi.set(mot[i], (q.hi.get(mot[i]) || 0) + 1); } }
+    }
+    const memo = new Map();
+    return (p) => {
+        if (memo.has(p)) return memo.get(p);
+        const q = by.get(p) || { top: -Infinity, hi: new Map(), nHi: 0 }, top = isFinite(q.top) ? q.top : null, cv = cli && cli[p];
+        let c;
+        if (cv > 0 && !(top !== null && top > cv * 10 + RULE.cliCheck.ceilingCounts)) c = { value: cv * 10, kind: 'cli', source: cliSource || 'CLI gov_max_throttle' };
+        else { let m = null; for (const [v, k] of q.hi) if (!m || k > m.k) m = { v, k };
+            const why = cv > 0 ? ` The CLI value ${cv} % is not used: motor[0] gets to ${r(top / 10, 1)} %.` : '';
+            if (m && q.nHi >= P.pile.minSamples && m.k >= P.pile.share * q.nHi && m.v % 10 === 0 && m.v >= 100) c = { value: m.v, kind: 'pile', source: `calculated from the log: motor[0] stays at ${m.v / 10} % in ${m.k} of ${q.nHi} samples while the governor command is more.${why}` };
+            else if (top !== null && top >= 1000 - P.atMax) c = { value: 1000, kind: 'top', source: `calculated from the log: motor[0] gets to ${r(top / 10, 1)} %, and gov_max_throttle has the values 10 to 100 in steps of 1.${why}` };
+            else c = { value: 1000, kind: 'assumed', source: `assumed 100 %: the log does not show the maximum, and motor[0] gets to ${top === null ? 'no value' : `${r(top / 10, 1)} %`}.${why}` }; }
+        c.top = top; memo.set(p, c); return c;
+    };
+}
+
+// The sudden changes of the headspeed signal of one segment or run. o: { hs (rpm), motor (counts of 0.1 %), state (governor states or
+// null), use (without states: the samples to examine), profile (labels or null), target, request (rpm or null), full (i => rpm, when
+// both are missing), rate, sum (govSum counts or null), ceiling (p => { value, kind, source }), t (i => s) }. -> { samples, windowMs,
+// thresholdRpmMs, accelRpmMs, accelBlocks, governedS, byProfile: { [p]: { ceiling, ceilingKind, ceilingSource, governedS, atMaxS,
+// bands [{ from, to (%), s, up, down }], max { s, up, down }, spikes, atMax, activeS, demand { from, step (%), s [] }, fallbacks,
+// fallbacksAtMax, fallbacksAfterSpike } }, spikes [{ i (start), last, t, t1, rate (rpm/ms), from, to (the farthest value), up, throttle (%),
+// atMax, band, pulses, state, profile }] (P.maxEvents or less), spikesTotal, fallbacks [{ i, t, profile, throttle (%), atMax, spike { i, t,
+// dtS, rate, from, to, up, throttle, atMax } | null }]: every FALLBACK entry gets its change from the full list
+function spikeScan(o, P = RULE.g21) {
+    const hs = o.hs, mot = o.motor, st = o.state || null, n = hs.length, rate = o.rate, S = (s) => Math.round(s * rate), dt = 1 / rate;
+    const k = Math.max(1, S(P.windowS)), dtMs = 1000 * k / rate, T = o.t || ((i) => r(i / rate, 3)), lab = (i) => o.profile ? o.profile[i] : 0;
+    const okState = new Uint8Array(16); for (const s of P.states) okState[s] = 1;
+    const full = (i) => o.request && o.request[i] > 0 ? o.request[i] : o.target && o.target[i] > 0 ? o.target[i] : o.full ? o.full(i) || 0 : 0;
+    const ref = (i) => o.target && o.target[i] > 0 ? o.target[i] : full(i);
+    const gov = new Uint8Array(n), cand = new Uint8Array(n);
+    for (let i = 0; i < n; i++) gov[i] = (st ? okState[st[i]] : !o.use || o.use[i]) && mot[i] > RULE.firmware.zeroMotor && hs[i] > P.minHeadspeed * full(i) ? 1 : 0;
+    for (let i = k; i < n; i++) if (gov[i]) { const d = Math.abs(hs[i] - hs[i - k]); if (d / dtMs > P.minRate && d >= P.minStep * ref(i)) cand[i] = 1; }
+    // the rotor acceleration in ACTIVE: 100-ms means, without the blocks of a change faster than minRate
+    const m = Math.max(1, S(P.accelBlockS)), cs = new Float64Array(n + 1), cc = new Int32Array(n + 1), acc = [];
+    for (let i = 0; i < n; i++) { cs[i + 1] = cs[i] + hs[i]; cc[i + 1] = cc[i] + cand[i]; }
+    for (let i = m; i + m <= n; i += m) if ((st ? st[i] === ACTIVE : gov[i]) && cc[i + m] === cc[i - m]) acc.push(Math.abs(cs[i + m] - 2 * cs[i] + cs[i - m]) / m / P.accelBlockS / 1000);
+    acc.sort((a, b) => a - b);
+    const p999 = acc.length ? quantile(acc, P.accelQ) : null, thr = Math.max(P.minRate, p999 === null ? 0 : P.accelFactor * p999);
+    // the sudden changes: episodes of the samples faster than minRate (gaps of episodeS or less, maxEpisodeS long or less) with one
+    // sample or more over the two limits; pulses: the runs of the samples over the limits, joined when closer than mergeS
+    const fast = (i) => i >= k && gov[i] === 1 && Math.abs(hs[i] - hs[i - k]) / dtMs > P.minRate;
+    const gapN = S(P.episodeS), maxN = Math.max(1, S(P.maxEpisodeS)), mergeN = S(P.mergeS), raw = []; let cur = null;
+    const close = () => { if (cur && cur.pulses) raw.push(cur); cur = null; };
+    for (let i = k; i < n; i++) {
+        if (!fast(i)) continue;
+        if (cur && (i - cur.last > gapN || i - cur.i > maxN)) close();
+        const d = hs[i] - hs[i - k], v = Math.abs(d) / dtMs;
+        if (!cur) cur = { i, last: i, d, v: 0, pulses: 0, p: -Infinity, ps: [] };
+        cur.last = i;
+        if (cand[i] && v > thr) { if (i - cur.p > mergeN) { cur.pulses++; cur.ps.push(i); } cur.p = i; if (v > cur.v) cur.v = v; }
+    }
+    close();
+    // the profiles: time in each band, the changes in each band, the governor command in ACTIVE
+    const vc = o.vc || (() => 1), D = P.demand, nb = Math.ceil((D.to - D.from) / D.step) + 1, B = new Map();
+    const prof = (p) => { if (B.has(p)) return B.get(p);
+        const c = o.ceiling ? o.ceiling(p) : { value: 1000, kind: 'assumed', source: 'assumed 100 %' }, top = c.value - P.atMax, edges = P.bands.filter(e => e < top);
+        const q = { c, top, edges, gov: 0, max: 0, band: new Array(edges.length + 1).fill(0), up: new Array(edges.length + 2).fill(0), down: new Array(edges.length + 2).fill(0), active: 0, demand: new Array(nb).fill(0), fb: 0, fbMax: 0, fbSpike: 0 };
+        B.set(p, q); return q; };
+    const bandOf = (q, u) => { if (u >= q.top) return q.edges.length + 1; let b = 0; while (b < q.edges.length && u >= q.edges[b]) b++; return b; }; // edges.length + 1: the maximum
+    for (let i = 0; i < n; i++) {
+        if (!gov[i]) continue;
+        const q = prof(lab(i)), b = bandOf(q, mot[i]); q.gov++; if (b > q.edges.length) q.max++; else q.band[b]++;
+        if (o.sum && (st ? st[i] === ACTIVE : true)) { q.active++; const x = o.sum[i] * vc(i); if (x >= D.from) q.demand[Math.min(nb - 1, Math.floor((x - D.from) / D.step))]++; }
+    }
+    // the maximum of motor[0] in [i0, i1)
+    const uMax = (i0, i1) => { let u = 0; for (let i = Math.max(0, i0); i < Math.min(n, i1); i++) if (mot[i] > u) u = mot[i]; return u; };
+    const spikes = raw.map(e => { const p = lab(e.i), q = prof(p), u = uMax(e.i - k - Math.max(1, S(P.fallbackS)), e.i - k + 1), b = bandOf(q, u); (e.d > 0 ? q.up : q.down)[b]++;
+        const h0 = hs[e.i - k]; let ext = e.i; for (let i = e.i; i <= e.last; i++) if (Math.abs(hs[i] - h0) > Math.abs(hs[ext] - h0)) ext = i;
+        return { i: e.i, last: e.last, t: T(e.i), t1: T(e.last), rate: r(e.v, 1), from: r(h0, 0), to: r(hs[ext], 0), up: e.d > 0, throttle: r(u / 10, 1), atMax: b > q.edges.length, band: b, pulses: e.pulses,
+            state: st ? STATES[st[e.i]] || String(st[e.i]) : null, profile: p }; });
+    // the FALLBACK entries: the throttle in the fallbackS before, and a sudden change that starts at or before the entry and ends at most
+    // spikeBeforeS before it, or after it (dtS: from the start of its last pulse at or before the entry, else from its start; startS and
+    // endS: the first and the last fast sample of the episode, in s before the entry, negative after it)
+    const fallbacks = [];
+    if (st) for (let c = 1; c < n; c++) {
+        if (st[c] !== 6 || st[c - 1] === 6) continue;
+        const p = lab(c), q = prof(p), u = uMax(c - Math.max(1, S(P.fallbackS)), c);
+        let x = -1; for (let j = 0; j < raw.length && raw[j].i <= c; j++) if (raw[j].last >= c - S(P.spikeBeforeS)) x = j;
+        const sp = x < 0 ? null : spikes[x], j = x < 0 ? -1 : raw[x].ps.filter(i => i <= c).pop() ?? raw[x].i;
+        const atMax = u >= q.top; q.fb++; if (atMax) q.fbMax++; if (sp) q.fbSpike++;
+        fallbacks.push({ i: c, t: T(c), profile: p, throttle: r(u / 10, 1), atMax,
+            spike: sp ? { i: sp.i, t: sp.t, dtS: r((c - j) / rate, 3), startS: r((c - raw[x].i) / rate, 3), endS: r((c - raw[x].last) / rate, 3), rate: sp.rate, from: sp.from, to: sp.to, up: sp.up, throttle: sp.throttle, atMax: sp.atMax } : null });
+    }
+    const s3 = (x) => r(x * dt, 3), byProfile = {};
+    for (const [p, q] of B) byProfile[p] = { ceiling: q.c.value, ceilingKind: q.c.kind, ceilingSource: q.c.source, governedS: s3(q.gov), atMaxS: s3(q.max),
+        bands: q.band.map((s, b) => ({ from: r((b ? q.edges[b - 1] : 0) / 10, 1), to: r((b < q.edges.length ? q.edges[b] : q.top) / 10, 1), s: s3(s), up: q.up[b], down: q.down[b] })),
+        max: { from: r(q.top / 10, 1), s: s3(q.max), up: q.up[q.edges.length + 1], down: q.down[q.edges.length + 1] },
+        spikes: q.up.reduce((a, v) => a + v, 0) + q.down.reduce((a, v) => a + v, 0), atMax: q.up[q.edges.length + 1] + q.down[q.edges.length + 1],
+        activeS: s3(q.active), demand: { from: D.from / 10, step: D.step / 10, s: q.demand.map(s3) }, fallbacks: q.fb, fallbacksAtMax: q.fbMax, fallbacksAfterSpike: q.fbSpike };
+    let g = 0; for (let i = 0; i < n; i++) g += gov[i];
+    return { samples: k, windowMs: r(dtMs, 2), thresholdRpmMs: r(thr, 1), accelRpmMs: r(p999, 2), accelBlocks: acc.length, governedS: s3(g), byProfile,
+        spikes: spikes.slice(0, P.maxEvents), spikesTotal: spikes.length, fallbacks: fallbacks.slice(0, P.maxEvents) };
+}
+
+// The test of check G21 on counts: k changes at the maximum of N, atMaxS of governedS s. share: the part of the time at the maximum,
+// p: P(X >= k) with X ~ Binomial(N, share), rates in each minute; pass: k >= minSpikes, p < maxP and the rate under the maximum
+// rateRatio times less than the rate at the maximum, or less
+function g21Test(k, N, atMaxS, governedS, R = DEFAULT_RULES.G21) {
+    const below = Math.max(0, governedS - atMaxS), share = governedS > 0 ? atMaxS / governedS : null, p = share === null ? null : binomTail(k, N, share);
+    const rateAtMax = atMaxS > 0 ? 60 * k / atMaxS : null, rateBelow = below > 0 ? 60 * (N - k) / below : null;
+    const pass = k >= R.minSpikes && p !== null && p < R.maxP && atMaxS > 0 && (rateBelow === null || rateBelow * R.rateRatio <= rateAtMax);
+    return { k, N, atMaxS: r(atMaxS, 3), governedS: r(governedS, 3), belowS: r(below, 3), share: r(share, 5), p: p === null ? null : +p.toPrecision(3), rateAtMax: r(rateAtMax, 3), rateBelow: r(rateBelow, 4), pass };
+}
+
+// The G21 numbers pooled over flights (items: [{ log, metrics: spikeScan output }]), for each profile label and for all of them, with
+// the verdict of each label. -> { byProfile: { [p]: { ...g21Test, logs, flights, ceilings, fallbacks, demand, severity, basis } }, all }
+function g21Pool(items, R = DEFAULT_RULES.G21) {
+    const acc = new Map(), all = { k: 0, N: 0, atMaxS: 0, governedS: 0 };
+    for (const it of items) { const m = it.metrics; if (!m || m.skipped || !m.byProfile) continue;
+        for (const [p, g] of Object.entries(m.byProfile)) {
+            const a = acc.get(p) || acc.set(p, { k: 0, N: 0, atMaxS: 0, governedS: 0, activeS: 0, logs: new Set(), flights: 0, ceilings: [], fb: 0, fbMax: 0, fbSpike: 0, demand: null, thr: [], acc: [] }).get(p);
+            a.k += g.atMax; a.N += g.spikes; a.atMaxS += g.atMaxS; a.governedS += g.governedS; a.activeS += g.activeS || 0; a.fb += g.fallbacks; a.fbMax += g.fallbacksAtMax; a.fbSpike += g.fallbacksAfterSpike;
+            if (g.governedS > 0) { a.flights++; a.logs.add(it.log); a.ceilings.push({ log: it.log, value: r(g.ceiling / 10, 1), kind: g.ceilingKind, source: g.ceilingSource }); }
+            if (num(m.thresholdRpmMs) !== null) a.thr.push(m.thresholdRpmMs); if (num(m.accelRpmMs) !== null) a.acc.push(m.accelRpmMs);
+            if (g.demand) { if (!a.demand) a.demand = { from: g.demand.from, step: g.demand.step, s: g.demand.s.slice() }; else g.demand.s.forEach((s, j) => { a.demand.s[j] += s; }); }
+            all.k += g.atMax; all.N += g.spikes; all.atMaxS += g.atMaxS; all.governedS += g.governedS; } }
+    const allTest = g21Test(all.k, all.N, all.atMaxS, all.governedS, R), byProfile = {};
+    for (const [p, a] of acc) {
+        // basis 'pooled' only for a label with too few changes at its maximum for its own test (fewer than minSpikes), and whose own
+        // rates agree with the association (the rate under the maximum rateRatio times less than the rate at the maximum, or less): a
+        // label with enough changes and no association of its own, or with its changes mostly under the maximum, stays a value to monitor.
+        // No change in less than minOkS at the maximum: not measured (the time cannot show a signal with no error at the maximum)
+        const t = g21Test(a.k, a.N, a.atMaxS, a.governedS, R), rateOk = t.rateBelow === null || (t.rateAtMax !== null && t.rateBelow * R.rateRatio <= t.rateAtMax);
+        const basis = t.pass ? 'profile' : a.k >= 1 && a.k < R.minSpikes && rateOk && allTest.pass ? 'pooled' : null;
+        const severity = !(a.atMaxS > 0) ? (a.N > 0 ? 'note' : 'skipped') : basis ? 'flag' : a.N > 0 ? 'note' : a.atMaxS >= (R.minOkS || 0) ? 'ok' : 'skipped';
+        byProfile[p] = Object.assign(t, { severity, basis, logs: [...a.logs].sort((x, y) => x - y), flights: a.flights, activeS: r(a.activeS, 3), ceilings: a.ceilings,
+            fallbacks: { n: a.fb, atMax: a.fbMax, afterSpike: a.fbSpike }, demand: a.demand ? { from: a.demand.from, step: a.demand.step, s: a.demand.s.map(x => r(x, 3)) } : null,
+            thresholdRpmMs: a.thr.length ? [Math.min(...a.thr), Math.max(...a.thr)] : null, accelRpmMs: a.acc.length ? Math.max(...a.acc) : null });
+    }
+    return { byProfile, all: allTest };
+}
+const num = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 
 // ---------------------------------------------------------------------------------------------
 // analyse
@@ -253,6 +461,17 @@ function analyse(w, ctx) {
     out.G1 = { fallbackEntries: states.entries.filter(e => e.state === 'FALLBACK').map(e => ({ t: e.t, value: e.value, headspeedAt: e.headspeedAt, headspeedMax: e.headspeedMax, glitchSamplesNear: e.glitchSamplesNear, profile: e.profile })),
         fallbackKnown: !!gs, glitchSamples, glitchEvents: glitchList.length, events: glitchList.slice(0, 200), glitchInFlight: glitchList.filter(e => e.flying).length, headspeedMax: r(hs.reduce((a, v) => v > a ? v : a, 0), 0),
         criterion: `|hs - PT2(hs, ${RULE.firmware.rpmFilterHz} Hz)| > ${RULE.firmware.glitchDelta} x gov_headspeed, hs > ${RULE.firmware.glitchLimit} x gov_headspeed, or hs = 0 with motor[0] > ${RULE.firmware.zeroMotor}` };
+
+    // --- G21: sudden changes of the headspeed signal by throttle band, and the time at the throttle maximum. Without the flying mask
+    // when the log records GOVSTATE (the governor states decide), so that every mask of js/tuning_worker.js gives the same result
+    if (!mot) out.G21 = { skipped: 'The log does not record motor[0].' };
+    else {
+        const P = RULE.g21, use = gs ? null : flying, o = { hs, motor: mot, state: gs, use, profile: prof, target: tgt || null, request: req || null, full: fullAt, rate, sum: sum || null, t: T };
+        o.vc = vcompBlocks(o, P);
+        o.ceiling = ceilingsOf(o, P, ctx.maxThrottle || null, ctx.maxThrottleSource || null);
+        out.G21 = Object.assign(spikeScan(o, P), { governorStates: !!gs, vcomp: !sum ? null : 'median of motor[0] / govSum in ACTIVE for each block of ' + P.ratio.blockS + ' s' });
+        if (!gs) out.G21.note = 'no GOVSTATE events: the samples in flight with the motor on are used';
+    }
 
     // reference headspeed: target in a governed log, per-profile median otherwise
     const medHs = byP(p => { const v = []; for (let i = 0; i < n; i += 5) if (act[i] && prof[i] === p) v.push(hs[i]); v.sort((a, b) => a - b); return quantile(v, 0.5); });
@@ -652,7 +871,62 @@ function judge(flights, RULES = DEFAULT_RULES) {
         else { const o = stat(drop, 'overshoot');
             add('G4', above(o.mean, o.se, R.G4.flag) ? 'flag' : 'ok', logsOf(drop), p, r(o.mean, 4), r(o.se, 4), o.n, R.G4, `The headspeed overshoot after ${o.n} collective decreases is ${pct(o.mean, 2)} ± ${pct(o.se, 2)}. The maximum is ${pct(Math.max(...drop.map(e => e.overshoot)), 2)}.`); }
     }
+
+    // G21: the sudden changes of the headspeed signal against the throttle maximum, pooled over the flights, for each profile label. A
+    // label with too few changes at its maximum takes the test of all labels together (basis 'pooled')
+    const g21 = flights.filter(f => f.metrics && f.metrics.G21);
+    if (g21.length) {
+        const ok = g21.filter(f => !f.metrics.G21.skipped), R21 = Object.assign({}, DEFAULT_RULES.G21, R.G21 || {});
+        if (!ok.length) add('G21', 'skipped', [...new Set(g21.map(f => f.log))], null, null, null, 0, R.G21, g21[0].metrics.G21.skipped);
+        else { const G = g21Pool(ok.map(f => ({ log: f.log, metrics: f.metrics.G21 })), R21);
+            // no governed sample (the governor off, or no motor output in RECOVERY, ACTIVE or FALLBACK): not measured
+            if (!Object.keys(G.byProfile).length) add('G21', 'skipped', [...new Set(ok.map(f => f.log))], null, null, null, 0, R.G21,
+                'The logs have no samples with the governor in RECOVERY, ACTIVE or FALLBACK and the motor on. Thus, the logs cannot show this check.');
+            for (const [p, g] of Object.entries(G.byProfile).sort((a, b) => a[0] - b[0])) {
+                const events = [];
+                for (const f of ok) { const m = f.metrics.G21;
+                    for (const s of m.spikes || []) if (String(s.profile) === p) events.push({ log: f.log, t: s.t, t1: num(s.t1) !== null ? s.t1 : s.t, kind: 'spike', value: r(s.rate * 1000, 0), rate: s.rate, from: s.from, to: s.to, up: s.up, throttle: s.throttle, atMax: s.atMax, pulses: s.pulses, state: s.state, profile: s.profile });
+                    for (const x of m.fallbacks || []) if (String(x.profile) === p) events.push({ log: f.log, t: x.t, t1: x.t, kind: 'FALLBACK', value: x.throttle, throttle: x.throttle, atMax: x.atMax, spike: x.spike, profile: x.profile }); }
+                events.sort((a, b) => (a.log - b.log) || (a.t - b.t));
+                const finding = add('G21', g.severity, g.logs, +p, g.k, null, g.N, R.G21, g21Text(g, G.all, R21));
+                Object.assign(finding, { unit: 'count', atMax: g.k, spikes: g.N, atMaxS: g.atMaxS, belowS: g.belowS, governedS: g.governedS, share: g.share, p: g.p, rateAtMax: g.rateAtMax, rateBelow: g.rateBelow, minAtMaxS: R21.minOkS,
+                    basis: g.basis, pooled: G.all, flights: g.flights, ceilings: g.ceilings, fallbacks: g.fallbacks, demand: g.demand, activeS: g.activeS, thresholdRpmMs: g.thresholdRpmMs, accelRpmMs: g.accelRpmMs,
+                    events: events.slice(0, 2 * RULE.g21.maxEvents) });
+            } }
+    }
     return out;
 }
 
-module.exports = { EXTRA, RULE, DEFAULT_RULES, STATES, analyse, judge, pt2 };
+// The text of a G21 finding (ASD-STE100: the module texts are linted)
+function g21Text(g, A, R) {
+    const P = RULE.g21, n = (v, d = 1) => v === null || v === undefined ? 'unknown' : String(+(+v).toFixed(d)), many = (k, one, more) => `${k} ${k === 1 ? one : more || one + 's'}`;
+    const cs = [...new Set(g.ceilings.map(c => c.value))].sort((a, b) => a - b), ceil = cs.length === 1 ? `${n(cs[0])} %` : cs.length ? `${n(cs[0])} % to ${n(cs[cs.length - 1])} %` : 'unknown';
+    const th = g.thresholdRpmMs ? [...new Set(g.thresholdRpmMs.map(v => Math.round(v * 1000)))] : [P.minRate * 1000], thr = th.length === 1 ? `${th[0]} rpm/s` : `${th[0]} rpm/s to ${th[1]} rpm/s`;
+    const test = (q) => `\`P(X >= ${q.k}) = ${q.p}\` for \`X ~ Binomial(${q.N}, ${q.share})\``, out = [];
+    out.push(g.atMaxS > 0 ? `At the throttle maximum (${ceil}), the headspeed signal has ${many(g.k, 'sudden change')} in ${n(g.atMaxS, 2)} s. With the throttle less than the maximum, it has ${many(g.N - g.k, 'sudden change')} in ${n(g.belowS, 1)} s.`
+        : `The logs have no time at the throttle maximum (${ceil}) in RECOVERY, ACTIVE or FALLBACK. In ${n(g.governedS, 1)} s in these conditions, the headspeed signal has ${many(g.N, 'sudden change')}.`);
+    out.push(`In a sudden change, the headspeed signal changes by ${P.minStep * 100} % of the target or more in ${P.windowS * 1000} ms, at more than ${thr}. The rotor speed cannot change at this rate.`
+        + ` If the time between two changes is ${P.episodeS * 1000} ms or less, the analysis counts them as one sudden change.`
+        + (num(g.accelRpmMs) !== null ? ` In ${P.accelQ * 100} % of the ${P.accelBlockS * 1000} ms periods in ACTIVE, the rotor acceleration is ${Math.round(g.accelRpmMs * 1000)} rpm/s or less.` : ''));
+    // no change at the maximum (k = 0): no test value (P(X >= 0) is always 1), a plain sentence
+    if (g.atMaxS > 0 && g.k > 0) out.push(`Thus, ${n(100 * g.k / g.N, 0)} % of the sudden changes occur in ${n(100 * g.share, 2)} % of the time. The test value is ${test(g)}.`
+        + ` In each minute at the maximum, the signal has ${n(g.rateAtMax, 2)} sudden changes. In each minute at less than the maximum, it has ${n(g.rateBelow, 3)}.`);
+    else if (g.atMaxS > 0 && g.N > 0) out.push(`The throttle is at its maximum for ${n(100 * g.share, 2)} % of the time, and no sudden change occurs at the maximum. In each minute at less than the maximum, the signal has ${n(g.rateBelow, 3)} sudden changes.`);
+    const shortMax = g.atMaxS > 0 && g.atMaxS < R.minOkS ? ` The time at the throttle maximum is less than ${R.minOkS} s. Thus, the logs cannot show that the headspeed signal has no errors at the maximum.` : '';
+    if (g.severity === 'flag') out.push(g.basis === 'profile' ? 'Thus, the errors of the RPM signal are related to the throttle maximum.'
+        : `This PID profile has only ${many(g.k, 'sudden change')} at its maximum. Thus, the test uses all PID profiles together: ${test(A)}. The errors of the RPM signal are related to the throttle maximum.`);
+    else if (g.severity === 'note') out.push(g.atMaxS > 0 && g.k === 0 ? `The sudden changes occur only at less than the throttle maximum. Examine the RPM signal.${shortMax}`
+        : g.atMaxS > 0 ? `This test does not show that the sudden changes are related to the throttle maximum. The limits are ${R.minSpikes} changes or more and \`p < ${R.maxP}\`. Examine the RPM signal.`
+        : 'Thus, the logs cannot show that the sudden changes are related to the throttle maximum. Examine the RPM signal.');
+    else if (g.severity === 'ok') out.push(`The headspeed signal has no sudden change in ${n(g.governedS, 1)} s in RECOVERY, ACTIVE and FALLBACK, with ${n(g.atMaxS, 2)} s at the throttle maximum.`);
+    else if (g.atMaxS > 0) out.push(`The time at the throttle maximum is less than ${R.minOkS} s. Thus, the logs cannot show that the headspeed signal has no errors at the maximum.`);
+    else out.push('Thus, the logs cannot show this check.');
+    const f = g.fallbacks, starts = (k) => `${k} ${k === 1 ? 'starts' : 'start'}`;
+    // a FALLBACK entry of a sudden change: during the change, or spikeBeforeS or less after its last fast sample (spikeScan)
+    if (f && f.n) out.push(`The logs have ${many(f.n, 'FALLBACK entry', 'FALLBACK entries')}. Of these, ${starts(f.atMax)} with the throttle at its maximum, and ${starts(f.afterSpike)} during a sudden change or ${P.spikeBeforeS * 1000} ms or less after its end.`);
+    const src = [...new Set(g.ceilings.map(c => c.source))];
+    if (src.length) out.push(`Throttle maximum source: ${src.slice(0, 2).map(s => `"${String(s).replace(/"/g, "'")}"`).join(' and ')}.`);
+    return out.join('\n');
+}
+
+module.exports = { EXTRA, RULE, DEFAULT_RULES, STATES, analyse, judge, pt2, spikeScan, ceilingsOf, vcompBlocks, g21Test, g21Pool, binomTail };

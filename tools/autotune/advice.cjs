@@ -162,6 +162,10 @@ const RULES = {
     pidProfiles: 6,         // PID profiles a `diff all` prints
     rateProfiles: 6,        // rate profiles of 4.6 (CONTROL_RATE_PROFILE_COUNT on a target with more than 256 kB flash)
     commentWidth: 100,      // characters of an export comment line (the firmware CLI buffer holds 256)
+    // the governor values that the firmware changes with no CLI error (release/4.6.0 flight_governor.c, govLinks below)
+    govIdleScale: 10,       // gov_idle_throttle and gov_auto_throttle (0.1 %) <= govIdleScale x gov_handover_throttle (%) - 1 (1468-1477)
+    govFullModes: ['ELECTRIC', 'NITRO'],   // the gov_mode words that keep SWITCH (1490) and the four gov_use_* flags (1509)
+    govHeadspeedMin: 100,   // rpm: the governor uses this headspeed for a smaller gov_headspeed (1412, 1592: constrainf(headspeed, 100, 50000))
     // the sources of the rules (review V3): the "Source:" sentences after a rule (sourceSentences), in the words of the
     // pilot. No file name, line or section: the developer references are in the comments of this file only. A result
     // from a different helicopter says so, and it is never a value of the logs of the analysis. The text outside the
@@ -198,7 +202,13 @@ const RULES = {
         liftoff: 'a result on a different helicopter ("Gaui X4 II", 2026-10-04), not from the logs of this analysis: in 3 of 3 flights with the collective up before ACTIVE, a roll oscillation at 8.3 Hz to 8.7 Hz occurred on the skids, and in the 1 flight without, it did not occur',
         batch: 'firmware 4.6.0: in a command batch, `save` does not save after a command error, and `profile N` changes the PID profile that `save` keeps',  // cli.c cliBatch, prepareSave, changePidProfile
         firmware: 'firmware 4.6.0',
+        govIdleScale: 'firmware 4.6.0: when the flight controller starts, it keeps gov_idle_throttle and gov_auto_throttle at 10 x gov_handover_throttle - 1 or less',
+        govFullModes: 'firmware 4.6.0: if gov_mode is OFF, LIMIT or DIRECT, the flight controller changes gov_throttle_type SWITCH to NORMAL, and with LIMIT or DIRECT it sets the gov_use flags to OFF',
+        govHeadspeedMin: 'firmware 4.6.0: the governor uses 100 rpm if gov_headspeed is less than 100',
         fallback: 'firmware 4.6.0, governor.c: in FALLBACK the throttle is the governor I + F x (100 - gov_fallback_drop) / 100, and RECOVERY starts from the present headspeed and increases the throttle at the rate of gov_recovery_time',
+        // analysis/rpm-spikes (2026-10-15): the margin of check G21 (health_gov DEFAULT_RULES.G21.margin)
+        maxThrottleMargin: 'a result from the logs of one helicopter (2026-09 and 2026-10): 0 sudden changes in 54 s at 95 % to 99.5 % throttle',
+        spoolExit: 'firmware 4.6.0, governor.c: SPOOLUP, RECOVERY and BAILOUT end at 95 % of gov_max_throttle',
         community: 'a recommendation from other pilots',
     },
 };
@@ -217,6 +227,25 @@ const RANGE = { gyro_decimation_hz:[0,1000], motor_rpm_lpf:[0,255], blackbox_rat
     gyro_notch2_hz: [0, 1000], gyro_notch2_cutoff: [0, 1000], gyro_rpm_notch_min_hz: [1, 100] };
 for (const ax of lib.AXES) for (const k of ['p', 'i', 'd', 'f', 'b']) RANGE[`${ax}_${k}_gain`] = [0, 1000];
 for (const ax of lib.AXES) for (const k of ['d', 'gyro']) RANGE[`${ax}_${k}_cutoff`] = [0, 250];   // settings.c:1124-1134 (VAR_UINT8, PID profile)
+// The governor names (docs/GOVERNOR_AUTOTUNE.md section 7, the 42 CLI names of gov_tune.cjs): settings.c:956-973 (global) and
+// 1207-1226 (PID profile), release/4.6.0, the same as tools/autotune/firmware/schema.cjs. gov_idle_throttle and
+// gov_auto_throttle are in 0.1 % (governor.c:1362-1363); the firmware also keeps them at or below 10 x gov_handover_throttle - 1,
+// and gov_max_throttle at or above gov_handover_throttle (governor.c:1466-1486), when it starts: exportScript checks these
+// rules over all selected changes (govLinks), not one value here. gov_headspeed keeps the CLI range of settings.c, and
+// cliValueOk refuses less than RULES.govHeadspeedMin (the governor uses that). gov_bypass_throttle (MODE_ARRAY, 9 points, pg/governor.h:70) has no range in settings.c: each point is in
+// 0.5 % (governor.c:1659: / 200), thus 0-200 for each point (schema.cjs). The names with CLI words (GOV_CHOICES) have no range.
+for (const k of ['gov_startup_time', 'gov_tracking_time', 'gov_recovery_time', 'gov_spooldown_time']) RANGE[k] = [0, 600];
+for (const k of ['gov_throttle_hold_timeout', 'gov_autorotation_timeout', 'gov_idle_throttle', 'gov_auto_throttle', 'gov_pwr_filter', 'gov_rpm_filter', 'gov_tta_filter',
+    'gov_ff_filter', 'gov_d_filter', 'gov_d_gain', 'gov_tta_gain', 'gov_tta_limit', 'gov_yaw_ff_weight', 'gov_cyclic_ff_weight', 'gov_collective_ff_weight']) RANGE[k] = [0, 250];
+for (const k of ['gov_p_limit', 'gov_i_limit', 'gov_d_limit', 'gov_f_limit', 'gov_dyn_min_throttle']) RANGE[k] = [0, 100];
+Object.assign(RANGE, { gov_handover_throttle: [10, 100], gov_max_throttle: [10, 100], gov_min_throttle: [10, 100], gov_fallback_drop: [0, 50], gov_collective_curve: [5, 40],
+    gov_headspeed: [0, 50000], gov_bypass_throttle: [0, 200] });
+const GOV_CURVE_POINTS = 9;   // GOV_THROTTLE_CURVE_POINTS (pg/governor.h:70): the values of gov_bypass_throttle
+// The CLI words of the governor names that are not numbers (cli.c cliSet: MODE_LOOKUP takes a word of its table, MODE_BITSET a
+// word of lookupTableOffOn; a number is "INVALID VALUE"): settings.c:171-173 (OFF, ON), 474-480 (gov_mode, gov_throttle_type),
+// 956-957 and 1202-1205. The export writes these words as the CLI prints them (upper case), and no other word.
+const GOV_CHOICES = { gov_mode: ['OFF', 'LIMIT', 'DIRECT', 'ELECTRIC', 'NITRO'], gov_throttle_type: ['NORMAL', 'SWITCH', 'FUNCTION'] };
+for (const k of ['gov_use_fallback_precomp', 'gov_use_pid_spoolup', 'gov_use_voltage_comp', 'gov_use_dyn_min_throttle']) GOV_CHOICES[k] = ['OFF', 'ON'];
 
 // Thresholds for the 2-SE test of checks whose judge compares means only, or whose estimate advice pools over logs (F10,
 // C14; T14 in its generator): [threshold, side], side 1 flags above, -1 below, 0 on |value|; null takes the finding's
@@ -296,6 +325,18 @@ Object.assign(PARAMS, {
     gyro_notch1_hz: ['global', 'gyro_notch_hz', 0, 0], gyro_notch2_hz: ['global', 'gyro_notch_hz', 1, 0], gyro_notch1_cutoff: ['global', 'gyro_notch_cutoff', 0, 0], gyro_notch2_cutoff: ['global', 'gyro_notch_cutoff', 1, 0],
 });
 for (const [ax, bw] of [['roll', [50, 15]], ['pitch', [50, 15]], ['yaw', [100, 20]]]) { PARAMS[`${ax}_gyro_cutoff`] = ['profile', `${ax}BW`, 0, bw[0]]; PARAMS[`${ax}_d_cutoff`] = ['profile', `${ax}BW`, 1, bw[1]]; }
+// The other governor names (docs/GOVERNOR_AUTOTUNE.md section 7: gov_tune.cjs writes every one of the 42), with the 4.6.0
+// defaults of pg/governor.c (global) and pg/pid.c:106-126 (PID profile; governor.flags 0: the four gov_use_* flags OFF).
+// The log header has govPID (P, I, D, F, gain) and yaw_tta (gain, limit) only (blackbox.c:1668-1699): the others come
+// from the CLI dump or from gov_params.cjs.
+for (const [k, def] of Object.entries({ gov_mode: 'OFF', gov_throttle_type: 'NORMAL', gov_startup_time: 200, gov_tracking_time: 50, gov_recovery_time: 30, gov_spooldown_time: 30,
+    gov_throttle_hold_timeout: 50, gov_autorotation_timeout: 15, gov_handover_throttle: 25, gov_idle_throttle: 0, gov_auto_throttle: 0,
+    gov_pwr_filter: 5, gov_rpm_filter: 10, gov_tta_filter: 0, gov_ff_filter: 5, gov_d_filter: 50 })) PARAMS[k] = ['global', null, null, def];
+PARAMS.gov_bypass_throttle = ['global', null, 'all', Array(GOV_CURVE_POINTS).fill(0).join(',')];
+Object.assign(PARAMS, { gov_d_gain: ['profile', 'govPID', 2, 0], gov_tta_gain: ['profile', 'yaw_tta', 0, 0], gov_tta_limit: ['profile', 'yaw_tta', 1, 20] });
+for (const [k, def] of Object.entries({ gov_headspeed: 1000, gov_p_limit: 20, gov_i_limit: 95, gov_d_limit: 20, gov_f_limit: 100, gov_yaw_ff_weight: 10, gov_cyclic_ff_weight: 10,
+    gov_collective_ff_weight: 50, gov_collective_curve: 20, gov_max_throttle: 100, gov_min_throttle: 10, gov_fallback_drop: 10, gov_dyn_min_throttle: 80,
+    gov_use_fallback_precomp: 'OFF', gov_use_voltage_comp: 'OFF', gov_use_pid_spoolup: 'OFF', gov_use_dyn_min_throttle: 'OFF' })) PARAMS[k] = ['profile', null, null, def];
 // the feature names of 4.6 (cli.c featureNames: `feature NAME` turns it on, `feature -NAME` off): the export writes no other name
 const FEATURE_NAMES = ['RX_PPM', 'RX_SERIAL', 'SOFTSERIAL', 'GPS', 'RANGEFINDER', 'TELEMETRY', 'RX_PARALLEL_PWM', 'RX_MSP', 'RSSI_ADC', 'LED_STRIP', 'DASHBOARD', 'OSD', 'CMS', 'RX_SPI',
     'GOVERNOR', 'ESC_SENSOR', 'FREQ_SENSOR', 'DYN_NOTCH', 'RPM_FILTER'];
@@ -359,7 +400,7 @@ const COVERAGE = [
     '7|governor|Governor FF weights|gov_collective_ff_weight,gov_cyclic_ff_weight,gov_yaw_ff_weight,gov_collective_curve|G3 G4|cli|',
     '7|governor|Governor limits|gov_p_limit,gov_i_limit,gov_d_limit,gov_f_limit|G3 G7|cli|',
     '7|governor|Governor headspeed|gov_headspeed|G1 G2|cli|',
-    '7|governor|Throttle limits|gov_max_throttle,gov_min_throttle|G6 G7 L1|cli|',
+    '7|governor|Throttle limits|gov_max_throttle,gov_min_throttle|G6 G7 L1 G21|cli|',
     '7|governor|Voltage compensation|gov_use_voltage_comp|G8 G11 G13 D5|cli|',
     '7|governor|Governor filters|gov_rpm_filter,gov_pwr_filter,gov_ff_filter,gov_d_filter|G1 G10|cli|',
     '7|governor|Ramp times|gov_startup_time,gov_spoolup_time,gov_tracking_time,gov_recovery_time,gov_spooldown_time|G14 G15 G16 G19|cli|',
@@ -369,7 +410,7 @@ const COVERAGE = [
     '7|governor|PID spool-up and minimum throttle|gov_use_pid_spoolup,gov_use_dyn_min_throttle,gov_dyn_min_throttle||cli|A log cannot show it: motor[0] shows only the minimum.|nolog',
     '8|precondition|Motor poles and gear ratios|motor_poles,main_rotor_gear_ratio,tail_rotor_gear_ratio|G12 F5 F6|cli|The gear ratios in the configuration are correct. Check G12 examines motor_poles and the RPM sensor.',
     '8|precondition|Motor RPM filter|motor_rpm_lpf,motor_rpm_factor||cli|A log cannot show it.|nolog',
-    '8|precondition|RPM source and ESC signal|dshot_bidir,motor_pwm_protocol,motor_pwm_rate,use_unsynced_pwm,feature FREQ_SENSOR,freq_input_*|G1||The ESC telemetry is too slow for an RPM source (RPMM).',
+    '8|precondition|RPM source and ESC signal|dshot_bidir,motor_pwm_protocol,motor_pwm_rate,use_unsynced_pwm,feature FREQ_SENSOR,freq_input_*|G1 G21||The ESC telemetry is too slow for an RPM source (RPMM).',
     '8|precondition|ESC throttle range|min_throttle,max_throttle|||The log header records them (`minthrottle`, `maxthrottle`). No check examines them.',
     '8|precondition|ESC and motor start|(no parameter)|G17||Check G17 finds motor steps that the throttle does not cause. The ESC adjustments are not in the CLI.',
     '8|precondition|ESC telemetry|esc_sensor_*,blackbox_log_esc|||No check uses the ESC telemetry: `Tesc`, `EscV`, `EscI`, `EscThr`, and `Ibat` and `Vbat` when the ESC is the battery sensor. Check D3 shows only the fields that the log has, and G12 uses gyroRAW lines, not `EscRPM`.',
@@ -398,7 +439,8 @@ const COVERAGE = [
 // fields a check needs (health_setup D3), for the needs-fields status of the coverage rows
 const RAW = ['gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]'], GOVF = ['govTarget', 'govSum'];
 const FIELDS = { F5: RAW, F6: RAW, F11: RAW, G0: GOVF, G2: GOVF, G3: GOVF.concat('setpoint[3]'), G4: GOVF.concat('setpoint[3]'), G5: GOVF, G9: GOVF,
-    G6: ['motor[0]'], G7: ['motor[0]'], G8: ['motor[0]', 'Vbat'], G11: ['motor[0]', 'Vbat'], D5: ['Vbat'], G13: ['Vbat'], P1: ['Vbat', 'motor[0]'], P2: ['Vbat', 'Ibat'], C9: ['axisO[0]', 'axisO[1]'], T6: ['setpoint[3]'] };
+    G6: ['motor[0]'], G7: ['motor[0]'], G8: ['motor[0]', 'Vbat'], G11: ['motor[0]', 'Vbat'], D5: ['Vbat'], G13: ['Vbat'], P1: ['Vbat', 'motor[0]'], P2: ['Vbat', 'Ibat'], C9: ['axisO[0]', 'axisO[1]'], T6: ['setpoint[3]'],
+    G21: ['motor[0]'] };
 const ELSEWHERE = ['T3', 'T10', 'F7'];  // section-10 checks that no module of the app runs
 // D3 skip names of checks that exist in no module: battery current (Ibat) and G12 from the ESC rpm (EscRPM); no check
 // reads Ibat, Tesc or any ESC telemetry field (coverage row 'ESC telemetry')
@@ -407,7 +449,7 @@ const NEW = { 'health_config.cjs': ['D9'], 'health_power.cjs': ['P1', 'P2'], 'he
     'health_phase.cjs': ['D7', 'G15', 'G16', 'G17', 'G18', 'C15'], 'health_rescue.cjs': ['G19', 'T15', 'D8'], 'health_limits.cjs': ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'] }; // the checks added for the Tuning dialog (docs/DEVELOPMENT.md section 13)
 
 const UNITS = { D1: 'Hz', D2: 'frames', D3: 'checks', D4: 'values', D5: 'V', G0: 'samples', G1: 'entries', G2: 'fraction', G3: 'fraction', G4: 'fraction', G5: 's', G6: '%',
-    G7: 'fraction', G8: 'ratio', G9: 'prominence', G10: 'coherence', G11: '% points per pack', G12: 'x headspeed/60', G13: 'V/cell', C1: 's', C2: 's', C3: 'fraction', C4: '%',
+    G7: 'fraction', G8: 'ratio', G9: 'prominence', G10: 'coherence', G11: '% points per pack', G12: 'x headspeed/60', G13: 'V/cell', G21: 'count', C1: 's', C2: 's', C3: 'fraction', C4: '%',
     C6: 'prominence', C8: 'deg/s per deg/s^2', C9: 'deg/s', C10: 's', C11: 'fraction', T2: 'prominence', T4: 'fraction', T5: 'ratio', T6: 'deg/s', T7: 'r', T8: 's',
     T9: 'fraction', F1: 'stages', F2: 'Hz', F3: 'Q', F4: 'Hz', F5: 'x rotor', F6: 'dB', F8: 'on/off', F9: 'notches' };
 const RATES_TYPES = ['NONE', 'BETAFLIGHT', 'RACEFLIGHT', 'KISS', 'ACTUAL', 'QUICK', 'ROTORFLIGHT']; // TUNING_KNOWLEDGE 2.12
@@ -418,7 +460,7 @@ const RATES_TYPES = ['NONE', 'BETAFLIGHT', 'RACEFLIGHT', 'KISS', 'ACTUAL', 'QUIC
 
 // id kind step row lane title | home checks (SETUP rules, C7, L5 and L6 by axis as hierarchy.cjs homeOf): the prerequisites
 // (step 0) and the tuning blocks (SPEC3 A, B)
-const NODES0 = ['logging prereq 0 0 prereq Blackbox log|D1 D2 D3 D4 H', 'rpm prereq 0 1 prereq RPM signal and motor poles|G1 G12 G20', 'power prereq 0 2 prereq Battery and power|D5 G13 G11 P1 P2',
+const NODES0 = ['logging prereq 0 0 prereq Blackbox log|D1 D2 D3 D4 H', 'rpm prereq 0 1 prereq RPM signal and motor poles|G1 G12 G20 G21', 'power prereq 0 2 prereq Battery and power|D5 G13 G11 P1 P2',
     'mechanics prereq 0 3 prereq Mechanical parts|F7 C15 T4 SETUP:i_gain', 'rescue prereq 0 4 prereq Rescue|D9 D8 D6', 'controller prereq 0 5 prereq Flight controller|SETUP:pid_mode SETUP:rates_type D7 R1 L7',
     'filters block 1 0 main Filters|F1 F2 F3 F4 F5 F6 F8 F9 F10 F11 C11', 'governor block 2 0 main Governor|G0 G2 G3 G4 G5 G6 G7 G8 G9 G10 G14 G15 G16 G17 G18 G19 L1',
     'cyclic block 3 0 cyclic Cyclic gains|C1 C2 C3 C4 C5 C6 C9 C12 C13 C7:cyclic L2 L3', 'tail block 3 1 tail Tail gains|T1 T2 T3 T9 T10 T11 T12 C7:yaw',
@@ -678,6 +720,11 @@ function change(c, o) {
     const P = PARAMS[o.parameter], r = rec(Object.assign({ severity: 'action', scope: P[0] }, o)), lim = RANGE[o.parameter];
     let b = current(c, o.parameter, o.profile);
     if (b.unknown && num(o.recovered) !== null) b = { value: Math.round(o.recovered), source: o.recoveredFrom || `the gain that the gain model calculated from the flights${num(o.profile) > 0 ? ` of ${prof(o.profile)}` : ' (PID profile unknown)'}`, approx: true, why: b.unknown };
+    // a value that the analysis calculates exactly from the log (check G21: the throttle maximum from the pile of motor[0]): CLI text
+    if (b.unknown && o.calculated && num(o.calculated.value) !== null) b = { value: o.calculated.value, source: o.calculated.source, calculated: true, why: b.unknown };
+    // a CLI value that the log contradicts (check G21: the log shows a higher throttle maximum): the value of the log is the present value,
+    // and there is no CLI text (unconfirmed: the CLI dump and the log do not agree)
+    else if (!b.unknown && o.calculated && o.calculated.overrides && num(o.calculated.value) !== null) b = { value: o.calculated.value, source: o.calculated.source, calculated: true, unconfirmed: true };
     if (b.conflict) r.caveats.push(`The log header gives ${o.parameter} ${b.conflict.header}, but the CLI dump gives ${b.conflict.cli} (check D4). The app cannot find which value is correct at this time. Thus, there is no CLI text.`);
     if (b.unknown) {
         const verb = STEPVERB[o.direction] || 'Change', on = P[0] === 'global' || !(num(o.profile) > 0) ? '' : ` on ${prof(o.profile)}`, end = P[0] !== 'global' && !(num(o.profile) > 0) ? ' (PID profile unknown)' : '';
@@ -709,6 +756,9 @@ function change(c, o) {
         r.caveats.push(`The firmware range of ${o.parameter} is ${lim[0]} to ${lim[1]}, and the CLI does not accept a value out of it. Thus, ${asked} becomes ${to}.`); }
     const on = P[0] === 'global' ? '' : ` on ${prof(o.profile)}`, fromTo = `${o.parameter}${on} from ${b.approx ? 'approximately ' : ''}${b.value} to ${to} (${b.source})`;
     Object.assign(r, { from: b.value, to, base: b, sets: [[o.parameter, to]], fromSets: { [o.parameter]: b.value }, setText: `Set ${fromTo}.`, setNote: `The analysis gives a change of ${fromTo}.` });
+    // the governor values that the firmware keeps in a relation with this one (exportScript govLinks): their values at this time, from
+    // the sources of the present value (review 2026-10-15: the CLI dump gives gov_handover_throttle and gov_min_throttle)
+    if (GOV_LINKED.has(o.parameter)) { const lk = linkedNow(c, o.parameter, o.profile); if (lk) r.linked = lk; }
     // round 3 M5: a step that the limit makes smaller than the measured correction gives the full correction and the step
     if (want !== null && b.value !== 0 && to !== b.value && Math.abs(want - to) > 0.5) {
         const t = fullText(want - b.value); r.full = { change: Math.round(want - b.value), step: to - b.value };
@@ -811,6 +861,34 @@ const perAxis = (id, area, title, rule, advice, o = {}) => (L, c) => [...group(L
 
 // D4: the CLI names of the global values (health_setup PAIRS_GLOBAL, the features and the mixer inputs); the others are values of a PID profile
 const D4_GLOBAL = /^(gyro_|dyn_notch_|pid_process_denom$|mixer$|feature$)/;
+// G21 (review 2026-10-15): the overload before the FALLBACK entries of the results in list. Check G20 (health_rescue) gives each entry
+// the run of the throttle at its high value before the change and the headspeed decrease in it (events: start, seconds, value = the
+// decrease); an entry of check G21 (events kind 'FALLBACK': log, t) is the G20 entry of its log at the same time. nFb: the FALLBACK
+// entries of the results. -> sentences, or '' when no entry has an overload
+function g21Overload(list, c, nFb) {
+    const fbs = list.flatMap(f => (Array.isArray(f.events) ? f.events : []).filter(e => e && e.kind === 'FALLBACK' && num(e.t) !== null).map(e => ({ log: num(e.log) !== null ? e.log : logsOf(f)[0], t: e.t })));
+    const g20 = (c.F || []).filter(g => g.id === 'G20'), hit = []; let high = null;
+    for (const x of fbs) for (const g of g20) { if (!logsOf(g).includes(x.log)) continue;
+        const e = (Array.isArray(g.events) ? g.events : []).find(q => q && num(q.start) !== null && Math.abs(q.start - x.t) < 0.002 && num(q.seconds) !== null && num(q.value) !== null);
+        if (e) { hit.push(e); if (g.threshold && num(g.threshold.throttleHigh) !== null) high = g.threshold.throttleHigh; break; } }
+    if (!hit.length) return '';
+    const rng = (a, d, u) => { const lo = fmt(Math.min(...a), d), hi = fmt(Math.max(...a), d); return lo === hi ? `${lo}${u}` : `${lo}${u} to ${hi}${u}`; }, n = Math.max(nFb || 0, hit.length);
+    const who = hit.length === n ? (n === 1 ? 'Before the FALLBACK entry' : `Before each of the ${n} FALLBACK entries`) : `Before ${hit.length} of the ${n} FALLBACK entries`;
+    return `${who}, the throttle is at ${fmt((high === null ? 950 : high) / 10, 1)} % or more for ${rng(hit.map(e => e.seconds), 2, ' s')}. During this period, the headspeed decreases by ${rng(hit.map(e => 100 * e.value), 1, ' %')} (check G20).`
+        + ' A lower maximum throttle can make this decrease larger.';
+}
+// G21:signal (review 2026-10-15): the raw RPM of the log. Firmware 4.6.0 motors.c:310 writes motorRpmRaw[i] (the RPM of motor i before
+// its filter, not the headspeed) to debug[i] when debug_mode is RPM_SOURCE (index 47 of debug.h, js/flightlog_fielddefs.js
+// DEBUG_MODE_RF_4_6): the times of its sudden changes against those of the headspeed, never its values (CLAUDE.md "Gear ratios")
+const DEBUG_RPM_SOURCE = 47;
+function rawRpmText(c) {
+    const h = c && c.header && typeof c.header === 'object' && Object.keys(c.header).length ? c.header : null, v = h ? h.debug_mode : undefined;
+    const known = v !== undefined && v !== null && v !== '', on = known && (String(v).trim().toUpperCase() === 'RPM_SOURCE' || +v === DEBUG_RPM_SOURCE);
+    const compare = 'compare the times of the sudden changes of `debug[0]` and of the headspeed.', note = '`debug[0]` is the motor speed before its filter. Thus, compare only the times, not the values. The gear ratios in the configuration are correct.';
+    if (on) return `The log records the raw RPM in \`debug[0]\`, because \`debug_mode\` is \`RPM_SOURCE\`. In the log viewer, ${compare} ${note}`;
+    if (known) return `The log does not record the raw RPM, because \`debug_mode\` is not \`RPM_SOURCE\`. To record the raw RPM, set \`debug_mode\` to \`RPM_SOURCE\` for one flight. Then, in the log viewer, ${compare} ${note}`;
+    return `If \`debug_mode\` is not \`RPM_SOURCE\`, set it to \`RPM_SOURCE\` for one flight. Then, in the log viewer, ${compare} ${note}`;
+}
 const GEN = {
     D1(L, c) {
         const bad = L.filter(isFlag); if (!bad.length) return [];
@@ -984,7 +1062,9 @@ const GEN = {
             text: `There ${sum(bad) === 1 ? 'is 1 FALLBACK entry' : `are ${fmt(sum(bad), 0)} FALLBACK entries`} (${logsText(bad, c)}). FALLBACK does not show that the RPM source is incorrect. `
                 + 'Possible causes are low RPM, sudden RPM changes, or a FALLBACK mode switch that is on. '
                 + '\nExamine the FALLBACK mode switch, RPM signal, headspeed and throttle at each entry. '
-                + 'If you find an RPM source problem, repair it. Complete this check before you change governor gains or RPM filters.' })
+                + (bad.length && bad.every(f => c.g1Spike.has(f)) ? `Each FALLBACK entry comes during a sudden change of the RPM signal at the throttle maximum or ${fmt(1000 * (gov.RULE.g21 ? gov.RULE.g21.spikeBeforeS : 0.03), 0)} ms or less after its end (checks G20 and G21). `
+                    + 'The change of `gov_max_throttle` of check G21 corrects this problem. Thus, this check does not stop the changes of the governor gains and the RPM filters.'
+                    : 'If you find an RPM source problem, repair it. Complete this check before you change governor gains or RPM filters.') })
             .concat(one(ex.concat(g20), { id: 'G1:overload', severity: 'watch', title: 'FALLBACK at a headspeed decrease at full throttle', sources: [src(GR.G1.source), ruleSrc(RR, 'G19'), ruleSrc(RR, 'G20')],
                 rule: 'Check G1 has a problem if the governor goes to FALLBACK. Rule K22: a FALLBACK at a large load of check G19 or G20 is a possible result of that load.',
                 text: `There ${sum(ex) === 1 ? 'is 1 FALLBACK entry' : `are ${fmt(sum(ex), 0)} FALLBACK entries`} (${logsText(ex, c)}). Each one comes while the headspeed decreases with the throttle at its limit (checks G19 and G20). `
@@ -1098,6 +1178,67 @@ const GEN = {
             text: `The main rotor line is at \`${fmt(o, 4)} × headspeed / 60\`. The headspeed, the RPM notch filters and the governor limits have the same error. The gear ratios in the configuration are correct. `
                 + 'Examine motor_poles and the RPM sensor: its signal and the source that the Motors tab selects.'
                 + (num(poles) > 0 && o ? ` If motor_poles causes the error, ${fmt(poles / o, 1)} gives the correct headspeed, not ${poles}.` : '') });
+    },
+    // G21 (analysis/rpm-spikes, user rule 2026-10-15: for every helicopter): the sudden changes of the headspeed signal at the throttle
+    // maximum. For each PID profile with a problem: gov_max_throttle = the maximum - margin (health_gov DEFAULT_RULES.G21), the remedy of
+    // the RPM prerequisite (no gate holds it, RPM_REMEDY). The present value: the CLI section, else the maximum that health_gov calculated
+    // from the log (the pile of motor[0] while the governor command is more, critique C8; or motor[0] at 99.5 % or more, a whole percent),
+    // else unknown (no CLI). The cost: the time with the governor command at the new maximum or more (the demand histogram of ACTIVE), and
+    // the time at the maximum now, for each flight. One check of the RPM signal for all PID profiles
+    G21(L, c) {
+        const bad = L.filter(isFlag); if (!bad.length) return [];
+        const R = Object.assign({ minSpikes: 3, maxP: 0.001, rateRatio: 10, margin: 3 }, GR.G21 || {}), out = [], f1 = (v, d = 1) => fmt(v, d);
+        const rule = `Check G21 has a problem if ${R.minSpikes} or more sudden changes of the headspeed signal come at the throttle maximum. Their test value \`p\` must be less than \`${R.maxP}\`. `
+            + `Also, the rate at less than the maximum must be ${fmt(100 / R.rateRatio, 0)} % of the rate at the maximum or less. A lower throttle limit keeps the throttle out of the band where the RPM signal has errors.`;
+        const sources = [src(GR.G21 && GR.G21.source), RULES.source.maxThrottleMargin];
+        const test = (q) => `\`P(X >= ${q.k}) = ${q.p}\` for \`X ~ Binomial(${q.N}, ${q.share})\``;
+        for (const [p, list] of group(bad, profileOf)) {
+            const sumOf = (k) => list.reduce((a, f) => a + (num(f[k]) || 0), 0), k = sumOf('value'), N = list.reduce((a, f) => a + (num(f.n) || 0), 0);
+            const t = typeof gov.g21Test === 'function' ? gov.g21Test(k, N, sumOf('atMaxS'), sumOf('governedS'), R) : { k, N, atMaxS: sumOf('atMaxS'), belowS: sumOf('belowS'), share: null, p: null, rateAtMax: null, rateBelow: null };
+            // the results of this PID profile together (its configurations) must keep the rate rule: with the rate under the maximum more
+            // than 1 / rateRatio of the rate at the maximum, a lower maximum does not remove most errors (health_gov g21Pool: no pooled basis)
+            if (!t.pass && num(t.rateBelow) !== null && !(num(t.rateAtMax) !== null && t.rateBelow * R.rateRatio <= t.rateAtMax)) continue;
+            const flights = Math.max(1, sumOf('flights')), fb = list.reduce((a, f) => { const b = f.fallbacks || {}; return { n: a.n + (num(b.n) || 0), atMax: a.atMax + (num(b.atMax) || 0), afterSpike: a.afterSpike + (num(b.afterSpike) || 0) }; }, { n: 0, atMax: 0, afterSpike: 0 });
+            const ceilings = list.flatMap(f => Array.isArray(f.ceilings) ? f.ceilings : []), known = ceilings.filter(q => ['cli', 'pile', 'top'].includes(q.kind) && num(q.value) !== null);
+            const values = [...new Set(known.map(q => q.value))].sort((a, b) => a - b), calc = known.filter(q => q.kind !== 'cli');
+            // the present value: the CLI section (current), else the maximum that the analysis calculates from the logs
+            // the throttle maximum from the log: the pile (motor[0] stays there while the governor command is more), else motor[0] at
+            // 99.5 % or more, which is 100 % (gov_max_throttle accepts the values 10 to 100 in steps of 1; STE: no "whole percent")
+            const top = (gov.RULE.g21 ? 1000 - gov.RULE.g21.atMax : 995) / 10;
+            const cur = current(c, 'gov_max_throttle', p), how = (q) => q.kind === 'pile' ? `motor[0] stays at ${f1(q.value)} % while the governor command is more` : `motor[0] gets to ${f1(top)} % or more`;
+            // a CLI value that the log contradicts (motor[0] gets to more than it): the log value is the present value, with no CLI text
+            const contra = !cur.unknown && num(cur.value) !== null && calc.some(q => q.value > cur.value + 0.2);
+            const conflict = values.length > 1 ? `The logs show different throttle maximums of ${and(values.map(v => `${f1(v)} %`))}. Thus, the value at this time is unknown, and there is no CLI text.`
+                : contra ? `The CLI value of gov_max_throttle is ${cur.value}, but the log shows the throttle at ${f1(Math.max(...calc.map(q => q.value)))} %. Thus, there is no CLI text.` : null;
+            const calculated = values.length === 1 && calc.length && Number.isInteger(values[0]) && (!conflict || contra)
+                ? Object.assign({ value: values[0], source: `the throttle maximum that the analysis calculates from the logs: ${how(calc[0])}` }, contra ? { overrides: true } : {}) : null;
+            const from = contra && calculated ? calculated.value : !cur.unknown && num(cur.value) !== null ? cur.value : calculated ? calculated.value : values.length === 1 ? values[0] : 100, to = Math.round(from - R.margin);
+            // the cost in the logs: the time with the governor command at the new maximum or more, and at the maximum now, for each flight
+            const D = list.map(f => f.demand).filter(d => d && Array.isArray(d.s)), at = (d, x) => d.s.reduce((a, s, j) => a + (d.from + j * d.step >= x - 1e-9 ? s : 0), 0);
+            const over = D.length ? D.reduce((a, d) => a + at(d, to), 0) / flights : null, now = t.atMaxS / flights;
+            const where = `${logsText(list, c)}, ${prof(p)}`;
+            const lines = [`At the throttle maximum of ${f1(from)} %, the headspeed signal has ${many(k, 'sudden change')} in ${f1(t.atMaxS, 2)} s (${where}). With the throttle less than the maximum, it has ${many(N - k, 'sudden change')} in ${f1(t.belowS)} s.`,
+                num(t.p) !== null ? `The test value is ${test(t)}. In each minute, the rate is ${f1(t.rateAtMax, 2)} at the maximum and ${f1(t.rateBelow, 3)} at less than the maximum.` : '',
+                // the test of all PID profiles together only when the results of this PID profile (its configurations together) do not pass alone
+                !t.pass && list.some(f => f.basis === 'pooled') && list[0].pooled ? `This PID profile has only ${many(k, 'sudden change')} at its maximum. Thus, the test uses all PID profiles together: ${test(list[0].pooled)}.` : '',
+                // a FALLBACK entry of a sudden change: during the change, or spikeBeforeS or less after its last fast sample (health_gov spikeScan)
+                fb.n ? `Of the ${fb.n} FALLBACK ${fb.n === 1 ? 'entry' : 'entries'}, ${fb.atMax} ${fb.atMax === 1 ? 'starts' : 'start'} at the throttle maximum and ${fb.afterSpike} ${fb.afterSpike === 1 ? 'starts' : 'start'} during a sudden change or ${fmt(1000 * (gov.RULE.g21 ? gov.RULE.g21.spikeBeforeS : 0.03), 0)} ms or less after its end.` : '',
+                g21Overload(list, c, fb.n),
+                // the time at the new maximum and at the maximum now, each with its own value (review 2026-10-15: "At this time" read as the 3.84 s)
+                over !== null ? `With a maximum of ${to} %, the throttle stays less than the governor command for ${f1(over, 2)} s in each flight of these logs. With the maximum of ${f1(from)} %, the throttle is at its maximum for ${f1(now, 2)} s in each flight.`
+                    : `The log does not record govSum. Thus, the analysis cannot calculate the time with the governor command at ${to} % or more. To record govSum, set \`blackbox_log_governor\` to ON.`];
+            const r = change(c, { id: `G21:gov_max_throttle:p${p}`, area: 'governor', profile: p, parameter: 'gov_max_throttle', to, direction: 'lower', title: 'Decrease the maximum throttle', evidence: list.map(evidence),
+                rule: `${rule} The step is ${R.margin} %.`, sources, text: lines.filter(Boolean).join('\n'), calculated,
+                caveats: [`The governor also uses 95 % of \`gov_max_throttle\` to end SPOOLUP, RECOVERY and BAILOUT (${RULES.source.spoolExit}).`] });
+            if (conflict) { r.caveats.push(conflict); r.base = Object.assign({}, r.base, { unconfirmed: true }); }
+            out.push(r);
+        }
+        out.push(rec({ id: 'G21:signal', area: 'precondition', severity: 'check', title: 'Examine the RPM signal at the maximum throttle', evidence: bad.map(evidence), rule, sources,
+            text: [`The RPM signal has errors at the throttle maximum (${logsText(bad, c)}). A lower throttle limit keeps the throttle out of this band, but the cause stays.`,
+                'Make sure that the RPM sensor wire is not near the motor wires or the battery wires. Examine the supply wire and the ground wire of the RPM sensor.',
+                'If the RPM signal comes from a frequency sensor input, examine `freq_input_pull`, `freq_input_edge` and `freq_input_minhz`.',
+                rawRpmText(c)].join('\n') }));
+        return out;
     },
     G13(L, c) {
         const bad = L.filter(isFlag), amb = L.filter(f => f.severity === 'note' && /cell count ambiguous/.test(String(f.text)) && !/Vbat in flight 0 -> 0/.test(String(f.text)));
@@ -1697,6 +1838,7 @@ function stale(c, r) {
 }
 
 const LOOP_GAIN = /^(roll|pitch|yaw)_[pidfbo]_gain$|^yaw_c?cw_stop_gain$/, GOV_GAIN = /^gov_(\w_)?gain$/;
+const RPM_REMEDY = /^G21:gov_max_throttle(:|$)/;   // the change of the RPM prerequisite (check G21): no governor gate holds it
 // the filter issues of c.filterIssues ('F10 yaw' included) as check ids, and in words
 const issueIds = (list) => list.map(x => x.split(' ')[0]);
 const issueText = (list) => list.map(x => x.replace(/^(\w+) (\w+)$/, '$1 ($2)'));
@@ -1726,10 +1868,12 @@ function guard(r, c) {
         const other = [...c.filterIssues].filter(x => x !== 'F10 yaw');
         if (other.length) hold(r, `${cap(checks(issueText(other)))} ${other.length === 1 ? 'shows a filter problem' : 'show filter problems'}. The filter change comes first, because it changes the D-term noise. Decrease ${param} only if more than 50 % of its power stays at more than 30 Hz after the filter change.`, issueIds(other));
     }
-    // guard 2: governor and RPM-notch changes wait for poles / gear and for the RPM signal (TUNING_KNOWLEDGE 9.1 step 0)
-    if (chg && (r.area === 'governor' || /^gyro_rpm_notch/.test(param))) {
+    // guard 2: governor and RPM-notch changes wait for poles / gear and for the RPM signal (TUNING_KNOWLEDGE 9.1 step 0). The
+    // remedy of check G21 (a lower gov_max_throttle) is a change of the RPM prerequisite itself: these guards do not hold it. A G1
+    // whose FALLBACK entries all come from the G21 errors does not hold a change either (hierarchy spikeFallbacks, user 2026-10-15)
+    if (chg && (r.area === 'governor' || /^gyro_rpm_notch/.test(param)) && !RPM_REMEDY.test(r.id)) {
         if (c.flags('G12').length) hold(r, 'Check G12 shows an incorrect headspeed. The governor and the RPM notch filters use this headspeed. Correct motor_poles or the RPM sensor first.', ['G12']);
-        if (c.flags('G1').length) hold(r, 'Check G1 shows FALLBACK entries. Their cause and the RPM signal must be examined before a governor or RPM notch filter change.', ['G1']);
+        if (c.flags('G1').some(f => !c.g1Spike.has(f))) hold(r, 'Check G1 shows FALLBACK entries. Their cause and the RPM signal must be examined before a governor or RPM notch filter change.', ['G1']);
     }
     // guard 2, cyclic and tail: a headspeed factor error beyond the RPM-notch tolerance moves every RPM notch off its line
     // and, under a governor, the flown headspeed; what was measured before the poles / gear fix waits (TUNING_KNOWLEDGE 9.1
@@ -1766,8 +1910,12 @@ function guard(r, c) {
 // the G1 flags whose FALLBACK entries all come at an overload: of check G19 (at a rescue) or of check G20 (every FALLBACK, with or
 // without a rescue: coordinator, round 2). The times of a G1 flag: its times and every FALLBACK entry of its text ("<t> s (<s> s long")
 function g1Overload(F, flags) {
-    const out = new Set(), tol = 0.05, over = flags('G19').flatMap(g => (g.events || []).filter(e => e && e.overload && num(e.overload.untilT) !== null).map(e => ({ log: logsOf(g)[0], t: e.overload.untilT })))
+    const out = new Set(), tol = 0.05, over0 = flags('G19').flatMap(g => (g.events || []).filter(e => e && e.overload && num(e.overload.untilT) !== null).map(e => ({ log: logsOf(g)[0], t: e.overload.untilT })))
         .concat(F.filter(g => g.id === 'G20').flatMap(g => (g.events || []).filter(e => e && e.kind === 'overload' && num(e.start) !== null).map(e => ({ log: logsOf(g)[0], t: e.start }))));
+    // a FALLBACK that check G20 gives to an error of the RPM signal (a sudden change of check G21 before it, also at the throttle limit)
+    // is not a result of the load, also when check G19 finds an overload at the same time
+    const signal = F.filter(g => g.id === 'G20').flatMap(g => (g.events || []).filter(e => e && e.kind === 'signal' && num(e.start) !== null).map(e => ({ log: logsOf(g)[0], t: e.start })));
+    const over = over0.filter(o => !signal.some(q => q.log === o.log && Math.abs(q.t - o.t) <= tol));
     if (!over.length) return out;
     for (const f of flags('G1')) { const own = [...String(f.text || '').matchAll(/(\d+(?:\.\d+)?) s \([\d.]+ s long/g)].map(m => +m[1]);
         const times = [...new Set((Array.isArray(f.times) ? f.times : []).concat(own, [...String(f.text || '').matchAll(/\bat (\d+(?:\.\d+)?) s\b/g)].map(m => +m[1])))].filter(t => num(t) !== null);
@@ -1923,6 +2071,7 @@ const EFFECT = {
     G2: () => 'This change can keep the headspeed nearer to the target in stable flight.', G3: () => 'This change can decrease the headspeed decrease when collective increases.', G4: () => 'This change can decrease the headspeed overshoot after a collective change.',
     G5: () => 'This change can decrease the time to the headspeed target.', G9: () => 'This change can decrease the headspeed oscillation.', G10: () => 'This change can decrease the effect of the governor on the tail oscillation.',
     G15: () => 'This change can decrease the torque during spool-up.',
+    G21: () => 'Then the throttle stays out of the band where the RPM signal has errors.',
     C7: () => 'The gain model estimates the response. A new flight must measure the response with the exported values.',
 };
 const effectOf = (r) => { const id = String(r.id).split(':')[0].replace(/#\d+$/, ''), e = EFFECT[id]; try { return e ? e(r) : null; } catch (err) { return null; } };
@@ -1962,7 +2111,7 @@ function finish(r) {
 // sequence: GOVT F -> I -> P; TUNE D -> P -> I -> FF on each axis, pitch before roll; tail D -> P -> I -> FF, then the
 // collective FF, then the stop gains; then the severity
 const SEV = { action: 0, check: 1, watch: 2, info: 3 };
-const STEP = ['G1', 'G12', 'D4', 'D9', 'D6', 'P1', 'P2', 'T8', 'C2', 'T13', 'T4', 'C10', 'D5', 'G13', 'D1', 'D2', 'D3', 'H', 'F1', 'F2', 'F3', 'F5', 'F6', 'F8', 'F10', 'C11', 'F11', 'F4', 'F9',
+const STEP = ['G1', 'G12', 'G21', 'D4', 'D9', 'D6', 'P1', 'P2', 'T8', 'C2', 'T13', 'T4', 'C10', 'D5', 'G13', 'D1', 'D2', 'D3', 'H', 'F1', 'F2', 'F3', 'F5', 'F6', 'F8', 'F10', 'C11', 'F11', 'F4', 'F9',
     'G14', 'G6', 'G3', 'G4', 'G9', 'G5', 'G2', 'G10', 'G11', 'G8', 'G0', 'R1', 'SETUP'];
 const ITEM = { C5: 11, C6: 12, C1: 12, C3: 13, C4: 13, C14: 20, C12: 30, C13: 31, T1: 11, T2: 12, T9: 13, T6: 20, T7: 20, T14: 21, T5: 22, T11: 30, T12: 31 };
 const KIND = { d: 0, p: 1, i: 2, f: 3, o: 4, b: 5 };
@@ -1980,7 +2129,7 @@ const sortKey = (r) => { const n = r.node ? Q.byId.get(r.node) : null;
 function compare(a, b) { const x = sortKey(a), y = sortKey(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; }
 
 const OUT_KEYS = ['id', 'node', 'area', 'order', 'severity', 'title', 'text', 'procedure', 'parameter', 'scope', 'cliProfile', 'profile', 'rateProfile', 'axis', 'from', 'fromSource', 'fromSources', 'fromSets', 'to', 'direction', 'cli', 'evidence', 'rule', 'sources', 'confidence', 'blockedBy', 'holds', 'gate', 'causes', 'caveats', 'group', 'groupSize',
-    'dataset', 'supportedBy', 'ab', 'slope'];   // round 3 M1: null and [] without configurations
+    'dataset', 'supportedBy', 'ab', 'slope', 'linked'];   // round 3 M1: null and [] without configurations; linked: the governor values of govLinks (change)
 
 // ---------------------------------------------------------------------------------------------
 // Coverage
@@ -2070,6 +2219,7 @@ function advise(input) {
         const lid = axis === 'yaw' ? 'L4' : 'L3', lf = flags(lid).filter(f => same(f) && (lid === 'L4' ? f.channel === 'tail' : f.channel === axis || f.channel === 'ring'));
         return lf.length ? { id: lid, s: sum(lf), n: lf.length } : null; };
     c.g1Overload = g1Overload(F, flags);
+    c.g1Spike = HIER && typeof HIER.spikeFallbacks === 'function' ? HIER.spikeFallbacks(F) : new Set();   // the G1 flags of check G21 only
     // Keep line-location information independent of recommendations. F5 is a
     // raw-line/RPM-location reference, not proof of insufficient total filtering.
     const rawLines=F.filter(f=>f.id==='F5'&&measured(f)).flatMap(f=>Array.isArray(f.lines)?f.lines:
@@ -2453,23 +2603,46 @@ function finishFilter(r) {
 // src/js/presets/source/retriever.js); its "Load Backup" sends a .txt or .config file as CLI lines. The firmware CLI
 // ignores the text after # (cli.c processCharacter). Thus, the export is one CLI file, and there is no preset file.
 
-// the recommendations that the export panel ticks first: every action with CLI text; checks, watches and information never
-const exportable = (r) => !!r && r.severity === 'action' && Array.isArray(r.cli) && r.cli.length > 0 && !(r.blockedBy || []).length && !(r.causes || []).some(x => x && x.holds);
+// the recommendations that the export panel ticks first: every action with CLI text; checks, watches and information never. A headspeed
+// change never: it is the decision of the pilot (user, 2026-10-15)
+const setsHeadspeed = (r) => Array.isArray(r.cli) && r.cli.some(l => /^set gov_headspeed = /.test(String(l)));
+const exportable = (r) => !!r && r.severity === 'action' && Array.isArray(r.cli) && r.cli.length > 0 && !setsHeadspeed(r) && !(r.blockedBy || []).length && !(r.causes || []).some(x => x && x.holds);
 function defaultPicks(recommendations) { return (Array.isArray(recommendations) ? recommendations : []).filter(exportable).map(r => r.id); }
 
-// one value that the CLI accepts for name k (guards 5, 6 and 12): a number in RANGE, a filter type name, or a list of
-// exactly 16 integers for the RPM notch arrays (SPEC2 C10); the filter floors and the RPM notch sources that the firmware knows
+// one value that the CLI accepts for name k (guards 5, 6 and 12): a number in RANGE, a filter type name, a governor word
+// (GOV_CHOICES), 9 integers in RANGE for gov_bypass_throttle, or a list of exactly 16 integers for the RPM notch arrays
+// (SPEC2 C10); the filter floors and the RPM notch sources that the firmware knows
 function cliValueOk(k, v, replayValidated = false) {
     if(k==='motor_rpm_lpf') {const values=String(v).split(',').map(Number);return replayValidated&&/^\d+(,\d+){3}$/.test(String(v))&&values.every(x=>Number.isInteger(x)&&x>=0&&x<=255);}
     const P = PARAMS[k]; if (!P || typeof v !== 'string' || !v.length) return false;
+    // the governor words (gov_mode, gov_throttle_type, the gov_use_* flags), and the 9 points of gov_bypass_throttle, each in RANGE
+    if (GOV_CHOICES[k]) return GOV_CHOICES[k].includes(v);
+    if (k === 'gov_bypass_throttle') return /^\d+(,\d+)*$/.test(v) && v.split(',').length === GOV_CURVE_POINTS && v.split(',').every(x => +x >= RANGE[k][0] && +x <= RANGE[k][1]);
     if (P[2] === 'all') return /^-?\d+(,-?\d+)*$/.test(v) && v.split(',').length === BANKS && (replayValidated || floorsOk(k, v)) && legal(k, v);
     if (/_type$/.test(k)) return setup.LPF_TYPES.includes(v);
     if (!/^-?\d+$/.test(v)) return false;
+    if (k === 'gov_headspeed' && +v < RULES.govHeadspeedMin) return false;   // the CLI accepts it, but the governor uses RULES.govHeadspeedMin
     return (replayValidated || floorsOk(k, +v)) && legal(k, +v);
 }
+// why the CLI file does not take value v of a governor name (cliValueOk false), or null: the words, the 9 points of the
+// curve, the headspeed that the governor uses, and the range of the other numbers. A governor name has no filter limit
+const code = (w) => `\`${w}\``;
+const or = (list) => list.length < 2 ? list.join('') : `${list.slice(0, -1).join(', ')} or ${list[list.length - 1]}`;
+function govValueWhy(k, v) {
+    if (GOV_CHOICES[k]) return `The value of \`${k}\` must be one of these words: ${GOV_CHOICES[k].map(code).join(', ')}.`;
+    if (k === 'gov_bypass_throttle') return `Each of the ${GOV_CURVE_POINTS} numbers of \`${k}\` must be from ${RANGE[k][0]} to ${RANGE[k][1]}, in steps of 1.`;
+    if (k === 'gov_headspeed' && /^\d+$/.test(v) && +v < RULES.govHeadspeedMin)
+        return `If \`${k}\` is less than ${RULES.govHeadspeedMin}, the governor uses ${RULES.govHeadspeedMin} rpm. Thus, the value must be from ${RULES.govHeadspeedMin} to ${RANGE[k][1]}.`;
+    // gov_headspeed: its first value is RULES.govHeadspeedMin (cliValueOk), not the 0 of RANGE
+    if (/^gov_/.test(k) && RANGE[k]) return `The value of \`${k}\` must be from ${k === 'gov_headspeed' ? RULES.govHeadspeedMin : RANGE[k][0]} to ${RANGE[k][1]}, in steps of 1.`;
+    return null;
+}
 // why a picked recommendation does not go into the file, or null; and its commands: { scope, index, sets: [[k, v]] }
+// A check with CLI text and optIn true goes into the file only when the pilot selects it: defaultPicks and the panel select
+// actions only (docs/GOVERNOR_AUTOTUNE.md section 5: the gov_bypass_throttle curve is a check, "not selected by default",
+// because the BYPASS switch is the pilot's choice)
 function exportPlan(r) {
-    if (r.severity !== 'action') return { why: 'It is not a change. Only a change with CLI text goes into the file.' };
+    if (r.severity !== 'action' && !(r.severity === 'check' && r.optIn === true)) return { why: 'It is not a change. Only a change with CLI text goes into the file.' };
     if ((r.blockedBy || []).length) return { why: 'A step before it in the tuning sequence has a problem. Correct that step first.' };
     if ((r.causes || []).some(x => x && x.holds)) return { why: 'It can be a result of a problem before it (refer to "Possible result of"). Correct that problem first.' };
     const cli = Array.isArray(r.cli) ? r.cli.map(String) : [];
@@ -2500,9 +2673,10 @@ function exportPlan(r) {
         }
         if (!PARAMS[m[1]]) return { why: `\`${m[1]}\` is not a name that the app writes.` };
         if (PARAMS[m[1]][0] !== scope) return { why: `\`${m[1]}\` is not a ${scope === 'profile' ? 'PID profile' : scope === 'rateprofile' ? 'rate profile' : 'global'} value.` };
-        const arrayCount = m[1] === 'motor_rpm_lpf' ? 4 : BANKS;
-        if (PARAMS[m[1]][2] === 'all' && m[2].split(',').length !== arrayCount) return { why: `The value of \`${m[1]}\` must have ${arrayCount} numbers, one for each ${m[1] === 'motor_rpm_lpf' ? 'motor' : 'bank'}.` };
-        if (!cliValueOk(m[1], m[2], r.replayValidated === true)) return { why: `The value of \`${m[1]}\` is not in its firmware range, or it is less than a filter limit.` };
+        const arrayCount = m[1] === 'motor_rpm_lpf' ? 4 : m[1] === 'gov_bypass_throttle' ? GOV_CURVE_POINTS : BANKS;
+        const arrayItem = m[1] === 'motor_rpm_lpf' ? 'motor' : m[1] === 'gov_bypass_throttle' ? 'point of the throttle curve' : 'bank';
+        if (PARAMS[m[1]][2] === 'all' && m[2].split(',').length !== arrayCount) return { why: `The value of \`${m[1]}\` must have ${arrayCount} numbers, one for each ${arrayItem}.` };
+        if (!cliValueOk(m[1], m[2], r.replayValidated === true)) return { why: govValueWhy(m[1], m[2]) || `The value of \`${m[1]}\` is not in its firmware range, or it is less than a filter limit.` };
         sets.push([m[1], m[2]]);
     }
     return sets.length || features.length ? { scope, index, sets, features } : { why: 'It has no `set` command.' };
@@ -2556,6 +2730,133 @@ function evidenceLines(e, base) {
 // ({ reasons, text, findings }), else null. The boolean r.stale of the H staleness test (stale()) is not this flag: such a
 // recommendation has no CLI text
 const staleOf = (r) => r && r.stale && typeof r.stale === 'object' && typeof r.stale.text === 'string' && r.stale.text.trim() ? r.stale : null;
+
+// Governor values that depend on other values (review of 2026-10-14). The firmware changes them with no CLI error
+// (release/4.6.0 flight_governor.c): governorInit (1611-1615) runs validateAndFixGovernorConfig (1488-1503) when the flight
+// controller starts, and governorInitProfile (1543-1547) runs validateAndFixGovernorProfile (1505-1521) for the PID profile
+// that it selects, if gov_mode is not OFF:
+//   - gov_idle_throttle and gov_auto_throttle <= min(10 x gov_handover_throttle - 1, 250), gov_auto_throttle >= gov_idle_throttle;
+//   - gov_max_throttle (each PID profile) >= gov_handover_throttle, gov_min_throttle <= gov_max_throttle;
+//   - gov_mode OFF, LIMIT or DIRECT: gov_throttle_type SWITCH becomes NORMAL; LIMIT or DIRECT: the four gov_use_* flags become OFF.
+// A rule applies when the file sets one of its two values. The other value is the value of the file, else the present value
+// from the recommendations (fromSets, else parameter and from; two different present values: unknown). An unknown present
+// value takes each value that the firmware can keep: its RANGE, in the limits that the firmware applied to the present values.
+// 'fail' (the firmware changes a value of the file): the changes that set one of the two values are not in the file.
+// 'unknown': the change stays, and its comment lines give the rule, the unknown value and the condition (the log does not
+// record most of these values: CLAUDE.md "No access to the flight controller").
+const GOV_FLAGS = Object.keys(GOV_CHOICES).filter(k => /^gov_use_/.test(k));
+const GOV_LINKED = new Set(['gov_mode', 'gov_throttle_type', 'gov_handover_throttle', 'gov_idle_throttle', 'gov_auto_throttle', 'gov_max_throttle', 'gov_min_throttle'].concat(GOV_FLAGS));
+// a governor value in one form: a CLI word (a number is the index of the word, as the schema stores it), else a number; null if neither
+function govValue(k, v) {
+    if (v === null || v === undefined || v === '') return null;
+    if (GOV_CHOICES[k]) { const w = typeof v === 'boolean' ? (v ? 'ON' : 'OFF') : /^\d+$/.test(String(v)) ? GOV_CHOICES[k][+v] : String(v).trim().toUpperCase();
+        return GOV_CHOICES[k].includes(w) ? w : null; }
+    const x = Number(v); return Number.isFinite(x) ? x : null;
+}
+// The values at this time of the governor values linked to param (GOV_LINKED) on log profile p, from the sources of the present value
+// (current: the configuration, the log header of the PID profile at the start of the log, the CLI section of that PID profile, the
+// CLI global section). A value that is unknown, an estimate or in conflict is left out. -> { name: { value, source } } or null
+function linkedNow(c, param, p) {
+    const out = {};
+    for (const k of GOV_LINKED) {
+        const P = PARAMS[k]; if (k === param || !P || (P[0] !== 'global' && !(num(p) > 0))) continue;
+        const b = current(c, k, p);
+        if (b.unknown || b.unconfirmed || b.approx || b.conflict || b.value === null || b.value === undefined) continue;
+        out[k] = { value: b.value, source: b.source };
+    }
+    return Object.keys(out).length ? out : null;
+}
+// live: the entries { r, plan } with sets; list: all recommendations (their present values: fromSets, parameter and from, and the
+// linked values of change: r.linked). Returns { why: Map(entry -> text), notes: Map(entry -> [texts]) }
+function govLinks(list, live) {
+    const set = new Map(), cur = new Map(), srcOf = new Map(), staleKeys = new Set(), BAD = {}, key = (p, k) => `${p === null ? 'g' : p}|${k}`;
+    const keysOf = new Map(live.map(x => [x, new Set(x.plan.sets.map(([k]) => key(PARAMS[k] && PARAMS[k][0] === 'global' ? null : x.plan.index, k)))]));
+    for (const x of live) for (const [k, v] of x.plan.sets) if (GOV_LINKED.has(k)) set.set(key(PARAMS[k][0] === 'global' ? null : x.plan.index, k), govValue(k, v));
+    for (const r of list) {
+        const p = num(r.profile), idx = Number.isInteger(p) && p > 0 && p <= RULES.pidProfiles ? p - 1 : null, fs = r.fromSets && typeof r.fromSets === 'object' ? r.fromSets : {};
+        const add = (k, v0, src) => { const P = GOV_LINKED.has(k) && PARAMS[k], g = !!P && P[0] === 'global', v = govValue(k, v0);
+            if (!P || v === null || (!g && idx === null)) return;
+            const q = key(g ? null : idx, k); cur.set(q, cur.has(q) && cur.get(q) !== v ? BAD : v);
+            // the source of a linked value for the notes; a value of the log header with a flag of the recommendation is possibly not current
+            if (src && !srcOf.has(q)) { srcOf.set(q, src); if (staleOf(r) && /log header/.test(src)) staleKeys.add(q); } };
+        for (const k of Object.keys(fs)) add(k, fs[k]);
+        if (typeof r.parameter === 'string' && (fs[r.parameter] === undefined || fs[r.parameter] === null)) add(r.parameter, r.from);
+        const lk = r.linked && typeof r.linked === 'object' ? r.linked : {};
+        for (const k of Object.keys(lk)) if (lk[k] && typeof lk[k] === 'object' && !(k in fs) && k !== r.parameter) add(k, lk[k].value, typeof lk[k].source === 'string' ? lk[k].source : null);
+    }
+    const now = (p, k) => { const v = cur.get(key(p, k)); return v === BAD ? undefined : v; };
+    const isSet = (p, k) => set.has(key(p, k)), fin = (p, k) => isSet(p, k) ? set.get(key(p, k)) : now(p, k);
+    // intervals: a <= b for all values ('ok'), for no value ('fail'), else 'unknown'
+    const exact = (v, lo, hi) => v === undefined ? [lo, hi] : [v, v], le = (a, b) => a[1] <= b[0] ? 'ok' : a[0] > b[1] ? 'fail' : 'unknown';
+    const S = RULES.govIdleScale, FULL = RULES.govFullModes, OFF = GOV_CHOICES.gov_mode[0], maxIdle = (h) => Math.min(S * h - 1, RANGE.gov_idle_throttle[1]);
+    const h0 = now(null, 'gov_handover_throttle'), m0 = now(null, 'gov_mode'), idle0 = now(null, 'gov_idle_throttle'), top0 = h0 === undefined ? RANGE.gov_idle_throttle[1] : maxIdle(h0);
+    const H = exact(fin(null, 'gov_handover_throttle'), ...RANGE.gov_handover_throttle), L = [maxIdle(H[0]), maxIdle(H[1])];
+    const I = exact(fin(null, 'gov_idle_throttle'), RANGE.gov_idle_throttle[0], top0), A = exact(fin(null, 'gov_auto_throttle'), idle0 === undefined ? RANGE.gov_auto_throttle[0] : idle0, top0);
+    const modeF = fin(null, 'gov_mode'), modes = modeF === undefined ? GOV_CHOICES.gov_mode : [modeF], valid0 = m0 !== undefined && m0 !== OFF;
+    const lowModes = GOV_CHOICES.gov_mode.filter(m => !FULL.includes(m)), clearModes = lowModes.filter(m => m !== OFF);
+    // one rule: a and b [p, k], res, the rule sentence, fix [p, k, the value of the firmware or null] (fail), need { a: condition on a, b: on b } (unknown)
+    const rules = [];
+    const idleRule = (k, X) => rules.push({ a: [null, k], b: [null, 'gov_handover_throttle'], res: le(X, L), fix: [null, k, L[0] === L[1] ? L[0] : null],
+        text: `The flight controller keeps \`${k}\` at \`${S} × gov_handover_throttle - 1\` or less.`, need: { a: `${L[0]} or less`, b: `${Math.ceil((X[0] + 1) / S)} or more` } });
+    idleRule('gov_idle_throttle', I); idleRule('gov_auto_throttle', A);
+    rules.push({ a: [null, 'gov_auto_throttle'], b: [null, 'gov_idle_throttle'], res: le(I, A), fix: [null, 'gov_auto_throttle', L[0] === L[1] ? Math.min(I[0], L[0]) : null],
+        text: 'The flight controller keeps `gov_auto_throttle` at `gov_idle_throttle` or more.', need: { a: `${I[1]} or more`, b: `${A[0]} or less` } });
+    { const t = fin(null, 'gov_throttle_type'), types = t !== undefined ? [t] : m0 !== undefined && !FULL.includes(m0) ? GOV_CHOICES.gov_throttle_type.filter(w => w !== 'SWITCH') : GOV_CHOICES.gov_throttle_type;
+        const low = modes.filter(m => !FULL.includes(m));
+        rules.push({ a: [null, 'gov_throttle_type'], b: [null, 'gov_mode'], res: !types.includes('SWITCH') || !low.length ? 'ok' : types.length === 1 && low.length === modes.length ? 'fail' : 'unknown',
+            fix: [null, 'gov_throttle_type', 'NORMAL'], text: `If \`gov_mode\` is ${or(lowModes.map(code))}, the flight controller changes \`gov_throttle_type\` from \`SWITCH\` to \`NORMAL\`.`,
+            need: { a: or(GOV_CHOICES.gov_throttle_type.filter(w => w !== 'SWITCH').map(code)), b: or(FULL.map(code)) } }); }
+    // the PID profile rules: none if gov_mode is OFF (governorInitProfile)
+    if (modes.some(m => m !== OFF)) for (let p = 0; p < RULES.pidProfiles; p++) {
+        const max0 = now(p, 'gov_max_throttle');
+        const MX = exact(fin(p, 'gov_max_throttle'), valid0 && h0 !== undefined ? h0 : RANGE.gov_max_throttle[0], RANGE.gov_max_throttle[1]);
+        const MN = exact(fin(p, 'gov_min_throttle'), RANGE.gov_min_throttle[0], valid0 && max0 !== undefined ? max0 : RANGE.gov_min_throttle[1]);
+        rules.push({ a: [p, 'gov_max_throttle'], b: [null, 'gov_handover_throttle'], res: le(H, MX), fix: [p, 'gov_max_throttle', H[0] === H[1] ? H[0] : null],
+            text: 'The flight controller keeps `gov_max_throttle` at `gov_handover_throttle` or more.', need: { a: `${H[1]} or more`, b: `${MX[0]} or less` } });
+        rules.push({ a: [p, 'gov_min_throttle'], b: [p, 'gov_max_throttle'], res: le(MN, MX), fix: [p, 'gov_min_throttle', MX[0] === MX[1] ? MX[0] : null],
+            text: 'The flight controller keeps `gov_min_throttle` at `gov_max_throttle` or less.', need: { a: `${MX[0]} or less`, b: `${MN[1]} or more` } });
+        for (const f of GOV_FLAGS) {
+            const v = fin(p, f), vals = v !== undefined ? [v] : valid0 && !FULL.includes(m0) ? ['OFF'] : ['OFF', 'ON'], clear = modes.filter(m => clearModes.includes(m));
+            rules.push({ a: [p, f], b: [null, 'gov_mode'], res: !vals.includes('ON') || !clear.length ? 'ok' : vals.length === 1 && clear.length === modes.length ? 'fail' : 'unknown',
+                fix: [p, f, 'OFF'], text: `If \`gov_mode\` is ${or(clearModes.map(code))}, the flight controller sets \`${f}\` to \`OFF\`.`, need: { a: code('OFF'), b: or(FULL.map(code)) } });
+        }
+    }
+    const label = (p, k) => `\`${k}\`${p === null ? '' : ` (${prof(p + 1)})`}`, show = (v) => v === undefined ? 'unknown' : typeof v === 'string' ? code(v) : String(v);
+    const why = new Map(), notes = new Map(), noteKeys = new Map(), known = new Map();
+    for (const R of rules) {
+        if (!(isSet(...R.a) || isSet(...R.b))) continue;
+        const ka = key(...R.a), kb = key(...R.b);
+        // a rule that holds with a linked value of the CLI dump or of the log (r.linked): the rule, the value and its source
+        if (R.res === 'ok') {
+            if (isSet(...R.a) && isSet(...R.b)) continue;
+            const [given, other] = isSet(...R.a) ? [ka, R.b] : [kb, R.a], ko = key(...other), src = srcOf.get(ko), v = now(...other);
+            if (!src || v === undefined) continue;
+            const text = `${R.text} The value of ${label(...other)} is ${show(v)} (the value at this time is from the ${clean(src).replace(/^the /, '')}).`
+                + (staleKeys.has(ko) ? ' This value is possibly not current.' : '');
+            for (const x of live) if (keysOf.get(x).has(given)) { const m = known.get(x) || []; if (!m.includes(text)) m.push(text); known.set(x, m); }
+            continue;
+        }
+        if (R.res === 'fail') {
+            const [p, k, v] = R.fix;
+            const text = `${R.text} With the selected changes, ${label(...R.a)} is ${show(fin(...R.a))} and ${label(...R.b)} is ${show(fin(...R.b))}. ` +
+                `Thus, the flight controller changes ${label(p, k)}${v === null ? '' : ` to ${show(v)}`} when it ${p === null ? 'starts' : 'selects this PID profile'}. The CLI does not show an error.`;
+            for (const x of live) if (!why.has(x) && (keysOf.get(x).has(ka) || keysOf.get(x).has(kb))) why.set(x, text);
+            continue;
+        }
+        // unknown: exactly one of the two values is set (both set are both known), and the other value is unknown
+        const [given, other, cond] = isSet(...R.a) ? [ka, R.b, R.need.b] : [kb, R.a, R.need.a];
+        for (const x of live) if (keysOf.get(x).has(given)) {
+            const nk = `${R.text}|${other[1]}|${cond}`, m = noteKeys.get(x) || new Map(); noteKeys.set(x, m);
+            if (!m.has(nk)) m.set(nk, { text: R.text, k: other[1], cond, profiles: [] });
+            if (other[0] !== null && !m.get(nk).profiles.includes(other[0] + 1)) m.get(nk).profiles.push(other[0] + 1);
+        }
+    }
+    for (const [x, m] of noteKeys) notes.set(x, [...m.values()].map(n => { const ps = n.profiles.sort((a, b) => a - b);
+        const name = `\`${n.k}\`${!ps.length ? '' : ps.length === 1 ? ` (${prof(ps[0])})` : ` (PID profiles ${and(ps.map(String))})`}`;
+        return `${n.text} The value of ${name} is unknown. Before you use this change, make sure that ${name} is ${n.cond}.`; }));
+    for (const [x, m] of known) notes.set(x, m.concat(notes.get(x) || []));
+    return { why, notes };
+}
 
 /**
  * exportScript(recs, picks, meta) -> string: the CLI file of the export panel.
@@ -2665,9 +2966,18 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
     for (const x of plans) if (x.plan.sets && x.plan.sets.concat((x.plan.features || []).map(([n]) => [`feature ${n}`])).some(([k]) => value.get(`${x.plan.scope}|${x.plan.index}|${k}`).size > 1))
         x.plan = { why: 'Two selected changes set the same value to different numbers. Select one of them.' };
     // a group of changes that the model made together (SPEC2 C3): all of its changes, or none
-    for (const [g, xs] of group(plans.filter(x => x.r.group && x.plan.sets), x => x.r.group)) {
+    const groups = () => { for (const [g, xs] of group(plans.filter(x => x.r.group && x.plan.sets), x => x.r.group)) {
         const size = Math.max(...list.filter(r => r.group === g).map(r => r.groupSize || 0), list.filter(r => r.group === g).length);
         if (xs.length < size) for (const x of xs) x.plan = { why: `It is 1 of ${size} changes that the model makes together (\`${clean(g).replace(/`/g, "'")}\`). Select all ${size} changes, or none of them.` };
+    } };
+    groups();
+    // the governor values that the firmware changes with no CLI error (govLinks): a change that gives one is not in the file.
+    // Without it, the values of the file change, and a rule can fail again: until no rule fails
+    let links = govLinks(list, plans.filter(x => x.plan.sets));
+    for (let n = 0; links.why.size && n < plans.length; n++) {
+        for (const [x, why] of links.why) x.plan = { why };
+        groups();
+        links = govLinks(list, plans.filter(x => x.plan.sets));
     }
     const ok = plans.filter(x => x.plan.sets), bad = plans.filter(x => !x.plan.sets);
     const flightPlan = require('./control_tune.cjs').flightPlan(ok.map(x => x.r));
@@ -2693,7 +3003,8 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
         if (`# ${k}: ${val}`.length <= 240 && lines.length <= 6) out.push(`# ${k}: ${val}`); else out.push(`# ${k}:`, ...lines);
     }
     out.push('#');
-    ok.forEach(({ r, plan }, i) => {
+    ok.forEach((x, i) => {
+        const { r, plan } = x;
         out.push(...commentLines(`Change ${i + 1} of ${ok.length}: ${r.title}`), `#   Recommendation \`${clean(r.id).replace(/`/g, "'")}\`.`);
         if (plan.scope === 'profile') out.push(`#   ${prof(plan.index + 1)}, CLI \`profile ${plan.index}\`.`);
         else if (plan.scope === 'rateprofile') out.push(`#   Rate profile ${plan.index + 1}, CLI \`rateprofile ${plan.index}\`.`);
@@ -2706,6 +3017,8 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
         for (const [n, on] of plan.features || []) { const prev = prevOf(`feature ${n}`); out.push(`#   \`feature ${n}\`: ${on ? 'on' : 'off'}${prev === null ? '. The previous value is unknown.' : ` (it is ${prev === true || prev === 'on' ? 'on' : 'off'} at this time).`}`); }
         for (const [k, v] of plan.sets) { const prev = prevOf(k), from = r.fromSources && r.fromSources[k] ? r.fromSources[k] : r.fromSource;
             out.push(prev !== null ? `#   \`${k}\`: from ${clean(prev)} to ${v}${from ? ` (the value at this time is from the ${clean(from).replace(/^the /, '')})` : ''}.` : `#   \`${k}\`: set to ${v}. The previous value is unknown.`); }
+        // a governor rule that needs a value that is unknown (govLinks): the rule and the condition
+        for (const t of links.notes.get(x) || []) out.push(...commentLines(t, true));
         const ev = Array.isArray(r.evidence) ? r.evidence : [];
         for (const e of ev.slice(0, 3)) out.push(...evidenceLines(e, base));
         if (ev.length > 3) out.push(`#   The recommendation has ${ev.length - 3} more results.`);

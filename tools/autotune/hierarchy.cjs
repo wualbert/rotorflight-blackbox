@@ -66,9 +66,11 @@ const PREREQ = [
         checks: ['D1', 'D2', 'D3', 'D4', 'H'], gates: ['filters', 'governor', 'cyclic', 'tail'],
         params: ['blackbox_device', 'blackbox_rate_denom', 'blackbox_log_gyro_raw', 'blackbox_log_pid', 'blackbox_log_setpoint', 'blackbox_log_mixer', 'blackbox_log_servos', 'blackbox_log_rpm',
             'blackbox_log_governor', 'blackbox_log_battery', 'debug_mode'], docs: [P.blackbox] },
+    // G21: the RPM signal at the throttle maximum (analysis/rpm-spikes). Its remedy, a lower gov_max_throttle, is a change of this item:
+    // the recommendation is on this item (homeOf), and no gate holds it (a prerequisite is never blocked)
     { id: 'rpm', title: 'RPM signal and motor poles', about: 'The RPM notch filters and the governor use the RPM signal. The gear ratios in the configuration are correct.',
-        note: 'The gear ratios in the configuration are correct.', checks: ['G1', 'G12', 'G20'], gates: ['filters', 'governor'],
-        params: ['motor_poles', 'feature FREQ_SENSOR', 'dshot_bidir', 'motor_pwm_protocol', 'freq_input_minhz'], docs: [P.rpmMeasure, P.motors] },
+        note: 'The gear ratios in the configuration are correct.', checks: ['G1', 'G12', 'G20', 'G21'], gates: ['filters', 'governor'],
+        params: ['motor_poles', 'feature FREQ_SENSOR', 'dshot_bidir', 'motor_pwm_protocol', 'freq_input_minhz', 'freq_input_pull', 'freq_input_edge', 'gov_max_throttle'], docs: [P.rpmMeasure, P.motors] },
     { id: 'power', title: 'Battery and power', about: 'The battery must supply the power of the flight with a small voltage decrease. A weak battery can cause a throttle limit.',
         checks: ['D5', 'G13', 'G11', 'P1', 'P2'], gates: ['governor'],
         params: ['battery_cell_count', 'vbat_min_cell_voltage', 'vbat_warning_cell_voltage', 'vbat_max_cell_voltage', 'battery_meter', 'current_meter'], docs: [P.power] },
@@ -146,6 +148,7 @@ const LEGACY = { setup: 'controller', servos: 'mechanics', mixer: 'mechanics', t
 
 // viaRules: a cause edge that makes a block a possible result only through a K rule with its time test (causesOf), not for
 // every problem upstream: the tail authority causes the tail gain symptoms only when the output limit comes first
+const RPM_GATES = ['G1', 'G12', 'G20', 'SETUP', 'C7'];
 const e = (from, to, kind, why, source, when, viaRules) => Object.assign({ from, to, kind, why, text: why, source }, when ? { when } : {}, viaRules ? { viaRules: true } : {});
 const EDGES = [
     // the prerequisites and the blocks that need them
@@ -153,8 +156,10 @@ const EDGES = [
     e('logging', 'governor', 'validity', 'The governor tuning procedure uses a log at 1 kHz with the debug mode GOVERNOR.', 'DOC GOVT preparation', ['D1']),
     e('logging', 'cyclic', 'validity', 'If the log rate is less than 1 kHz, the results of the oscillation and of the time delay are not accurate.', 'INF Nyquist', ['D1']),
     e('logging', 'tail', 'validity', 'If the log rate is less than 1 kHz, the results of the tail oscillation are not accurate.', 'INF Nyquist', ['D1']),
-    Object.assign(e('rpm', 'filters', 'gate', 'The RPM notch filters operate correctly only with a fast RPM signal and the correct motor pole count.', 'DOC RPMM, RPMF, MOTORS'), { scope: ['F3', 'F5', 'F6', 'F9'] }),
-    e('rpm', 'governor', 'gate', 'The governor modes ELECTRIC and NITRO use the RPM signal. The gear ratios in the configuration are correct.', 'DOC GOVTAB, GOVT note, MOTORS'),
+    // fromChecks: not G21. The RPM signal errors at the throttle maximum are sparse, and their remedy (a lower gov_max_throttle) does not
+    // change the other tuning (user, 2026-10-15). A G1 whose FALLBACK entries all come from them does not count either (spikeFallbacks)
+    Object.assign(e('rpm', 'filters', 'gate', 'The RPM notch filters operate correctly only with a fast RPM signal and the correct motor pole count.', 'DOC RPMM, RPMF, MOTORS'), { scope: ['F3', 'F5', 'F6', 'F9'], fromChecks: RPM_GATES }),
+    Object.assign(e('rpm', 'governor', 'gate', 'The governor modes ELECTRIC and NITRO use the RPM signal. The gear ratios in the configuration are correct.', 'DOC GOVTAB, GOVT note, MOTORS'), { fromChecks: RPM_GATES }),
     e('power', 'governor', 'gate', 'Low battery voltage can cause a throttle limit. Governor gains cannot increase the maximum throttle.', 'DOC FLYR, GOVTAB, INF'),
     e('mechanics', 'filters', 'order', 'Correct the blade tracking and the balance before you set the notch filters.', 'DOC FILT'),
     // fromChecks: the gate holds only for a problem of these checks of the prerequisite (a ground resonance does not hold the tail gains)
@@ -319,6 +324,18 @@ function graph() {
 // ---------------------------------------------------------------------------------------------
 
 const logsOf = (f) => Array.isArray(f.log) ? f.log : f.log === null || f.log === undefined ? [] : [f.log];
+// The G1 flags whose FALLBACK entries all follow a sudden change of the RPM signal at the throttle maximum (check G20 kind 'signal',
+// atMax), when check G21 flags in these findings: the sparse problem of G21, with its own remedy (gov_max_throttle). No gate holds
+// on them (user, 2026-10-15). G1 times: its times, else every "<t> s (<s> s long" of its text (index seconds, as G20 start)
+function spikeFallbacks(F) {
+    const out = new Set(), list = (F || []).filter(Boolean), tol = 0.05;
+    if (!list.some(f => f.id === 'G21' && f.severity === 'flag')) return out;
+    const at = list.filter(g => g.id === 'G20').flatMap(g => (g.events || []).filter(e => e && e.kind === 'signal' && e.signal && e.signal.atMax && isFinite(e.start)).map(e => ({ log: logsOf(g)[0], t: e.start })));
+    for (const f of list) if (f.id === 'G1' && f.severity === 'flag') {
+        const times = Array.isArray(f.times) && f.times.length ? f.times : [...String(f.text || '').matchAll(/(\d+(?:\.\d+)?) s \([\d.]+ s long/g)].map(m => +m[1]);
+        if (times.length && times.every(t => at.some(q => logsOf(f).includes(q.log) && Math.abs(q.t - t) <= tol))) out.add(f); }
+    return out;
+}
 // the PID profile of a finding or an evidence row: the worker's pidProfile (1-6) first, else the toolkit label (SPEC2 D12)
 const pidOk = (v) => Number.isInteger(v) && v >= 1 && v <= 6 ? v : null;
 const profileOf = (f) => { const q = pidOk(f.pidProfile); if (q !== null) return q; const p = typeof f.profile === 'string' && /^\d+$/.test(f.profile) ? +f.profile : f.profile; return typeof p === 'number' && isFinite(p) && p > 0 ? p : null; };
@@ -461,7 +478,8 @@ function benchLogs(F, logs) {
 /**
  * findings: worker findings (fid, id, severity, log, profile, axis, thin, explained; node if set). recs: advice
  * recommendations with evidence rows (fid), or null when advice is not available (then every flag counts).
- * opts: { logs, coverage (advice coverage rows), header, fields, cli (health_setup.parseCli), profile, byProfile }, all
+ * opts: { logs, coverage (advice coverage rows), header, fields, cli (health_setup.parseCli), profile, byProfile, all (every finding,
+ * for spikeFallbacks when findings is one configuration) }, all
  * optional. profile (1-6, 0 for "PID profile unknown"): the status of that PID profile only, from its findings and
  * recommendations and those with no profile. Without it, the status of all profiles together, with byProfile: { [key]:
  * the status of that profile } and profiles: [keys] (byProfile: false leaves them out), and each node gets
@@ -549,9 +567,13 @@ function statusOne(findings, recs, opts, want) {
     const upstreamOk = (x, id) => x && x !== id && (bySequence(x, id) < 0 || (RULE_UP.get(id) || []).includes(x));
     // the problems upstream that gate a block: a direct gate with a scope holds only the problems of its checks in the block, one
     // with fromChecks only the problems of those checks of the upstream item (its problem findings and SETUP or C7 recommendations)
-    const idsOf = (u) => [...new Set(byNode.get(u).filter(problemFinding).map(f => f.id).concat((nodes[u].problemRecs || []).map(x => String(x).split(':')[0])))];
-    const holds = (u, id) => { const q = scopeOf(u, id), fc = fromChecksOf(u, id);
-        return (!q || byNode.get(id).some(f => problemFinding(f) && q.includes(f.id))) && (!fc || idsOf(u).some(x => fc.includes(x))); };
+    const spiky = spikeFallbacks(o.all || F0);
+    const idsOf = (u) => [...new Set(byNode.get(u).filter(f => problemFinding(f) && !spiky.has(f)).map(f => f.id).concat((nodes[u].problemRecs || []).map(x => String(x).split(':')[0])))];
+    // fromChecks of u on its way to id: of the edge u > id, else of an edge from u to an item that gates id (rpm > filters > cyclic)
+    const fromOk = (u, id) => (GATE_UP.get(id) || []).includes(u) ? (!fromChecksOf(u, id) || idsOf(u).some(x => fromChecksOf(u, id).includes(x)))
+        : EDGES.some(x => x.kind === 'gate' && x.from === u && gateUpstream(id).concat(id).includes(x.to) && (!x.fromChecks || idsOf(u).some(y => x.fromChecks.includes(y))));
+    const holds = (u, id) => { const q = scopeOf(u, id);
+        return (!q || byNode.get(id).some(f => problemFinding(f) && q.includes(f.id))) && fromOk(u, id); };
     const gatesOf = (id) => gateUpstream(id).filter(u => P.has(u) && holds(u, id));
     for (const id of [...P].filter(isBlock)) {
         const N = nodes[id], up = gatesOf(id);
@@ -567,7 +589,7 @@ function statusOne(findings, recs, opts, want) {
     // gatedBy: the gates of a CHANGE of the values of a block, also when the block has no problem (the filter autotune proposes
     // changes with no filter problem). The first problems upstream along the gate edges, fromChecks applied. A scope is not
     // applied here: the caller applies it to the values that it changes (rpm > filters: the values that the RPM signal drives)
-    for (const n of BLOCKS) { const up = gateUpstream(n.id).filter(u => P.has(u) && (!fromChecksOf(u, n.id) || idsOf(u).some(x => fromChecksOf(u, n.id).includes(x))));
+    for (const n of BLOCKS) { const up = gateUpstream(n.id).filter(u => P.has(u) && fromOk(u, n.id));
         nodes[n.id].gatedBy = up.filter(u => !gateUpstream(u).some(v => up.includes(v) && v !== u)); }
     // "Start here" (coordinator rule, round 2): a block with a problem, not blocked and not a possible result, whose blocks before
     // it in the sequence (BEFORE: filters, governor, then its lane) have no problem and no gate upstream with a problem. Never a
@@ -590,7 +612,8 @@ function statusOne(findings, recs, opts, want) {
         const N = nodes[n.id]; if (N.reason) continue;
         if (n.kind === 'prereq') {
             const ids = N.checksRun || [], probIds = [...new Set(byNode.get(n.id).filter(f => (N.problemFids || []).includes(f.fid)).map(f => f.id))];
-            N.reason = N.status === 'problem' ? `${probIds.length ? `${probIds.length > 1 ? 'Checks' : 'Check'} ${andList(probIds)} found a problem.` : 'A check of this item found a problem.'} Correct it before you tune the tuning blocks after it.`
+            const holdsAny = (n.gates || []).some(b => { const fc = fromChecksOf(n.id, b); return !fc || idsOf(n.id).some(x => fc.includes(x)); });
+            N.reason = N.status === 'problem' ? `${probIds.length ? `${probIds.length > 1 ? 'Checks' : 'Check'} ${andList(probIds)} found a problem.` : 'A check of this item found a problem.'} ${holdsAny ? 'Correct it before you tune the tuning blocks after it.' : 'This problem does not stop the tuning of the tuning blocks after it.'}`
                 : N.status === 'ok' ? `No problem found. ${ids.length > 1 ? 'These checks operated' : 'This check operated'}: ${andList(ids)}.`
                 : coverageWhy(n) || 'The logs cannot show this item. Examine it on the helicopter.';
             continue;
@@ -606,4 +629,4 @@ function statusOne(findings, recs, opts, want) {
     return { nodes, startHere, prereqProblems, profile: want, bench: [...bench].sort((a, b) => a - b) };
 }
 
-module.exports = { PREREQ, BLOCKS, NODES, EDGES, RULES, LEGACY, scopeOf, fromChecksOf, homeOf, isPrereq, isBlock, graph, status, causesOf, gateUpstream, axisOf, compatible, profileKey, startsBefore, bySequence };
+module.exports = { PREREQ, BLOCKS, NODES, EDGES, RULES, LEGACY, scopeOf, fromChecksOf, homeOf, isPrereq, isBlock, graph, status, causesOf, gateUpstream, spikeFallbacks, axisOf, compatible, profileKey, startsBefore, bySequence };

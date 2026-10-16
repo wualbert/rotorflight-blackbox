@@ -813,7 +813,10 @@ test('guard 5: relative steps are bounded to 20 %, also after rounding; document
 test('guard 5: every value stays within its firmware range (settings.c); at a limit the step is a watch', () => {
     assert.deepEqual([advice.RANGE.yaw_cw_stop_gain, advice.RANGE.yaw_collective_ff_gain, advice.RANGE.pitch_collective_ff_gain, advice.RANGE.gov_f_gain, advice.RANGE.roll_p_gain, advice.RANGE.dyn_notch_q, advice.RANGE.blackbox_rate_denom],
         [[25, 250], [0, 250], [0, 250], [0, 250], [0, 1000], [10, 100], [1, 8000]]);
-    for (const k of Object.keys(advice.PARAMS)) if (!/^gyro_rpm_notch_(source|q|center)_/.test(k) && !/^gyro_lpf\d_type$/.test(k)) assert.ok(advice.RANGE[k], `${k} has no firmware range`);
+    // no range: the RPM notch arrays, the filter types, and the governor names with CLI words (MODE_LOOKUP, MODE_BITSET)
+    const WORDS = /^gov_(mode|throttle_type|use_(fallback_precomp|pid_spoolup|voltage_comp|dyn_min_throttle))$/;
+    for (const k of Object.keys(advice.PARAMS)) if (!/^gyro_rpm_notch_(source|q|center)_/.test(k) && !/^gyro_lpf\d_type$/.test(k) && !WORDS.test(k)) assert.ok(advice.RANGE[k], `${k} has no firmware range`);
+    for (const k of Object.keys(advice.PARAMS)) if (WORDS.test(k)) assert.equal(advice.RANGE[k], undefined, `${k} is a word, not a number`);
     const h = (o) => ({ header: Object.assign({}, HEADER, o) }), t5 = f({ id: 'T5', value: 2, se: 0.2, larger: 'ccw', text: 'stops' });
     const stop = only(run([t5], h({ yaw_stop_gain: [120, 26] })), 'T5');                     // 26 x 0.9 = 23, below 25
     assert.deepEqual(stop.cli, ['profile 0', 'set yaw_ccw_stop_gain = 25']);
@@ -913,8 +916,14 @@ function settingRange(name) {
     return [m[1], m[2]].map(x => /^\d+$/.test(x) ? +x : MACRO[x]);
 }
 
+// gov_bypass_throttle is a MODE_ARRAY: settings.c gives no range (the storage, VAR_UINT8, holds 0-255), and governor.c
+// divides each point by 200 (1.0 = 100 % throttle). The vendor copy is the file of release/4.6.0 (tools/autotune/firmware)
+const GOVERNOR_C = fs.readFileSync(path.join(ROOT, 'tools/autotune/firmware/vendor/flight_governor.c'), 'utf8');
+const ARRAY_RANGE = { gov_bypass_throttle: () => /gov\.throttleCurve\[i\] = governorConfig\(\)->gov_bypass_throttle\[i\] \/ 200\.0f;/.test(GOVERNOR_C) ? [0, 200] : null };
+
 test('guard 5: every RANGE is the firmware range of settings.c (release/4.6.0)', () => {
-    for (const [name, lim] of Object.entries(advice.RANGE)) assert.deepEqual(settingRange(name), lim, name);
+    for (const [name, lim] of Object.entries(advice.RANGE)) assert.deepEqual(ARRAY_RANGE[name] ? ARRAY_RANGE[name]() : settingRange(name), lim, name);
+    assert.deepEqual(settingRange('gov_bypass_throttle'), [0, 255], 'each point of the curve fits in its storage');
 });
 
 test('guard 12: every CLI name is a Rotorflight 4.6 name from health_setup PAIRS or TUNING_KNOWLEDGE', () => {
@@ -1365,6 +1374,226 @@ test('exportScript: range checks (RANGE, filter floors, RPM notch sources), unkn
     const t = advice.exportScript([a, b], ['a', 'b'], {});
     assert.deepEqual(commands(t), []);
     assert.equal((flat(t).match(/Two selected changes set the same value to different numbers/g) || []).length, 2);
+});
+
+// The 42 governor CLI names of Rotorflight 4.6.0 (docs/GOVERNOR_AUTOTUNE.md section 5): the clivalue rows of settings.c
+// (956-973 global, 1202-1226 PID profile), with their mode and the CLI words of their lookup tables (cli.c cliSet: MODE_BITSET
+// takes lookupTableOffOn)
+const GOV_NAMES = [...SETTINGS.matchAll(/\{ "(gov_\w+)",\s+VAR_\w+\s*\|\s*(MASTER|PROFILE)_VALUE\s*(?:\|\s*(MODE_\w+))?/g)]
+    .map(m => ({ name: m[1], scope: m[2] === 'MASTER' ? 'global' : 'profile', mode: m[3] || 'MODE_DIRECT' }));
+const lookupWords = (table) => JSON.parse(`[${new RegExp(`${table}\\[\\] = \\{([^}]*)\\}`).exec(SETTINGS)[1].trim().replace(/,$/, '')}]`);
+const GOV_WORDS = { gov_mode: lookupWords('lookupTableGovernorMode'), gov_throttle_type: lookupWords('lookupTableGovernorThrottleType') };
+for (const g of GOV_NAMES) if (g.mode === 'MODE_BITSET') GOV_WORDS[g.name] = lookupWords('lookupTableOffOn');
+
+test('governor names (docs/GOVERNOR_AUTOTUNE.md section 7): all 42 in PARAMS with the scope, default and range of the firmware', () => {
+    assert.equal(GOV_NAMES.length, 42, GOV_NAMES.map(g => g.name).join(' '));
+    assert.deepEqual(GOV_WORDS.gov_mode, ['OFF', 'LIMIT', 'DIRECT', 'ELECTRIC', 'NITRO']);
+    assert.deepEqual(GOV_WORDS.gov_throttle_type, ['NORMAL', 'SWITCH', 'FUNCTION']);
+    assert.deepEqual(Object.keys(GOV_WORDS).filter(k => /^gov_use_/.test(k)).sort(), ['gov_use_dyn_min_throttle', 'gov_use_fallback_precomp', 'gov_use_pid_spoolup', 'gov_use_voltage_comp']);
+    // tools/autotune/firmware/schema.cjs: the defaults of pg/governor.c and pg/pid.c, gov_flags 0 (all flags OFF), and the ranges
+    const schema = new Map(require('../tools/autotune/firmware/schema.cjs').fields.map(x => [x.name, x]));
+    const field = (name) => schema.get(name.replace(/_ff_weight$/, '_weight'));
+    for (const { name, scope, mode } of GOV_NAMES) {
+        const P = advice.PARAMS[name];
+        assert.ok(P, `${name} is not in PARAMS`);
+        assert.equal(P[0], scope, `${name} scope`);
+        if (mode === 'MODE_BITSET') { assert.equal(P[3], 'OFF', name); assert.equal(schema.get('gov_flags').default, 0); continue; }
+        if (mode === 'MODE_LOOKUP') { assert.equal(P[3], GOV_WORDS[name][field(name).default], name); continue; }
+        if (mode === 'MODE_ARRAY') {
+            assert.equal(P[3], Array.from({ length: 9 }, (_, i) => schema.get(`${name}[${i}]`).default).join(','), name);
+            for (let i = 0; i < 9; i++) assert.deepEqual([schema.get(`${name}[${i}]`).min, schema.get(`${name}[${i}]`).max], advice.RANGE[name], `${name}[${i}]`);
+            continue;
+        }
+        assert.equal(P[3], field(name).default, `${name} default`);
+        assert.deepEqual(advice.RANGE[name], [field(name).min, field(name).max], `${name} range`);
+    }
+    // the log header has govPID (P, I, D, F, gain) and yaw_tta (gain, limit) only (blackbox.c:1668-1699)
+    for (const [name, key, i] of [['gov_p_gain', 'govPID', 0], ['gov_i_gain', 'govPID', 1], ['gov_d_gain', 'govPID', 2], ['gov_f_gain', 'govPID', 3], ['gov_gain', 'govPID', 4], ['gov_tta_gain', 'yaw_tta', 0], ['gov_tta_limit', 'yaw_tta', 1]])
+        assert.deepEqual(advice.PARAMS[name].slice(1, 3), [key, i], name);
+    assert.ok(GOV_NAMES.every(g => advice.PARAMS[g.name][1] === null || /^gov_(gain|[pidf]_gain|tta_gain|tta_limit)$/.test(g.name)), 'no other header key');
+});
+
+test('exportScript: governor changes of a PID profile and global governor changes, with their comment lines', () => {
+    const GOV_I = { id: 'GT:gov_i_gain:p2', severity: 'action', scope: 'profile', profile: 2, cliProfile: 1, title: 'Decrease the governor I gain', parameter: 'gov_i_gain', from: 50, to: 40,
+        cli: ['profile 1', 'set gov_i_gain = 40', 'set gov_use_fallback_precomp = ON', 'set gov_headspeed = 2400'], fromSets: { gov_i_gain: 50, gov_use_fallback_precomp: 'OFF', gov_headspeed: 2300 },
+        fromSources: { gov_i_gain: 'log header, PID profile 2 at the start of the log', gov_use_fallback_precomp: 'CLI dump, section `profile 1`', gov_headspeed: 'CLI dump, section `profile 1`' },
+        evidence: [{ id: 'G9', fid: 'g9a', log: 3, profile: 2, value: 0.031, se: 0.004, display: { value: '3.1 ± 0.4 %', bound: '2 %' } }],
+        rule: 'The headspeed error in the model must decrease by more than 2 SE.', blockedBy: [], causes: [], caveats: [] };
+    const GLOBAL = { id: 'GT:global', severity: 'action', scope: 'global', profile: null, title: 'Set the governor mode and the throttle curve', parameter: 'gov_mode', from: 'DIRECT', to: 'ELECTRIC',
+        cli: ['set gov_mode = ELECTRIC', 'set gov_throttle_type = FUNCTION', 'set gov_bypass_throttle = 0,25,50,75,100,125,150,175,200', 'set gov_recovery_time = 20'],
+        fromSets: { gov_mode: 'DIRECT', gov_throttle_type: 'NORMAL', gov_bypass_throttle: '0,0,0,0,0,0,0,0,0' }, fromSource: 'CLI dump',
+        evidence: [], rule: 'The headspeed error in the model must decrease by more than 2 SE.', blockedBy: [], causes: [], caveats: [] };
+    // GOV_I also sets gov_headspeed: a headspeed change is never selected first (the decision of the pilot, user 2026-10-15)
+    assert.deepEqual(advice.defaultPicks([GOV_I, GLOBAL]), [GLOBAL.id], 'the changes with CLI text are selected, but not a headspeed change');
+    const text = advice.exportScript([GOV_I, GLOBAL], [GOV_I.id, GLOBAL.id], { activeProfile: 0, date: '2026-10-14' });
+    assert.deepEqual(commands(text), ['batch start', 'profile 1', 'set gov_i_gain = 40', 'set gov_use_fallback_precomp = ON', 'set gov_headspeed = 2400',
+        'set gov_mode = ELECTRIC', 'set gov_throttle_type = FUNCTION', 'set gov_bypass_throttle = 0,25,50,75,100,125,150,175,200', 'set gov_recovery_time = 20', 'profile 0', 'save']);
+    assert.match(text, /# Change 1 of 2: Decrease the governor I gain\n#   Recommendation `GT:gov_i_gain:p2`\.\n#   PID profile 2, CLI `profile 1`\.\n/);
+    assert.match(text, /#   `gov_i_gain`: from 50 to 40 \(the value at this time is from the log header, PID profile 2 at the start of the log\)\.\n/);
+    assert.match(text, /#   `gov_use_fallback_precomp`: from OFF to ON \(the value at this time is from the CLI dump, section `profile 1`\)\.\n/);
+    assert.match(text, /#   `gov_headspeed`: from 2300 to 2400 \(the value at this time is from the CLI dump, section `profile 1`\)\.\n/);
+    assert.match(text, /#   Result of check G9 \(log 3, PID profile 2\), `g9a`: the value is 3\.1 ± 0\.4 %\.\n#   The limit is 2 %\.\n#   Rule: The headspeed error in the model must decrease by more than 2 SE\.\n/);
+    assert.match(text, /# Change 2 of 2: Set the governor mode and the throttle curve\n#   Recommendation `GT:global`\.\n#   Global value \(all PID profiles\)\.\n/);
+    assert.match(text, /#   `gov_mode`: from DIRECT to ELECTRIC \(the value at this time is from the CLI dump\)\.\n#   `gov_throttle_type`: from NORMAL to FUNCTION \(the value at this time is from the CLI dump\)\.\n/);
+    assert.match(text, /#   `gov_bypass_throttle`: from 0,0,0,0,0,0,0,0,0 to 0,25,50,75,100,125,150,175,200 \(the value at this time is from the CLI dump\)\.\n#   `gov_recovery_time`: set to 20\. The previous value is unknown\.\n/);
+    assert.match(text, /# PID profile 2\nprofile 1\n[\s\S]*# Global values\nset gov_mode = ELECTRIC\n/);
+    assert.match(text, /# Select PID profile 1 again, as before the changes\.\nprofile 0\nsave$/);
+    // the scopes of settings.c: a global name under `profile N` and a PID profile name without it are refused
+    assert.match(flat(advice.exportScript([Object.assign({}, GOV_I, { cli: ['profile 1', 'set gov_rpm_filter = 15'] })], [GOV_I.id], {})), /`gov_rpm_filter` is not a PID profile value\./);
+    assert.match(flat(advice.exportScript([Object.assign({}, GLOBAL, { cli: ['set gov_use_voltage_comp = ON'] })], [GLOBAL.id], {})), /`gov_use_voltage_comp` is not a global value\./);
+});
+
+test('exportScript: governor values: the CLI words of settings.c, the 9 points of gov_bypass_throttle, and the firmware ranges', () => {
+    const base = { title: 'X', severity: 'action', evidence: [], blockedBy: [], causes: [] };
+    const one = (name, v) => { const g = GOV_NAMES.find(x => x.name === name), cli = `set ${name} = ${v}`;
+        return advice.exportScript([Object.assign({ id: 'x' }, base, g.scope === 'profile' ? { scope: 'profile', profile: 3, cliProfile: 2, cli: ['profile 2', cli] } : { scope: 'global', profile: null, cli: [cli] })], ['x'], {}); };
+    const ok = (name, v) => { const t = one(name, v); assert.ok(commands(t).includes(`set ${name} = ${v}`), `${name} = ${v}: ${flat(t)}`); };
+    // the reason of each refusal is its own (review of 2026-10-14): the words, the 9 points, the range. A governor name has no filter limit
+    const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const reason = (name) => GOV_WORDS[name] ? new RegExp(esc(`The value of \`${name}\` must be one of these words: ${GOV_WORDS[name].map(w => `\`${w}\``).join(', ')}.`))
+        : name === 'gov_bypass_throttle' ? /Each of the 9 numbers of `gov_bypass_throttle` must be from 0 to 200, in steps of 1\./
+        : new RegExp(esc(`The value of \`${name}\` must be from ${name === 'gov_headspeed' ? advice.RULES.govHeadspeedMin : advice.RANGE[name][0]} to ${advice.RANGE[name][1]}, in steps of 1.`));
+    const refused = (name, v, re) => { const t = one(name, v); assert.deepEqual(commands(t), [], `${name} = ${v}`); assert.match(flat(t), re || reason(name), `${name} = ${v}`);
+        assert.doesNotMatch(flat(t), /filter limit/, `${name} = ${v}`); };
+    // the words: each word of its table, and no other (a number, lower case, the NONE of other tools, a word of another table)
+    for (const [name, words] of Object.entries(GOV_WORDS)) {
+        for (const w of words) ok(name, w);
+        for (const w of ['0', '1', '3', words[words.length - 1].toLowerCase(), 'NONE', 'TRUE', 'AUTO', `${words[0]},${words[0]}`]) refused(name, w);
+    }
+    refused('gov_mode', 'ON'); refused('gov_use_pid_spoolup', 'ELECTRIC'); refused('gov_throttle_type', 'OFF');
+    // gov_bypass_throttle: exactly 9 integers, each 0-200 (0.5 % of throttle)
+    ok('gov_bypass_throttle', '0,0,0,0,0,0,0,0,0'); ok('gov_bypass_throttle', '200,200,200,200,200,200,200,200,200'); ok('gov_bypass_throttle', '0,20,40,70,100,130,160,180,200');
+    refused('gov_bypass_throttle', '0,20,40,70,100,130,160,180', /The value of `gov_bypass_throttle` must have 9 numbers, one for each point of the throttle curve\./);
+    refused('gov_bypass_throttle', '0,20,40,70,100,130,160,180,200,200', /must have 9 numbers, one for each point of the throttle curve/);
+    refused('gov_bypass_throttle', '0,20,40,70,100,130,160,180,201'); refused('gov_bypass_throttle', '-1,20,40,70,100,130,160,180,200'); refused('gov_bypass_throttle', '0,20,40,70,100.5,130,160,180,200');
+    // the numbers: both limits of RANGE, and nothing out of them or not an integer
+    const numeric = GOV_NAMES.filter(g => g.mode === 'MODE_DIRECT');
+    assert.equal(numeric.length, 35);
+    // gov_headspeed: the governor uses RULES.govHeadspeedMin for a smaller value (flight_governor.c:1412, 1592), thus that is its first value
+    const HS = /If `gov_headspeed` is less than 100, the governor uses 100 rpm\. Thus, the value must be from 100 to 50000\./;
+    for (const { name } of numeric) {
+        const [lo0, hi] = advice.RANGE[name], lo = name === 'gov_headspeed' ? advice.RULES.govHeadspeedMin : lo0;
+        ok(name, lo); ok(name, hi);
+        refused(name, lo - 1, name === 'gov_headspeed' ? HS : null); refused(name, hi + 1); refused(name, `${lo}.5`); refused(name, 'ON');
+    }
+    assert.equal(advice.RULES.govHeadspeedMin, 100);
+    refused('gov_headspeed', 0, HS); refused('gov_headspeed', 1, HS); ok('gov_headspeed', 100);
+    // a value out of RANGE gives the range that the export takes: from RULES.govHeadspeedMin, not from the 0 of settings.c
+    refused('gov_headspeed', 50001, /The value of `gov_headspeed` must be from 100 to 50000, in steps of 1\./); refused('gov_headspeed', -5, /must be from 100 to 50000/);
+    assert.deepEqual(['gov_headspeed', 'gov_handover_throttle', 'gov_idle_throttle', 'gov_collective_curve', 'gov_fallback_drop', 'gov_max_throttle', 'gov_startup_time'].map(k => advice.RANGE[k]),
+        [[0, 50000], [10, 100], [0, 250], [5, 40], [0, 50], [10, 100], [0, 600]]);
+});
+
+// The governor values that depend on other values (review of 2026-10-14). The firmware changes them with no CLI error when it
+// starts (validateAndFixGovernorConfig) and when it selects a PID profile with gov_mode not OFF (validateAndFixGovernorProfile):
+// a selected set of changes that gives such a value is not in the file; a rule with an unknown value gives a comment line.
+// GOVERNOR_C: the vendor copy of release/4.6.0 (above), the same as test/fixtures/rotorflight-4.6/flight_governor.c
+test('exportScript: governor values that depend on other values: the firmware rules of flight_governor.c, over all selected changes', () => {
+    // the rules that the export copies, as the pinned firmware has them
+    for (const re of [/const int maxIdle = constrain\(governorConfig\(\)->gov_handover_throttle \* 10 - 1, 0, 250\);/, /autoThrottle = constrain\(autoThrottle, idleThrottle, maxIdle\);/,
+        /maxThrottle = constrain\(maxThrottle, governorConfig\(\)->gov_handover_throttle, 100\);/, /minThrottle = constrain\(minThrottle, 10, maxThrottle\);/,
+        /if \(governorConfig\(\)->gov_mode < GOV_MODE_ELECTRIC\) \{\s*if \(governorConfig\(\)->gov_throttle_type == GOV_THROTTLE_SWITCH\)/,
+        /if \(governorConfig\(\)->gov_mode < GOV_MODE_ELECTRIC\) \{\s*CLEAR_BIT\(pidProfile->governor\.flags,/, /if \(gov\.govMode\)\s*\{\s*validateAndFixGovernorProfile\(\);/])
+        assert.match(GOVERNOR_C, re);
+    assert.equal(advice.RULES.govIdleScale, 10); assert.deepEqual(advice.RULES.govFullModes, ['ELECTRIC', 'NITRO']);
+    const base = { evidence: [], blockedBy: [], causes: [], caveats: [] };
+    const g = (id, cli, extra) => Object.assign({ id, title: `Change ${id}`, severity: 'action', scope: 'global', profile: null, cli }, base, extra || {});
+    const p = (id, prof, cli, extra) => Object.assign({ id, title: `Change ${id}`, severity: 'action', scope: 'profile', profile: prof, cliProfile: prof - 1, cli: [`profile ${prof - 1}`].concat(cli) }, base, extra || {});
+    // the present values: rows that are not selected (their fromSets), as gov_tune.cjs gives them
+    const now = (sets, prof) => Object.assign({ id: `now${prof || ''}`, title: 'Present values', severity: 'info', scope: prof ? 'profile' : 'global', profile: prof || null, cli: [], fromSets: sets }, base);
+    const all = (sets) => [1, 2, 3, 4, 5, 6].map(q => now(sets, q));
+    const PRESENT = [now({ gov_mode: 'ELECTRIC', gov_throttle_type: 'NORMAL', gov_handover_throttle: 25, gov_idle_throttle: 0, gov_auto_throttle: 0 })]
+        .concat(all({ gov_max_throttle: 100, gov_min_throttle: 10, gov_use_fallback_precomp: 'OFF', gov_use_voltage_comp: 'OFF', gov_use_pid_spoolup: 'OFF', gov_use_dyn_min_throttle: 'OFF' }));
+    const run = (recs, picks, present = PRESENT) => advice.exportScript(present.concat(recs), picks || recs.map(r => r.id), {});
+    const notIn = (t, id) => { const m = new RegExp(`Not in the file: Change ${id} \\(\`${id}\`\\)\\. (.*?)(?= Not in the file: | This file has no commands\\.|\\n|$)`).exec(flat(t)); return m ? m[1] : ''; };
+
+    // the probe of the review: three changes, each of them gives a value that the firmware changes. None goes into the file
+    let t = run([g('G1', ['set gov_handover_throttle = 20', 'set gov_idle_throttle = 250', 'set gov_auto_throttle = 100']),
+        p('P1', 1, ['set gov_max_throttle = 15', 'set gov_min_throttle = 50', 'set gov_use_voltage_comp = ON']), g('G2', ['set gov_mode = LIMIT', 'set gov_throttle_type = SWITCH'])], null, []);
+    assert.deepEqual(commands(t), []);
+    assert.match(notIn(t, 'G1'), /^The flight controller keeps `gov_idle_throttle` at `10 × gov_handover_throttle - 1` or less\. With the selected changes, `gov_idle_throttle` is 250 and `gov_handover_throttle` is 20\. Thus, the flight controller changes `gov_idle_throttle` to 199 when it starts\. The CLI does not show an error\./);
+    assert.match(notIn(t, 'P1'), /`gov_max_throttle` \(PID profile 1\) is 15 and `gov_handover_throttle` is 20\. Thus, the flight controller changes `gov_max_throttle` \(PID profile 1\) to 20 when it selects this PID profile\./);
+    assert.match(notIn(t, 'G2'), /^If `gov_mode` is `OFF`, `LIMIT` or `DIRECT`, the flight controller changes `gov_throttle_type` from `SWITCH` to `NORMAL`\. With the selected changes, `gov_throttle_type` is `SWITCH` and `gov_mode` is `LIMIT`\./);
+
+    // gov_idle_throttle and gov_auto_throttle: 10 x gov_handover_throttle - 1 or less (and 250)
+    for (const k of ['gov_idle_throttle', 'gov_auto_throttle']) {
+        const at = (h, v) => run([g('X', [`set ${k} = ${v}`])], null, [now({ gov_mode: 'ELECTRIC', gov_handover_throttle: h, gov_idle_throttle: 0, gov_auto_throttle: 250 })]);
+        t = at(25, 250); assert.deepEqual(commands(t), [], k); assert.match(notIn(t, 'X'), new RegExp(`changes \`${k}\` to 249 when it starts`));
+        assert.deepEqual(commands(at(25, 249)), ['batch start', `set ${k} = 249`, 'save'], k);
+        assert.deepEqual(commands(at(26, 250)), ['batch start', `set ${k} = 250`, 'save'], k);
+        assert.deepEqual(commands(at(10, 100)), [], k); assert.deepEqual(commands(at(10, 99)), ['batch start', `set ${k} = 99`, 'save'], k);
+    }
+    // gov_auto_throttle: gov_idle_throttle or more
+    t = run([g('A', ['set gov_auto_throttle = 40'])], null, [now({ gov_mode: 'ELECTRIC', gov_handover_throttle: 25, gov_idle_throttle: 50, gov_auto_throttle: 60 })]);
+    assert.deepEqual(commands(t), []); assert.match(notIn(t, 'A'), /keeps `gov_auto_throttle` at `gov_idle_throttle` or more\..*changes `gov_auto_throttle` to 50 when it starts\./);
+    assert.deepEqual(commands(run([g('A', ['set gov_auto_throttle = 50'])], null, [now({ gov_mode: 'ELECTRIC', gov_handover_throttle: 25, gov_idle_throttle: 50, gov_auto_throttle: 60 })])),
+        ['batch start', 'set gov_auto_throttle = 50', 'save']);
+
+    // gov_max_throttle: gov_handover_throttle or more, in each PID profile; gov_min_throttle: gov_max_throttle or less
+    t = run([p('M', 3, ['set gov_max_throttle = 24'])]); assert.deepEqual(commands(t), []);
+    assert.match(notIn(t, 'M'), /`gov_max_throttle` \(PID profile 3\) is 24 and `gov_handover_throttle` is 25\. Thus, the flight controller changes `gov_max_throttle` \(PID profile 3\) to 25 when it selects this PID profile\./);
+    assert.deepEqual(commands(run([p('M', 3, ['set gov_max_throttle = 25'])])), ['batch start', 'profile 2', 'set gov_max_throttle = 25', 'save']);
+    const with2 = (sets) => PRESENT.map(r => r.profile === 2 ? Object.assign({}, r, { fromSets: Object.assign({}, r.fromSets, sets) }) : r);
+    t = run([p('N', 2, ['set gov_min_throttle = 60'])], null, with2({ gov_max_throttle: 50 }));
+    assert.deepEqual(commands(t), []); assert.match(notIn(t, 'N'), /keeps `gov_min_throttle` at `gov_max_throttle` or less\..*changes `gov_min_throttle` \(PID profile 2\) to 50 when it selects this PID profile\./);
+    assert.deepEqual(commands(run([p('N', 2, ['set gov_min_throttle = 60']), p('O', 2, ['set gov_max_throttle = 60'])], null, with2({ gov_max_throttle: 50 }))),
+        ['batch start', 'profile 1', 'set gov_min_throttle = 60', 'set gov_max_throttle = 60', 'save'], 'the two changes together');
+    // a handover change applies to gov_max_throttle of each PID profile
+    t = run([g('H', ['set gov_handover_throttle = 40'])], null, PRESENT.map(r => r.profile === 5 ? Object.assign({}, r, { fromSets: Object.assign({}, r.fromSets, { gov_max_throttle: 35 }) }) : r));
+    assert.deepEqual(commands(t), []); assert.match(notIn(t, 'H'), /`gov_max_throttle` \(PID profile 5\) is 35 and `gov_handover_throttle` is 40\./);
+
+    // the four gov_use_* flags: OFF with gov_mode LIMIT or DIRECT. With gov_mode OFF, the firmware does not change the PID profile values
+    t = run([p('F', 2, ['set gov_use_voltage_comp = ON']), g('D', ['set gov_mode = DIRECT'])]);
+    assert.deepEqual(commands(t), []);
+    for (const id of ['F', 'D']) assert.match(notIn(t, id), /^If `gov_mode` is `LIMIT` or `DIRECT`, the flight controller sets `gov_use_voltage_comp` to `OFF`\. With the selected changes, `gov_use_voltage_comp` \(PID profile 2\) is `ON` and `gov_mode` is `DIRECT`\. Thus, the flight controller changes `gov_use_voltage_comp` \(PID profile 2\) to `OFF` when it selects this PID profile\./, id);
+    assert.deepEqual(commands(run([p('F', 2, ['set gov_use_voltage_comp = ON'])])), ['batch start', 'profile 1', 'set gov_use_voltage_comp = ON', 'save'], 'ELECTRIC');
+    assert.deepEqual(commands(run([p('F', 2, ['set gov_use_voltage_comp = ON']), g('O', ['set gov_mode = OFF'])])),
+        ['batch start', 'profile 1', 'set gov_use_voltage_comp = ON', 'set gov_mode = OFF', 'save'], 'gov_mode OFF keeps the flags');
+    assert.deepEqual(commands(run([g('D', ['set gov_mode = DIRECT'])])), ['batch start', 'set gov_mode = DIRECT', 'save'], 'all flags OFF, NORMAL: nothing changes');
+    // gov_throttle_type SWITCH: ELECTRIC or NITRO only
+    for (const [mode, n] of [['LIMIT', 0], ['OFF', 0], ['DIRECT', 0], ['ELECTRIC', 3], ['NITRO', 3]])
+        assert.equal(commands(run([g('S', ['set gov_throttle_type = SWITCH'])], null, [now({ gov_mode: mode })])).length, n, mode);
+
+    // a refused change gives back the present value, and a different rule can then fail: until no rule fails
+    t = run([g('H', ['set gov_handover_throttle = 20']), g('I', ['set gov_idle_throttle = 220']), p('M', 2, ['set gov_max_throttle = 22'])]);
+    assert.deepEqual(commands(t), []);
+    assert.match(notIn(t, 'H'), /`gov_idle_throttle` is 220 and `gov_handover_throttle` is 20\./); assert.match(notIn(t, 'I'), /`gov_idle_throttle` is 220 and `gov_handover_throttle` is 20\./);
+    assert.match(notIn(t, 'M'), /`gov_max_throttle` \(PID profile 2\) is 22 and `gov_handover_throttle` is 25\./, 'without the change of H, the handover is 25');
+
+    // an unknown value: the change stays, and its comment lines give the rule and the condition
+    t = run([p('M', 3, ['set gov_max_throttle = 97'])], null, []);
+    assert.deepEqual(commands(t), ['batch start', 'profile 2', 'set gov_max_throttle = 97', 'save']);
+    assert.match(t, /#   `gov_max_throttle`: set to 97\. The previous value is unknown\.\n#   The flight controller keeps `gov_max_throttle` at `gov_handover_throttle` or more\.\n#   The value of `gov_handover_throttle` is unknown\.\n#   Before you use this change, make sure that `gov_handover_throttle` is 97 or less\.\n/);
+    assert.match(t, /#   The value of `gov_min_throttle` \(PID profile 3\) is unknown\.\n#   Before you use this change, make sure that `gov_min_throttle` \(PID profile 3\) is 97 or less\.\n/);
+    assert.doesNotMatch(run([p('M', 3, ['set gov_max_throttle = 97'])]), /is unknown\.\n#   Before you use/, 'the present values are known');
+    t = run([g('H', ['set gov_handover_throttle = 30'])], null, [now({ gov_mode: 'ELECTRIC', gov_handover_throttle: 25, gov_idle_throttle: 0, gov_auto_throttle: 0 }), now({ gov_max_throttle: 100 }, 1)]);
+    assert.match(flat(t), /The value of `gov_max_throttle` \(PID profiles 2, 3, 4, 5 and 6\) is unknown\. Before you use this change, make sure that `gov_max_throttle` \(PID profiles 2, 3, 4, 5 and 6\) is 30 or more\./);
+    assert.deepEqual(commands(t), ['batch start', 'set gov_handover_throttle = 30', 'save']);
+    // a lower handover keeps gov_max_throttle (the firmware kept it at the present handover or more), but not gov_idle_throttle
+    t = run([g('H', ['set gov_handover_throttle = 20'])], null, [now({ gov_mode: 'ELECTRIC', gov_handover_throttle: 25 })]);
+    assert.doesNotMatch(flat(t), /gov_max_throttle/); assert.match(flat(t), /make sure that `gov_idle_throttle` is 199 or less\./);
+    // a present value from a row (parameter and from) counts; two different present values are unknown
+    const row = (k, v, prof) => Object.assign({ id: `row:${k}:${v}`, title: k, severity: 'info', scope: prof ? 'profile' : 'global', profile: prof || null, parameter: k, from: v, cli: [] }, base);
+    assert.deepEqual(commands(run([g('I', ['set gov_idle_throttle = 250'])], null, [row('gov_handover_throttle', 25), row('gov_auto_throttle', 250)])), []);
+    t = run([g('I', ['set gov_idle_throttle = 250'])], null, [row('gov_handover_throttle', 25), row('gov_handover_throttle', 30), row('gov_auto_throttle', 250)]);
+    assert.deepEqual(commands(t), ['batch start', 'set gov_idle_throttle = 250', 'save']); assert.match(flat(t), /make sure that `gov_handover_throttle` is 26 or more\./);
+    // a word as its index (the schema and the log header give numbers), a flag as a boolean
+    assert.deepEqual(commands(run([p('F', 2, ['set gov_use_pid_spoolup = ON'])], null, [row('gov_mode', 2)])), []);
+    assert.deepEqual(commands(run([g('D', ['set gov_mode = LIMIT'])], null, [row('gov_throttle_type', 1)].concat([1, 2, 3, 4, 5, 6].map(q => now({ gov_use_fallback_precomp: false, gov_use_voltage_comp: 0, gov_use_pid_spoolup: 'off', gov_use_dyn_min_throttle: 'OFF' }, q))))), []);
+});
+
+test('exportScript: a governor check with CLI text and optIn goes into the file only when the pilot selects it (gov_bypass_throttle, docs/GOVERNOR_AUTOTUNE.md section 5)', () => {
+    const B = { id: 'gov:bypass', title: 'Throttle curve for BYPASS', severity: 'check', optIn: true, scope: 'global', profile: null, parameter: 'gov_bypass_throttle', from: '0,0,0,0,0,0,0,0,0',
+        fromSets: { gov_bypass_throttle: '0,0,0,0,0,0,0,0,0' }, fromSource: 'CLI dump', cli: ['set gov_bypass_throttle = 0,25,50,75,100,125,150,175,200'], evidence: [], blockedBy: [], causes: [], caveats: [] };
+    assert.deepEqual(advice.defaultPicks([B]), [], 'not selected by default');
+    assert.equal(advice.script([B]), '', 'the report has no CLI file of it');
+    const t = advice.exportScript([B], [B.id], {});
+    assert.deepEqual(commands(t), ['batch start', 'set gov_bypass_throttle = 0,25,50,75,100,125,150,175,200', 'save']);
+    assert.match(t, /# Change 1 of 1: Throttle curve for BYPASS\n#   Recommendation `gov:bypass`\.\n#   Global value \(all PID profiles\)\.\n#   `gov_bypass_throttle`: from 0,0,0,0,0,0,0,0,0 to 0,25,50,75,100,125,150,175,200 \(the value at this time is from the CLI dump\)\.\n/);
+    // without optIn, a check stays out of the file; a watch or information with optIn too
+    for (const r of [Object.assign({}, B, { optIn: undefined }), Object.assign({}, B, { severity: 'watch' }), Object.assign({}, B, { severity: 'info' })])
+        assert.match(flat(advice.exportScript([r], [r.id], {})), /Not in the file: Throttle curve for BYPASS \(`gov:bypass`\)\. It is not a change\./);
+    assert.match(flat(advice.exportScript([Object.assign({}, B, { blockedBy: ['rpm'] })], [B.id], {})), /A step before it in the tuning sequence has a problem\./);
 });
 
 test('exportScript: a change with values that are possibly not current (r.stale) stays selected, and a comment line before its commands gives the flag (CLAUDE.md)', () => {
@@ -1879,6 +2108,139 @@ test('G1 at an overload of G19 (rule K22): overload context cannot clear the RPM
     assert.deepEqual(g1s(other).map(x => [x.id, x.severity]), [['G1', 'check']]);
 });
 
+// G21 (health_gov judge, analysis/rpm-spikes): the sudden changes of the headspeed signal at the throttle maximum of PID profile 2 of the
+// Fireball dump 2026-10-05: 6 of 7 at 100 %, in 1.56 % of the time. demand: the governor command in ACTIVE, 0.5 % bins from 85 %
+const G21_DEMAND = { from: 85, step: 0.5, s: Array.from({ length: 51 }, (_, j) => j >= 24 && j < 31 ? 1 : j < 24 ? 10 : 0) };   // 7 s at 97 % or more
+const G21F = (o = {}) => f(Object.assign({ module: 'gov', id: 'G21', log: [11, 13, 14], profile: 2, value: 6, se: null, n: 7, unit: 'count', threshold: { minSpikes: 3, maxP: 0.001, rateRatio: 10, margin: 3, source: 'pipeline, unvalidated' },
+    atMax: 6, spikes: 7, atMaxS: 23.4, belowS: 1472.6, governedS: 1496, share: 0.01564, p: 1.2e-10, rateAtMax: 15.38, rateBelow: 0.0407, basis: 'profile',
+    pooled: { k: 6, N: 7, atMaxS: 23.4, governedS: 1496, share: 0.01564, p: 1.2e-10, pass: true }, flights: 3, activeS: 1400,
+    ceilings: [11, 13, 14].map(log => ({ log, value: 100, kind: 'pile', source: 'calculated from the log: motor[0] stays at 100 % in 1608 of 1608 samples while the governor command is more.' })),
+    fallbacks: { n: 3, atMax: 3, afterSpike: 3 }, demand: G21_DEMAND, events: [{ log: 11, t: 54.621, kind: 'spike', atMax: true, rate: 293.1 }, { log: 11, t: 54.622, kind: 'FALLBACK', atMax: true }],
+    text: 'At the throttle maximum (100 %), the headspeed signal has 6 sudden changes in 23.4 s.' }, o));
+
+test('G21: sudden changes at the throttle maximum give gov_max_throttle = the maximum - 3 with CLI text, and a check of the RPM signal', () => {
+    // the present value from the maximum that the analysis calculates from the logs (the pile of motor[0]), no CLI dump
+    const out = run([G21F()]), r = only(out, 'G21:gov_max_throttle'), sig = only(out, 'G21:signal');
+    assert.deepEqual([r.id, r.node, r.area, r.severity, r.profile, r.from, r.to, r.direction], ['G21:gov_max_throttle:p2', 'rpm', 'governor', 'action', 2, 100, 97, 'lower']);
+    assert.deepEqual(r.cli, ['profile 1', 'set gov_max_throttle = 97']); assert.deepEqual([r.blockedBy, r.gate], [[], null]);
+    assert.match(r.fromSource, /^the throttle maximum that the analysis calculates from the logs: motor\[0\] stays at 100 % while the governor command is more$/);
+    assert.match(r.text, /At the throttle maximum of 100 %, the headspeed signal has 6 sudden changes in 23\.4 s \(logs 11, 13 and 14, PID profile 2\)\. With the throttle less than the maximum, it has 1 sudden change in 1472\.6 s\./);
+    assert.match(r.text, /The test value is `P\(X >= 6\) = [\d.e-]+` for `X ~ Binomial\(7, 0\.0156\d*\)`\. In each minute, the rate is 15\.38 at the maximum and 0\.041 at less than the maximum\./);
+    // the FALLBACK entries in the words of checks G20 and G21 (review 2026-10-15: "30 ms or less after" against "50 ms before")
+    assert.match(r.text, /Of the 3 FALLBACK entries, 3 start at the throttle maximum and 3 start during a sudden change or 30 ms or less after its end\./);
+    // the time at the new maximum and at the maximum now, each with its value (review 2026-10-15: "At this time" read as the 2.33 s)
+    assert.match(r.text, /With a maximum of 97 %, the throttle stays less than the governor command for 2\.33 s in each flight of these logs\. With the maximum of 100 %, the throttle is at its maximum for 7\.8 s in each flight\./);
+    assert.doesNotMatch(r.text, /At this time, the throttle/);
+    assert.match(r.text, /Set gov_max_throttle on PID profile 2 from 100 to 97 \(the throttle maximum that the analysis calculates from the logs/);
+    assert.match(r.rule, /^Check G21 has a problem if 3 or more sudden changes of the headspeed signal come at the throttle maximum\. Their test value `p` must be less than `0\.001`\./);
+    assert.match(r.rule, /A lower throttle limit keeps the throttle out of the band where the RPM signal has errors\. The step is 3 %\./);
+    assert.ok(r.sources.some(x => /0 sudden changes in 54 s at 95 % to 99\.5 % throttle/.test(x)), 'the evidence of the margin');
+    assert.equal(r.evidence[0].id, 'G21');
+    assert.deepEqual([sig.severity, sig.cli, sig.node], ['check', [], 'rpm']);
+    assert.match(sig.text, /Make sure that the RPM sensor wire is not near the motor wires or the battery wires\./);
+    assert.match(sig.text, /If the RPM signal comes from a frequency sensor input, examine `freq_input_pull`, `freq_input_edge` and `freq_input_minhz`\./);
+    // the raw RPM (review 2026-10-15): debug[0] of RPM_SOURCE is the motor speed before its filter (motors.c:310), so the times of the
+    // sudden changes, never the values; the log header tells if the log records it (debug_mode 47 is RPM_SOURCE in 4.6)
+    assert.match(sig.text, /If `debug_mode` is not `RPM_SOURCE`, set it to `RPM_SOURCE` for one flight\. Then, in the log viewer, compare the times of the sudden changes of `debug\[0\]` and of the headspeed\./);
+    assert.match(sig.text, /`debug\[0\]` is the motor speed before its filter\. Thus, compare only the times, not the values\./);
+    assert.doesNotMatch(sig.text, /compare the `debug` values with the headspeed/);
+    const sigOf = (mode) => only(run([G21F()], { header: Object.assign({}, HEADER, { debug_mode: mode }) }), 'G21:signal').text;
+    assert.match(sigOf(0), /The log does not record the raw RPM, because `debug_mode` is not `RPM_SOURCE`\. To record the raw RPM, set `debug_mode` to `RPM_SOURCE` for one flight\. Then, in the log viewer, compare/);
+    assert.match(sigOf(47), /The log records the raw RPM in `debug\[0\]`, because `debug_mode` is `RPM_SOURCE`\. In the log viewer, compare the times/);
+    assert.doesNotMatch(sigOf(47), /set `debug_mode`/);
+    assert.doesNotMatch(sig.text, /do the analysis again/, 'no module reads the debug fields (review 2026-10-15)');
+    assert.match(sig.text, /The gear ratios in the configuration are correct\./); assert.doesNotMatch(sig.text + r.text, /pulley|tooth|gear ratio is|change the gear/i);
+    // the CLI section of PID profile 2 gives the present value; a CLI value under the recorded throttle is not used
+    const cli = (v) => setup.parseCli(`${CLI_TEXT}\nprofile 1\nset gov_max_throttle = ${v}\n`);
+    const c = only(run([G21F({ ceilings: [{ log: 11, value: 98, kind: 'cli', source: 'CLI gov_max_throttle' }] })], { cli: cli(98) }), 'G21:gov_max_throttle');
+    assert.deepEqual([c.from, c.to, c.cli], [98, 95, ['profile 1', 'set gov_max_throttle = 95']]); assert.match(c.fromSource, /CLI dump/);
+    // a CLI value that the log contradicts: the value of the log is the present value (review 2026-10-15), with no CLI text
+    const old = only(run([G21F()], { cli: cli(90) }), 'G21:gov_max_throttle');
+    assert.deepEqual(old.cli, []); assert.match(old.caveats.join(' '), /The CLI value of gov_max_throttle is 90, but the log shows the throttle at 100 %\. Thus, there is no CLI text\./);
+    assert.deepEqual([old.from, old.to], [100, 97]); assert.match(old.text, /\nAt the throttle maximum of 100 %, the headspeed signal has 6 sudden changes/);
+    assert.match(old.text, /The analysis gives a change of gov_max_throttle on PID profile 2 from 100 to 97 \(the throttle maximum that the analysis calculates from the logs/);
+    assert.match(old.fromSource, /^the throttle maximum that the analysis calculates from the logs/); assert.doesNotMatch(old.text, /from 90 to 87|maximum of 87 %/);
+    // the maximum from motor[0] at 99.5 % or more (kind 'top'): an STE text (review 2026-10-15: no "whole percent")
+    const top = only(run([G21F({ ceilings: [11, 13, 14].map(log => ({ log, value: 100, kind: 'top', source: 'calculated from the log' })) })]), 'G21:gov_max_throttle');
+    assert.deepEqual([top.from, top.to, top.cli], [100, 97, ['profile 1', 'set gov_max_throttle = 97']]);
+    assert.equal(top.fromSource, 'the throttle maximum that the analysis calculates from the logs: motor[0] gets to 99.5 % or more');
+    assert.doesNotMatch(top.text + advice.exportScript([top], [top.id], { date: '2026-10-15' }), /whole/, 'STE: no "whole percent"');
+    // no govSum: the step that records it
+    const noSum = only(run([G21F({ demand: null })]), 'G21:gov_max_throttle');
+    assert.match(noSum.text, /The log does not record govSum\. Thus, the analysis cannot calculate the time with the governor command at 97 % or more\. To record govSum, set `blackbox_log_governor` to ON\./);
+    // different maximums in the logs, PID profile unknown, a value to monitor (no association), not measured: no CLI text or no recommendation
+    const two = only(run([G21F({ ceilings: [{ log: 11, value: 95, kind: 'pile' }, { log: 13, value: 100, kind: 'pile' }] })]), 'G21:gov_max_throttle');
+    assert.deepEqual(two.cli, []); assert.match(two.caveats.join(' '), /The logs show different throttle maximums of 95 % and 100 %\./);
+    assert.deepEqual(only(run([G21F({ profile: 0 })]), 'G21:gov_max_throttle').cli, [], 'PID profile unknown');
+    // two configurations of PID profile 2 (the worker pools by configuration): one recommendation with the sums; the second has 1 change
+    // at its maximum (basis pooled), but the sums pass the test alone: no text of the test of all PID profiles
+    const cfg = only(run([G21F({ fid: 'b', log: [11, 13], value: 5, n: 5, atMaxS: 13.1, belowS: 907.2, governedS: 920.3 }),
+        G21F({ fid: 'e', log: [14], value: 1, n: 1, atMaxS: 3.8, belowS: 290.2, governedS: 294, basis: 'pooled', p: 0.0127 })]), 'G21:gov_max_throttle');
+    assert.deepEqual([cfg.to, cfg.cli], [97, ['profile 1', 'set gov_max_throttle = 97']]);
+    assert.match(cfg.text, /the headspeed signal has 6 sudden changes in 16\.9 s/); assert.doesNotMatch(cfg.text, /This PID profile has only/);
+    const one = only(run([G21F({ value: 1, n: 1, atMaxS: 3.8, belowS: 290.2, governedS: 294, basis: 'pooled', p: 0.0127 })]), 'G21:gov_max_throttle');
+    assert.match(one.text, /This PID profile has only 1 sudden change at its maximum\. Thus, the test uses all PID profiles together: `P\(X >= 6\) = 1\.2e-10`/);
+    // a PID profile whose results together break the rate rule (the rate under the maximum more than 10 % of the rate at it): no change,
+    // because a lower maximum does not remove most of its errors (review 2026-10-15); the check of the RPM signal stays
+    const mostly = run([G21F({ value: 1, n: 7, atMaxS: 5, belowS: 100, governedS: 105, basis: 'pooled', p: 0.289 })]);
+    assert.deepEqual(recs(mostly, 'G21:gov_max_throttle'), []); assert.equal(only(mostly, 'G21:signal').severity, 'check');
+    assert.deepEqual(recs(run([G21F({ severity: 'note', value: 4, n: 12, basis: null })]), 'G21'), [], 'sudden changes everywhere: a value to monitor, no recommendation');
+    assert.deepEqual(recs(run([G21F({ severity: 'skipped', value: 0, n: 0, atMaxS: 0 })]), 'G21'), []);
+});
+
+// review 2026-10-15: every FALLBACK of PID profile 2 follows 0.17 s to 0.33 s of overload (check G20): the recommendation gives the
+// measured decrease; the linked governor values of the CLI dump (gov_handover_throttle, gov_min_throttle) are known in the CLI file
+test('G21: the overload before the FALLBACK entries (check G20); the linked values of the CLI dump in the CLI file', () => {
+    const fb = (t) => ({ log: 11, t, kind: 'FALLBACK', atMax: true, spike: { t: t - 0.001, dtS: 0.001 } });
+    const g21 = G21F({ events: [{ log: 11, t: 54.621, kind: 'spike', atMax: true, rate: 293.1 }, fb(54.622), fb(159.549), Object.assign(fb(193.686), { log: 14 })] });
+    const ev = (start, seconds, fall) => ({ kind: 'signal', start, causes: ['signal', 'overload'], seconds, value: fall });
+    const g20 = [f({ module: 'rescue', id: 'G20', severity: 'note', profile: null, log: 11, value: 2, n: 2, threshold: { throttleHigh: 950 }, events: [ev(54.622, 0.203, 0.054), ev(159.549, 0.26, 0.102)] }),
+        f({ module: 'rescue', id: 'G20', severity: 'note', profile: null, log: 14, value: 1, n: 1, threshold: { throttleHigh: 950 }, events: [ev(193.686, 0.33, 0.191)] })];
+    const r = only(run([g21].concat(g20)), 'G21:gov_max_throttle');
+    assert.match(r.text, /\nBefore each of the 3 FALLBACK entries, the throttle is at 95 % or more for 0\.2 s to 0\.33 s\. During this period, the headspeed decreases by 5\.4 % to 19\.1 % \(check G20\)\. A lower maximum throttle can make this decrease larger\.\n/);
+    assert.match(only(run([g21, g20[0]]), 'G21:gov_max_throttle').text, /\nBefore 2 of the 3 FALLBACK entries, the throttle is at 95 % or more for 0\.2 s to 0\.26 s\./);
+    assert.doesNotMatch(only(run([g21]), 'G21:gov_max_throttle').text, /During this period/, 'no check G20: no sentence');
+    // the CLI dump (a diff: the defaults 25 and 10 of 4.6) gives the linked values: no "is unknown" in the CLI file, the value and its source
+    const cliOf = (extra) => setup.parseCli(`${CLI_TEXT}${extra || ''}\nprofile 1\nset gov_max_throttle = 100\n`);
+    const out = run([G21F({ ceilings: [{ log: 11, value: 100, kind: 'cli', source: 'CLI gov_max_throttle' }] })], { cli: cliOf() }), c = only(out, 'G21:gov_max_throttle');
+    assert.deepEqual([c.from, c.to, c.linked.gov_handover_throttle.value, c.linked.gov_min_throttle.value], [100, 97, 25, 10], JSON.stringify(c.linked));
+    const text = flat(advice.exportScript(out.recommendations, [c.id], { date: '2026-10-15' }));
+    assert.doesNotMatch(text, /is unknown/);
+    assert.match(text, /The flight controller keeps `gov_max_throttle` at `gov_handover_throttle` or more\. The value of `gov_handover_throttle` is 25 \(the value at this time is from the CLI dump/);
+    assert.match(text, /The flight controller keeps `gov_min_throttle` at `gov_max_throttle` or less\. The value of `gov_min_throttle` \(PID profile 2\) is 10 \(the value at this time is from the CLI dump/);
+    assert.deepEqual(commands(advice.exportScript(out.recommendations, [c.id], { date: '2026-10-15' })), ['batch start', 'profile 1', 'set gov_max_throttle = 97', 'save']);
+    // a linked value of the CLI dump that the change breaks: the firmware changes the value, the change is not in the file
+    const bad = run([G21F({ ceilings: [{ log: 11, value: 100, kind: 'cli', source: 'CLI gov_max_throttle' }] })], { cli: setup.parseCli(`${CLI_TEXT}\nprofile 1\nset gov_max_throttle = 100\nset gov_min_throttle = 99\n`) });
+    const bt = advice.exportScript(bad.recommendations, ['G21:gov_max_throttle:p2'], { date: '2026-10-15' });
+    assert.deepEqual(commands(bt), []); assert.match(flat(bt), /Not in the file: Decrease the maximum throttle .*`gov_min_throttle` \(PID profile 2\) is 99/);
+    // without a CLI dump: unknown, as before
+    assert.match(flat(advice.exportScript(run([G21F()]).recommendations, ['G21:gov_max_throttle:p2'], { date: '2026-10-15' })), /The value of `gov_handover_throttle` is unknown\./);
+});
+
+test('G21: the remedy of the RPM prerequisite: no gate holds it, the other governor changes stay held; the CLI file', () => {
+    const g1 = f({ module: 'gov', id: 'G1', profile: null, value: 3, log: 11, times: [54.622], text: '3 FALLBACK entries' });
+    const g3 = f({ module: 'gov', id: 'G3', governorResponse: GOV_RESPONSE, log: [5], profile: 2, value: 0.07, se: 0.005, text: 'droop 7 %: F too low (GOVT)' });
+    const g21 = G21F(), out = run([g21, g1, g3]), r = only(out, 'G21:gov_max_throttle'), held = only(out, 'G3:');
+    assert.deepEqual([r.cli, r.blockedBy, r.gate, r.holds], [['profile 1', 'set gov_max_throttle = 97'], [], null, []], 'guard 2 and the gates do not hold the remedy of check G21');
+    assert.deepEqual(held.cli, []); assert.match(held.blockedBy.join(' '), /Check G1 shows FALLBACK entries/);
+    assert.ok(held.gate && held.gate.held.includes('rpm'), JSON.stringify(held.gate));
+    if (H) { const st = H.status([g21, g1, g3], out.recommendations);
+        assert.equal(st.nodes.rpm.status, 'problem'); assert.ok(st.nodes.rpm.recs.includes('G21:gov_max_throttle:p2') && st.nodes.rpm.problemFids.includes(g21.fid), JSON.stringify(st.nodes.rpm));
+        assert.deepEqual([st.nodes.governor.status, st.nodes.governor.blockedBy], ['blocked', ['rpm']]); }
+    assert.deepEqual(advice.defaultPicks(out.recommendations), ['G21:gov_max_throttle:p2'], 'the change with CLI text is selected first');
+    const text = advice.exportScript(out.recommendations, null, { date: '2026-10-15' });
+    assert.deepEqual(commands(text), ['batch start', 'profile 1', 'set gov_max_throttle = 97', 'save']);
+    assert.match(flat(text), /Recommendation `G21:gov_max_throttle:p2`\./); assert.match(flat(text), /from 100 to 97/);
+});
+
+test('G1 at an overload of G19 and a sudden change of check G21 (G20 signal): the FALLBACK is an error of the RPM signal, not a result of the load', () => {
+    const g1 = f({ module: 'gov', id: 'G1', profile: null, value: 1, log: 14, times: [193.686], text: '1 FALLBACK entry at 193.686 s (0.213 s long). RPM signal lost or glitching' });
+    const g20 = (kind) => f({ module: 'rescue', id: 'G20', severity: 'note', profile: null, log: 14, value: kind === 'overload' ? 1 : 0, n: 1, events: [{ kind, start: 193.686, causes: kind === 'overload' ? ['overload'] : ['signal', 'overload'] }] });
+    const g1s = (o) => o.recommendations.filter(x => /^G1(:|$)/.test(x.id)).map(x => [x.id, x.severity]);
+    assert.deepEqual(g1s(run([g1, g20('overload')])), [['G1', 'check'], ['G1:overload', 'watch']]);
+    assert.deepEqual(g1s(run([g1, g20('signal')])), [['G1', 'check']], 'a sudden change before the FALLBACK: no overload context');
+});
+
 // findings in the shape that health_limits.cjs judge gives them
 const LM = (id, ch, o) => f(Object.assign({ module: 'limits', id, channel: ch, unit: 's', phase: 'flight', thin: false, se: null, log: 14, profile: 2, limits: { lo: null, hi: 1000, source: 'firmware' } }, o));
 test('L1-L7: one item for each output and PID profile with its periods; a problem is a check, a short period alone a watch; never CLI', () => {
@@ -2146,7 +2508,9 @@ test('configuration export restores the selected LUA variant and rejects mixed a
     const b={gov_headspeed:2500,roll_d_cutoff:30,iterm_relax_type:2,'iterm_relax_cutoff[0]':10,'iterm_relax_cutoff[1]':10,'iterm_relax_cutoff[2]':10};
     ds.datasets[0].values=a;ds.datasets[1].values=b;ds.diff=Object.keys(a).map(name=>({name}));advice.configurationBases(ds);
     const restore=ds.datasets[0].exportBase;assert.deepEqual(restore.unsupported,[]);
-    const script=advice.exportScript(restore.records);
+    // a headspeed is not selected first (the decision of the pilot, user 2026-10-15): the pilot selects every record here
+    assert.ok(!advice.exportScript(restore.records).includes('set gov_headspeed'),'a recorded headspeed is not restored unless the pilot selects it');
+    const script=advice.exportScript(restore.records,restore.records.map(r=>r.id));
     assert.match(script,/set iterm_relax_cutoff = 8,9,10/);assert.match(script,/set iterm_relax_type = RP\n/);
     assert.match(script,/set roll_d_cutoff = 15/,'a recorded value can be restored within the firmware range');
     assert.match(script,/set gov_headspeed = 2300/);

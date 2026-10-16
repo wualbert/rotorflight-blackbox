@@ -123,11 +123,11 @@ test('gateUpstream: the gate edges, transitive, in sequence (the prerequisites f
 test('homes: every check id has a prerequisite or a block, and a catalog entry, and back', () => {
     const all = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'H', 'SETUP', 'R1'].concat(Array.from({ length: 11 }, (_, i) => `F${i + 1}`), Array.from({ length: 15 }, (_, i) => `G${i}`),
         Array.from({ length: 14 }, (_, i) => `C${i + 1}`), Array.from({ length: 14 }, (_, i) => `T${i + 1}`), ['D7', 'G15', 'G16', 'G17', 'G18', 'C15'],
-        ['G19', 'T15', 'D8', 'G20'], ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'], ['D9', 'P1', 'P2']);
+        ['G19', 'T15', 'D8', 'G20'], ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'], ['D9', 'P1', 'P2'], ['G21']);
     const home = (id, a) => H.homeOf(id, a === undefined ? null : a);
     // SPEC3 A: the prerequisites
     assert.deepEqual(['D1', 'D2', 'D3', 'D4', 'H'].map(id => home(id)), Array(5).fill('logging'));
-    assert.deepEqual(['G1', 'G12', 'G20'].map(id => home(id)), ['rpm', 'rpm', 'rpm']);
+    assert.deepEqual(['G1', 'G12', 'G20', 'G21', 'G21:gov_max_throttle:p2'].map(id => home(id)), Array(5).fill('rpm'), 'G21 and its remedy (a lower gov_max_throttle) are of the RPM signal');
     assert.deepEqual(['D5', 'G13', 'G11', 'P1', 'P2'].map(id => home(id)), Array(5).fill('power'));
     assert.deepEqual(['F7', 'C15', 'T4', 'SETUP:roll_i_gain'].map(id => home(id)), Array(4).fill('mechanics'));
     assert.deepEqual(['D9', 'D8', 'D6', 'D6:excluded'].map(id => home(id)), Array(4).fill('rescue'));
@@ -412,7 +412,8 @@ test('GEAR RULE: no item, edge, K rule or reason tells that a gear ratio, a pull
     const bad = []; for (const t of texts.filter(x => typeof x === 'string')) for (const s of sentencesOf(t)) if (GEAR(s) && !OK.has(s)) bad.push(s);
     assert.deepEqual(bad, []);
     const g = byId.get('rpm');
-    assert.deepEqual([g.title, g.note, g.checks], ['RPM signal and motor poles', 'The gear ratios in the configuration are correct.', ['G1', 'G12', 'G20']]);
+    assert.deepEqual([g.title, g.note, g.checks], ['RPM signal and motor poles', 'The gear ratios in the configuration are correct.', ['G1', 'G12', 'G20', 'G21']]);
+    assert.ok(g.params.includes('gov_max_throttle') && g.params.includes('freq_input_pull'), `the remedies of check G21: ${g.params}`);
     for (const n of H.NODES) { assert.ok(!n.params.some(p => /gear_ratio/.test(p)), `${n.id}: ${n.params}`); for (const d of n.docs) assert.ok(!/gear/i.test(d.url + d.title), d.url); }
     assert.match(H.EDGES.find(e => e.from === 'rpm' && e.to === 'governor').why, /The gear ratios in the configuration are correct\.$/);
     assert.ok(H.RULES.find(k => k.id === 'K11').first.includes('Make sure that the motor pole count and the RPM sensor are correct (G12).'));
@@ -578,7 +579,7 @@ test('round 2: D2 is a logging problem only for a loss of 1 % of the frames; the
 
 test('round 2: a gate of a prerequisite holds only for its checks (fromChecks): a ground resonance holds the cyclic gains, a loose tail linkage the tail gains', () => {
     const f = (fid, id, extra) => Object.assign({ fid, id, severity: 'flag', log: 1, profile: 1 }, extra), st = (F) => H.status(F, F.map(x => ({ id: x.id, severity: 'check', evidence: [{ fid: x.fid }] })), {});
-    assert.deepEqual([H.fromChecksOf('mechanics', 'cyclic'), H.fromChecksOf('mechanics', 'tail'), H.fromChecksOf('controller', 'cyclic'), H.fromChecksOf('rpm', 'filters')], [['F7', 'C15', 'SETUP'], ['F7', 'T4'], ['SETUP'], null]);
+    assert.deepEqual([H.fromChecksOf('mechanics', 'cyclic'), H.fromChecksOf('mechanics', 'tail'), H.fromChecksOf('controller', 'cyclic'), H.fromChecksOf('rpm', 'filters')], [['F7', 'C15', 'SETUP'], ['F7', 'T4'], ['SETUP'], ['G1', 'G12', 'G20', 'SETUP', 'C7']]);
     let s = st([f('a', 'C15', { axis: 'roll' }), f('b', 'C1', { axis: 'roll' }), f('c', 'T2')]);
     assert.deepEqual([s.nodes.cyclic.status, s.nodes.tail.status, s.startHere], ['blocked', 'startHere', ['tail']]);
     s = st([f('a', 'T4'), f('b', 'C1', { axis: 'roll' }), f('c', 'T2')]);
@@ -587,6 +588,29 @@ test('round 2: a gate of a prerequisite holds only for its checks (fromChecks): 
     const l7 = f('l', 'L7', { module: 'limits', channel: 'collectiveCommand', value: 0.9, n: 1 });
     s = H.status([l7], [{ id: 'L7:collectiveCommand:p1', severity: 'watch', evidence: [{ fid: 'l' }] }], {});
     assert.deepEqual([s.nodes.controller.status, C.status(l7)], ['ok', 'monitor']);
+});
+
+test('G21 does not gate: the RPM signal errors at the throttle maximum, and a G1 whose FALLBACK entries all come from them (user, 2026-10-15)', () => {
+    const st = (F, o) => H.status(F, F.map(x => ({ id: x.id === 'G21' ? 'G21:gov_max_throttle:p2' : x.id, severity: x.id === 'G21' ? 'action' : 'check', evidence: [{ fid: x.fid }] })), o || {});
+    const g21 = { fid: 's', id: 'G21', severity: 'flag', log: [1, 2], profile: 2 }, g6 = { fid: 'v', id: 'G6', severity: 'flag', log: 1, profile: 2 }, f6 = { fid: 'n', id: 'F6', severity: 'flag', log: 1, profile: 2 };
+    const g1 = (times) => ({ fid: 'g', id: 'G1', severity: 'flag', log: 1, profile: null, times, text: '' });
+    const g20 = (kind, atMax) => ({ fid: 'r', id: 'G20', severity: 'note', log: 1, profile: null, events: [{ start: 54.622, kind, signal: kind === 'signal' ? { kind: 'spike', atMax } : null }] });
+    // G21 alone: the RPM item has a problem, the governor and the RPM notch filters are not held
+    let s = st([g21, g6]);
+    assert.deepEqual([s.nodes.rpm.status, s.nodes.governor.status, s.nodes.governor.blockedBy, s.nodes.governor.gatedBy, st([g21, f6]).nodes.filters.status, st([g21]).nodes.filters.gatedBy], ['problem', 'startHere', [], [], 'startHere', []]);
+    assert.match(s.nodes.rpm.reason, /Check G21 found a problem\. This problem does not stop the tuning of the tuning blocks after it\.$/);
+    const c1 = { fid: 'c', id: 'C1', severity: 'flag', log: 1, profile: 2, axis: 'roll' };
+    s = st([g21, c1]); assert.deepEqual([s.nodes.cyclic.status, s.nodes.cyclic.blockedBy, s.nodes.cyclic.gatedBy], ['startHere', [], []], 'not through rpm > filters > cyclic either');
+    assert.deepEqual(st([{ fid: 'p', id: 'G12', severity: 'flag', log: 1, profile: null }, c1]).nodes.cyclic.blockedBy, ['rpm'], 'G12 holds the cyclic gains through the filters');
+    // G1 with each FALLBACK after a spike at the maximum, with G21: not held. Without G21, at a lower throttle, or one entry more: held
+    s = st([g21, g1([54.622]), g20('signal', true), g6]);
+    assert.deepEqual([s.nodes.governor.status, s.nodes.governor.blockedBy, H.spikeFallbacks([g21, g1([54.622]), g20('signal', true)]).size], ['startHere', [], 1]);
+    assert.deepEqual(['blocked', 'blocked', 'blocked'], [st([g1([54.622]), g20('signal', true), g6]), st([g21, g1([54.622]), g20('signal', false), g6]), st([g21, g1([54.622, 80]), g20('signal', true), g6])].map(x => x.nodes.governor.status));
+    assert.equal(st([g21, g1([54.622]), g20('overload', false), g6]).nodes.governor.status, 'blocked', 'a FALLBACK at an overload holds the governor');
+    assert.equal(st([g21, { fid: 'p', id: 'G12', severity: 'flag', log: 1, profile: null }, g6]).nodes.governor.status, 'blocked', 'G12 holds the governor');
+    // one configuration with no G21 flag of its own: opts.all gives the G21 flag of the other configuration
+    const one = [Object.assign({}, g21, { severity: 'note' }), g1([54.622]), g20('signal', true), g6];
+    assert.deepEqual([st(one).nodes.governor.status, st(one, { all: one.concat([g21]) }).nodes.governor.status], ['blocked', 'startHere']);
 });
 
 test('round 2: the chips of a block are groups of its parameters with the checks that inform each', () => {

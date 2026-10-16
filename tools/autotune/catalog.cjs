@@ -16,7 +16,7 @@
  *   LABELS       the STE status words of findings and of the steps of hierarchy.cjs
  *   CHECKS[id]   { id, noun, unit, scale, node (or node(axis, f)), tab, module, phases, evidence, template, ... }
  *
- * Check ids: section 10 of TUNING_KNOWLEDGE.md (D1-D6, H, SETUP, F1-F11, G0-G14, C1-C14, T1-T14, R1), the gain decisions
+ * Check ids: section 10 of TUNING_KNOWLEDGE.md (D1-D6, H, SETUP, F1-F11, G0-G14, G21, C1-C14, T1-T14, R1), the gain decisions
  * of report.cjs (C7) and health_phase.cjs (D7, G15-G18, C15: the unit of the finding chooses the sentence).
  *
  * Limits come from the finding's threshold (a RULES object or a number) over the modules' DEFAULT_RULES; a threshold
@@ -294,6 +294,39 @@ X('G12', { noun: 'headspeed scale', unit: 'x', scale: 1, tab: 'governor', module
     bound: (f, v, R) => { const t = num(f.threshold) !== null ? f.threshold : R.tolerance; return num(t) === null ? null : `${fmt(1 - t, 4)} x to ${fmt(1 + t, 4)} x`; },
     after: (f) => f.severity === 'flag' ? 'Because the gear ratios in the configuration are correct, the cause is the motor pole count or the RPM sensor.' : GEARS_OK,
     evidence: ev('flight', [['gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]'], ['headspeed']], { kind: 'spectrum', curve: 'more.vib' }, { analyser: 'gyroRAW[0]', expected: () => 'The main rotor peak is at 1 x the rotor frequency from the headspeed.' }) });
+// G21: the sudden changes of the headspeed signal against the time at the throttle maximum (health_gov G21, pooled over the flights
+// for each PID profile): value the changes at the maximum, n all changes, atMaxS and governedS the time at the maximum and in RECOVERY,
+// ACTIVE and FALLBACK, share, p (the binomial test), basis ('profile' | 'pooled'), fallbacks { n, atMax, afterSpike }
+const g21Has = (f) => num(f.governedS) !== null;
+// the words of a G21 result: one configuration of the worker (f.dataset, a module label of js/tuning_worker.js) is not all of its PID
+// profile ("In configuration E (PID profile 2), ..."), else "In PID profile 2, " (review 2026-10-15: configuration E has 1 of the 5
+// sudden changes of PID profile 2)
+const g21In = (f, v) => typeof f.dataset === 'string' && f.dataset ? `In configuration ${f.dataset} (${v.profile || 'PID profile unknown'}), ` : v.In;
+// the FALLBACK entries of a sudden change (health_gov spikeScan: during the change, or spikeBeforeS or less after its last fast sample)
+const g21After = () => { const s = MOD.gov && MOD.gov.RULE && MOD.gov.RULE.g21 && num(MOD.gov.RULE.g21.spikeBeforeS); return `during a sudden change or ${fmt(1000 * (s === null ? 0.03 : s))} ms or less after its end`; };
+X('G21', { noun: 'sudden RPM changes', unit: '', scale: 1, tab: 'governor', module: 'gov', nOf: 'sudden changes',
+    info: 'This check compares the sudden changes of the headspeed signal with the time at the throttle maximum.',
+    say: (f, v) => !(num(f.atMaxS) > 0) ? `${g21In(f, v)}the logs have no time at the throttle maximum. The headspeed signal has ${many(f.n, 'sudden change')} at less than the maximum.`
+        // two sentences: the summary adds the limit (two) and the FALLBACK entries (one), at most 6 in the paragraph (STE Rule 6.6). A
+        // PID profile with basis 'pooled' gives the test value of all PID profiles together. No change at the maximum: no test value
+        // (P(X >= 0) is always 1), a plain sentence
+        : num(f.n) > 0 && !(num(f.value) > 0) ? `${g21In(f, v)}the headspeed signal has no sudden change at the throttle maximum, and ${many(f.n, 'sudden change')} at less than the maximum. The throttle is at its maximum for ${fmt(100 * f.share, 2)} % of the time.`
+        : num(f.n) > 0 ? `${g21In(f, v)}the headspeed signal has ${fmt(f.value)} of its ${many(f.n, 'sudden change')} at the throttle maximum, in ${fmt(100 * f.share, 2)} % of the time.`
+            + (f.basis === 'pooled' && f.pooled && num(f.pooled.p) !== null ? ` The test value \`p\` of all PID profiles together is \`${f.pooled.p}\`.` : num(f.p) !== null ? ` The test value \`p\` is \`${f.p}\`.` : '')
+            : `${g21In(f, v)}the headspeed signal has no sudden change in ${pair(f.governedS, null, 's')}, with ${pair(f.atMaxS, null, 's')} at the throttle maximum.`,
+    after: (f) => { const b = f.fallbacks; if (!b || !(num(b.n) > 0)) return null;
+        return `Of the ${fmt(b.n)} FALLBACK ${b.n === 1 ? 'entry' : 'entries'}, ${fmt(b.afterSpike)} ${b.afterSpike === 1 ? 'starts' : 'start'} ${g21After()}, and ${fmt(b.atMax)} ${b.atMax === 1 ? 'starts' : 'start'} at the throttle maximum.`; },
+    limit: (f, v, R) => num(R.minSpikes) === null ? null : `The limit is ${fmt(R.minSpikes)} sudden changes at the throttle maximum, with a test value \`p\` of less than \`${R.maxP}\`. Also, the rate at less than the maximum must be ${fmt(100 / R.rateRatio)} % of the rate at the maximum or less.`,
+    bound: (f, v, R) => num(R.minSpikes) === null ? null : `${fmt(R.minSpikes)} sudden changes or more at the throttle maximum`,
+    value: (f) => num(f.value) === null ? null : num(f.atMaxS) > 0 ? `${fmt(f.value)} of ${many(f.n, 'sudden change')} at the throttle maximum, in ${fmt(100 * f.share, 2)} % of the time` : `${many(f.n, 'sudden change')} at less than the throttle maximum`,
+    // not measured: no time at the maximum, or no sudden change in less than minAtMaxS at the maximum (health_gov DEFAULT_RULES.G21.minOkS)
+    skipped: (f) => !g21Has(f) ? 'This check did not operate on this log. The toolkit text gives the cause.'
+        : num(f.atMaxS) > 0 ? `The logs have only ${fmt(f.atMaxS)} s with the throttle at its maximum${num(f.minAtMaxS) !== null ? `, and a minimum of ${fmt(f.minAtMaxS)} s is necessary` : ''}. Thus, the logs cannot show that the headspeed signal has no errors at the maximum.`
+        : 'The logs have no time with the throttle at its maximum in RECOVERY, ACTIVE or FALLBACK. Thus, the logs cannot show this check.',
+    evidence: ev('events', [['headspeed', 'govTarget'], ['motor[0]'], ['govSum']], { kind: 'governor', curve: 'more.gov', snippet: { fields: ['headspeed', 'govTarget', 'motor[0]'] } },
+        // every sudden change at the maximum and every FALLBACK entry (review 2026-10-15: 3 spans left out the change of log 12 at 94.67 s)
+        { pads: [0.3, 0.3], maxSpans: (f) => Math.max(3, (Array.isArray(f.events) ? f.events : []).filter(e => e && (e.kind === 'FALLBACK' || e.atMax)).length),
+            expected: () => 'The headspeed signal changes smoothly, also with the throttle at its maximum.' }) });
 
 // --- loops (health_loop.cjs) ---
 X('C1', { noun: 'I-term limit', unit: 's', scale: 1, tab: 'checks', module: 'loop',
@@ -520,9 +553,13 @@ X('G19', { noun: 'rescue headspeed', unit: '%', scale: 100, tab: 'governor', mod
 // signal | none. Information: an overload is a possible result of the throttle limit (rule K22), the others are check G1
 X('G20', { noun: 'FALLBACK cause', unit: '', scale: 1, tab: 'governor', module: 'rescue', note: 'information', statusOf: (f) => (f.severity === 'note' || f.severity === 'flag') && !isThin(f) ? 'information' : null,
     info: 'This check compares each change to FALLBACK with the headspeed and throttle.',
-    why: (f) => num(f.value) > 0 && f.value === f.n ? 'The FALLBACK occurs with a headspeed decrease at the throttle limit. This does not show that the RPM signal is correct.' : 'A FALLBACK at a usual load is possibly an error of the RPM signal (check G1).',
+    // value: the entries with an overload sign, also with an error of the signal (health_rescue G20, review 2026-10-15): with both
+    // causes, the summary gives both
+    why: (f) => num(f.value) > 0 && num(f.signals) > 0 ? 'The FALLBACK has two possible causes. These are an error of the headspeed signal (checks G1 and G21) and a headspeed decrease at the throttle limit.'
+        : num(f.value) > 0 && f.value === f.n ? 'The FALLBACK occurs with a headspeed decrease at the throttle limit. This does not show that the RPM signal is correct.' : 'A FALLBACK at a usual load is possibly an error of the RPM signal (check G1).',
     say: (f) => `${cap(many(f.value, 'FALLBACK'))} of ${fmt(f.n)} ${num(f.value) === 1 ? 'comes' : 'come'} at a headspeed decrease with the throttle at 95 % or more.`
-        + (num(f.signals) > 0 ? ` ${cap(many(f.signals, 'FALLBACK'))} ${f.signals === 1 ? 'comes' : 'come'} at an error of the headspeed signal.` : ''),
+        + (num(f.spikes) > 0 ? ` ${cap(many(f.spikes, 'FALLBACK'))} ${f.spikes === 1 ? 'comes' : 'come'} ${g21After().replace('a sudden change', 'a sudden change of the headspeed signal')} (check G21).` : '')
+        + (num(f.signals) - (num(f.spikes) || 0) > 0 ? ` ${cap(many(f.signals - (num(f.spikes) || 0), 'FALLBACK'))} ${f.signals - (num(f.spikes) || 0) === 1 ? 'comes' : 'come'} at ${num(f.spikes) > 0 ? 'a different error' : 'an error'} of the headspeed signal.` : ''),
     limit: () => 'This check gives information only. It has no limit.', value: (f) => num(f.value) === null ? null : `${fmt(f.value)} of ${fmt(f.n)} at the throttle limit`,
     evidence: ev('events', [['headspeed', 'govTarget'], ['motor[0]'], ['mixer[3]']], { kind: 'governor', curve: 'more.gov', snippet: { fields: ['headspeed', 'govTarget', 'motor[0]'] } },
         { pads: [0.5, 0.5], expected: () => 'The governor stays in ACTIVE. At a large load, the throttle does not stay at its limit.' }) });
@@ -701,6 +738,10 @@ const LEAD = {
     G10: { sym: 'The headspeed and the yaw rate have the same oscillation.', why: 'The signals are related. This does not show which loop causes the oscillation.' },
     G11: { sym: 'At equal collective, the throttle increases during the flight.', why: 'A decrease in battery voltage can make more throttle necessary at equal load. Compare the voltage and load before you identify the cause.' },
     G12: { sym: 'The main rotor vibration line is not at the rotor frequency that the log records.', why: 'The RPM notch filters and the governor use this headspeed.' },
+    G21: { sym: (f) => f.severity === 'flag' ? 'The headspeed signal changes suddenly when the throttle is at its maximum.' : 'The headspeed signal has sudden changes.',
+        why: (f) => f.severity === 'flag' ? 'A sudden change of the RPM signal can start FALLBACK. A lower throttle limit keeps the throttle out of the band where the RPM signal has errors.'
+            : 'The governor and the RPM notch filters use this signal. The rotor speed cannot change this fast.',
+        good: 'The headspeed signal has no sudden change, also at the throttle maximum.' },
 };
 const LIMIT_WHY = { L1: 'At the throttle limit, the governor cannot command more throttle. The headspeed signal shows if the governor holds its target.', L2: 'At the collective limit, the pilot or the rescue cannot get more collective.', L3: 'At the cyclic limit, the swash plate cannot move more.',
     L4: 'Gains cannot increase the output range. The limit does not identify the cause.', L5: 'At its limit, the servo cannot move more.', L6: 'At its limit, the I-term cannot increase its output.',
@@ -760,7 +801,7 @@ const homeOf = (id, axis) => H ? H.homeOf(id, axis) : null;
 // cyclic, radio, logging. C7 by its axis
 const AREAS = ['power', 'motor', 'governor', 'rpm', 'vibration', 'limits', 'tail', 'cyclic', 'radio', 'logging'];
 const AREA_OF = {};
-for (const [area, ids] of Object.entries({ logging: 'D1 D2 D3 D4 H SETUP D7', rpm: 'G1 G12 G20', power: 'D5 G13 G11 P1 P2', motor: 'G17 G18',
+for (const [area, ids] of Object.entries({ logging: 'D1 D2 D3 D4 H SETUP D7', rpm: 'G1 G12 G20 G21', power: 'D5 G13 G11 P1 P2', motor: 'G17 G18',
     governor: 'G0 G2 G3 G4 G5 G6 G7 G8 G9 G10 G14 G15 G16 G19', vibration: 'F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 C11 C15 T4', limits: 'L1 L2 L3 L4 L5 L6 L7 C2 T8',
     tail: 'T1 T2 T3 T5 T6 T7 T9 T10 T11 T12 T13 T14 T15', cyclic: 'C1 C3 C4 C5 C6 C8 C9 C10 C12 C13 C14', radio: 'R1 D6 D8 D9' })) for (const id of ids.split(' ')) AREA_OF[id] = area;
 for (const [id, c] of Object.entries(CHECKS)) {
@@ -918,6 +959,15 @@ const SIZE = {
         const e = f.worstError && num(f.worstError.value) !== null && num(f.worstError.limit) > 0 ? Math.abs(f.worstError.value) / f.worstError.limit : null;
         const v = [a, e].filter(x => x !== null); return v.length ? Math.max(...v) : null; },
     P1: (f) => { const L = f.limits || {}; return num(f.minCell) > 0 && num(L.min) > 0 ? L.min / f.minCell : null; },
+    // G21 (review 2026-10-15): the strength of the result's own test, the larger of k / minSpikes (the sudden changes at the maximum)
+    // and log(p) / log(maxP) (its own test value), never inverted: more changes at the maximum or a smaller p is a larger result. A
+    // result with basis 'pooled' (fewer than minSpikes changes of its own) is a problem by the test of all PID profiles together only:
+    // its size is 1, at its limit, less than each result that passes its own test (more than 1)
+    G21: (f) => { const R = rulesOf(f, CHECKS.G21), k = num(f.value), p = num(f.p);
+        if (k === null) return null;
+        const byK = num(R.minSpikes) > 0 ? k / R.minSpikes : 0, byP = p === null || !(num(R.maxP) > 0 && R.maxP < 1) || p >= 1 ? 0 : p > 0 ? Math.log(p) / Math.log(R.maxP) : ISSUE_RULES.maxSize;
+        const own = Math.max(byK, byP);
+        return f.basis === 'pooled' ? 1 : own; },
 };
 function sizeOf(f, st) {
     const own = /^L\d$/.test(f.id) ? SIZE.L : SIZE[f.id];

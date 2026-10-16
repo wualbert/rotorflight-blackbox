@@ -13,6 +13,7 @@ const R = require('../tools/autotune/health_rescue.cjs');
 const bbl = require('./helpers/bbl_encode.cjs');
 
 const app = lib.loadApp(), tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rescue-')), RATE = 1000;
+process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
 const EXTRA = [...new Set(R.EXTRA.concat(['servo[3]']))];
 const at = (s) => Math.round(s * RATE);
 const within = (got, want, tol, what) => assert.ok(typeof got === 'number' && Math.abs(got - want) <= tol, `${what}: got ${got}, want ${want} +- ${tol}`);
@@ -137,6 +138,10 @@ test('real: the rescues of the Fireball dump 2026-10-05', { skip: !REAL || !fs.e
     const d16 = ev('D8', 15, 151.372); assert.equal(d16.f.severity, 'flag'); assert.deepEqual([d16.changes[0].from, d16.changes[0].to], [3, 2]); within(d16.changes[0].dtS, -0.002, 0.002, 'log 16 change');
     // log 6: no flag of any rescue check
     for (const id of ['G19', 'T15', 'D8']) assert.equal(F.find(f => f.id === id && f.log === 5).severity, 'ok', `log 6 ${id}`);
+    // G20: the FALLBACK of log 15 comes 22 ms after a sudden change of the headspeed signal at 100 % throttle (check G21): an error of the
+    // RPM signal, with the overload of check G19 as a second cause
+    const fb15 = F.find(f => f.id === 'G20' && f.log === 14).events[0];
+    assert.deepEqual([fb15.kind, fb15.signal.kind, fb15.causes, fb15.signal.throttle], ['signal', 'spike', ['signal', 'overload'], 1000]); within(fb15.signal.dtS, 0.022, 0.003, 'log 15 sudden change');
     // log 16 G19: the target change of the PID profile is commanded: -3.4 % against the ramping govTarget, no flag
     const g16 = ev('G19', 15, 151.372); assert.equal(g16.f.severity, 'ok'); within(g16.value, -0.034, 0.005, 'log 16 decrease');
 });
@@ -157,10 +162,47 @@ test('G20: an overload before the FALLBACK, an error of the RPM signal, and no o
     ({ m, g } = g20(sig));
     assert.deepEqual([m.fallbacks[0].kind, m.fallbacks[0].signal.kind, g.value, g.signals], ['signal', 'zero', 0, 1]);
     assert.match(g.text, /the headspeed signal reads 0 while the throttle is less than 95 %\.\n1 of 1 FALLBACK has no measured headspeed decrease at the throttle limit\. Examine the RPM signal \(check G1\)\.$/);
-    // no overload sign
-    const none = bog(); for (let i = at(29.0); i < at(29.75); i++) { none.w.extra['motor[0]'][i] = 700; none.w.hs[i] = 2500; }
+    // no overload sign: the throttle at 70 % and a smooth headspeed (no step at the change: a step of 643 rpm in 1 ms is a sudden
+    // change of check G21, an error of the RPM signal)
+    const none = bog(); for (let i = at(29.0); i < at(31.5); i++) { if (i < at(29.75)) none.w.extra['motor[0]'][i] = 700; none.w.hs[i] = 2500; }
     ({ m } = g20(none)); assert.equal(m.fallbacks[0].kind, 'none');
+    // a sudden change of the headspeed signal (check G21: +600 rpm for one sample) 10 ms before the change with the throttle at 100 %: an
+    // error of the RPM signal (critique C12: the earlier rule examined only samples under the high throttle), with the overload as a second cause
+    const spike = bog(); spike.w.hs[at(29.74)] += 600;
+    ({ m, g } = g20(spike));
+    assert.deepEqual([m.fallbacks[0].kind, m.fallbacks[0].signal.kind, m.fallbacks[0].causes, m.fallbacks[0].signal.throttle], ['signal', 'spike', ['signal', 'overload'], 1000]);
+    within(m.fallbacks[0].signal.dtS, 0.01, 0.002, 'the sudden change 10 ms before the change to FALLBACK'); assert.ok(m.fallbacks[0].signal.atMax, 'at the throttle maximum');
+    // value: the entries with an overload sign, also with the error of the signal (review 2026-10-15: "0 FALLBACKs of 2 come at a
+    // headspeed decrease" against causes ['signal', 'overload']); overloadOnly: the overload with no error of the signal
+    assert.deepEqual([g.value, g.overloads, g.overloadOnly, g.signals, g.spikes, g.spikesOverload, g.events[0].bad, g.events[0].causes], [1, 1, 0, 1, 1, 1, true, ['signal', 'overload']]);
+    // the start and the end of the sudden change against the change (review 2026-10-15: "50 ms before the change" against "30 ms or less after")
+    assert.deepEqual([m.fallbacks[0].signal.startS, m.fallbacks[0].signal.endS], [0.01, 0.007]);
+    assert.match(g.text, /^At the change to FALLBACK at 29\.75 s, the headspeed signal changes suddenly from [\d]+ rpm to [\d]+ rpm\. This sudden change starts 10 ms before the change to FALLBACK and ends 7 ms before it\. The throttle is 100 % \(check G21\)\. Also, the throttle is at 95 % or more for 0\.35 s/);
+    assert.match(g.text, /\n1 of 1 FALLBACK starts during a sudden change of the headspeed signal or 30 ms or less after its end\. This is an error of the RPM signal, also at the throttle limit \(checks G1 and G21\)\. Before this FALLBACK, the headspeed also decreases with the throttle at 95 % or more\.$/);
+    // the catalog: the value, the summary and the text agree, with both causes
+    const CAT = require('../tools/autotune/catalog.cjs'), sum = CAT.summary(g);
+    assert.match(sum, /1 FALLBACK of 1 comes at a headspeed decrease with the throttle at 95 % or more\. 1 FALLBACK comes during a sudden change of the headspeed signal or 30 ms or less after its end \(check G21\)\./);
+    assert.match(sum, /The FALLBACK has two possible causes\. These are an error of the headspeed signal \(checks G1 and G21\) and a headspeed decrease at the throttle limit\./);
+    assert.doesNotMatch(sum, /usual load/);
     // a log with no rescue: the FALLBACK has its cause, and the rescue checks have no rescue
     const quiet = bog({ rescue: null }); ({ m, g } = g20(quiet));
     assert.equal(m.rescues.length, 0); assert.equal(m.fallbacks[0].kind, 'overload'); assert.equal(g.value, 1);
+});
+
+// review 2026-10-15: health_gov spikeScan gives at most RULE.g21.maxEvents changes in its list. G20 gets the change of each FALLBACK
+// from the full list: a FALLBACK at 100 % throttle 5 ms after the 252nd sudden change of a bad RPM signal is an error of the RPM
+// signal (check G21), not an overload only (advice K22 must not excuse G1 as a result of the load)
+test('G20: the sudden change before a FALLBACK after more than maxEvents changes is the cause', () => {
+    const rate = 1000, n = 260000, hs = new Float32Array(n), mot = new Float32Array(n), tg = new Float32Array(n), st = new Uint8Array(n), prof = new Uint8Array(n).fill(2);
+    for (let i = 0; i < n; i++) { hs[i] = 4500 + 5 * Math.sin(i / 50); tg[i] = 4500; st[i] = 4; mot[i] = 700; }
+    for (let s = 0; s < 251; s++) { const i = 2000 + s * 1000; hs[i] = 9000; hs[i + 1] = 9000; }      // 251 doubled readings, 1 s apart
+    const last = 2000 + 250 * 1000; for (let i = last - 2000; i < last + 300; i++) mot[i] = 1000;
+    const c = last + 5; for (let i = c; i < c + 200; i++) st[i] = 6;                                     // FALLBACK 5 ms after the last
+    for (let i = last - 300; i < last + 400; i++) if (i !== last && i !== last + 1) hs[i] -= Math.min(150, 150 * (i - (last - 300)) / 300);
+    const w = { n, rate, fromS: 0, hs, extra: { govTarget: tg, 'motor[0]': mot, govRequest: tg }, govStateAt: st, profileAt: prof, u: [new Float32Array(n), new Float32Array(n), new Float32Array(n)], flight: { header: {} } };
+    const m = R.analyse(w, { rate, govState: st, profile: prof });
+    assert.equal(m.fallbacks.length, 1);
+    const fb = m.fallbacks[0];
+    assert.deepEqual([fb.kind, fb.causes, fb.signal && fb.signal.kind, fb.signal && fb.signal.throttle, fb.signal && fb.signal.atMax], ['signal', ['signal', 'overload'], 'spike', 1000, true], JSON.stringify(fb));
+    within(fb.signal.dtS, 0.005, 0.0005, 'the sudden change 5 ms before the FALLBACK');
 });

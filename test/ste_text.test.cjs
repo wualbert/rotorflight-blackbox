@@ -13,8 +13,10 @@
 //     every text that our DOM scripts (js/tuning_dialog.js, js/log_lens.js, js/*_view.js) write through $ or the DOM
 //     stand-ins is read, with every TuningPlot spec
 //   - the worker texts (notes, progress, the window observations of the derive command: the literals of js/tuning_worker.js),
+//   - the sentences of the governor model (every tools/autotune/gov_*.cjs), and the governorTuned results of the worker with the real logs
 //     the messages of js/tuning_snippet.js, the view shell (index.html, js/main.js) and the STE rules in CLAUDE.md
-//   - with AUTOTUNE_REAL_LOG set: also the TuningResults of test/tuning_worker.test.cjs (slow), of AUTOTUNE_RESCUE_LOG too when set
+//   - with AUTOTUNE_REAL_LOG set: also the TuningResults of test/tuning_worker.test.cjs (slow), of AUTOTUNE_RESCUE_LOG too when set; with
+//     AUTOTUNE_GOV_LOG set (alone or with them): the governorTuned result of that dump (AUTOTUNE_GOV_CLI, AUTOTUNE_GOV_RPM as the worker test)
 // Not linted: <code>, <pre>, [data-ste="quoted"] (toolkit text that is not STE, log-derived strings, quotes), CLI text,
 // the upstream Flight analysis text (js/flight_analysis*.js).
 //
@@ -523,6 +525,30 @@ function filterTexts(t, add) {
 }
 function filterExportTexts(status, add) { for (const reason of status && status.reasons || []) add(reason, 'message', 'filter CLI export reason'); }
 function filterResultTexts(r, add) { if (!r || typeof r !== 'object') return; filterTexts(r.text, add); filterExportTexts(r.cliExport, add); recommendationTexts(r.recommendations, add); for (const n of [].concat(r.notes || [])) add(n, 'note', 'filter search note'); }
+// the governor model (docs/GOVERNOR_AUTOTUNE.md section 8: the governorTuned result of the worker, gov_tune.cjs autotune): the status
+// reasons, the limitations, the rows, the recommendations, the stale of each, the plot labels and the notes of the worker
+function governorResultTexts(r, add) {
+    if (!r || typeof r !== 'object') return;
+    for (const t of [].concat(r.reasons || [])) add(t, 'message', 'governor model reason');
+    for (const t of [].concat(r.limitations || [])) add(typeof t === 'string' ? t : t && t.text, 'note', 'governor model limitation');
+    for (const n of [].concat(r.notes || [])) add(typeof n === 'string' ? n : n && n.text, 'note', 'governor model note');
+    for (const q of [].concat(r.skipped || [])) if (q) add(q.reason, 'message', `governor model log ${q.log}`);
+    const flag = (x, where) => { if (x && x.stale && typeof x.stale === 'object') add(x.stale.text, 'message', `${where} stale`); };
+    for (const x of [].concat(r.rows || [])) if (x && typeof x === 'object') {
+        const where = `governor row ${x.name}${x.profile ? ` ${x.profile}` : ''}`;
+        add(x.title, 'label', `${where} title`); add(x.text, 'message', `${where} text`); add(x.reason, 'message', `${where} reason`); add(x.record, 'instruction', `${where} record`);
+        for (const e of [].concat(x.evidence || [])) if (e) add(e.text, 'message', `${where} evidence`);
+        flag(x, where);
+    }
+    recommendationTexts(r.recommendations, add);
+    for (const x of [].concat(r.recommendations || [])) if (x && typeof x === 'object') flag(x, x.id || 'governor recommendation');
+    const plots = [].concat(r.plots || [], r.twin && r.twin.plots || []);
+    for (const q of plots) if (q && typeof q === 'object') {
+        add(q.title, 'label', `governor plot ${q.id}`); add(q.note, 'message', `governor plot ${q.id} note`);
+        for (const a of [q.x, q.y, q.y2]) if (a) add(a.label, 'label', `governor plot ${q.id} axis`);
+        for (const x of [].concat(q.series || [], q.bands || [])) if (x) add(x.name || x.label, 'label', `governor plot ${q.id} series`);
+    }
+}
 // The values that are possibly not current (CLAUDE.md, 2026-10-06): the spans of result.epochs and result.freshness, the
 // stale flag of each finding, limits period, recommendation, issue and gains decision, and the conflicts of result.cliStatus
 // (a CLI dump that does not agree with the log)
@@ -779,11 +805,13 @@ function afterScript(ctx, name, add) {
         // rescues, PID profile changes at a rescue and 6 flight logs that the Gaui X4 dump does not have): the other results of the
         // worker tests come from simulated logs, some with stand-in modules that the tests inject, and our modules give their texts
         // in their own harvests
-        const reals = [process.env.AUTOTUNE_REAL_LOG, process.env.AUTOTUNE_RESCUE_LOG].filter(Boolean).map((f) => path.basename(f));
+        // (AUTOTUNE_GOV_LOG: the dump of the governorTune test of the real logs, with its result texts: governorTuned)
+        const reals = [process.env.AUTOTUNE_REAL_LOG, process.env.AUTOTUNE_RESCUE_LOG, process.env.AUTOTUNE_GOV_LOG].filter(Boolean).map((f) => path.basename(f));
         const isReal = (r) => !reals.length || reals.includes(r.fileName);
         const wrapped = function (m) {
             try { if (m && m.type === 'result' && m.result && isReal(m.result)) resultTexts(m.result, (t, k, w) => add('TuningResult', t, k, w));
-                if (m && m.type === 'filterTuned' && m.result && isReal(m.result)) filterResultTexts(m.result, (t, k, w) => add('TuningResult', t, k, w)); } catch (e) { /* reader */ }
+                if (m && m.type === 'filterTuned' && m.result && isReal(m.result)) filterResultTexts(m.result, (t, k, w) => add('TuningResult', t, k, w));
+                if (m && m.type === 'governorTuned' && m.result && isReal(m.result)) governorResultTexts(m.result, (t, k, w) => add('TuningResult', t, k, w)); } catch (e) { /* reader */ }
             return post.apply(this, arguments);
         };
         wrapped.steWrapped = true;
@@ -877,8 +905,9 @@ const CHECK_IDS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'H', 'SETUP', ...[...Arra
     ...[...Array(14)].map((_, i) => `C${i + 1}`), ...[...Array(14)].map((_, i) => `T${i + 1}`), 'R1',
     'D7', 'G15', 'G16', 'G17', 'G18', 'C15',  // the phase checks of health_phase.cjs (SPEC2 section 6)
     'G19', 'T15', 'D8', 'G20', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7',  // health_rescue.cjs and health_limits.cjs
-    'D9', 'P1', 'P2']; // health_config.cjs and health_power.cjs (SPEC3 A, I)
-const moduleOf = (id) => /^(G19|T15|D8|G20)$/.test(id) ? 'rescue' : id === 'D9' ? 'config' : /^P[12]$/.test(id) ? 'power' : /^L\d$/.test(id) ? 'limits' : /^(D7|G1[5-8]|C15)$/.test(id) ? 'phase' : /^(D[1-4]|F[1-9]|H|SETUP)$/.test(id) ? 'setup' : /^(D5|G\d|G1[0-3])$/.test(id) ? 'gov'
+    'D9', 'P1', 'P2',  // health_config.cjs and health_power.cjs (SPEC3 A, I)
+    'G21']; // health_gov.cjs: the RPM signal at the throttle maximum (analysis/rpm-spikes)
+const moduleOf = (id) => /^(G19|T15|D8|G20)$/.test(id) ? 'rescue' : id === 'D9' ? 'config' : /^P[12]$/.test(id) ? 'power' : /^L\d$/.test(id) ? 'limits' : /^(D7|G1[5-8]|C15)$/.test(id) ? 'phase' : /^(D[1-4]|F[1-9]|H|SETUP)$/.test(id) ? 'setup' : /^(D5|G\d|G1[0-3]|G21)$/.test(id) ? 'gov'
     : /^(C5|C1[23]|T1|T1[12]|R1)$/.test(id) ? 'track' : /^(D6|F1[01]|T1[34]|C14|G14)$/.test(id) ? 'more' : id === 'C7' ? 'report' : /^(T3|T10|F7)$/.test(id) ? 'wag' : 'loop';
 const tryRequire = (rel) => { const abs = path.join(ROOT, rel); if (!fs.existsSync(abs)) return { missing: rel }; try { return { mod: require(abs) }; } catch (e) { return { error: `${rel}: ${e.message}` } } };
 const call = (fn, ...args) => { try { return typeof fn === 'function' ? fn(...args) : undefined; } catch (e) { return { steError: e }; } };
@@ -1022,6 +1051,17 @@ function digitalTwinSource() {
     }
     return {items,errors:[]};
 }
+// The governor model and autotune (docs/GOVERNOR_AUTOTUNE.md): the sentences of every tools/autotune/gov_*.cjs (the reasons, the rows, the
+// rules, the limitations and the progress texts that the Governor tab shows)
+function governorSource() {
+    const dir = path.join(ROOT, 'tools/autotune'), files = fs.readdirSync(dir).filter((f) => /^gov_[a-z0-9_]*\.cjs$/.test(f)).sort(), items = [];
+    if (!files.length) return { missing: 'tools/autotune/gov_*.cjs' };
+    for (const f of files) {
+        const rel = `tools/autotune/${f}`, src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+        for (const x of sentenceLiterals(src)) items.push({ text: x.text, kind: x.kind, where: `${rel}:${lineOf(src, x.at)}` });
+    }
+    return { items, errors: [] };
+}
 // The markup of the views (index.html) and the strings of the "Show in the log" functions of js/main.js
 function elementsOf(html, re) {
     const out = [];
@@ -1123,7 +1163,7 @@ const HARVEST = [
     { file: 'test/datasets.test.cjs', expect: ['tools/autotune/datasets.cjs'] },          // round 3 M1
     { file: 'test/filter_tune.test.cjs', expect: ['tools/autotune/filter_tune.cjs'] },    // round 3 M2
     { file: 'test/filter_autotune.test.cjs', expect: ['tools/autotune/filter_autotune.cjs'] },
-    { file: 'test/tuning_worker.test.cjs', expect: ['TuningResult'], env: 'AUTOTUNE_REAL_LOG', timeoutS: 3600, heapMb: 12000 },
+    { file: 'test/tuning_worker.test.cjs', expect: ['TuningResult'], env: ['AUTOTUNE_REAL_LOG', 'AUTOTUNE_GOV_LOG'], timeoutS: 3600, heapMb: 12000 },
 ];
 // The names that advice.cjs exports (read from the source: the module is not loaded in the main thread for this)
 function adviceExports() {
@@ -1296,7 +1336,7 @@ function mainThread() {
         const groups = new Map();
         const group = (name) => { if (!groups.has(name)) groups.set(name, { items: [], errors: [], via: new Set(), missing: null }); return groups.get(name); };
         const direct = [['tools/autotune/catalog.cjs (summary of every check id)', catalogSource], ['tools/autotune/hierarchy.cjs (titles, texts, status reasons)', hierarchySource],
-            ['digital twin (model and firmware messages)', digitalTwinSource],
+            ['digital twin (model and firmware messages)', digitalTwinSource], ['governor model (tools/autotune/gov_*.cjs)', governorSource],
             ['js/tuning_worker.js (notes, progress, window observations)', workerSource], ['js/tuning_snippet.js (messages)', snippetSource],
             ['view shell (index.html, js/main.js)', shellSource], ['CLAUDE.md (STE rules)', ruleSource]];
         for (const [name, fn] of direct) {
@@ -1305,7 +1345,7 @@ function mainThread() {
         }
         const todo = HARVEST.map((h) => {
             if (!fs.existsSync(path.join(ROOT, h.file))) return Promise.resolve({ h, skip: `${h.file} not found` });
-            if (h.env && !process.env[h.env]) return Promise.resolve({ h, skip: `${h.env} is not set` });
+            if (h.env && ![].concat(h.env).some((e) => process.env[e])) return Promise.resolve({ h, skip: `${[].concat(h.env).join(' or ')} is not set` });
             return harvest(h.file, h).then((r) => ({ h, r }));
         });
         const harvested = await Promise.all(todo);

@@ -106,10 +106,80 @@ unknown settings continue to block eligibility. Logged initial I/O terms seed
 integrator state where possible; filter-state transients require warmup.
 
 The regression suite compares native compiled C and WASM on coupled, saturated
-trajectories for modes 3 and 4 and the electric governor. It also checks gain
+trajectories for modes 3 and 4 and the electric governor, and the governor-only path
+with the full path. It also checks gain
 scaling, stop asymmetry, anti-windup, mode-4 coupling, governor state changes,
 disarm, missing configuration and corrupt artifacts. These checks verify the
 software execution boundary. They do not establish flight-model accuracy.
+
+## Governor alone (`rf_gov_step`, `rf_gov_profile`, `govCreate`)
+
+The governor digital twin (`docs/GOVERNOR_AUTOTUNE.md` section 6) runs the original
+governor without the PID and the mixer. `rf_gov_step` advances the time as `rf_step`,
+copies the recorded stabilized roll, pitch, yaw and collective (`input[15..18]`) to
+`mixer.input[1..4]`, sets `mixer.cyclicTotal` from roll and pitch, calls the original
+`governorUpdate` and writes the 13 governor outputs to `output[46..58]`. For identical
+mixer inputs these outputs equal the governor outputs of the full `rf_step` path
+(regression). `rf_gov_profile` copies `config[115..135]` to the governor values of the
+PID profile and calls the original `governorInitProfile`, as the firmware does at a PID
+profile change (`pid.c:709`). It keeps the governor state: in ACTIVE the reset request
+re-seeds I from the current throttle, and the target ramps to the new headspeed at the
+tracking rate.
+
+`firmware_controller.govCreate({values, gear, cells, restVoltage, minCell, maxCell,
+voltageSource, pidHz})` loads the same artifact and returns `step`, `profile` and
+`reset`. `values` use the schema names. Its boundary (`govRequiredFields`) is the
+governor values, `pid_looptime` (from `pidHz`), `main_rotor_dir`, `tail_rotor_mode`,
+the gear ratio, the cell count and the voltage source. PID values take release
+defaults and are never executed. Values that the firmware does not read with the
+given settings may be unknown and get release defaults (`assumed`):
+
+- the bypass curve (`step` refuses `govBypass` then);
+- the TTA limit without a TTA gain or outside DIRECT and ELECTRIC, and the TTA filter
+  and `main_rotor_dir` (the TTA sign, `govInitTTA`) when TTA is off;
+- `tail_rotor_mode` when the governor does not read the yaw (no yaw feedforward and
+  no TTA);
+- the voltage compensation inputs without the flag, without ELECTRIC, or with a known
+  meter other than ADC.
+
+Every other value must be known and in its CLI range, or `govCreate` throws an error
+that names it. A cell count of 0 is unknown. It is refused when the voltage
+compensation is active. A motorized tail is refused when the governor reads the yaw:
+the firmware writes the tail motor throttle to the logged yaw (`mixer[2]`) after
+`governorUpdate`. The log header records neither `tail_rotor_mode` nor
+`main_rotor_dir`.
+
+`step({rawMotorRpm, batteryVoltage, throttleCommand, throttleOff, armed,
+mixer:[roll,pitch,yaw,collective], timeS?, govBypass?, govSuspend?, govFallback?,
+rcDeflection?})` returns `{P, I, D, F, sum, targetHS, requestHS, currentHeadSpeed,
+state, ttaIncrease, spoolUpRatio, spooledUp, throttle}`. BYPASS maps the collective
+stick, so `govBypass` needs the four `rcDeflection` values. `profile(values)` takes
+all governor values of the new PID profile. A missing value is unknown, except a value
+that the new profile does not read. It refuses a change of a global value, and a
+global value that was assumed at `govCreate` stays unknown. `values` holds the known
+values only, so `profile({...gov.values, ...changes})` cannot make an assumed value
+known. `reset()` returns to the values of `govCreate` and zeroes the governor state,
+Kmot included.
+
+Time: `rf_step` and `rf_gov_step` read whole microseconds as two exact 16-bit halves
+(`input[34]` high, `input[43]` low; `input[34] < 0` adds one PID loop). The host
+`millis()` is that uint32 count / 1000, but the firmware ms clock wraps only after
+49.7 days. Only time differences reach the governor, so a first time after 1000 s
+moves the origin to 1000 s before it. A time before the previous time, or 2^32 us
+after the origin, is an error.
+
+Configuration mapping: `fromHeader` reads CLI `battery_meter` as `voltage_meter`
+(NONE 0, ADC 1, ESC 2) and `gov_mode = OFF` as 0. `battery_cell_count = 0` is the
+firmware auto rule: `govCells` (and `fromHeader` with `context.restVoltage`) gives the
+count of `health_power.autoCells` for the rest voltage. The cell limits come from
+`health_power.limitsOf` (0.01 V or 0.1 V units). A header limit that is not in
+`loggedHeaderFields` is a parser default and does not hide the CLI limits. An unknown
+gear ratio gives 1:1 with the headspeed as the motor speed; the governor law and its
+glitch limits scale with the same ratio, so the result does not change.
+
+`analysis/governor-twin/parity.cjs` replays every extracted Fireball and Gaui log open
+loop on the recorded headspeed and writes `out/parity.json` (gate: state agreement
+0.995 or more, ACTIVE `motor[0]` RMS 2 per mille or less).
 
 ## Gyro sensor execution
 

@@ -232,7 +232,7 @@ var AnalysisView = (function () {
         if (/^(L\d+|C2|T8)$/.test(id)) return "limits";    // the control outputs at their limits (CLAUDE.md "Control limits")
         if (/^(D5|G11|G13|P\d+)$/.test(id)) return "power";
         if (/^G(17|18)$/.test(id)) return "motor";
-        if (/^G(1|12|20)$/.test(id)) return "rpm";
+        if (/^G(1|12|20|21)$/.test(id)) return "rpm";   // G21: the RPM signal at the throttle maximum (catalog.cjs AREA_OF)
         if (/^G\d+$/.test(id)) return "governor";
         if (/^(F\d+|C11|C15|T4)$/.test(id)) return "vibration";
         if (/^(D6|D8|D9|R1)$/.test(id)) return "radio";

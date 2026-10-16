@@ -420,6 +420,15 @@ function dist() {
         './tools/autotune/firmware/schema.cjs',
         './tools/autotune/firmware/**/*',
         './tools/autotune/param_epochs.cjs',
+        // the governor model and autotune (worker command governorTune, docs/GOVERNOR_AUTOTUNE.md)
+        './tools/autotune/gov_twin.cjs',
+        './tools/autotune/gov_data.cjs',
+        './tools/autotune/gov_params.cjs',
+        './tools/autotune/gov_sim.cjs',
+        './tools/autotune/gov_fit.cjs',
+        './tools/autotune/gov_search.cjs',
+        './tools/autotune/gov_scenarios.cjs',
+        './tools/autotune/gov_tune.cjs',
 
         // everything else
         './package.json', // For NW.js

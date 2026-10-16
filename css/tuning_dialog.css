@@ -122,6 +122,9 @@
     font-size: calc(13.5 * var(--rf-px));
 }
 
+.tuning-stale-text > p { margin: 0 0 4px; }
+.tuning-stale-text > p:last-child { margin-bottom: 0; }
+
 .tuning-stale-links {
     margin-top: 2px;
     font-size: calc(13 * var(--rf-px));
@@ -1926,6 +1929,17 @@
 .tuning-ct-parameters small { display: block; color: #607589; }
 .tuning-ct-reason { margin: 14px 0; padding: 14px 18px; border-left: 3px solid #6e879f; background: #f5f8fa; }
 .tuning-ct-reason > h6 { margin-top: 0; font-size: calc(15 * var(--rf-px)); }
+/* the governor model of the Governor tab (govModelHtml) */
+.tuning-gm-family { margin-top: 16px; }
+.tuning-gm-family > .tuning-h { margin-bottom: 4px; }
+.tuning-gm-counts { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 6px; }
+.tuning-gm-table td { vertical-align: top; }
+.tuning-gm-table td > small { display: block; color: #607589; }
+.tuning-gm-table td > p { margin: 0 0 4px; }
+.tuning-gm-evidence { margin: 0; padding-left: 1.2em; }
+.tuning-gm-rec .tuning-step-pick { margin-top: 0; font-weight: 600; }
+.tuning-gm-status { margin: 10px 0; }
+.tuning-gm-optin { margin: 4px 0; }
 .tuning-ct-evidence { border-top: 1px solid #e1e7ec; padding-top: 10px; margin-top: 10px; }
 .tuning-ct-evidence p { margin-bottom: 6px; }
 .tuning-ct-delta { color: #886128; font-weight: 600; font-variant-numeric: tabular-nums; }

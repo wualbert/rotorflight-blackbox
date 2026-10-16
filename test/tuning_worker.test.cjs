@@ -266,8 +266,9 @@ test('T0: the worker is Chromium 99 syntax as written (esbuild chrome99 output e
 
 test('T0: the toolkit files the worker runs in Chromium 99 are Chromium 99 syntax and use no newer API', (t) => {
     const { dir, names, optional } = fetchedToolkit();
-    assert.equal(names.length, 39);
-    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline']);
+    assert.equal(names.length, 47);
+    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline',
+        'gov_twin', 'gov_data', 'gov_params', 'gov_sim', 'gov_fit', 'gov_search', 'gov_scenarios', 'gov_tune']);
     let esbuild = null; try { esbuild = require(path.join(REPO, 'node_modules/esbuild')); } catch (e) { /* the API check still runs */ }
     for (const n of names) {
         const file = path.join(JS, `${dir}${n}.cjs`);
@@ -286,7 +287,7 @@ test('T0: every file the worker loads is a relative URL to a file that exists an
     const list = /(?:var distSources|APP_ASSET_SOURCES) = \[([\s\S]*?)\];/.exec(gulp)[1], quoted = (s) => [...s.matchAll(/'([^']+)'/g)].map(m => m[1]);
     const scripts = quoted(/importScripts\(([^)]*)\)/.exec(src)[1]).map(u => path.posix.join('js', u));
     const toolkit = names.map(n => path.posix.normalize(path.posix.join('js', `${dir}${n}.cjs`)));
-    assert.equal(scripts.length, 12); assert.equal(names.length, 39);
+    assert.equal(scripts.length, 12); assert.equal(names.length, 47);
     toolkit.forEach((f, i) => { if (optional.includes(names[i]) && !fs.existsSync(path.join(REPO, f))) { t.diagnostic(`${f} is not in the repo yet: an optional module`); toolkit[i] = null; } });
     for (const f of scripts.concat(toolkit.filter(Boolean))) {
         assert.ok(!/^\/|^[a-z]+:/i.test(f) && !f.startsWith('..'), `${f} relative to the app root`);
@@ -1067,8 +1068,10 @@ test('evidence.cjs (when present): every flag has evidence; spans in frame secon
         if (!f.evidence) continue;
         const e = f.evidence;
         assert.equal(e.v, 1, f.fid); assert.equal(e.fid, f.fid);
-        // 3 or less; a check of the control limits keeps up to 10 periods (catalog.cjs evidence.maxSpans: CLAUDE.md "Control limits")
-        assert.ok(Array.isArray(e.spans) && e.spans.length <= (/^(L\d|P1)$/.test(f.id) ? 10 : 3), `${f.fid}: spans ${J(e.spans)}`);
+        // 3 or less; a check of the control limits keeps up to 10 periods (catalog.cjs evidence.maxSpans: CLAUDE.md "Control limits"), and
+        // G21 every sudden change at the maximum and every FALLBACK entry (review 2026-10-15)
+        const cap = /^(L\d|P1)$/.test(f.id) ? 10 : f.id === 'G21' ? Math.max(3, (f.events || []).filter(q => q && (q.kind === 'FALLBACK' || q.atMax)).length) : 3;
+        assert.ok(Array.isArray(e.spans) && e.spans.length <= cap, `${f.fid}: spans ${J(e.spans)}`);
         for (const q of e.spans) assert.ok(isFinite(q.t0) && isFinite(q.t1) && q.t0 <= q.t1 && q.t1 >= 0 && q.t0 <= dur(q.log === undefined ? logsOf(f)[0] : q.log) + 5, `${f.fid}: span ${J(q)}`);
         if (e.view) assert.ok(isFinite(e.view.t0) && isFinite(e.view.t1) && e.view.t0 <= e.view.t1, `${f.fid}: view ${J(e.view)}`);
     }
@@ -1134,11 +1137,12 @@ test('derive: init loads the toolkit once; derive never decodes, makes no fs cal
     assert.deepEqual(Object.keys(ready.result.modules), ['track', 'more', 'gov', 'catalog']);
     assert.ok(ready.result.modules.track && ready.result.modules.more && ready.result.modules.gov, J(ready.result));
     assert.equal(ready.result.modules.catalog, has('catalog.cjs'));
-    assert.equal(W.fetches.length, 39, 'each toolkit file fetched once');
+    const fetched = fetchedToolkit().names.length; // REQUIRED, GAINS, OPTIONAL and ON_DEMAND (47 with the governor modules)
+    assert.equal(W.fetches.length, fetched, 'each toolkit file fetched once');
     const x = Float32Array.from(noise(4000, 1, 10));
     await W.derive('bandpass', { x }, 1000, { lo: 5, hi: 50 });
     await W.derive('window', { 'setpoint[0]': x, 'gyroADC[0]': x }, 1000, {});
-    assert.equal(W.fetches.length, 39, 'no fetch after init');
+    assert.equal(W.fetches.length, fetched, 'no fetch after init');
     assert.equal((await TW.deriveKit()).calls.n, 0, 'no fs call');
     const bad = async (msg, text) => { const m = await W.post(Object.assign({ cmd: 'derive' }, msg)); assert.deepEqual([m.type, m.message], ['error', text]); };
     await bad({ kind: 'nope', rate: 1000, cols: { x } }, 'The function "nope" is unknown.');
@@ -1272,7 +1276,7 @@ function phaseTruth(w, rpm, airborneEvents) {
     return { P, flying, fm, all, flight, both, spans: P.spans.map(q => ({ phase: q.phase, t0: at(q.i0), t1: at(q.i1) })) };
 }
 // the truth of the governor metrics of segment `seg` of one log (bytes) as the worker must give them in a flight log: health_gov of
-// the worker's kit at that flight rpm, over the stub's phases: D5, G13, G12 and states on every phase, G1 on the ground and flight
+// the worker's kit at that flight rpm, over the stub's phases: D5, G13, G12, G21 and states on every phase, G1 on the ground and flight
 // phases, the rest on the ground and flight phases at the flight rpm or more less `keep` (rescue, level modes, failsafe; null:
 // nothing), and phaseMasks
 async function govTruth(W, rpm, bytes, seg, cliText, keep) {
@@ -1283,10 +1287,10 @@ async function govTruth(W, rpm, bytes, seg, cliText, keep) {
     for (const q of P.spans) { all.fill(1, q.i0, q.i1); if (q.phase === 'ground' || q.phase === 'flight') { rotor.fill(1, q.i0, q.i1); for (let i = q.i0; i < q.i1; i++) tracking[i] = w.hs[i] >= rpm && (!keep || keep[i]) ? 1 : 0; } }
     const ctx = K.health.buildCtx(w, w.flight, { flying, profile: Uint8Array.from(w.profileAt), cli: cliText, cliParsed: cliText ? K.core.setup.parseCli(cliText) : null, app: W.ctx });
     const run = (mask) => K.core.gov.analyse(w, Object.assign({}, ctx, { flying: mask, flyingAll: flying })), a = run(all), b = run(rotor), out = run(tracking);
-    for (const k of ['D5', 'G13', 'G12', 'states']) out[k] = a[k];
+    for (const k of ['D5', 'G13', 'G12', 'G21', 'states']) out[k] = a[k];
     out.G1 = b.G1;
     const sum = (m) => m.reduce((x, v) => x + v, 0);
-    out.phaseMasks = { all: { phases: ['idle', 'spoolup', 'ground', 'flight', 'spooldown'], seconds: r1(sum(all) / rate), checks: ['D5', 'G13', 'G12'] },
+    out.phaseMasks = { all: { phases: ['idle', 'spoolup', 'ground', 'flight', 'spooldown'], seconds: r1(sum(all) / rate), checks: ['D5', 'G13', 'G12', 'G21'] },
         rotor: { phases: ['ground', 'flight'], seconds: r1(sum(rotor) / rate), checks: ['G1'] }, tracking: { phases: ['ground', 'flight'], seconds: r1(sum(tracking) / rate), active: !!w.govStateAt } };
     return out;
 }
@@ -1342,7 +1346,7 @@ test('D13: a log with no flight is a bench run, which the app does not analyse; 
     const ph = (pred) => R.findings.filter(pred).map(f => f.phase);
     assert.ok(ph(f => f.module === 'phase').length && ph(f => f.module === 'phase').every(p => p === 'all'), 'health_phase findings');
     const govPh = R.findings.filter(f => f.module === 'gov' && logsOf(f).length);
-    assert.ok(govPh.length && govPh.every(f => f.phase === (['D5', 'G13', 'G12'].includes(f.id) ? 'all' : 'ground+flight')) && ph(f => f.module === 'loop' && logsOf(f).length).every(p => p === 'flight'), 'governor all or ground+flight, loop flight');
+    assert.ok(govPh.length && govPh.every(f => f.phase === (['D5', 'G13', 'G12', 'G21'].includes(f.id) ? 'all' : 'ground+flight')) && ph(f => f.module === 'loop' && logsOf(f).length).every(p => p === 'flight'), 'governor all or ground+flight, loop flight');
     assert.ok(govPh.every(f => J(f.phases) === J(f.phase === 'all' ? ['idle', 'spoolup', 'ground', 'flight', 'spooldown'] : ['ground', 'flight'])), 'phases: the phase names of the masks');
     assert.ok(ph(f => ['D1', 'D3', 'SETUP', 'F1', 'F2', 'F4'].includes(f.id) && logsOf(f).length).every(p => p === null) && ph(f => f.id === 'F5' && logsOf(f).length).every(p => p === 'flight'), 'header checks have no phase');
     // with excludeAbnormal the attitude mask is also normal (no rescue): health_more sees flying, normal and the flight phases
@@ -1778,6 +1782,10 @@ test('T3: Gaui X4 dump in file scope: only #49, #50, #51 and #58 are analysed, t
     const bench = new Set(R.benchRuns.map(b => b.log)), stray = R.findings.filter(f => logsOf(f).length && logsOf(f).every(l => bench.has(l)) && f.id !== 'D7');
     assert.deepEqual(stray.map(f => f.fid), [], 'findings of bench runs');
     assert.ok(R.findings.some(f => f.module === 'phase' && f.log === 50), 'health_phase findings of #50');
+    // check G21: the Gaui X4 II never gets to its throttle maximum (95 % or less): no problem, and no change of gov_max_throttle
+    const g21 = R.findings.filter(f => f.id === 'G21');
+    assert.ok(g21.length && g21.every(f => f.severity !== 'flag' && !(f.atMaxS > 0)), J(g21.map(f => [f.fid, f.severity, f.atMaxS])));
+    assert.ok(!R.advice.recommendations.some(r => /^G21/.test(r.id)), 'no recommendation of check G21');
     // the flight rpm from the flights only
     assert.ok(R.flightRpm.source === 'govTarget' && R.flightRpm.logs.every(l => GAUI_FLIGHTS.includes(l)), J(R.flightRpm));
     // the flights in frame seconds, inside their records; phases contiguous; the attitude checks on the flight phases only
@@ -1787,7 +1795,7 @@ test('T3: Gaui X4 dump in file scope: only #49, #50, #51 and #58 are analysed, t
         if (l.flown) assert.ok(l.normalS <= (l.phaseSeconds.flight || 0) + 0.2, `#${l.log}.${l.segment}: attitude ${l.normalS} s, flight phase ${l.phaseSeconds.flight} s`);
     }
     assert.equal(R.flights.length, R.records.reduce((n, l) => n + (l.logClass === 'flight' ? l.flights.length : 0), 0));
-    assert.ok(R.findings.filter(f => f.module === 'loop' && logsOf(f).length).every(f => f.phase === 'flight') && R.findings.filter(f => f.module === 'gov' && logsOf(f).length).every(f => f.phase === (['D5', 'G13', 'G12'].includes(f.id) ? 'all' : 'ground+flight')), 'phases of the findings');
+    assert.ok(R.findings.filter(f => f.module === 'loop' && logsOf(f).length).every(f => f.phase === 'flight') && R.findings.filter(f => f.module === 'gov' && logsOf(f).length).every(f => f.phase === (['D5', 'G13', 'G12', 'G21'].includes(f.id) ? 'all' : 'ground+flight')), 'phases of the findings');
     // review A8: D7 lists the flights in frame seconds, the flights of the records
     for (const l of GAUI_FLIGHTS) { const d7 = R.findings.find(f => f.id === 'D7' && f.log === l), fl = R.flights.filter(q => q.log === l);
         assert.deepEqual(d7.flights.map(q => [q.t0, q.t1]), fl.map(q => [q.t0, q.t1]), `#${l} D7 flights`);
@@ -1988,7 +1996,28 @@ test('round 2: Fireball 2026-10-05 in file scope: P1 at the load steps of each f
     const d9 = R.findings.filter(f => f.id === 'D9' && f.severity === 'ok').map(f => f.pidProfile).sort();
     assert.deepEqual(d9, [1, 2], 'a rescue state in PID profiles 1 and 2');
     const g20 = R.findings.filter(f => f.id === 'G20');
-    assert.deepEqual(g20.map(f => [f.log, f.value, f.n]), [[11, 2, 2], [14, 1, 1]], 'log 12: 2 FALLBACKs at the throttle limit; log 15: 1 at the rescue');
+    // check G20 with the detector of check G21 (critique C12): each FALLBACK comes 30 ms or less after a sudden change of the headspeed
+    // signal at 100 % throttle, an error of the RPM signal (value: the FALLBACK entries with an overload sign, also with the error of the
+    // signal: review 2026-10-15, each entry has 0.2 s to 0.33 s at 95 % throttle or more; overloadOnly: the overload alone)
+    assert.deepEqual(g20.map(f => [f.log, f.value, f.n, f.signals, f.spikes, f.overloadOnly]), [[11, 2, 2, 2, 2, 0], [14, 1, 1, 1, 1, 0]], 'log 12: 2 FALLBACKs, log 15: 1 at the rescue, each during a sudden change');
+    assert.ok(g20.every(f => f.events.every(e => e.kind === 'signal' && e.signal.kind === 'spike' && e.signal.throttle >= 995)), J(g20.map(f => f.events)));
+    // check G21 (analysis/rpm-spikes): the sudden changes at 100 % throttle in PID profile 2 (configurations B and E), the change of
+    // gov_max_throttle to 97 with CLI text that no gate holds (the remedy of the RPM prerequisite), and a check of the RPM signal
+    const g21 = R.findings.filter(f => f.id === 'G21' && f.severity === 'flag');
+    // one sudden change is one episode (review 2026-10-15): the burst of log 14 at 205.81 s to 205.97 s counts once in configuration B
+    assert.deepEqual(g21.map(f => [f.pidProfile, f.basis, f.value, f.n, f.status]), [[2, 'profile', 4, 4, 'problem'], [2, 'pooled', 1, 1, 'problem']], J(g21.map(f => f.fid)));
+    assert.ok(g21[0].p < 1e-6 && g21[0].fallbacks.afterSpike === 2 && g21.every(f => f.evidence && f.evidence.spans.length > 0 && f.evidence.spans.every(q => [11, 13, 14].includes(q.log))), J(g21.map(f => f.evidence && f.evidence.spans)));
+    assert.ok(R.findings.filter(f => f.id === 'G21' && f.pidProfile !== 2).every(f => f.severity !== 'flag'));
+    const gmt = R.advice.recommendations.find(r => r.id === 'G21:gov_max_throttle:p2'), sig = R.advice.recommendations.find(r => r.id === 'G21:signal');
+    assert.deepEqual([gmt.node, gmt.severity, gmt.from, gmt.to, gmt.cli, gmt.blockedBy], ['rpm', 'action', 100, 97, ['profile 1', 'set gov_max_throttle = 97'], []]);
+    assert.match(gmt.text, /At the throttle maximum of 100 %, the headspeed signal has 5 sudden changes in [\d.]+ s \(logs [\d, and]+, PID profile 2\)\. With the throttle less than the maximum, it has 0 sudden changes/);
+    // the stale flag of a G21 result names the source of gov_max_throttle (the log header does not record it: review 2026-10-15)
+    assert.ok(R.findings.filter(f => f.id === 'G21' && f.stale).every(f => !/log header of log/.test(f.stale.source) && /gov_max_throttle/.test(f.stale.source)), J(R.findings.filter(f => f.id === 'G21').map(f => f.stale && f.stale.source)));
+    // no change in less than 12 s at the maximum is not measured, never satisfactory (review 2026-10-15)
+    assert.ok(R.findings.filter(f => f.id === 'G21' && f.status === 'satisfactory').every(f => f.atMaxS >= 12), J(R.findings.filter(f => f.id === 'G21').map(f => [f.pidProfile, f.status, f.atMaxS])));
+    assert.deepEqual([sig.severity, sig.cli], ['check', []]);
+    assert.ok(R.hierarchy.nodes.rpm.recs.includes('G21:gov_max_throttle:p2') && R.hierarchy.nodes.governor.status === 'blocked', J(R.hierarchy.nodes.rpm));
+    assert.match(R.advice.script, /\nprofile 1\n(#[^\n]*\n|set [^\n]+\n)*set gov_max_throttle = 97\n/, 'the CLI file selects the change first');
     const g1 = R.findings.filter(f => f.id === 'G1' && f.severity === 'flag');
     assert.ok(g1.length === 2 && g1.every(f => f.status === 'problem'), J(g1.map(f => [f.log, f.status])));
     assert.equal(R.hierarchy.nodes.rpm.status, 'problem', 'FALLBACK still needs diagnosis when throttle reaches its limit');
@@ -2082,6 +2111,34 @@ test('rescue transition text retains actual PID profile numbers when configurati
         assert.equal(f.dataset,'C');assert.equal(f.profile,1,'configuration C belongs to PID profile 1');
     }
 });
+// review 2026-10-15: G1 and G20 have no label of their own (one result for each log), but their events and spans have the labels of
+// the configurations: they show the PID profile of that configuration, never the number of the label ("PID profile 5" for configuration
+// E of PID profile 2). The text of one configuration says "This configuration", not "This PID profile"
+test('labels of the configurations: the events and spans of a result with no label show the PID profile; "This configuration"', async () => {
+    const rescue = `'use strict'; module.exports = {EXTRA: [], RULE: {}, DEFAULT_RULES: {},
+        analyse: (w,ctx) => ({label: Array.from(ctx.profile).find(x=>x>0), t: w.fromS + 5}),
+        judge: flights => [].concat(...flights.filter(f=>f.metrics.label>0).map(f=>[
+            {id:'G20',severity:'note',log:f.log,profile:null,value:0,n:1,unit:'count',text:'One FALLBACK.',events:[{t:f.metrics.t,t1:f.metrics.t+0.05,start:f.metrics.t,kind:'signal',profile:f.metrics.label}]},
+            {id:'G19',severity:'flag',log:f.log,profile:f.metrics.label,value:-0.1,n:1,text:'This PID profile has only 1 rescue. In this PID profile, the decrease is large.',events:[{t:f.metrics.t,profile:f.metrics.label}]}])), curves:()=>null};`;
+    const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE, 'health_rescue.cjs': rescue });
+    const R = await W.result({ cmd: 'analyseFile', fileName: 'sim.bbl', selectedLog: 3, options: { flightRpm: TRUTH.rpm, cliText: CLI, curves: false, gains: false, keepMetrics: true } }, S.bytes);
+    const pidOf = (id) => { const d = R.datasets.datasets.find(x => x.id === id); return d && d.pidProfile > 0 ? d.pidProfile : 0; };
+    const g20 = R.findings.filter(f => f.id === 'G20'), g19 = R.findings.filter(f => f.id === 'G19');
+    assert.ok(g20.length && g19.length, J(R.findings.map(f => f.id)));
+    // log 3 flies configuration C (PID profile 1) with a label that is not 1: the test can see the error
+    const l3 = R.records.find(l => l.log === 3 && l.metrics && l.metrics.rescue).metrics.rescue.label, c3 = g20.find(f => f.log === 3);
+    assert.ok(l3 !== 1 && c3, `the label of log 3 is ${l3}`);
+    assert.deepEqual([c3.profile, c3.events[0].profile, c3.events[0].dataset], [null, 1, 'C'], J(c3.events));
+    for (const f of g20) { const p = pidOf(f.events[0].dataset);
+        assert.equal(f.events[0].profile, p, J(f.events));
+        assert.ok(f.evidence && f.evidence.spans.length && f.evidence.spans.every(q => q.profile === p && q.pidProfile === (p > 0 ? p : null)), J(f.evidence && f.evidence.spans)); }
+    for (const f of g19) {
+        assert.deepEqual([f.pidProfile, f.events[0].profile], [pidOf(f.dataset) || null, pidOf(f.dataset)], J(f));
+        assert.equal(f.text, 'This configuration has only 1 rescue. In this configuration, the decrease is large.');
+        assert.ok(f.evidence.spans.every(q => q.pidProfile === (pidOf(f.dataset) || null)), J(f.evidence.spans));
+    }
+});
+
 test('round 3 M1: every sample has the label of its configuration, the modules pool by configuration; f.dataset, the fid and result.datasets', async () => {
     const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE, 'health_track.cjs': STUB_LABELS });
     const run = (o, sel = 1) => W.result({ cmd: 'analyseFile', fileName: 'sim.bbl', selectedLog: sel, options: Object.assign({ flightRpm: TRUTH.rpm, cliText: CLI, curves: false, keepMetrics: true }, o) }, S.bytes);
@@ -2640,4 +2697,325 @@ test('configuration-specific curves and advice use each LUA interval and its rec
         assert.equal(list[0].probe.gain,d.values.roll_p_gain);assert.deepEqual(list[0].probe.datasets,[d.id]);
         assert.ok(list[0].probe.findings.every(id=>id===d.id));assert.equal(list[0].dataset,d.id);
     }
+});
+
+// ---------------------------------------------------------------------------------------------
+// governorTune (docs/GOVERNOR_AUTOTUNE.md section 8): the governor model and autotune of gov_tune.cjs on the flight logs of a file
+// ---------------------------------------------------------------------------------------------
+
+// A gov_tune.cjs stand-in (the real autotune has its own tests: test/gov_tune.test.cjs): it records what the worker gives (seen) and
+// answers in the protocol. WAIT true: after its second progress text it waits for the cancel (o.cancelled)
+const STUB_GOV_TUNE = `'use strict';
+const WAIT = false;
+async function autotune(runs, o) {
+    o.progress('The stub examines the runs.', 0.25);
+    let waited = 0;
+    if (WAIT) { o.progress('The stub waits for the cancel.', 0.5); while (!o.cancelled() && waited < 4000) { await new Promise(r => setTimeout(r, 5)); waited++; } }
+    o.progress('The stub is complete.', 1);
+    const seen = runs.map(r => ({ log: r.log, segment: r.segment, cls: r.class, segClass: r.segmentClass, hasGovernor: r.hasGovernor, phase: !!r.phase, profile0: r.profile[0], profiles: [...new Set(r.profile)].sort(),
+        filled: r.profileFilled, armingProfile: r.armingProfile, armSource: r.armSource, disarms: r.disarms.length, disarmEvents: (r.events || []).filter(e => e.event === 15).length,
+        armed: r.armed.reduce((s, v) => s + v, 0), n: r.n, rate: r.rate }));
+    const rec = (id, x) => Object.assign({ id, title: 'Stub change', severity: 'action', node: 'governor', area: 'governor', scope: 'profile', profile: 1, cliProfile: 0, parameter: 'gov_p_gain',
+        from: 40, to: 50, fromSource: 'log header', cli: ['profile 0', 'set gov_p_gain = 50'], evidence: [], rule: 'Stub rule.', text: 'Stub text.', stale: null, blockedBy: [], causes: [], caveats: [], confidence: 'predicted' }, x);
+    const own = { reasons: ['unlogged', 'rearm'], source: 'log header, PID profile 1 at the start of the log', text: 'This value is possibly not the same in all logs. The stub gives two causes.',
+        flags: [{ reason: 'unlogged', name: 'gov_i_gain', logs: [0, 1], text: 'The value of "gov_i_gain" changes between logs, and the log does not record the change.' }, { reason: 'rearm', logs: [0], text: 'The pilot armed the helicopter again in log 1.' }] };
+    return { status: 'validated', reasons: [], seen, cli: o.cli, budgetMs: o.budgetMs || null, cancelled: o.cancelled(), waited,
+        twin: { params: { kv: 1.5 }, uncertainty: { kv: 0.1 }, validation: { passed: true }, plots: [{ id: 'hs', title: 'Headspeed', kind: 'time', x: { label: 'Time (s)' }, y: { label: 'Headspeed (rpm)' },
+            series: [{ name: 'Log', x: Float64Array.of(0, 0.5), y: Float32Array.of(2500, 2501), style: 'line', role: 'measured' }] }] },
+        rows: [{ name: 'gov_p_gain', scope: 'profile', profile: 1, current: { value: 40, source: 'log header' }, status: 'change', to: 50, evidence: [], rule: 'GT18', method: 'simulation', stale: null, family: 'gains' },
+            { name: 'gov_spoolup_time', scope: 'global', profile: null, current: { value: 100, source: 'log header' }, status: 'keep', to: null, evidence: [{ text: 'Spool-up.', log: 0, t0: 5, t1: 6 }], rule: 'GT6', method: 'rule', stale: null, family: 'state' }],
+        recommendations: [rec('gov:p'), rec('gov:spool', { scope: 'global', profile: null, cliProfile: null, parameter: 'gov_spoolup_time', cli: ['set gov_spoolup_time = 120'], confidence: 'measured', evidence: [{ log: 0, times: [5, 6], text: 'Spool-up.' }] }),
+            rec('gov:i', { parameter: 'gov_i_gain', confidence: 'measured', stale: own })],
+        limitations: ['The stub has no model.'], plots: [] };
+}
+module.exports = { autotune };`;
+const govTune = async (W, options, bytes, fileName = 'sim.bbl') => { const m = await W.send({ cmd: 'governorTune', fileName, options }, bytes); assert.equal(m.type, 'governorTuned', `${m.message}\n${m.stack}`); return m.result; };
+const GDM = require('../tools/autotune/gov_data.cjs');
+
+test('governorTune: the runs of every flight log reach gov_tune.cjs autotune with all phases, the PID profiles and the CLI dump; a JSON result with the logs, notes and progress', async () => {
+    const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': STUB_GOV_TUNE });
+    const R = await govTune(W, { flightRpm: TRUTH.rpm, cliText: CLI, cliName: TRUTH.cliName, budgetMs: 1234 }, S.bytes);
+    assert.deepEqual(JSON.parse(JSON.stringify(R)), R, 'JSON data only: no typed array, function or undefined');
+    assert.deepEqual(R.twin.plots[0].series[0], { name: 'Log', x: [0, 0.5], y: [2500, 2501], style: 'line', role: 'measured' });
+    // the flight logs with the governor fields (log 5 has no extra field: no motor output and no governor values); log 0 is a bench run,
+    // log 2 does not parse, log 6 has no headspeed
+    assert.deepEqual([R.status, R.logs, R.benchRuns], ['validated', [1, 3, 4], [0]]);
+    assert.deepEqual(R.skipped.map(q => q.log), [2, 5, 6], J(R.skipped));
+    assert.equal(R.skipped.find(q => q.log === 5).reason, 'The log does not record all the values that the governor model uses.');
+    // log 6 of the viewer: the decoder cannot read a log without the headspeed field; the cause and the setting that records it
+    assert.equal(R.skipped.find(q => q.log === 6).reason, `${GDM.TEXT.noHs} To record the headspeed, set "blackbox_log_rpm" to ON.`);
+    for (const t of [GDM.TEXT.noMotor, GDM.TEXT.noGov]) assert.ok(R.notes.includes(`${t.replace(/\.$/, '')} (log 6).`), `${t}\n${R.notes.join('\n')}`);
+    assert.ok(R.notes.includes('The governor analysis does not use bench runs (1 log).'), R.notes.join('\n'));
+    // each segment of a flight log is a run, with its phases (log 2 of the viewer has a logging gap: two runs). The PID profile before
+    // the first logged change (frame 0) is the profile at the start of the log that the CLI dump and govRequest confirm (PID profile 1)
+    assert.deepEqual(R.seen.map(q => [q.log, q.segment, q.cls, q.hasGovernor, q.phase, q.rate]), [[1, 0, 'flight', true, true, 1000], [1, 1, 'flight', true, true, 1000], [3, 0, 'flight', true, true, 1000], [4, 0, 'flight', true, true, 1000]]);
+    assert.deepEqual(R.seen.map(q => [q.log, q.profile0, q.armingProfile, q.filled > 0]), [[1, 1, 1, true], [1, 1, 1, false], [3, 1, 1, true], [4, 1, 1, true]]);
+    assert.deepEqual(R.seen[0].profiles, [1, 2], 'log 2 of the viewer: PID profile 1, then 2 from 28 s');
+    // no DISARM event in these logs: the arm switch (flightModeFlags bit 0) gives the arm state
+    assert.ok(R.seen.every(q => q.disarms === 0 && q.armSource === 'switch' && q.armed === q.n), J(R.seen));
+    assert.deepEqual([R.cli, R.cliName, R.budgetMs, R.flightRpm.value, R.fileName, R.selection], [CLI, TRUTH.cliName, 1234, TRUTH.rpm, 'sim.bbl', null]);
+    assert.deepEqual(R.limitations, ['The stub has no model.']);
+    assert.ok(R.timing.totalS >= R.timing.modelS && R.timing.decodeS > 0 && R.timing.model === null, J(R.timing)); // the stub gives no timing
+    // progress: the logs, then the model texts of the toolkit in 0.45..0.99, in order
+    const P = W.progress.filter(p => p.id === 1), gov = P.filter(p => p.stage === 'governor');
+    assert.ok(P.some(p => p.text === 'The app loads log 2 of 7 for the governor analysis.'), J(P.map(p => p.text)));
+    assert.deepEqual(gov.map(p => [p.text, p.fraction]), [['The app makes the governor model from 3 flight logs.', 0.45], ['The stub examines the runs.', 0.585], ['The stub is complete.', 0.99]]);
+    assert.ok(P.every((p, i) => !i || p.fraction >= P[i - 1].fraction), 'the fraction does not decrease');
+    // without a CLI dump: cli null (the log is the only necessary input); options.logs and the flight selection: whole logs
+    const L = await govTune(W, { flightRpm: TRUTH.rpm, logs: [3, 0] }, S.bytes);
+    assert.deepEqual([L.cli, L.cliName, L.logs, L.benchRuns, L.seen.map(q => q.log)], [null, null, [3], [0], [3]]);
+    const F = await govTune(W, { flightRpm: TRUTH.rpm, flights: [{ log: 1, flight: 0 }] }, S.bytes);
+    assert.deepEqual([F.logs, F.selection, F.seen.map(q => [q.log, q.segment])], [[1], { logs: [1], whole: true }, [[1, 0], [1, 1]]]);
+    assert.ok(F.notes.includes('The governor analysis uses all of each log with a selected flight, because the governor model starts when the pilot arms the helicopter.'), F.notes.join('\n'));
+});
+
+test('governorTune: without the necessary fields or without a flight log, status unavailable with the reasons in STE, and gov_tune.cjs does not run', async () => {
+    const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': STUB_GOV_TUNE });
+    const R = await govTune(W, { flightRpm: TRUTH.rpm, logs: [5] }, S.bytes);
+    assert.deepEqual([R.status, R.logs, R.rows, R.recommendations, R.plots, R.twin, 'seen' in R], ['unavailable', [], [], [], [], null, false]);
+    assert.deepEqual(R.reasons, [GDM.TEXT.noMotor, GDM.TEXT.noGov]);
+    assert.match(GDM.TEXT.noGov, /The log records these values only with "blackbox_log_governor" ON\.$/, 'the setting that records the governor values (a note: no instruction)');
+    // a flight log without the headspeed field (log 7 of the viewer): its cause, not "no flight"
+    const H = await govTune(W, { flightRpm: TRUTH.rpm, logs: [6] }, S.bytes);
+    assert.deepEqual([H.status, H.reasons, H.skipped, H.benchRuns], ['unavailable', [`${GDM.TEXT.noHs} To record the headspeed, set "blackbox_log_rpm" to ON.`],
+        [{ log: 6, reason: `${GDM.TEXT.noHs} To record the headspeed, set "blackbox_log_rpm" to ON.` }], []]);
+    // only a log that the app cannot read: its cause
+    const U = await govTune(W, { flightRpm: TRUTH.rpm, logs: [2] }, S.bytes);
+    assert.deepEqual([U.status, U.reasons], ['unavailable', ['The app cannot read this log.']]);
+    const B = await govTune(W, { flightRpm: TRUTH.rpm, logs: [0, 2] }, S.bytes);
+    assert.deepEqual([B.status, B.reasons, B.benchRuns, B.skipped], ['unavailable', ['The selected logs have no flight. The governor analysis does not use bench runs.'], [0], [{ log: 2, reason: 'The app cannot read this log.' }]]);
+    assert.ok(B.notes.includes('The governor analysis does not use bench runs (1 log).'), B.notes.join('\n'));
+});
+
+test('governorTune: cancel between logs and during the model (cancelled() of autotune); errors of the toolkit are named', async () => {
+    const S = sim();
+    const A = worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': STUB_GOV_TUNE }), early = A.send({ cmd: 'governorTune', fileName: 'sim.bbl', options: { flightRpm: TRUTH.rpm } }, S.bytes);
+    A.ctx.onmessage({ data: { cmd: 'cancel', id: 1 } });
+    assert.deepEqual([(await early).type, (await early).message], ['error', 'You canceled the analysis.']);
+    const W = worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': STUB_GOV_TUNE.replace('const WAIT = false;', 'const WAIT = true;') });
+    const late = W.send({ cmd: 'governorTune', fileName: 'sim.bbl', options: { flightRpm: TRUTH.rpm, logs: [3] } }, S.bytes);
+    for (let k = 0; k < 4000 && !W.progress.some(p => p.text === 'The stub waits for the cancel.'); k++) await new Promise(r => setTimeout(r, 5));
+    const t0 = Date.now(); W.ctx.onmessage({ data: { cmd: 'cancel', id: 1 } });
+    assert.deepEqual([(await late).type, (await late).message], ['error', 'You canceled the analysis.']);
+    assert.ok(Date.now() - t0 < 2000, 'autotune saw cancelled() at once (the stub waits 20 s without it)');
+    const none = await worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': null }).send({ cmd: 'governorTune', fileName: 'sim.bbl', options: { flightRpm: TRUTH.rpm, logs: [3] } }, S.bytes);
+    assert.deepEqual([none.type, none.message], ['error', 'The app cannot load the toolkit file "gov_tune.cjs". The error is "Cannot find module \'./gov_tune.cjs\'".']);
+    const old = await worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': 'module.exports = { tune() { return {}; } };' }).send({ cmd: 'governorTune', fileName: 'sim.bbl', options: { flightRpm: TRUTH.rpm, logs: [3] } }, S.bytes);
+    assert.deepEqual([old.type, old.message], ['error', 'The toolkit file "gov_tune.cjs" has no function "autotune".']);
+    const empty = await worker().post({ cmd: 'governorTune', fileName: 'x.bbl', options: {} });
+    assert.deepEqual([empty.type, empty.message], ['error', 'The command has no log data.']);
+});
+
+test('governorTune: the DISARM events reach the runs; the stale of each recommendation and row (G:gov for the model, its parameter for a rule, the flags of gov_tune.cjs)', async () => {
+    const W = worker({ 'gov_tune.cjs': STUB_GOV_TUNE }), TW = W.ctx.TuningWorker;
+    const R = await govTune(W, { flightRpm: 1900 }, rearmFile(), 'rearm.bbl');
+    // log 1 of the viewer: DISARM at 3 s, armed again at 4 s (the switch): one run with one disarm; PID profile 1 at the start from the headspeed.
+    // Log 2: PID profile unknown before the change to 1 at 14 s (no fill)
+    assert.deepEqual(R.seen.map(q => [q.log, q.disarmEvents, q.disarms, q.armSource, q.armingProfile, q.profiles]), [[0, 1, 1, 'events', 1, [1]], [1, 0, 0, 'switch', 0, [0, 1]]]);
+    // the governor of this fixture stays ACTIVE at the disarm, so gov_data.cjs arms the run again at the first state after RULES.disarmHoldS
+    assert.equal(R.seen[0].n - R.seen[0].armed, Math.round(GDM.RULES.disarmHoldS * 1000), 'samples disarmed after the DISARM at 3 s');
+    const rec = (id) => R.recommendations.find(x => x.id === id), row = (name) => R.rows.find(x => x.name === name);
+    // gov:p, a result of the model of PID profile 1: every governor value. Log 1 after the second arm, log 2 from 14 s (PID profile 1 is not
+    // the profile at the start of log 2)
+    assert.deepEqual(rec('gov:p').stale.reasons, ['rearm', 'switched'], J(rec('gov:p').stale));
+    assert.match(rec('gov:p').stale.text, /^This recommendation uses a part of the log in which the values are possibly not the values of the log header\. /);
+    assert.deepEqual(row('gov_p_gain').stale.reasons, ['rearm', 'switched']);
+    assert.match(row('gov_p_gain').stale.text, /^This result uses a part of the log /);
+    // the source of the switched PID profile 1 (log 2 from 14 s; options.logs [1]: the only part that gov:p touches): the rows of the stub do not
+    // give one (current.from), thus unknown
+    const one = { flightRpm: 1900, logs: [1] }, U = await govTune(worker({ 'gov_tune.cjs': STUB_GOV_TUNE }), one, rearmFile(), 'rearm.bbl');
+    assert.match(U.recommendations.find(x => x.id === 'gov:p').stale.source, /^The values of PID profile 1 are unknown\./, J(U.recommendations.find(x => x.id === 'gov:p').stale));
+    // with the value sources of the rows (row.current.from, review 2026-10-15): a value of the log header of a log that starts with PID profile 1,
+    // the CLI dump, the analysis of the log, and some unknown values. The flag gives the source that the result uses, not "unknown"
+    const src = (rows) => STUB_GOV_TUNE.replace("rows: [{ name: 'gov_p_gain', scope: 'profile', profile: 1, current: { value: 40, source: 'log header' }", `rows: ${rows}.concat([{ name: 'gov_p_gain', scope: 'profile', profile: 1, current: { value: 40, source: 'log header' }`)
+        .replace("method: 'rule', stale: null, family: 'state' }],", "method: 'rule', stale: null, family: 'state' }]),");
+    const hdr = "[{ name: 'gov_i_gain', scope: 'profile', profile: 1, current: { value: 50, source: 'log header, PID profile 1 at the start of the log', from: 'header', logs: [0] }, status: 'keep', evidence: [], rule: 'value', method: 'rule', stale: null }]";
+    const H = await govTune(worker({ 'gov_tune.cjs': src(hdr) }), one, rearmFile(), 'rearm.bbl');
+    const hp = H.recommendations.find(x => x.id === 'gov:p').stale;
+    assert.deepEqual(hp.reasons, ['switched']);
+    // gov_p_gain of the stub has no source: some values of PID profile 1 are unknown, not all of them
+    assert.match(hp.source, /^For PID profile 1, the app uses the values of the log header of log 1\. Some values of PID profile 1 are unknown\./, hp.source);
+    assert.ok(!/The values of PID profile 1 are unknown/.test(hp.text), hp.text);
+    const mix = "[{ name: 'gov_i_gain', scope: 'profile', profile: 1, current: { value: 50, source: 'CLI dump, section `profile 0`', from: 'cli' }, status: 'keep', evidence: [], rule: 'value', method: 'rule', stale: null }," +
+        " { name: 'gov_f_gain', scope: 'profile', profile: 1, current: { value: 10, source: 'calculated from the log: a fit', from: 'log' }, status: 'keep', evidence: [], rule: 'value', method: 'rule', stale: null }]";
+    const M = await govTune(worker({ 'gov_tune.cjs': src(mix) }), one, rearmFile(), 'rearm.bbl');
+    // gov:p reads every governor value of PID profile 1: the CLI dump, the analysis and an unknown value (gov_p_gain of the stub has no from)
+    assert.match(M.recommendations.find(x => x.id === 'gov:p').stale.source, /^For PID profile 1, the app uses the values of the CLI dump and the values that it calculated from the flights\. Some values of PID profile 1 are unknown\./);
+    // a rule row reads its own value only: gov_i_gain of the CLI dump
+    assert.match(M.rows.find(x => x.name === 'gov_i_gain').stale.source, /^For PID profile 1, the app uses the values of the CLI dump\. For the other values, the app uses the log header of log 2\.$/);
+    // gov:spool, a global value measured at 5-6 s of log 1 of the viewer: the second arm only (a PID profile change cannot change it)
+    assert.deepEqual([rec('gov:spool').stale.reasons, rec('gov:spool').stale.spans.map(q => q.log)], [['rearm'], [0]]);
+    assert.deepEqual(row('gov_spoolup_time').stale.reasons, ['rearm']);
+    // gov:i: the flags of gov_tune.cjs join the stale of the worker; its second arm is the worker's (paramEpochs), its change between logs stays
+    const s = rec('gov:i').stale;
+    assert.deepEqual([s.reasons, s.flags.map(f => f.reason), s.valueSource], [['rearm', 'switched', 'unlogged'], ['unlogged'], 'log header, PID profile 1 at the start of the log']);
+    // each part a paragraph (STE Rule 6.6: a line break between the text of the worker and each flag of gov_tune.cjs)
+    assert.ok(s.text.endsWith('.\nThe value of "gov_i_gain" changes between logs, and the log does not record the change.') && !s.text.includes('The stub gives two causes.'), s.text);
+    // govJoin without the parts of the log (no param_epochs.cjs): the flag of gov_tune.cjs as it is; with them and only the causes of the worker: the worker's
+    const G = TW.gov, own = { reasons: ['rearm'], text: 'This value is possibly not the same in all logs.', flags: [{ reason: 'rearm', text: 'x' }], source: 'CLI dump' };
+    assert.equal(G.govJoin(null, own, false), own);
+    assert.equal(G.govJoin(null, own, true), null);
+    assert.deepEqual(JSON.parse(J(G.govJoin(null, Object.assign({}, own, { flags: [{ reason: 'cli', text: 'The CLI dump gives 5.' }, { reason: 'rearm', text: 'x' }] }), true))),
+        { reasons: ['cli'], text: 'This value is possibly not the same in all logs.\nThe CLI dump gives 5.', source: '', spans: [], flags: [{ reason: 'cli', text: 'The CLI dump gives 5.' }], valueSource: 'CLI dump' });
+    // a summary flag of gov_tune.cjs (logs []) stands for the flags of each log of its name (and PID profile); the text of each part once
+    const per = (logs, v) => ({ reason: 'unlogged', name: 'gov_spoolup_time', logs, text: `In log ${logs[0] + 1}, the value is ${v}.` });
+    const sum = { reason: 'unlogged', name: 'gov_spoolup_time', logs: [], text: 'The value changes between logs. The values are 100 in log 6 and 80 in log 11.' };
+    const other = { reason: 'unlogged', name: 'gov_startup_time', profile: 2, logs: [5], text: 'In log 6, the value of "gov_startup_time" is 200.' };
+    const mine = { reasons: ['rearm'], text: 'This recommendation uses a part of the log. The cause is a second arm.', source: 'log header', spans: [{ log: 5, t0: 1, t1: 2 }] };
+    const joined = G.govJoin(mine, { reasons: ['unlogged', 'rearm'], text: 'x', source: 'CLI dump', flags: [per([5], 100), per([10], 80), sum, other, Object.assign({}, other), { reason: 'rearm', text: 'y' }] }, true);
+    assert.equal(joined.text, `${mine.text}\n${sum.text}\n${other.text}`);
+    assert.deepEqual(JSON.parse(J([joined.reasons, joined.flags.length, joined.spans])), [['rearm', 'unlogged'], 5, mine.spans]);
+    assert.deepEqual(J([...G.govTimes([{ log: 1, times: [3, 4] }, { log: 1, t0: 7, t1: null }, { log: null, t0: 1 }, { text: 'x' }])]), J([[1, [[3, 4], [7, 7]]]]));
+    assert.equal(G.govTimes([]), null);
+    // a summary of PID profile 1 (gov_tune simStale) stands for the flags of each log of its name and PID profile; a flag of one log with no
+    // PID profile (an older result) matches it too; another PID profile keeps its own summary (review 2026-10-15)
+    const pl = (logs, v, profile) => Object.assign({ reason: 'unlogged', name: 'gov_yaw_ff_weight', logs, text: `In log ${logs[0] + 1}, the value is ${v}.` }, profile === undefined ? {} : { profile });
+    const s1 = { reason: 'unlogged', name: 'gov_yaw_ff_weight', profile: 1, logs: [], text: '"gov_yaw_ff_weight" (PID profile 1) changes between logs.' };
+    const s2 = { reason: 'unlogged', name: 'gov_yaw_ff_weight', profile: 2, logs: [], text: '"gov_yaw_ff_weight" (PID profile 2) changes between logs.' };
+    const jp = G.govJoin(mine, { reasons: ['unlogged'], text: 'x', source: 'analysis of the log', flags: [pl([38], 10, 1), pl([39], 30, 1), s1, pl([40], 40), pl([41], 50, 2), s2] }, true);
+    assert.equal(jp.text, `${mine.text}\n${s1.text}\n${s2.text}`);
+    // without param_epochs.cjs: no stale of the worker, the flags of gov_tune.cjs stay
+    const N = await govTune(worker({ 'gov_tune.cjs': STUB_GOV_TUNE, 'param_epochs.cjs': null }), { flightRpm: 1900 }, rearmFile(), 'rearm.bbl');
+    assert.deepEqual(N.recommendations.map(x => [x.id, x.stale && x.stale.reasons]), [['gov:p', null], ['gov:spool', null], ['gov:i', ['unlogged', 'rearm']]]);
+});
+
+// a flight log with a logging gap at 18 s: part 1 has no flight of its own (airborne 26-44 s) and a DISARM at 3 s (armed again at 4 s)
+const govGapFile = (() => { let v = null; return () => v || (v = (() => {
+    const a = bbl.simulateFlight({ seconds: 50, seed: 47, airborne: [26, 44], gapAt: 18, start: '2026-10-04T18:30:00.000+00:00', profiles: [{ from: 0, profile: 1, target: HS_TARGET[1] }] });
+    a.events = [[2990, EVT.FLIGHT_MODE, { newFlags: 0, lastFlags: ARM }], [3000, EVT.DISARM, { reason: 4 }], [4000, EVT.FLIGHT_MODE, { newFlags: ARM, lastFlags: 0 }]];
+    return bbl.encode([a]).bytes;
+})()); })();
+
+test('governorTune: each part of a flight log is a flight run (segmentClass keeps its own class); a DISARM goes only to the run of its part', async () => {
+    const R = await govTune(worker({ 'gov_tune.cjs': STUB_GOV_TUNE }), { flightRpm: 1900 }, govGapFile(), 'gap.bbl');
+    assert.deepEqual([R.status, R.logs, R.benchRuns, R.skipped], ['validated', [0], [], []]);
+    // part 1 (0-18 s): the spool-up and the ground running of the flight log, with the DISARM at 3 s. Part 2: no DISARM, the arm switch
+    assert.deepEqual(R.seen.map(q => [q.segment, q.cls, q.segClass, q.disarmEvents, q.disarms, q.armSource]), [[0, 'flight', 'bench', 1, 1, 'events'], [1, 'flight', 'flight', 0, 0, 'switch']]);
+    assert.equal(R.seen[1].armed, R.seen[1].n, 'part 2 is armed from its first sample');
+});
+
+test('governorTune: when the flight phases of a part stop, the note says that the governor analysis does not use that part', async () => {
+    const S = sim(), stop = STUB_PHASE + "\nconst own = module.exports.phases; module.exports.phases = (w, ctx) => { if (w.fromS > 50) throw new Error('stub stop'); return own(w, ctx); };";
+    const R = await govTune(worker({ 'health_phase.cjs': stop, 'gov_tune.cjs': STUB_GOV_TUNE }), { flightRpm: TRUTH.rpm, logs: [1] }, S.bytes);
+    assert.deepEqual(R.seen.map(q => [q.log, q.segment, q.cls]), [[1, 0, 'flight']]);
+    assert.ok(R.notes.includes('The app cannot find the flight phases of a part of this log. Thus, the governor analysis does not use that part (log 2).'), R.notes.join('\n'));
+    assert.ok(R.notes.includes('The function "phases" of "health_phase.cjs" stopped. The error is "stub stop" (log 2).'), R.notes.join('\n'));
+    assert.ok(!R.notes.some(t => /airborne time|do not record all the values/.test(t)), R.notes.join('\n'));
+});
+
+test('governorTune: a selected log gets its PID profile at the start from the headspeeds of the other logs of the file, as the analysis', async () => {
+    // hsFile log 0: 2500 rpm with no change, PID profile 2 only from the changes of the bench run (log 3)
+    const W = worker({ 'gov_tune.cjs': STUB_GOV_TUNE }), A = await W.result({ cmd: 'analyseFile', fileName: 'hs.bbl', selectedLog: 0, options: { flightRpm: 1900, curves: false, flights: [{ log: 0, flight: 0 }] } }, hsFile());
+    assert.deepEqual(A.profiles.arming.filter(q => q.log === 0).map(q => [q.profile, q.confirmed]), [[2, true]]);
+    const R = await govTune(W, { flightRpm: 1900, logs: [0] }, hsFile(), 'hs.bbl');
+    assert.deepEqual(R.seen.map(q => [q.log, q.armingProfile, q.profile0, q.profiles, q.filled === q.n]), [[0, 2, 2, [2], true]]);
+    assert.ok(W.progress.some(p => p.text === 'The app reads the headspeed of log 4 of 4.'), J(W.progress.map(p => p.text)));
+    // log 2: 2700 rpm at the start, PID profile 3 from the change of log 1 at 14 s
+    const B = await govTune(W, { flightRpm: 1900, logs: [2] }, hsFile(), 'hs.bbl');
+    assert.deepEqual(B.seen.map(q => [q.log, q.armingProfile, q.profile0]), [[2, 3, 3]]);
+});
+
+test('governorTune: options.blockedBy (the gates of the Governor step) holds each change: blockedBy texts and no CLI text; checks keep theirs', async () => {
+    const S = sim(), W = worker({ 'health_phase.cjs': STUB_PHASE, 'gov_tune.cjs': STUB_GOV_TUNE.replace("rec('gov:i', { parameter: 'gov_i_gain', confidence: 'measured', stale: own })",
+        "rec('gov:i', { parameter: 'gov_i_gain', confidence: 'measured', stale: own }), rec('gov:check', { severity: 'check', cli: [] })") });
+    const gates = ['The prerequisite "RPM signal and motor poles" has a problem. Correct it before you tune this tuning block.',
+        'The prerequisite "Battery and power" has a problem. Correct it before you tune this tuning block.', 'A gate with its own text.'];
+    const R = await govTune(W, { flightRpm: TRUTH.rpm, logs: [3], blockedBy: ['rpm', 'power', 'A gate with its own text.', 'unknown', 'rpm'] }, S.bytes);
+    assert.deepEqual(R.blockedBy, gates);
+    assert.deepEqual(R.recommendations.map(x => [x.id, x.severity, x.blockedBy, x.cli]), [['gov:p', 'action', gates, []], ['gov:spool', 'action', gates, []], ['gov:i', 'action', gates, []], ['gov:check', 'check', [], []]]);
+    const F = await govTune(W, { flightRpm: TRUTH.rpm, logs: [3] }, S.bytes);
+    assert.deepEqual([F.blockedBy, F.recommendations.map(x => [x.id, x.blockedBy.length, x.cli.length])], [[], [['gov:p', 0, 2], ['gov:spool', 0, 1], ['gov:i', 0, 2], ['gov:check', 0, 0]]]);
+});
+
+test('governorTune: READS G:gov is the 42 names of gov_tune.cjs REGISTRY; a related global value reads the global scope only', { skip: !has('gov_tune.cjs') }, () => {
+    const W = worker(), TW = W.ctx.TuningWorker, GTM = require('../tools/autotune/gov_tune.cjs');
+    assert.deepEqual([...TW.gov.GOV_NAMES], GTM.REGISTRY.map(r => r.name));
+    for (const n of TW.gov.GOV_NAMES) assert.deepEqual([...TW.READS[`G:${n}`]], [n]);
+    assert.deepEqual([...TW.READS['G:global']], ['@global']);
+});
+
+// a worker with the real toolkit that can also fetch controller.wasm as bytes (firmware_controller.cjs: the native governor, its hash)
+function govWorker(override) {
+    const W = worker(override);
+    W.ctx.crypto = require('node:crypto').webcrypto;
+    const fetchText = W.ctx.fetch;
+    W.ctx.fetch = async (url) => { const res = await fetchText(url); const f = path.resolve(JS, url); return Object.assign({}, res, { arrayBuffer: async () => { const b = fs.readFileSync(f); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); } }); };
+    return W;
+}
+
+test('governorTune smoke: the real gov_tune.cjs autotune on two simulated flight logs, with a small budget (when it exports autotune)', { skip: !has('gov_tune.cjs') || typeof require('../tools/autotune/gov_tune.cjs').autotune !== 'function' }, async () => {
+    const S = sim(), W = govWorker({ 'health_phase.cjs': STUB_PHASE });
+    const R = await govTune(W, { flightRpm: TRUTH.rpm, logs: [3, 4], budgetMs: 3000 }, S.bytes);
+    assert.ok(['validated', 'partial', 'rejected', 'unavailable'].includes(R.status), R.status);
+    assert.deepEqual(JSON.parse(JSON.stringify(R)), R);
+    assert.ok(Array.isArray(R.rows) && Array.isArray(R.recommendations) && Array.isArray(R.reasons), Object.keys(R).join());
+    assert.ok(R.recommendations.every(x => 'stale' in x && x.node === 'governor'), J(R.recommendations.map(x => [x.id, x.node])));
+    assert.deepEqual(R.logs, [3, 4]);
+    assert.ok(R.timing.model && R.timing.model.totalS >= 0, J(R.timing)); // the timing of autotune
+    process.stderr.write(`# governorTune smoke: ${R.status}, ${R.rows.length} rows, ${R.recommendations.length} recommendations, ${R.timing.totalS} s\n`);
+});
+
+// The governor model on a real dump, with the real worker and toolkit (docs/GOVERNOR_AUTOTUNE.md section 8):
+//   AUTOTUNE_GOV_LOG=<dump.BBL> [AUTOTUNE_GOV_CLI=<CLI dump>] [AUTOTUNE_GOV_RPM=<flight rpm>] [AUTOTUNE_GOV_OUT=<result.json>] \
+//     [AUTOTUNE_GOV_FIXTURE=<.json.gz>] node --max-old-space-size=8000 --test --test-name-pattern='governorTune real' test/tuning_worker.test.cjs
+// AUTOTUNE_GOV_FIXTURE writes the result with each plot series thinned to GOV_FIXTURE_POINTS points, gzip: the fixture of the dialog test
+// (test/fixtures/governor_tuned_fireball.json.gz is the Fireball dump with its CLI dump)
+// Fireball 2026-10-05 with and without its CLI dump of 2026-10-13, Gaui X4 II 2026-10-04 23:34 (AUTOTUNE_GOV_RPM=2000) and the older Gaui
+// dump of 11:37 (Vbat logged as 0: the path without voltage) take 4-6 min each. The result must be JSON of a sane size, cover the 42
+// names, give the profile line first in each profile change, and put each time plot on the frame clock of the viewer: the headspeed of
+// a time plot at x is the logged headspeed at log.getMinTime() + x s, as the dialog seeks it (env.seekFrame)
+const GOV_LOG = process.env.AUTOTUNE_GOV_LOG || '', GOV_FIXTURE_POINTS = 200;
+// the result with the series of each plot thinned to n points (the same indices for x and y): a fixture of a sane size
+function govFixture(R, n) {
+    const out = JSON.parse(JSON.stringify(R)), thin = (p) => { for (const s of p.series || []) { const m = Math.min(s.x.length, s.y.length), step = Math.max(1, Math.ceil(m / n)), k = [];
+        for (let i = 0; i < m; i += step) k.push(i); s.x = k.map(i => s.x[i]); s.y = k.map(i => s.y[i]); } };
+    for (const p of (out.twin && out.twin.plots || []).concat(out.plots || [])) thin(p);
+    return out;
+}
+test('governorTune real dump: status, the 42 names, JSON of a sane size and the frame clock of the time plots (AUTOTUNE_GOV_LOG)', { skip: !GOV_LOG || !fs.existsSync(GOV_LOG), timeout: 3 * 3600e3 }, async () => {
+    const W = govWorker(), TW = W.ctx.TuningWorker, cliFile = process.env.AUTOTUNE_GOV_CLI || '', rpm = +process.env.AUTOTUNE_GOV_RPM || null;
+    const bytes = new Uint8Array(fs.readFileSync(GOV_LOG)), t0 = Date.now();
+    const R = await govTune(W, Object.assign({ flightRpm: rpm }, cliFile ? { cliText: fs.readFileSync(cliFile, 'utf8'), cliName: path.basename(cliFile) } : {}), bytes, path.basename(GOV_LOG));
+    const text = JSON.stringify(R), wallS = (Date.now() - t0) / 1000;
+    assert.deepEqual(JSON.parse(text), R, 'JSON data only');
+    assert.ok(text.length < 8e6, `result size ${text.length} bytes`);
+    if (process.env.AUTOTUNE_GOV_OUT) fs.writeFileSync(process.env.AUTOTUNE_GOV_OUT, text);
+    if (process.env.AUTOTUNE_GOV_FIXTURE) fs.writeFileSync(process.env.AUTOTUNE_GOV_FIXTURE, require('node:zlib').gzipSync(JSON.stringify(govFixture(R, GOV_FIXTURE_POINTS)), { level: 9 }));
+    assert.ok(['validated', 'partial', 'rejected', 'unavailable'].includes(R.status), R.status);
+    assert.ok(R.reasons.every(t => typeof t === 'string' && t.trim()) && (R.status === 'validated' || R.reasons.length), J(R.reasons));
+    if (R.logs.length) { // the rule rows of every flight log: each of the 42 names has a row
+        const names = new Set(R.rows.map(r => r.name));
+        assert.deepEqual([...TW.gov.GOV_NAMES].filter(n => !names.has(n)), [], 'a row for each governor parameter');
+    }
+    for (const x of R.recommendations) {
+        assert.ok('stale' in x && x.node === 'governor', J([x.id, x.node]));
+        const cli = (x.cli || []).concat(x.optIn && x.optIn.cli || []);
+        if (cli.length && x.scope === 'profile') assert.equal(cli[0], `profile ${x.profile - 1}`, J([x.id, cli]));
+        if (x.severity === 'action' && x.cli.length) assert.ok(x.cli.some(l => /^set gov_\w+ = /.test(l)), J([x.id, x.cli]));
+    }
+    // the frame clock: each time plot with a log; the headspeed series of the twin plots against the log at the same frame seconds
+    const plots = (R.twin && R.twin.plots || []).concat(R.plots || []).filter(p => p.kind === 'time');
+    assert.ok(plots.every(p => Number.isInteger(p.log) && R.logs.includes(p.log)), J(plots.map(p => [p.id, p.log])));
+    const hsPlots = plots.filter(p => /^twin-hs-/.test(p.id)), own = new W.ctx.Uint8Array(bytes.length); own.set(bytes); // the bytes in the realm, as the worker has them
+    const idx = new W.ctx.FlightLogIndex(own);
+    for (const p of hsPlots) {
+        const s = p.series.find(q => q.role === 'measured'), pick = [];
+        for (let k = 0; k < s.x.length; k += Math.max(1, Math.floor(s.x.length / 40))) if (s.x[k] !== null && s.y[k] !== null) pick.push(k);
+        const bytesOf = own.subarray(idx.getLogBeginOffset(p.log), idx.getLogBeginOffset(p.log + 1));
+        const log = new W.ctx.FlightLog(bytesOf); assert.ok(log.openLog(0), `log ${p.log}`);
+        const hi = log.getMainFieldIndexByName('headspeed'), tMin = log.getMinTime(), at = (x) => {
+            const tU = tMin + x * 1e6, chunks = log.getChunksInTimeRange(tU - 2e4, tU + 2e4); let best = null;
+            for (const c of chunks) for (const f of c.frames) if (!best || Math.abs(f[1] - tU) < Math.abs(best[1] - tU)) best = f;
+            return best ? best[hi] : null; };
+        const err = pick.map(k => Math.abs(at(s.x[k]) - s.y[k]) / Math.max(1, s.y[k])), late = pick.map(k => Math.abs(at(s.x[k] + 5) - s.y[k]) / Math.max(1, s.y[k]));
+        const med = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+        assert.ok(med(err) < 0.01, `${p.id}: the logged headspeed at the plot time differs by ${med(err)} (median, relative)`);
+        assert.ok(p.bands === undefined || p.bands.every(b => b.x0 <= b.x1 && b.x0 >= s.x[0] - 1 && b.x1 <= s.x[s.x.length - 1] + 1), `${p.id} bands`);
+        process.stderr.write(`# ${p.id}: |hs(log at x) - hs(plot)| median ${(100 * med(err)).toFixed(3)} %, 5 s later ${(100 * med(late)).toFixed(3)} %, ${(p.bands || []).length} state bands\n`);
+    }
+    const count = {}; for (const r of R.rows) count[r.status] = (count[r.status] || 0) + 1;
+    process.stderr.write(`# governorTune ${path.basename(GOV_LOG)}${cliFile ? ' + CLI' : ''}: ${R.status}, logs ${J(R.logs)}, ${R.rows.length} rows ${J(count)}, ${R.recommendations.length} recommendations, ` +
+        `${text.length} bytes, ${wallS.toFixed(0)} s (${J(R.timing)})\n`);
+    for (const x of R.recommendations.filter(q => q.severity === 'action' || q.optIn)) process.stderr.write(`#   ${x.severity}${x.optIn ? ' opt-in' : ''} ${x.parameter} ${x.profile ? `PID profile ${x.profile}` : 'all'}: ${J(x.from)} -> ${J(x.to)} ${J(x.cli.length ? x.cli : x.optIn ? x.optIn.cli : [])}\n`);
+    for (const t of R.reasons) process.stderr.write(`#   reason: ${t}\n`);
 });

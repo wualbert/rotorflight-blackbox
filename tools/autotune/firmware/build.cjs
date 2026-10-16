@@ -52,7 +52,7 @@ function build(options = {}) {
     cp.execFileSync(compiler, ['-std=gnu11', '-O2', '-ffp-contract=off', '-fno-fast-math', '-Werror=implicit-function-declaration',
         '-mexec-model=reactor', file, '-lm', '-Wl,--export=rf_config', '-Wl,--export=rf_input', '-Wl,--export=rf_output',
         '-Wl,--export=rf_reset', '-Wl,--export=rf_step', '-Wl,--export=rf_seed',
-        '-Wl,--export=rf_servo_config', '-Wl,--export=rf_servo_reset', '-Wl,--export=rf_map_mixer', '-o', output], {stdio:'pipe'});
+        '-Wl,--export=rf_servo_config', '-Wl,--export=rf_servo_reset', '-Wl,--export=rf_map_mixer', '-Wl,--export=rf_gov_step', '-Wl,--export=rf_gov_profile', '-o', output], {stdio:'pipe'});
     const bytes = fs.readFileSync(output), module = new WebAssembly.Module(bytes);
     if (WebAssembly.Module.imports(module).length) throw Error('Controller must have no host imports');
     const provenance = {...verifySources(), artifactSha256:crypto.createHash('sha256').update(bytes).digest('hex'),

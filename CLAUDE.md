@@ -42,7 +42,8 @@ AUTOTUNE_REAL_LOG=<RTFL_BLACKBOX_LOG_20261004_113720.BBL> AUTOTUNE_RESCUE_LOG=<f
 PARAM_EPOCHS_LOG=<fireball 2026-10-05 dump.bbl> node --test test/param_epochs.test.cjs   # arms, re-arms and the parts of each log whose values are possibly not current
 node --test test/datasets.test.cjs test/filter_tune.test.cjs   # configurations (datasets.cjs) and the filter search (filter_tune.cjs, worker command filterTune)
 node tools/autotune/datasets.cjs <log file> [--cli <dump>]        # the configurations of a file; node tools/autotune/filter_tune.cjs <out dir> <log file> [--cli <dump>]: the filter search
-node --test test/ste_text.test.cjs        # ASD-STE100 lint of every text that the app shows (docs/STE_GLOSSARY.md); about 30 s
+node --test test/ste_text.test.cjs        # ASD-STE100 lint of every text that the app shows (docs/STE_GLOSSARY.md); about 2.5 min
+AUTOTUNE_GOV_LOG=<dump.BBL> [AUTOTUNE_GOV_CLI=<cli dump>] node --test test/ste_text.test.cjs   # also the governorTuned result of a real dump (with AUTOTUNE_REAL_LOG: the analysis results)
 
 # Gaui X4 II: every measurement of one dump in about 4 min (cache + toolkit + 12 area run.sh), no agents;
 # then the saved workflow x4-new-dump interprets it against the previous dump
@@ -54,6 +55,22 @@ node analysis/twin6dof/extract.cjs <out dir> <log file> [log indexes]      # log
 node analysis/twin6dof/dev.cjs <data dir> <out dir> --fit <stages.json>    # staged fit with a worker pool, held-out evaluation
 node analysis/twin6dof/closed.cjs <data dir> <model.json> <cli dump> <out.json>   # native controller flies the twin, held-out windows
 python plot.py <out dir>/eval_test.json <prefix>                          # prediction-quality figures (in analysis/twin6dof)
+
+# governor twin and governor autotune (docs/GOVERNOR_AUTOTUNE.md; worker command governorTune: DEVELOPMENT.md section 13)
+node analysis/governor-20261014/extract.cjs <data dir> <log file> [log indexes]           # whole logs -> float32 columns (dev data)
+node analysis/governor-20261014/phase.cjs <data dir> <log file> <log indexes> <flight rpm> # the flight phases of the dev data
+node analysis/governor-twin/dev.cjs <fireball|gaui> [--cli <dump>] [--no-current]         # identify and validate the twin: out/<craft>/result.json
+node analysis/governor-twin/tune.cjs <fireball|gaui> [--cli <dump>] [--no-current]        # autotune on the dev data (about 3.5 min): out/<craft>/tune.{json,md}
+node analysis/governor-twin/parity.cjs [fireball|gaui] [--logs 10,11]                     # open-loop parity of the native governor
+python3 analysis/governor-twin/plot.py <out dir>                                          # prediction-quality figures; needs numpy, matplotlib
+python3 analysis/governor-twin/plot_tune.py <out dir>                                     # autotune figures (tune_<plot id>.png)
+node tools/autotune/gov_tune.cjs <data dir> [--cli <dump>] [--json <out>]                 # one row for each of the 42 governor parameters
+node --test test/gov_twin.test.cjs test/gov_data.test.cjs test/gov_params.test.cjs test/gov_sim.test.cjs test/gov_fit.test.cjs test/gov_scenarios.test.cjs test/gov_search.test.cjs test/gov_tune.test.cjs   # about 1 min
+node --test --test-name-pattern=governorTune test/tuning_worker.test.cjs                  # the worker command (stand-in gov_tune, and the real autotune on the simulated file)
+node --test --test-name-pattern="governor model" test/tuning_dialog.test.cjs            # the Governor model panel, its plots, the CLI file; the real Fireball result (test/fixtures)
+# the worker on a real dump, about 4 min each (Fireball 2026-10-05 with or without its CLI dump; Gaui X4 II: AUTOTUNE_GOV_RPM=2000);
+# AUTOTUNE_GOV_FIXTURE=test/fixtures/governor_tuned_fireball.json.gz with the Fireball dump and its CLI dump writes the fixture of the dialog test again
+AUTOTUNE_GOV_LOG=<dump.BBL> [AUTOTUNE_GOV_CLI=<cli dump>] [AUTOTUNE_GOV_RPM=2000] [AUTOTUNE_GOV_OUT=<result.json>] node --max-old-space-size=8000 --test --test-name-pattern='governorTune real' test/tuning_worker.test.cjs
 
 # read the flash of a flight controller over USB, read-only (Configurator closed)
 python3 tools/flash_read.py /dev/cu.usbmodemXXXX --out log.bbl [--resume]

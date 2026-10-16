@@ -395,6 +395,12 @@ const CAND = {
     G1: (f, recs) => recs.flatMap(rec => { const g = mt(rec, 'gov') && mt(rec, 'gov').G1; if (!g) return [];
         return f.severity === 'flag' ? fromEvents(rec, g.fallbackEntries, [1, 1], (e) => e.value, () => 'FALLBACK', runEnd) : fromEvents(rec, (g.events || []).filter(e => e.flying), [0.5, 0.5], (e) => e.value, () => 'Signal error'); }),
     G2: (f, recs) => recs.flatMap(rec => loc(rec) ? fromSpans(rec, loc(rec).G2, (q) => sameProfile(q.profile, f.profile)).map(c => Object.assign(c, { rank: Math.abs(c.value) })) : []),
+    // G21 pools the flights (health_gov judge): each event has its log. A FALLBACK after a sudden change ranks first, then a sudden change
+    // at the throttle maximum, then by its rate. A sudden change is an episode: from its start t to its last fast sample t1
+    G21: (f, recs, x, ctx) => (Array.isArray(f.events) ? f.events : []).filter(e => e && num(e.t) !== null).map(e => {
+        const list = num(e.log) !== null ? recordsOf(ctx, e.log) : recs, rec = list.find(q => { const [a, b] = spanOf(q); return e.t >= a - 1e-3 && e.t <= b + 0.05; }) || list[0] || null;
+        const rank = (e.kind === 'FALLBACK' ? (e.spike ? 2e6 : 1e6) : 0) + (e.atMax ? 1e5 : 0) + (num(e.rate) || 0);
+        return cand(rec, e.t, num(e.t1) !== null && e.t1 >= e.t ? e.t1 : e.t, e.kind === 'FALLBACK' ? 0.5 : 0.2, e.kind === 'FALLBACK' ? 0.5 : 0.2, e.value, e, e.kind === 'FALLBACK' ? 'FALLBACK' : 'Sudden change of the headspeed signal', rank); }).filter(c => c.rec),
     G3: (f, recs, x, ctx) => govEvents(f, ctx, 'rise', (e) => e.droop, (e) => e.t + 1 + (num(e.recoveryS) || 0), [0.3, 0]),
     G4: (f, recs, x, ctx) => govEvents(f, ctx, g4Dir(f, ctx), (e) => e.overshoot, (e) => e.t + 1.3, [0.3, 0]),
     G5: (f, recs, x, ctx) => govEvents(f, ctx, 'rise', (e) => (e.censored ? 100 : 0) + (num(e.recoveryS) || 0), (e) => (num(e.droopT) !== null ? e.droopT : e.t) + (num(e.recoveryS) || 0), [0.3, 0.5], (e) => e.recoveryS),
@@ -474,6 +480,8 @@ function g4Dir(f, ctx) {
 // Each candidate to frame seconds (core through the time map of its record, clipped to the record, then the pads), worst
 // first; no span that overlaps a kept one by more than RULE.overlap of the shorter; RULE.maxSpans or fewer
 function pickSpans(cands, f, c) {
+    // the number of spans: the evidence spec of the check (a number, or a function of the finding), else RULE.maxSpans
+    const own = c && c.evidence ? c.evidence.maxSpans : null, limit = (typeof own === 'function' ? num(own(f)) : num(own)) || RULE.maxSpans;
     const conv = cands.filter(q => q && num(q.c0) !== null).map((q, i) => {
         if (q.frame) return { i, q, t0: q.c0, t1: Math.max(q.c0, q.c1), k0: q.c0, k1: Math.max(q.c0, q.c1) };   // frame seconds already
         const [a, b] = q.rec ? spanOf(q.rec) : [-Infinity, Infinity], tm = q.rec && q.rec.timeMap, lo = toFrame(tm, a), hi = isFinite(b) ? toFrame(tm, b) : Infinity;
@@ -484,7 +492,7 @@ function pickSpans(cands, f, c) {
     for (const s of conv) {
         const len = Math.max(1e-6, s.t1 - s.t0);
         if (kept.some(k => k.q.rec === s.q.rec && Math.min(k.t1, s.t1) - Math.max(k.t0, s.t0) > RULE.overlap * Math.min(len, Math.max(1e-6, k.t1 - k.t0)))) continue;
-        kept.push(s); if (kept.length >= ((c && c.evidence && num(c.evidence.maxSpans)) || RULE.maxSpans)) break; // a check can keep more (the periods at a control limit)
+        kept.push(s); if (kept.length >= limit) break; // a check can keep more (the periods at a control limit, the sudden changes of check G21)
     }
     // the phase of a span: the phase spans of its record (the largest overlap with the event or block itself, the pads not
     // included), else the phase of its event or of the finding
@@ -565,6 +573,7 @@ const CAPTION = {
     G11: () => 'The points are the throttle at equal collective during the flight, and the limit is the throttle increase of one battery.',
     G12: () => 'The curves are the spectra of the raw gyro, and the line marks 1 x the rotor frequency from the headspeed.',
     G20: () => 'The curves are the headspeed, its target and the throttle before each FALLBACK, and a throttle at 95 % or more is a large load.',
+    G21: () => 'The curves are the headspeed, its target and the throttle at each sudden change of the headspeed signal and at each FALLBACK.',
     G19: (f, R) => `The curves are the headspeed, its target and the throttle at the rescue, and the line is the limit of ${lim(num(R.flag) === null ? null : -R.flag * 100, '%') || 'the decrease'}.`,
     C1: () => 'The curve is the I-term, and the limit is 95 % of its range.',
     C2: () => 'The curves are the cyclic and collective outputs, and each period at the output limit is a problem.',

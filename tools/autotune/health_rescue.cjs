@@ -12,10 +12,13 @@
  *   D8   PID profile change at a rescue: a change (INFLIGHT_ADJUSTMENT function 2) from RULE.profile.beforeS before to
  *        RULE.profile.afterS after the rescue start, with the two PID profiles and the governor targets
  *   G20  the cause of each FALLBACK (LOST_HEADSPEED before 4.6) of the governor, with or without a rescue (coordinator, round 2):
- *        'overload' when the throttle is at RULE.throttleHigh or more before the change while the headspeed decreases (the G19
- *        overload test); 'signal' when the headspeed signal reads 0, jumps (the glitch rule of governor.c: more than 25 % from its
- *        10 Hz PT2) or is more than 2 x the target, with the throttle under that value; else 'none' (no overload sign). Only
- *        'signal' and 'none' are errors of the RPM signal (check G1); an overload is the throttle limit (L1, rule K22)
+ *        'signal' when the headspeed signal reads 0, jumps (the glitch rule of governor.c: more than 25 % from its 10 Hz PT2) or is
+ *        more than 2 x the target with the throttle under RULE.throttleHigh, or when a sudden change of the headspeed signal of check
+ *        G21 (health_gov.cjs spikeScan, the same detector) comes RULE.fallback.spikeS or less before the change, at any throttle
+ *        (critique C12: the Fireball FALLBACK entries come at 100 % throttle, 1-22 ms after such a change); else 'overload' when the
+ *        throttle is at RULE.throttleHigh or more before the change while the headspeed decreases (the G19 overload test); else
+ *        'none' (no overload sign). causes lists both when both apply. Only 'signal' and 'none' are errors of the RPM signal (checks G1
+ *        and G21); an overload alone is the throttle limit (L1, rule K22)
  *   curves(w, ctx, metrics)  the rescue periods for the UI
  *
  * Module contract as health_loop.cjs: analyse measures with the parameters in RULE, judge decides with DEFAULT_RULES. These
@@ -80,10 +83,11 @@ const DEFAULT_RULES = {
 };
 const UNITS = { G19: 'fraction', T15: 'deg/s', D8: 'count', G20: 'count' };
 // G20: the window before a change to FALLBACK, and the glitch rule of the firmware (governor.c 584-606, health_gov RULE.firmware)
-RULE.fallback = { preS: 2, signalS: 0.5, afterS: 0.05, rpmFilterHz: 10, glitchDelta: 0.25, glitchLimit: 2, zeroMotor: 100, state: 6,
+// spikeS: a sudden change of the headspeed signal of check G21 (health_gov RULE.g21) at most this time before the change is its cause
+RULE.fallback = { preS: 2, signalS: 0.5, afterS: 0.05, spikeS: (GOV && GOV.RULE && GOV.RULE.g21 && GOV.RULE.g21.spikeBeforeS) || 0.03, rpmFilterHz: 10, glitchDelta: 0.25, glitchLimit: 2, zeroMotor: 100, state: 6,
     source: 'firmware 4.6.0 governor.c: FALLBACK (LOST_HEADSPEED before 4.6) when the RPM signal is not good, and the glitch rule of the RPM signal (25 % from its 10 Hz filter, 2 x the target, 0 with the motor on)' };
-DEFAULT_RULES.G20 = { source: `${P}; the overload test of check G19 (a headspeed decrease of 2 % or more with the throttle at 95 % or more, 0.3 s or less before the change), and the glitch rule of the firmware`,
-    note: 'information: the cause of each FALLBACK. An overload is a possible result of the throttle limit (rule K22); a signal error or no overload sign is an error of the RPM signal (check G1)' };
+DEFAULT_RULES.G20 = { source: `${P}; a sudden change of the headspeed signal of check G21 during the change or that ends 30 ms or less before it, at any throttle; the overload test of check G19 (a headspeed decrease of 2 % or more with the throttle at 95 % or more, 0.3 s or less before the change); and the glitch rule of the firmware`,
+    note: 'information: the cause of each FALLBACK. A sudden change of the headspeed signal is an error of the RPM signal (checks G1 and G21), also with the throttle at its limit; an overload with no signal error is a possible result of the throttle limit (rule K22); no sign is an error of the RPM signal (check G1)' };
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -150,16 +154,26 @@ function fallbacksOf(w, ctx, rate, C) {
     let lastActive = null; const refAt = new Float64Array(n);
     for (let i = 0; i < n; i++) { if (gov[i] === ACTIVE && tg[i] > 0) lastActive = tg[i]; refAt[i] = RAMP.has(gov[i]) || gov[i] === B.state ? lastActive || tg[i] : tg[i]; }
     const eAt = (i) => { const ref = refAt[i]; return ref > 0 ? (median(hs.subarray(Math.max(0, i - k), Math.min(n, i + k + 1))) - ref) / ref : null; };
+    // the sudden changes of the headspeed signal of check G21 (health_gov.cjs spikeScan: one detector for the two checks). Its FALLBACK
+    // entries are the entries of this loop (the same governor states): each gets its change from the full list of the changes, also
+    // after the first maxEvents (the list that spikeScan gives is cut to maxEvents)
+    const scan = mot && GOV && typeof GOV.spikeScan === 'function' ? GOV.spikeScan({ hs, motor: mot, state: gov, profile: prof || null, target: tg, request: X.govRequest || null, rate, t },
+        Object.assign({}, GOV.RULE.g21, { spikeBeforeS: B.spikeS, maxEvents: Infinity })) : null;
+    const spikeAt = new Map(); if (scan) for (const x of scan.fallbacks) if (x.spike) spikeAt.set(x.i, x.spike);
     const out = [];
     for (let c = 1; c < n && out.length < RULE.maxEvents; c++) {
         if (gov[c] !== B.state || gov[c - 1] === B.state) continue;
         const a0 = at(F(c) - B.preS), s0 = at(F(c) - B.signalS), ref = refAt[c - 1] || lastActive;
-        // signal: a glitch of the RPM signal before the change, with the throttle under its high value. After the change the
-        // governor cuts the throttle (FALLBACK), so a glitch there (signalAfter) is information only
+        // signal: a glitch of the RPM signal before the change with the throttle under its high value; else a sudden change of check
+        // G21 at most spikeS before the change, at any throttle (the RPM signal errors of the Fireball come at 100 % throttle:
+        // analysis/rpm-spikes). After the change the governor cuts the throttle (FALLBACK), so a glitch there (signalAfter) is
+        // information only
         const glitch = (i) => { const kind = hs[i] === 0 && mot && mot[i] > B.zeroMotor ? 'zero' : ref > 0 && Math.abs(hs[i] - pt[i]) > B.glitchDelta * ref ? 'jump' : ref > 0 && hs[i] > B.glitchLimit * ref ? 'limit' : null;
             return kind ? { kind, t: t(i), tS: r(F(i), 3), headspeed: r(hs[i], 0), filtered: r(pt[i], 0), throttle: mot ? mot[i] : null } : null; };
         let sig = null, after = null;
+        const sp = spikeAt.get(c) || null;
         for (let i = s0; i < c && !sig; i++) if (!(mot && mot[i] >= RULE.throttleHigh)) sig = glitch(i);
+        if (sp && !sig) sig = { kind: 'spike', t: sp.t, tS: r(F(sp.i), 3), dtS: sp.dtS, startS: sp.startS, endS: sp.endS, headspeed: sp.to, filtered: sp.from, rate: sp.rate, throttle: Math.round(sp.throttle * 10), atMax: sp.atMax };
         for (let i = c; i <= Math.min(n - 1, c + Math.round(B.afterS * rate)) && !after; i++) after = glitch(i);
         // overload: the last run of the throttle at its high value that ends lateS or less before the change, with the headspeed falling
         let ov = null, high = 0;
@@ -169,7 +183,8 @@ function fallbacksOf(w, ctx, rate, C) {
                 const e0 = eAt(s1), e2 = eAt(Math.min(e1, c)), fall = e0 !== null && e2 !== null ? e0 - e2 : null;
                 if (fall !== null && fall >= RULE.overload.fall) ov = { t: t(s1), tS: r(F(s1), 3), dtS: r(F(s1) - F(c), 3), seconds: r((e1 - s1) / rate, 3), fall: r(fall, 4) }; } }
         const e = eAt(Math.max(0, c - 1));
-        out.push({ t: t(c), tS: r(F(c), 3), profile: prof ? prof[c] : null, kind: sig ? 'signal' : ov ? 'overload' : 'none', overload: ov, signal: sig, signalAfter: after, throttleHighS: mot ? r(high / rate, 3) : null,
+        out.push({ t: t(c), tS: r(F(c), 3), profile: prof ? prof[c] : null, kind: sig ? 'signal' : ov ? 'overload' : 'none', causes: [sig ? 'signal' : null, ov ? 'overload' : null].filter(Boolean),
+            overload: ov, signal: sig, signalAfter: after, throttleHighS: mot ? r(high / rate, 3) : null,
             throttleMax: mot ? r(maxOf(mot, a0, c + 1), 0) : null, headspeedError: r(e, 4), ref: r(ref, 0), from: gov[c - 1] });
     }
     return out;
@@ -269,15 +284,29 @@ function judge(flights, RULES = DEFAULT_RULES) {
     for (const f of flights) {
         const M = f.metrics; if (!M) continue;
         if (Array.isArray(M.fallbacks) && M.fallbacks.length) { const L = M.fallbacks, ov = L.filter(x => x.kind === 'overload'), sg = L.filter(x => x.kind === 'signal');
-            const one = (x) => `At the change to FALLBACK ${at(x)}, ` + (x.kind === 'overload' ? `the throttle is at ${RULE.throttleHigh / 10} % or more for ${fmt(x.overload.seconds, 2)} s, and the headspeed decreases by ${pc(x.overload.fall)} % before the change.`
+            const load = (x) => `the throttle is at ${RULE.throttleHigh / 10} % or more for ${fmt(x.overload.seconds, 2)} s, and the headspeed decreases by ${pc(x.overload.fall)} % before the change.`;
+            // a sudden change of check G21: its first and last fast samples against the change (health_gov spikeScan startS, endS: s before
+            // the change, negative after it), the words of check G21 ("during a sudden change or 30 ms or less after its end")
+            const ms = (s) => fmt(1000 * Math.abs(s), 0), isN = (v) => typeof v === 'number' && isFinite(v), span = (q) => !isN(q.startS) || !isN(q.endS) ? `, ${ms(q.dtS)} ms before the change.`
+                : `. This sudden change starts ${ms(q.startS)} ms before the change to FALLBACK and ${q.endS > 0 ? `ends ${ms(q.endS)} ms before it` : q.endS < 0 ? `ends ${ms(q.endS)} ms after it` : 'ends at the change'}.`;
+            const one = (x) => `At the change to FALLBACK ${at(x)}, ` + (x.kind === 'overload' ? load(x)
                     + (x.signalAfter ? ` After the change, the headspeed signal ${x.signalAfter.kind === 'zero' ? 'reads 0' : `reads ${fmt(x.signalAfter.headspeed, 0)} rpm against ${fmt(x.signalAfter.filtered, 0)} rpm`}.` : '')
+                : x.kind === 'signal' && x.signal.kind === 'spike' ? `the headspeed signal changes suddenly from ${fmt(x.signal.filtered, 0)} rpm to ${fmt(x.signal.headspeed, 0)} rpm${span(x.signal)} The throttle is ${+(x.signal.throttle / 10).toFixed(1)} % (check G21).`
+                    + (x.overload ? ` Also, ${load(x)}` : '')
                 : x.kind === 'signal' ? `the headspeed signal ${x.signal.kind === 'zero' ? 'reads 0' : x.signal.kind === 'jump' ? `jumps to ${fmt(x.signal.headspeed, 0)} rpm from ${fmt(x.signal.filtered, 0)} rpm` : `reads ${fmt(x.signal.headspeed, 0)} rpm`} while the throttle is less than ${RULE.throttleHigh / 10} %.`
+                    + (x.overload ? ` Also, ${load(x)}` : '')
                 : `the throttle is less than ${RULE.throttleHigh / 10} % for most of the time, and the headspeed signal shows no error.`);
-            add('G20', 'note', f, null, { value: ov.length, n: L.length, unit: UNITS.G20, overloads: ov.length, signals: sg.length, threshold: { throttleHigh: RULE.throttleHigh, fall: RULE.overload.fall, lateS: RULE.overload.lateS }, phase: null,
-                events: L.map(x => ({ t: x.overload ? Math.min(x.overload.t, x.t) : Math.max(f.metrics.fromS, x.t - RULE.fallback.signalS), t1: x.t + RULE.fallback.afterS, start: x.t, tS: x.tS, kind: x.kind, value: x.overload ? x.overload.fall : null,
+            const spikes = sg.filter(x => x.signal && x.signal.kind === 'spike');
+            // value: the entries with an overload sign, also with an error of the signal (causes: both), as the summary says them
+            // (review 2026-10-15: the entries of a sudden change at 100 % throttle also have 0.17 s to 0.33 s of overload)
+            const loaded = L.filter(x => x.overload), both = spikes.filter(x => x.overload).length, quiet = L.filter(x => x.kind !== 'overload' && !spikes.includes(x) && !x.overload).length;
+            add('G20', 'note', f, null, { value: loaded.length, n: L.length, unit: UNITS.G20, overloads: loaded.length, overloadOnly: ov.length, signals: sg.length, spikes: spikes.length, spikesOverload: both, threshold: { throttleHigh: RULE.throttleHigh, fall: RULE.overload.fall, lateS: RULE.overload.lateS, spikeS: RULE.fallback.spikeS }, phase: null,
+                events: L.map(x => ({ t: x.overload ? Math.min(x.overload.t, x.t) : Math.max(f.metrics.fromS, x.t - RULE.fallback.signalS), t1: x.t + RULE.fallback.afterS, start: x.t, tS: x.tS, kind: x.kind, causes: x.causes || [x.kind], value: x.overload ? x.overload.fall : null,
                     seconds: x.overload ? x.overload.seconds : null, signal: x.signal, signalAfter: x.signalAfter, throttleHighS: x.throttleHighS, throttleMax: x.throttleMax, profile: x.profile, bad: x.kind !== 'overload' })),
                 text: para(...L.slice(0, 4).map(one), ov.length === L.length ? `Thus, ${L.length === 1 ? 'the FALLBACK is' : 'each FALLBACK is'} possibly a result of the load at the throttle limit. This does not show that the RPM signal is correct. Examine the RPM signal and power response at the same time.`
-                    : `${L.length - ov.length} of ${many(L.length, 'FALLBACK')} ${L.length - ov.length === 1 ? 'has' : 'have'} no measured headspeed decrease at the throttle limit. Examine the RPM signal (check G1).`) }); }
+                    : [spikes.length ? `${spikes.length} of ${many(L.length, 'FALLBACK')} ${spikes.length === 1 ? 'starts' : 'start'} during a sudden change of the headspeed signal or ${fmt(1000 * RULE.fallback.spikeS, 0)} ms or less after its end. This is an error of the RPM signal, also at the throttle limit (checks G1 and G21).`
+                        + (both ? ` ${both === spikes.length ? (both === 1 ? 'Before this FALLBACK' : 'Before each of these FALLBACKs') : `Before ${both} of these FALLBACKs`}, the headspeed also decreases with the throttle at ${RULE.throttleHigh / 10} % or more.` : '') : '',
+                        quiet > 0 ? `${quiet} of ${many(L.length, 'FALLBACK')} ${quiet === 1 ? 'has' : 'have'} no measured headspeed decrease at the throttle limit. Examine the RPM signal (check G1).` : ''].filter(Boolean).join(' ')) }); }
         if (M.skipped) { for (const id of ['G19', 'T15', 'D8']) add(id, 'skipped', f, null, { text: M.skipped }); continue; }
         if (!M.rescues.length) { for (const id of ['G19', 'T15', 'D8']) add(id, 'skipped', f, null, { n: 0, text: `The log has no rescue (${M.source === 'RESCUE_STATE' ? 'RESCUE_STATE' : M.source || 'no rescue data'}).` }); continue; }
         const groups = new Map(); for (const ev of M.rescues) { const k = ev.profile === null ? 'null' : String(ev.profile); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(ev); }

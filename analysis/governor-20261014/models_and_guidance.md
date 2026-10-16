@@ -1,0 +1,545 @@
+# Governor digital twin and governor autotune: plant model, identifiability and Rotorflight guidance
+
+2026-10-14. Input for the governor twin (drivetrain + ESC + battery) and the governor autotune. Read-only analysis.
+Firmware references are to the pinned Rotorflight 4.6.0 sources in `tools/autotune/firmware/vendor/`
+(commit 118e912, `tools/autotune/firmware/README.md`). Measurements are from the two dumps named in the task, decoded
+with `models_scripts/dumpsel.cjs` (0-based log index as returned by `FlightLog.openLog`). All scripts and per-log
+statistics are in `analysis/governor-20261014/models_scripts/` (section 10).
+
+---
+
+## 0. Summary
+
+1. **Model**: a grey-box, averaged electrical model (Drela first-order DC motor driven by an averaged ESC with
+   d·Vbat at the motor), a rigid drivetrain (optional one-way clutch), a quasi-steady rotor load torque (profile +
+   induced + collective/cyclic/yaw terms, tail share inside), a Thevenin battery (R0 only by default, one RC pair
+   optional), and explicit ESC behaviours that the logs show matter for the governor: a ~0.1 s throttle-to-torque
+   lag, a start-from-standstill acceleration limit (soft start), brake/coast at throttle off, and RPM-signal glitches
+   at full power. Battery current is **optional**: the model is parameterized in the "voltage domain"
+   (slip voltage s = d·V − Ke·ω) in which every quantity the governor sees (throttle in, headspeed and Vbat out) is
+   identifiable without current. Current only adds absolute scale (R_m, R0, J, watts, amps) and removes a bias.
+2. **Evidence that the structure is right** (section 4):
+   - Applied motor voltage d·V at 4500 rpm is constant over a whole pack (18.0–18.5 V in 6 Fireball flights while V
+     falls 24.3→22.2 V): the d·Vbat motor model holds, and the throttle need rises ~8 % per pack.
+   - With current (Gaui, 10 flights): rotor-referred Kv 154.7–157.5 rpm/V, R_m (motor+ESC+wires) 16.9–19.8 mΩ,
+     R0 (pack+leads) 13.2–18.1 mΩ, corr(hp V, hp I) = −0.93…−0.94; a polarization RC pair cuts the V residual by only
+     5–7 % (τ unstable 0.3–10 s) → R0-only by default.
+   - Without current, R0/R_m from a static regression is biased low by 20–50 % (Gaui: 0.33–0.67 vs 0.74–0.96
+     with current), so the no-current fit must be output-error on HS and V jointly, with uncertainty reported; Ke
+     from the low-load headspeed/(throttle·V) ratio agrees with the current-based value to ±1–2 % (Gaui).
+   - Throttle→torque lag 80–120 ms on both helicopters (HS acceleration, Ibat and Vbat all peak there); ESC
+     telemetry adds ≤ 20–40 ms. This is the dominant phase lag of the governor loop.
+3. **Fireball problems the autotune must address, quantified** (latest dump `…20261005_204823.BBL`):
+   - Power limit: throttle at 100 % for 2.1–6.7 s per 4500/5000-rpm flight; govSum demanded 1.20–1.37; headspeed
+     droops 17–25 % (no fallback) at Vbat 21.4–23.5 V; saturation runs cluster late in the pack.
+   - Voltage compensation cannot work on this setup: `battery_meter = ESC` and the firmware enables it only for an
+     ADC source (`flight_governor.c:1556`), whatever the flag.
+   - FALLBACK: 3 events (log 11 ×2, log 14), each triggered by an RPM-signal glitch while the throttle was at 100 %
+     and collective 0.65–1.04; all 6 glitches found in 1491 s of governed flight occurred inside the 23.6 s of
+     saturated throttle (none in 1467 s below 100 %). Each fallback cut the throttle from 1.0 to 0.67–0.72
+     (I × 0.9, precomp OFF), then RECOVERY restarted at 0.52–0.57 and ramped at 50 %/s: headspeed fell to
+     2580–2810 rpm (−38 to −43 % of 4500).
+   - Spool-up: the ESC limits acceleration from standstill to ≈ 550–690 rpm/s whatever the RF ramp (10 s, 8 s or the
+     2 s bailout ramp). The open-loop RF ramp outruns it; ACTIVE is entered with throttle 0.10–0.33 above the steady
+     value and the headspeed overshoots +7.1 % (10 s ramp) / +9 to +13 % (8 s ramp; +22 % once).
+   - FUNCTION throttle type with `gov_idle_throttle = gov_auto_throttle = 0`: every RUN→IDLE switch is treated as
+     an autorotation (`flight_governor.c:389-392`); a return to RUN within 15 s is a BAILOUT at the 2 s recovery ramp
+     even from a stopped motor (log 10: 4 s at 100 % throttle, then overshoot).
+   - Unlogged parameter change inside the dump: the SPOOLUP throttle slope is 0.100/s in logs 0–8 and 0.124/s in
+     logs 9–15 (`gov_spoolup_time` 100 → 80), contrary to "logs 6–16 no parameter changes".
+4. **Autotune** (section 7): closed-loop replay of every recorded flight phase through native governor (WASM) + twin,
+   plus synthetic scenarios (end-of-pack OCV, fresh pack, worst collective pumps, injected RPM glitch, hold/bailout).
+   Continuous search over effective gains, precomp, limits and filters with margin, headroom and robustness
+   constraints; rule-plus-simulation decisions for the state-machine parameters; a feasibility (power-limit) analysis
+   for `gov_headspeed`; a generated bypass curve. Every governor parameter is mapped (table 7.2).
+
+---
+
+## 1. What the native governor does (facts the twin and the autotune depend on)
+
+All in `tools/autotune/firmware/vendor/flight_governor.c` unless noted. The governor runs once per mixer update
+(`flight_mixer.c:542`), i.e. at the PID rate (Fireball 1 kHz, Gaui 2 kHz).
+
+### 1.1 Signal path in ACTIVE (ELECTRIC)
+
+| Step | Code | Notes |
+|---|---|---|
+| Raw motor RPM of motor 0 → PT2 at `gov_rpm_filter` Hz | 573-576, 1666 | headspeed = filtered × main gear ratio (579); ratio to full HS (582) |
+| RPM error: HS ratio < 1 % or raw < 10 rpm while throttle > 10 % | 585, consts 59-60 | |
+| RPM glitch: \|raw − filtered\| > 0.25 × full motor RPM, or raw > 2 × full motor RPM | 588, 1596-1597, consts 55-56 | thresholds are firmware constants, not tunable |
+| `motorRPMGood` only after 200 ms without error | 594-606, const 51 | one glitch drops it at once |
+| Normalized error e = (target − HS)/fullHS + TTA | 621 | |
+| P = K·Kp·e, C = K·Ki·e·dt, D = K·Kd·difFilter(e) | 625-627; d filter = `gov_d_filter`/10 Hz (1661) | K = gain/100, Kp = p/10, Ki = i/10, Kd = d/1000, Kf = f/100 (1559-1563) |
+| F = PT2_ff( K·Kf·(w_coll·\|coll\|^(curve/10) + w_cyc·cyclicTotal + w_yaw·\|yaw\|) ) | 465-488, 1668 | inputs are the **stabilized mixer inputs** (`flight_mixer.h:102-115`, cyclicTotal = √(SR²+SP²) `flight_mixer.c:327`), not raw sticks |
+| Clamp P, I, D to ±limit; F to [0, f_limit] | 935-938, 1565-1573 | doc says F ∈ ±f_limit; code `minF = 0` (1573): precomp only adds throttle |
+| Bumpless entry: I = throttle/vcomp − (P+D+F) | 945-954 | on every state change (`stateResetReq`, 399) |
+| sum = P+I+C+D+F; throttle = sum × vcomp | 957-960 | |
+| min throttle = max(gov_min_throttle, dynMin) | 963, 536-548 | dynMin only with flag and when RPMK > fullHS |
+| Anti-windup: add C only if not saturated | 965-967 | conditional integration |
+| Output clamp [min, max]; target slews to request at tracking rate × max(fullHS, RPMK) | 970-973, 562-565 | |
+| RPMK = EWMA(HS/throttle), cutoff 0.05 Hz (τ ≈ 3.2 s), when throttle > 0.2 and HS > 20 % | 550-560, 66, 1663 | a **loaded** "headspeed at 100 % throttle" |
+
+Voltage compensation (490-509): gain = clamp(cells·3.70 V / PT2_pwr(Vbat), 0.8, 1.2) multiplies the PID sum, i.e.
+it holds the loop gain and the throttle need constant in terms of d·V. **It is enabled only if the flag is set AND
+`getBatteryVoltageSource() == VOLTAGE_METER_ADC` AND mode ELECTRIC (1556).** With an ESC-sourced voltage it is
+silently off. The WASM host exposes the source as a configuration value (`host.c: getBatteryVoltageSource`), so the
+twin can reproduce both cases.
+
+### 1.2 States and the other control laws
+
+- Ramps: rate per tick = 10·dt/param (1603-1609): every `gov_*_time` is the 0→100 % time in 0.1 s; 0 = no limit
+  (`common_maths.h:235-243`). IDLE/HOLD: up = startup, down = spooldown, range [idle, handover] (1052). SPOOLUP: up =
+  spoolup (1055). ACTIVE target slew: tracking (1058, 973). AUTOROTATION: [auto, handover], up = recovery, down =
+  spooldown (1064). RECOVERY/BAILOUT: recovery both ways, range [idle, max] (1068). BYPASS: curve, recovery rate until
+  reached (1012-1040, 1071).
+- SPOOLUP (875-930): without `gov_use_pid_spoolup` the throttle ramps open loop toward the throttle input (FUNCTION
+  RUN maps the input to `gov_max_throttle`, 458). With it, after handover the PID tracks a target that ramps at
+  spoolup rate × max(fullHS, RPMK). Exit to ACTIVE at HS > 0.99 × request **or** throttle > 0.95 × max (1146).
+- FALLBACK (979-995): throttle = (I + F·[fallback precomp]) × vcomp × (1 − drop), drop ≤ 50 % (1583); P and D are
+  dropped. Back to RECOVERY when RPM is good for 200 ms (1180-1181).
+- RECOVERY/BAILOUT init (997-1010): target = current HS; throttle = min(HS/RPMK, HS/request) — i.e. the throttle that
+  gave this HS on average, not the throttle the target needs — then the recovery ramp, exit at 99 % HS or 95 % throttle
+  (1196, 1228).
+- THROTTLE_HOLD: timeout `gov_throttle_hold_timeout` × 100 ms (1650); RECOVERY if throttle returns (1123-1124).
+- AUTOROTATION: enabled if `gov_autorotation_timeout` > 0 (1557), timeout × 1000 ms (1651); detected when the input
+  falls below handover while ACTIVE and input ≥ auto throttle (389-392, 1157-1160); BAILOUT if input > handover with
+  RPM good (1207-1208).
+- FUNCTION type (449-461): input < 0.333 → idle throttle, < 0.666 → auto throttle, else max throttle.
+  With idle = auto, IDLE and AUTO are indistinguishable for `isAutorotation`.
+- TTA (511-534, 1523-1541): only with gain > 0 and limit > 0; gain = ±tta_gain/125 (rotation sign), divided by
+  K·Kp in ELECTRIC (1533); in ELECTRIC it adds up to 2·max(1 + limit − HSratio, 0) of normalized error (raises the
+  headspeed by up to `gov_tta_limit` %). Doc: for motorised tails.
+- Validation: idle ≤ min(10·handover − 1, 250) (0.1 % units), auto ≥ idle (1468-1477); max ≥ handover, min ∈ [10, max]
+  (1479-1486); handover ∈ [10, 100] (1496-1497); flags cleared below ELECTRIC (1509-1515); bypass point = value/200 over
+  collective −1…+1 in 8 bins (415-427, 1659); BYPASS only above handover (376; 4.6.0-RC1 release note).
+
+### 1.3 Defaults (pg_governor.c:30-49, pg_pid.c:106-126) and the two helicopters
+
+| Parameter | Default | Fireball (CLI 2026-10-13; PID profiles 1/2/3) | Gaui (log header only) |
+|---|---|---|---|
+| gov_mode / throttle_type | NONE / NORMAL | ELECTRIC / FUNCTION | ELECTRIC (govSum ≠ 0) |
+| startup / spoolup / tracking / recovery / spooldown (0.1 s) | 200/100/50/30/30 | 100/80/50/20/80 (log: spoolup 100 in logs 0–8) | spoolup ≈ 198 (logs 38–45) → ≈ 149 (46–49), from ramp slopes |
+| hold / autorotation timeout | 50 (5 s) / 15 (15 s) | 50 / 15 (HOLD 5.0 s and AUTOROT 15.0 s observed) | — |
+| idle / auto / handover | 0 / 0 / 25 | 0 / 0 / 25 | — |
+| pwr / rpm / tta / ff / d filter | 5/10/0/5/50 | 5/10/0/5/50 | ff = 5 Hz (fit, 4.8) |
+| headspeed | 1000 | 3500/4500/5000 | 2300/2500/2700 |
+| gain, P, I, D, F | 40, 40, 50, 0, 10 | 55, 18, 60, 2, 32 (header `govPID` [18,60,2,32,55]) | header [40,50,0,10,40] |
+| p/i/d/f limit | 20/95/20/100 | 30/95/5/40 | — |
+| yaw/cyclic/collective weight, curve | 10/10/50, 20 | 5/35/100-150-100, 20 | fit: coll ≈ 50, cyc ≈ 7.5, yaw ≈ 78 (?), curve 20 |
+| min/max throttle, fallback drop, dyn min | 10/100, 10, 80 | 10/100, 10, 80 | — |
+| flags fallback_precomp / voltage_comp / pid_spoolup / dyn_min | off | all OFF | — |
+| tta gain/limit | 0/20 | 0/20 (header `yaw_tta`) | 0/20 |
+| battery_meter / current | — | ESC / ESC (no current sensing; Ibat ≡ 0) | ESC V and I |
+| motor PWM | — | 250 Hz, 1100–1940 µs | 250 Hz, 1070–2000 µs |
+
+---
+
+## 2. Rotorflight's official guidance (doc.rotorflight.org, Rotorflight 4.6)
+
+### 2.1 Procedure (Tuning → Governor, Governor Setup)
+
+- Setup first: ESC in fixed-wing / external-governor / linear mode with its own governor off; ESC throttle range
+  calibrated to the Motors-tab Low/High throttle; "The motor must start below 5% and reach full power at 100%", no
+  deadbands; RPM measurement verified (ESC telemetry RPM is too slow for the governor); spool-up ≈ 10 s on a large
+  helicopter; "The governor needs about 15-25% of throttle in reserve"; throttle near 100 % in a hover means the
+  headspeed is too high for the motor, battery and pinion.
+- Preparation: TTA gain 0 while tuning; log at 1 kHz with the Governor field, debug GOVERNOR; change one gain at a
+  time (fly 3–4 values around the default). Test: hard pitch pumps and fast climb-outs.
+- Order: (1) collective precomp and F (sag on pumps → raise; overspeed → lower; steps ≈ 10), then cyclic and yaw
+  precomp with hard cyclic and pirouettes; (2) I: raise until a slow oscillation appears, then reduce by ≈ 1/3
+  (steps ≈ 25); (3) P: raise until fast oscillation, reduce by ≈ 1/3 (steps ≈ 10); master gain scales P, I, D if the
+  headspeed surges or hunts overall; (4) D usually not needed, heavy rotors may benefit.
+- Symptoms table: slow sag recovery → precomp/F then I; overshoot after a pump → lower precomp or P; ~1 Hz wander →
+  lower I; fast surging → lower P or master gain; throttle ≈ 100 % in hover → lower headspeed/change gearing; bog then
+  overspeed in descents → Dynamic Minimum Throttle; late-flight sag → Voltage Compensation "(needs Battery ADC)".
+- "A governor can be too good": a strong governor makes large torque changes the tail must counter; the answer may be a
+  softer governor, not more tail gain.
+
+### 2.2 Parameter meanings and advice (doc text, with the code facts that differ)
+
+| Parameter | Official meaning / advice | Code note |
+|---|---|---|
+| gov_mode | OFF, LIMIT, DIRECT, ELECTRIC, NITRO; ELECTRIC/NITRO need a fast RPM signal | arming disabled without one (1629-1633) |
+| gov_throttle_type | NORMAL (switch or stick curve), SWITCH (headspeed by throttle position), FUNCTION (OFF/IDLE/AUTO/RUN at 0/33/66 %) | the "target = full HS × throttle input" doc sentence is implemented only for SWITCH (440-446); NORMAL holds full HS |
+| gov_handover_throttle | above it the governor takes over; motor must start below it (doc setup page says "default 20 %") | default 25 (pg_governor.c:42); range 10–100 |
+| gov_idle_throttle | minimum output below handover; FUNCTION IDLE output | 0.1 % units, ≤ 25 % |
+| gov_auto_throttle | NORMAL/SWITCH: input below it cancels autorotation; FUNCTION: AUTO output | ≥ idle; equal to idle disables the IDLE/AUTO distinction |
+| gov_startup/spoolup/tracking/recovery/spooldown_time | 0→100 % times for IDLE start, spool-up (~10 s), target changes, fast spool-ups in flight (hold, fallback, bailout), throttle reductions at idle | 0.1 s units; 0 = no limit |
+| gov_throttle_hold_timeout | after an in-flight hold, the window for fast recovery | 0.1 s units |
+| gov_autorotation_timeout | max autorotation that can still bail out; 0 disables bailout | s units |
+| gov_bypass_throttle | collective→throttle curve for the BYPASS mode switch; backup for a failed RPM signal | 9 points, 0–200 = 0–100 % |
+| gov_pwr/rpm/tta/ff/d_filter | cutoffs for battery voltage (vcomp), headspeed, TTA, precomp, D-term; "defaults suit most helicopters" | PT2 except D (difFilter, value/10 Hz) |
+| gov_headspeed | full headspeed of the profile; use the manufacturer's value; keep 15–25 % reserve | |
+| gov_min_throttle / gov_max_throttle | least/most throttle while active / in any state | min ∈ [10, max], max ≥ handover |
+| gov_gain, p/i/d/f gains | master gain (scales P, I, D) and PID/F gains | master gain also scales F (482) and C |
+| gov_p/i/d/f_limit | term ranges | F lower bound is 0 in code |
+| yaw/cyclic/collective ff weights, collective curve | relative precomp weights; curve exponent/10, "15..25 likely good" | inputs are stabilized mixer commands |
+| gov_fallback_drop | throttle drop in FALLBACK "so you notice — land" | ≤ 50 % |
+| gov_use_fallback_precomp | keep precomp in FALLBACK | without it F = 0 in FALLBACK (985) |
+| gov_use_pid_spoolup | PID-controlled spool-up ("Governed Spoolup") | target ramp uses max(fullHS, RPMK) |
+| gov_use_voltage_comp | useful with high internal resistance (Li-ion, LiFePo4); needs Battery ADC | enforced by 1556 |
+| gov_use_dyn_min_throttle / gov_dyn_min_throttle | prevents throttle dropping too low if the one-way bearing disengages; % of steady throttle | uses RPMK estimate (540) |
+| gov_tta_gain / gov_tta_limit | motorised tails: raise headspeed briefly to help the tail; limit in % | |
+| Mode switches | BYPASS (curve, no safeguards), FALLBACK (simulate RPM loss), SUSPEND (PID off, F only) | |
+
+Release notes 4.6.0 / RC1 (github.com/rotorflight/rotorflight-firmware/releases): "Refactor Governor for Nitro/I.C.
+engines with multiple improvements and fixes", "Governor further improvements and throttle parameter checks",
+"Enable Bypass only when throttle channel is above handover", "Refactor throttle channel range and arm limit". The
+pinned source is the 4.6.0 release (README), so code wins where the doc differs.
+
+For comparison, ArduPilot's internal RSC governor (ardupilot.org, traditional-helicopter-internal-rsc-governor) has
+the same structure (throttle-curve feedforward, droop/proportional term, a torque compensator integrating a base
+torque) and, notably, a **torque limiter on spool-up** (`H_RSC_GOV_TORQUE`) that limits the torque rise once the
+rotor passes 50 % speed — the mechanism Rotorflight approximates with `gov_use_pid_spoolup`.
+
+---
+
+## 3. Signals available for identification
+
+| Signal | Field | Fireball | Gaui | Notes |
+|---|---|---|---|---|
+| Throttle (governor output) | `motor[0]`/1000 | yes | yes | plant input |
+| Headspeed | `headspeed` | freq sensor (FREQ B02, 24 poles, ratio 1:1) | yes | logged value is smoothed: a raw glitch shows as a 30 ms burst, not one sample |
+| Governor terms | govP/I/D/F/Sum ×1000, govTarget, govRequest | yes | yes | enables controller-only replay and parameter recovery |
+| Stabilized mixer inputs | `mixer[0..3]`/1000 | yes | yes | the precomp inputs and the rotor load inputs |
+| Battery voltage | `Vbat`/100 | ESC telemetry, 0 in log 1; 28–31 updates/s, 10 mV | ESC, 29–56 updates/s | |
+| Battery current | `Ibat`/100 | ≡ 0 (ESC has no sensing) | ESC, 63–95 % non-zero | **optional** |
+| Governor state | GOVERNOR_STATE events | yes | yes | |
+| Header | `govPID`, `yaw_tta`, PWM range | yes | yes | no other governor parameter is in the header |
+
+Treat Ibat ≡ 0 or Vbat ≡ 0 as missing (as `heli_twin` does for Vbat).
+
+---
+
+## 4. Measured evidence (method → number)
+
+### 4.1 Motor model and the d·V law
+- 4500-rpm windows, first vs last 30 s of ACTIVE (`pack.py`): Fireball d·V 18.21–18.48 V → 17.94–18.08 V while
+  Vbat 24.3–24.7 → 22.0–22.5 V and throttle 0.74–0.76 → 0.80–0.82 (logs 5, 10, 11, 13, 14, 15); Gaui at 2500 rpm
+  16.60→16.60 V and 16.70→16.71 V (logs 48, 49). The ESC duty equals the throttle in steady state (no ESC-side voltage
+  compensation) and the motor sees d·Vbat.
+- Gaui with current, `d·V = Ω/kv + R_m·I_b/d` in ACTIVE (`govstats.py`): kv 154.7–157.5 rotor-rpm/V, R_m
+  16.9–19.8 mΩ, residual 0.27–0.42 V; an added offset term is not identifiable (collinear, kv swings 141–228).
+- Low-load ratio method (no current; 99.5th percentile of 1-s HS/(d·V) in ACTIVE, `nocurrent2.py`): Gaui 154.4–156.5
+  (agrees ±1–2 % with the current fit); Fireball 260–291 (ground ACTIVE at −0.35 collective: 264–267). A parallel
+  output-error fit in this directory (`oe_esc_fit.json`) gives Fireball 316 and Gaui 170 (vs 157 with current): Kv
+  is **not well pinned without current**, while the predicted headspeed and throttle stay good
+  (`closed_check.json`: Gaui closed-loop HS RMS 11.7 rpm with the free fit vs 13.5 rpm with current-based values).
+
+### 4.2 Battery
+- Gaui R0 (pack + leads, at the ESC input) from hp(V) vs hp(I), 2 s high-pass: 13.2–18.1 mΩ (2.2–3.0 mΩ/cell);
+  corr −0.925…−0.944. Coulomb-counted OCV slope in flight −1.2 to −1.6 V/Ah (6S). Current p99 95–127 A, max 170 A;
+  power median 430–555 W, max 3.56 kW (`govstats.py`, `rc.py`).
+- One RC pair (τ grid 0.3–30 s): V residual 152→141, 154→145, 131→124 mV; τ 0.3/3/10 s and R1 −6.7/+5.6/+6.3 mΩ —
+  weak and unstable → R0-only default; RC pair only if a significance rule passes.
+- No current (Gaui, same flights): static regression of hp(V) on hp(d·(dV − Ke·ω)) with Ke fixed gives R0/R_m 0.33–0.57
+  (IV with throttle 0.41–0.67) vs 0.74–0.96 with current → biased low 20–50 % (`nocurrent*.py`, `lag.py`). The
+  current shape predicted from the motor model correlates 0.67–0.90 with the measured current.
+- Fireball (no current): R0/R_m ≈ 0.08–0.13 by the same (biased) method; rest voltage 25.2 V (4.20 V/cell) at start,
+  22.3–22.8 V after flights; ACTIVE p1 21.75–22.17 V; −1.2 V sag within 0.5 s at a full-collective pull (log 10, 135.5 s).
+
+### 4.3 Lags
+Cross-correlation of band-passed throttle with lagged signals in ACTIVE (`lag2.py`): HS acceleration (fast freq
+sensor) peaks at 80–120 ms (both helicopters), Ibat at 100–120 ms, Vbat at 60–100 ms. The ~0.1 s is mainly the ESC
+throttle→torque response (parallel OE fit: τ_esc 0.098 s Gaui, 0.113 s Fireball); telemetry adds ≤ 20–40 ms. The
+motor PWM at 250 Hz adds ≤ 4 ms hold. Electrical L/R (≈ 1 ms) is negligible at these rates.
+
+### 4.4 Power limit (Fireball)
+- Throttle ≥ 0.995 runs ≥ 30 ms (`pack.py`): log 5: 5 runs 2.1 s; 10: 8 runs 6.7 s (one 4.0 s run is the bailout,
+  4.5); 11: 18 runs 6.3 s; 13: 6 runs 2.7 s; 14: 3 runs 2.5 s; 15: 10 runs 3.2 s; median Vbat in the runs 21.3–23.6 V,
+  most late in the pack. Gaui: none (throttle p99 0.75–0.89, max 0.93).
+- During saturation govSum = 1.20 (log 10), 1.33–1.37 (log 14), I frozen (anti-windup works), droop 17.6–25.3 % in
+  flights without fallback (`govstats.py`). Example log 10, 135.5–136.4 s: collective 0.57→0.71, Vbat 22.85→21.64 V,
+  HS 4500→3631 rpm, recovery +2300–2600 rpm/s once collective falls (the motor is fast; the power is the limit).
+- Median throttle at 4500/5000 rpm 0.78–0.87 (13–22 % reserve; doc asks 15–25 %).
+
+### 4.5 Spool-up, bailout and the ESC soft start (Fireball)
+- `spool.py`: RF throttle slope in SPOOLUP 0.100/s (logs 0–8) and 0.124/s (logs 9–15). HS acceleration in the last
+  second 550–690 rpm/s in all 15 spool-ups; HS/(d·V) at exit 0.61–0.88 of the steady value; exit throttle 0.72 (10 s
+  ramp, V 23) and 0.85 (8 s, V 25) vs 0.52–0.75 steady → overshoot +7.1 % (10 s), +9.1 to +13.2 % (8 s), +22 % once.
+- Log 10, 16.9–23.5 s (BAILOUT from a stopped motor): throttle ramps at 50 %/s to 1.0, ACTIVE entered at throttle
+  > 95 % with I = 0.945, 4 s at 100 % throttle while HS rises at ≈ 640 rpm/s (HS/(d·V) only 30–130), then overshoot.
+  Same ≈ 640 rpm/s as the 10 s and 8 s ramps → an ESC acceleration limit from standstill (soft start), not the motor:
+  in flight the same motor accelerates the rotor at 2300–2600 rpm/s.
+- Gaui (15–20 s ramps): exit throttle within ±0.02 of steady (one +0.07), overshoot 0.3–1.3 %.
+
+### 4.6 FALLBACK and RPM glitches (Fireball)
+`glitch2.py` (HS jump > 8 % of target in 3 ms): 6 events in 1491 s governed, all with throttle at 100 % (saturated
+time 23.6 s; chance of all 6 falling in a 1.6 % share if independent ≈ 2·10⁻¹¹); 3 led to FALLBACK. Traces:
+log 11 54.61 s (collective 0.65, HS 3860 → glitch → FALLBACK throttle 0.688 for 0.2 s → RECOVERY at 0.657 → min HS
+3613), log 11 159.50 s (collective 0.89–1.0, FALLBACK 0.672, RECOVERY from 0.565, min HS 2582 = −42.6 %), log 14
+193.58 s (collective 1.04, FALLBACK 0.719, RECOVERY from 0.523, min HS 2586). Gaui: no glitch, no fallback.
+Cause cannot be separated from the logs (100 % duty regime vs highest current); both predict the same mitigation tests.
+
+### 4.7 Throttle off: brake vs coast
+Throttle-hold coasts (`detail.py`): Fireball log 3 15.9 s: 3499 → 1430 rpm in 0.6 s (decel rising to ≈ 5300 rpm/s),
+then ≈ 350 rpm/s — an ESC brake (or motor decoupling) phase, not aerodynamics. Gaui HOLD at 2300 rpm: 460–920 rpm/s,
+smooth (aero + friction). The off-throttle behaviour is ESC- and drivetrain-specific and must be a separate mode.
+
+### 4.8 Parameter recovery from the log works
+`ffit.py`: fitting govF to PT2(w·|mixer3|^e, cyclicTotal, |mixer2|) recovers for the Fireball curve 20, ff filter 5 Hz,
+K·Kf·w = 0.264/0.061/0.008 → weights 150/34/5 with K·Kf = 0.176 from the header (CLI: 150/35/5), RMS 0.4·10⁻³.
+Ramp slopes give the times (4.5), HOLD/AUTOROT durations give the timeouts (5.0 s, 15.0 s), FALLBACK throttle/I gives
+the drop (0.719/0.799 = 0.90 → 10 %).
+
+---
+
+## 5. Recommended plant model (governor twin)
+
+### 5.1 Structure
+
+Inputs per tick: governor throttle u (from the native governor), stabilized mixer inputs θ = mixer[3], c =
+√(mixer0²+mixer1²), y = mixer[2] (/1000), optional climb speed v_z (baro vario or 6-DOF twin) and advance ratio μ.
+
+States: ω_m (motor, rad/s; = N·Ω when engaged), Ω (rotor; only a separate state with a one-way clutch), d (ESC duty),
+S (ESC startup flag), SoC (or charge used q), V1 (optional RC), sensor states (telemetry delay line).
+
+Equations (Drela 2007 first-order motor; averaged ESC, Krause et al.; Thevenin battery, Chen & Rincón-Mora 2006,
+Hu et al. 2012; rotor torque, Leishman 2006 / Padfield 2007 / Gavrilets et al. 2001):
+
+```
+ESC        d* = clamp((u − u0)/(1 − u0), 0, 1)            u0 ≈ 0 (steady data, 4.1); start threshold only at spool-up
+           τe·ḋ = d* − d  (+ 1/f_pwm hold)                 τe ≈ 0.08–0.12 s (4.3)
+           soft start: while S = 1, ω̇_m ≤ a_ss; S → 0 when ω_m ≥ (1 − ε)·kv·d·V_b the first time   a_ss ≈ 640 rpm/s (Fireball)
+Motor      v_m = d·V_b,  I_m = (v_m − Ke·ω_m)/R_m          R_m = winding + ESC + wires
+           freewheel mode: diode → I_m = max(I_m, 0);  active ("damped light"/regenerative) → I_m ≥ −I_brk
+           current limit (if the ESC has one): I_m ≤ I_max
+           Q_m = Kt·(I_m − i0) ,  Kt = Ke (SI units; Drela: K_Q = K_V)
+           throttle off (u = 0): Q_m = −Q_brk(ω_m, t) if the ESC brakes on stop, else 0
+Battery    I_b = d·I_m + I_aux ;  V_b = OCV(SoC) − R0·I_b − V1 ;  V̇1 = (R1·I_b − V1)/τ1 (optional)
+           SȯC = −I_b/(3600·C);  OCV = N_s·ocv_LiPo(SoC), anchored by rest voltages before arm / after disarm
+Drivetrain J·Ω̇ = N·η·Q_m − Q_load            (rigid; J = rotor + N²·motor inertia)
+           one-way clutch: engaged iff ω_m ≥ N·Ω and the torque is positive; else J_m·ω̇_m = Q_m, J_r·Ω̇ = −Q_load
+Load       Q_load = n²·[q0 + qθ·|θ − θ0|^pθ + qc·c + qy·|y − y0|] + qv·T̂·v_z/Ω + qf·n ,  n = Ω/Ω_ref
+           (physical form: Q_mr = ρπR⁵Ω²[σCd0/8·(1 + Kμ·μ²) + C_T·λ], plus tail ≈ 10 % of main power in hover,
+            US 4,083,518; the empirical form is linear in q and its pθ plays the role of gov_collective_curve/10)
+Sensors    HS_raw = ω_m·(gear ratio, from configuration, assumed correct); glitch process (4.6) as an optional input;
+           V_log, I_log = ESC telemetry: extra delay 0–40 ms, sample-and-hold at the measured update rate, 10 mV/10 mA;
+           ADC source: vbat_lpf_hz filter instead of telemetry
+```
+
+### 5.2 Voltage-domain form (no current needed)
+
+Define the slip voltage s = d·V_b − Ke·ω_m (= R_m·I_m). Dividing by R_m and J:
+
+```
+ω̇_m = (s − s_load(ω, θ, c, y, v_z)) / (Ke·τ_m)        τ_m = J·R_m/(Ke·Kt)   [s]
+s_load = (R_m/Kt)·Q_load/N                              [V]  (coefficients q'_k in volts)
+V_b = OCV − β·d·s − V1 ,  β = R0/R_m
+```
+
+Parameters Ke, τ_m, q'_k, β, τe, a_ss, OCV path, (u0, freewheel mode) are identifiable from (u, V, HS, mixer). The
+physical set (R_m, J, Q in N·m, R0, amps, watts) needs one absolute scale: measured current (best), the craft geometry
+prior for J (as `heli_twin` already does, `heli_twin.cjs:78`), or a motor datasheet R_m/Kv given by the pilot (optional).
+
+Closed-form power limit used by the autotune (d = 1): s_max(Ω) = (OCV − Ke·NΩ − V1)/(1 + β); the steady headspeed Ω
+is feasible for a load if s_max(Ω) ≥ s_load(Ω, load). Required throttle d_req solves d·V_b(d) = Ke·NΩ_t + s_load;
+headroom h = 1 − d_req. Battery side: V_b ≥ N_s·V_min,cell ⇒ I_b ≤ (OCV − N_s·V_min)/R0 (P_max at that voltage =
+V_min·(OCV − V_min)/R0; absolute bound OCV²/4R0). Fireball illustration (Kv ≈ 270, uncertain ±10 %): s ≈ 1.5–1.8 V in
+4500-rpm hover, s ≈ 8.2 V at the log-10 saturation (d·V = 21.7 V, 3657 rpm).
+
+### 5.3 Why this complexity (and not more or less)
+
+- Average model is enough: commutation/PWM ripple and L/R are ≪ 1 ms; the governor runs at 1–2 kHz and its loop is
+  limited by the ~0.1 s ESC response.
+- d·V must be a product with the measured or modelled Vbat: the throttle need drifts 8 % per pack (4.1).
+- Battery sag must be internal (not the logged Vbat as an exogenous input, as `heli_twin.cjs:187` does): a gain change
+  changes the current, the sag and the available power at saturation, which is the main Fireball failure (4.4).
+- The ESC behaviours (lag, soft start, brake/freewheel mode) and the glitch process explain the spool-up overshoot,
+  the bailout saturation and the fallback droops; a smooth plant cannot reproduce them.
+- R0-only battery: the RC pair is not supported by the Gaui data (4.2). Temperature and ageing: absorb as slow drift.
+- One-way clutch only when the data show decoupling (motor speed dropping faster than physics with the throttle
+  low in flight); else rigid.
+
+### 5.4 Relation to the existing 6-DOF twin
+
+`heli_twin.cjs:186-188, 202` uses `Q_m = max(0, kmV·esc·Vbat − kmW·ω)` (kmV = Kt/R_m, kmW = Kt·Ke/R_m), first-order
+`tauEsc`, `tauHs`, exogenous Vbat and no tail power. Recommended: implement the subsystem above once (e.g.
+`gov_twin.cjs`) and call it from `heli_twin` in place of those lines, so the 6-DOF closed loop and the governor
+search share one physics. Changes: internal battery with optional current, freewheel/brake modes instead of the fixed
+`max(0, …)`, soft-start state, telemetry sensor model, load terms in the mixer inputs. For governor tuning the twin can
+run stand-alone with recorded mixer inputs as loads; the coupling back to attitude is weak except the yaw torque
+reaction, which the 6-DOF closed loop can check afterwards.
+
+---
+
+## 6. Identifiability and identification procedure
+
+### 6.1 Table
+
+| Quantity | Without current (V, u, HS, mixer) | With current | Without voltage (Vbat ≡ 0) |
+|---|---|---|---|
+| Ke (Kv) | yes if a low-load steady state exists (Gaui ±1–2 %); else weak (Fireball 260–316) | ±1 % (Gaui 154.7–157.5) | per throttle unit only (Ke·V0 lumped) |
+| τ_m, s_load coefficients | yes (spool-up, transients, three headspeeds, saturation periods) | yes, plus absolute J, Q | yes, at constant assumed V |
+| R_m, J, Q in SI, current, power | no (one scale missing) — use J prior or optional datasheet | yes (R_m 16.9–19.8 mΩ) | no |
+| β = R0/R_m | yes in principle, static regression biased low 20–50 %; output-error + uncertainty | R0 13–18 mΩ directly | no |
+| R1, τ1 | weak | weak (4.2) | no |
+| OCV(SoC) | rest anchors + modelled charge (scale uncertain) | coulomb count, −1.2…−1.6 V/Ah | no |
+| τe | yes (HS acceleration lag) | yes (current lag) | yes |
+| a_ss, brake, freewheel mode | yes (spool-ups, cuts, overspeed) | yes | yes |
+| ESC current limit | indistinguishable from R at full throttle | yes if reached | no |
+| glitch rate vs throttle/current | yes (6 events: all at 100 %) | yes | yes |
+
+Without Vbat the model falls back to a constant voltage (motor gain per throttle unit) and every battery-dependent
+result (end-of-pack headroom, vcomp, sag) is "not available", with the reason given.
+
+### 6.2 Stages (each output carries a bootstrap interval over flights or 5-s blocks)
+
+0. Qualification: flight vs bench (CLAUDE.md), phases, governor-state segments, PID profile per segment, Vbat/Ibat
+   presence and update rate, glitch detection (4.6), unlogged-change detection (ramp slopes, 4.5).
+1. Governor configuration: header `govPID`, `yaw_tta`; fits of govF (weights, curve, ff filter), clamps of P/I/D/F
+   (limits), ramp slopes (times), state durations (timeouts), FALLBACK ratio (drop), floors (min/dyn min), vcomp from
+   motor[0]/govSum (check G8). Verify by controller-only replay of the WASM governor on recorded HS and mixer inputs
+   against govP/I/D/F/Sum and motor[0] (target ≤ 1 % RMS, as for the PID).
+2. Lags: τe from HS acceleration, telemetry delay of V/I relative to it.
+3. Ke: low-load ratio (and, with current, the d·V regression).
+4. Plant: output-error on HS with the recorded throttle as input over whole governed segments (the speed loop is
+   open-loop stable, so long horizons are usable, unlike the attitude twin); open-loop segments carry most information
+   (non-PID spool-up ramps, throttle saturation at 100 %, FALLBACK at constant throttle, RECOVERY/BAILOUT ramps, cuts).
+   Closed-loop bias (Forssell & Ljung 1999): the direct method is consistent with a correct noise model; disturbance
+   torques correlated with the governor output are reduced by weighting the open-loop segments and using the mixer
+   inputs (exogenous to the speed loop) as instruments.
+5. Battery: β (or R0), optional RC, OCV path, by output-error on V jointly with HS.
+6. Closed loop on reserved flights: native governor + twin from the recorded pilot inputs; compare HS, throttle, V.
+7. Uncertainty: block bootstrap → parameter samples for the robust search.
+
+### 6.3 Acceptance thresholds (proposals for RULES, "pipeline, unvalidated")
+
+- Open-loop HS replay in ACTIVE: median |error| ≤ 1.5 % of target; Vbat RMS ≤ 0.15 V (Gaui residual 0.12–0.15 V).
+- Closed-loop: throttle RMS error ≤ 3 percentage points and HS RMS ≤ 1.5 % on reserved flights (parallel check:
+  Gaui 0.9 %/11.7 rpm, Fireball 2.0 %/52.5 rpm).
+- Spool-up and saturation events reproduced: exit throttle within ±0.05, saturated duration within ±30 %.
+
+---
+
+## 7. Governor autotune
+
+### 7.1 Simulation and objective
+
+Scenarios (per PID profile, since most governor parameters are per profile):
+- R: replay of every recorded governed segment (spool-up, ACTIVE, HOLD, AUTOROTATION/BAILOUT, FALLBACK/RECOVERY) with
+  the recorded pilot throttle state and mixer inputs, battery state from the recorded rest voltage.
+- E: the same load histories at end-of-pack OCV (from the worst recorded rest voltage, or 3.70 V/cell) and at full
+  pack (4.20 V/cell): the loop gain differs by about ±7 % without vcomp (Fireball 25.2 → 22.0 V).
+- P: worst recorded collective pumps (top 5 % of |dθ/dt| and θ) repeated.
+- G: an RPM glitch injected at each recorded saturation and at random times (fallback scenario).
+- S: spool-up from standstill and HOLD→RECOVERY, AUTOROT→BAILOUT at airborne headspeed.
+
+Cost for the continuous search (each term normalized by the current-settings baseline; 95 % intervals from the
+bootstrap twins):
+`J = w1·RMS(e)_ACTIVE + w2·mean(top-5 % droops) + w3·mean(top-5 % overspeeds) + w4·RMS(throttle above 5 Hz)
+ + w5·RMS(dQ_m/dt) + w6·spool-up overshoot + w7·droop in scenario G`
+(w5 encodes the doc's "a governor can be too good": torque steps disturb the tail.)
+
+Constraints: gain margin ≥ 6 dB and phase margin ≥ 45° from the linearized loop (twin + native filters + τe) at all
+headspeeds, both pack voltages and all bootstrap samples (the doc's "raise until oscillation, back off 1/3" is ≈ 3.5 dB;
+6 dB is the conservative choice); saturated share of ACTIVE not larger than baseline; I-limit reached only during
+saturation; throttle activity not larger than baseline unless J improves ≥ 10 %; robust selection by CVaR or worst
+case over the samples. A recommendation needs a predicted improvement whose 95 % interval excludes 0 (CLAUDE.md:
+number, uncertainty, rule).
+
+Search: optimize effective gains K·Kp, K·Ki, K·Kd, K·Kf and then map to integer CLI values (choose K so that p, i, d,
+f stay in 0–250 with resolution 0.1/0.1/0.001/0.01; TTA normalization by K·Kp, 1533, keeps TTA unchanged). Stage the
+search like the doc order (precomp/F → I → P → D → limits/filters), then a joint refinement with NOMAD (already used
+for the filters) or CMA-ES; ≈ 10–14 continuous variables, each evaluation a WASM replay of a few hundred seconds.
+
+### 7.2 Coverage of every governor parameter
+
+| Parameter (scope) | Method | Evidence / scenario | Fireball status |
+|---|---|---|---|
+| gov_gain, p/i/d/f gain (profile) | continuous search | R, E, P; margins | — |
+| collective/cyclic/yaw weight, collective curve (profile) | continuous search; start from the fitted load exponent pθ | R, P; govF fit (4.8) | — |
+| p/i/d/f limit (profile) | search with a constraint that limits are hit only in saturation | R, P | — |
+| gov_rpm_filter, gov_d_filter, gov_ff_filter (global) | search (phase vs noise), glitch detector uses the rpm filter (588) | R; margins | — |
+| gov_pwr_filter (global) | only if vcomp can be active | E | not used (ESC voltage) |
+| gov_use_voltage_comp (profile) | rule: possible only with `battery_meter = ADC` (1556); twin quantifies benefit (constant loop gain and throttle need) | E | cannot activate; report the 8 % throttle drift and ±7 % gain change |
+| gov_headspeed (profile) | feasibility: max headspeed with headroom ≥ 15 % at end-of-pack OCV for the 95th-percentile recorded load; saturation share predicted | E, P; 5.2 | 4500/5000 below doc reserve late in pack |
+| gov_max_throttle (profile) | keep 100 for power; test 95–98 only as a glitch mitigation trial, cost = lost power from the twin | G, 4.6 | glitches only at 100 % |
+| gov_min_throttle, gov_use_dyn_min_throttle, gov_dyn_min_throttle (profile) | rule + twin: needed only with a one-way clutch or unloading bog; else off | R (descents) | off; no decoupling evidence |
+| gov_fallback_drop, gov_use_fallback_precomp (profile) | twin scenario G: droop vs drop; drop stays ≥ a noticeable level (doc) | G, 4.6 | precomp ON would give (0.746 + 0.254)·0.9 ≈ 0.90 instead of 0.67 at 159.5 s |
+| gov_recovery_time (global) | scenario G/S: shortest time without overshoot; note the RECOVERY start throttle is HS/RPMK (1007) | G, S | 20 (2 s); recovery from 0.52 took 0.8 s |
+| gov_spoolup_time, gov_use_pid_spoolup (global/profile) | scenario S with identified a_ss: throttle slope ≤ a_ss/(Kv·V) or target slope ≤ a_ss; overshoot ≤ 2 % (check G16) | S, 4.5 | 640/(270·25) ≈ 0.095/s → ≥ 105 (10.5 s) open loop; PID spool-up needs 10·max(fullHS,RPMK)/a_ss ≈ 103 or more |
+| gov_startup_time, gov_spooldown_time (global) | scenario S (IDLE start and motor stop), checks G15/G17/G18 | S | — |
+| gov_tracking_time (global) | profile switches: target slope ≤ achievable acceleration at load without saturation | R (profile changes) | — |
+| gov_throttle_type, gov_idle_throttle, gov_auto_throttle, gov_handover_throttle (global) | rule from state census (G14): FUNCTION with idle = auto makes IDLE an autorotation; propose auto > idle (e.g. idle 0, auto ≥ 1 = 0.1 %) or timeout 0 | R, S | 12 of 14 logs enter AUTOROT on RUN→IDLE; log 10 bailout from 0 rpm |
+| gov_autorotation_timeout, gov_throttle_hold_timeout (global) | rule + scenario S (bailout from a stopped motor is limited by the ESC soft start) | S | 15 s / 5 s |
+| gov_bypass_throttle (global) | generated: steady throttle d_req(θ) at the profile headspeed and mid-pack OCV, 9 points in 0.5 % units | twin steady state | all 0 (bypass unusable as backup) |
+| gov_tta_gain, gov_tta_limit, gov_tta_filter (profile/global) | not applicable unless a motorised tail (mixer tail mode) | — | belt tail: keep 0 |
+| gov_mode | rule: ELECTRIC with a fast RPM source (freq sensor / bidirectional DShot) | G0 | ELECTRIC |
+| Non-governor inputs that change the result | battery_meter (vcomp), motor PWM range/ESC calibration (u0), RPM source and wiring (glitches), ESC settings (soft start, response, brake) | 4.x | advice only |
+
+### 7.3 Recommendation logic for the known problems
+
+1. **Power limit**: the twin predicts the saturated share and droops at end-of-pack voltage for each profile; if the
+   15 % headroom rule fails, recommend a lower `gov_headspeed` for that profile (quantified droop/saturation
+   reduction) or state the limit (collective range, battery R0); gains cannot add power — say so (G7).
+2. **Voltage compensation**: state that the flag has no effect with an ESC voltage source (1556) and that the governor
+   integral already removes the slow drift; quantify the drift (throttle +0.06–0.08 per pack at 4500 rpm) and the
+   loop-gain change, and tune for the worst pack voltage. If the pilot has an ADC voltage source, the twin can evaluate
+   vcomp with the measured telemetry-free filter.
+3. **Fallback**: report each event with the glitch, collective and throttle, the fallback and recovery throttles and
+   the minimum headspeed; recommend `gov_use_fallback_precomp = ON`, a smaller `gov_fallback_drop` and a recovery time
+   only if scenario G improves; tell the pilot to examine the RPM signal wire and sensor supply (3.3 V, routing away
+   from motor/battery leads); the 100 %-duty association suggests a `gov_max_throttle` 95–98 trial with its power cost.
+4. **Spool-up**: identify a_ss; recommend the ramp time (or PID spool-up with a slow enough ramp) that keeps the
+   predicted overshoot ≤ 2 %; mention the ESC soft-start setting as the other side.
+5. **Autorotation/bailout**: explain IDLE = AUTO with FUNCTION and the bailout from a stopped motor; recommend
+   `gov_auto_throttle` > `gov_idle_throttle` or `gov_autorotation_timeout = 0` if the pilot does not practise
+   autorotations.
+6. **Unlogged changes**: flag segments whose recovered parameters differ from the CLI dump (spool-up time logs 0–8)
+   per the "values possibly not current" rule.
+
+---
+
+## 8. Things the log does not record (tell the pilot)
+
+Governor parameters other than `govPID` and `yaw_tta` are not in the header; the analysis recovers most from the data
+(4.8) and flags the rest as unknown: filters other than ff, limits never reached, flags (fallback precomp, PID spool-up,
+dyn min) until their state occurs, bypass curve, battery source (inferred from Vbat update rate/quantization),
+ESC settings (soft start, brake, response) and the presence of a one-way bearing. Current is recorded only with a
+current sensor (`blackbox_log_battery` already logs Ibat if it exists). To record more: enable `blackbox_log_esc` for
+ESC RPM/temperature; a blades-off spool-up and a throttle cut on the ground give clean ESC soft-start and coast data.
+
+---
+
+## 9. Sources
+
+- Rotorflight documentation: https://doc.rotorflight.org/tuning/governor/ , /setup/governor/ , /setup/governor-setup/ ,
+  /configurator/tabs/governor/ , /contributing/tech/governor/ , /configurator/tabs/profiles/ , /configurator/tabs/power/ ,
+  /setup/esc-telemetry/ , /setup/rpm-measurement/ , /tuning/process/ (fetched 2026-10-14).
+- Rotorflight firmware release notes 4.6.0 and 4.6.0-RC1: https://github.com/rotorflight/rotorflight-firmware/releases
+- M. Drela, "First-Order DC Electric Motor Model", MIT, 2007: http://web.mit.edu/drela/Public/web/qprop/motor1_theory.pdf
+- P. Krause, O. Wasynczuk, S. Sudhoff, S. Pekarek, *Analysis of Electric Machinery and Drive Systems*, 3rd ed., Wiley 2013
+  (average-value models of BLDC drives).
+- BLHeli_32 manual ARM Rev32.x (damped light = regenerative braking + active freewheeling; brake on stop),
+  https://github.com/bitdump/BLHeli
+- Hobbywing Platinum V4 manuals/product pages (soft start-up, start-up time 4/8–25 s; external-governor mode),
+  https://www.hobbywing.com/en/products/platinum-hv-130a-v470 , https://support.hobbywingdirect.com
+- M. Chen, G. A. Rincón-Mora, "Accurate electrical battery model capable of predicting runtime and I–V performance",
+  IEEE Trans. Energy Conversion 21(2):504–511, 2006: https://rincon-mora.gatech.edu/publicat/jrnls/tec05_batt_mdl.pdf
+- X. Hu, S. Li, H. Peng, "A comparative study of equivalent circuit models for Li-ion batteries", J. Power Sources
+  198:359–367, 2012. H. He, R. Xiong, J. Fan, Energies 4(4):582–598, 2011. G. L. Plett, "Extended Kalman filtering for
+  battery management systems of LiPB-based HEV battery packs", Parts 1–3, J. Power Sources 134:252–292, 2004.
+- J. G. Leishman, *Principles of Helicopter Aerodynamics*, 2nd ed., Cambridge 2006 (C_P = κC_T^{3/2}/√2 + σC_d0/8(1+Kμ²)).
+- G. D. Padfield, *Helicopter Flight Dynamics*, 2nd ed., Blackwell 2007 (engine/rotor-speed degree of freedom).
+- V. Gavrilets, B. Mettler, E. Feron, "Nonlinear model for a small-size acrobatic helicopter", AIAA GNC 2001;
+  V. Gavrilets, PhD thesis, MIT 2003: https://dspace.mit.edu/handle/1721.1/17609
+- R. T. N. Chen, "An exploratory investigation of the flight dynamics effects of rotor rpm variations and rotor state
+  feedback in hover", NASA TM-103968, 1992: https://ntrs.nasa.gov/citations/19930010191
+- US Patent 4,083,518 "Mast torque metering system" (tail ≈ 10 % of power in hover).
+- U. Forssell, L. Ljung, "Closed-loop identification revisited", Automatica 35(7):1215–1241, 1999; L. Ljung,
+  *System Identification*, 2nd ed., 1999; M. B. Tischler, R. K. Remple, *Aircraft and Rotorcraft System Identification*,
+  2nd ed., AIAA 2012.
+- ArduPilot internal RSC governor: https://ardupilot.org/copter/docs/traditional-helicopter-internal-rsc-governor.html
+
+---
+
+## 10. Reproduction
+
+Decode (Node prefix as in the task): `node --max-old-space-size=12000 models_scripts/dumpsel.cjs <dump.BBL> <out dir>
+<first> <last>` (Gaui with `AUTOTUNE_FLIGHT_RPM=2000`); writes logNN.npy (selected fields) and logNN.json (fields,
+events, header). The Python scripts expect a working directory with `fb/`, `gaui/` (decoded) and `scripts/` (copies of
+`models_scripts/*.py`); run with `/Users/albertwu/miniconda3/envs/rs-bench/bin/python -I scripts/<name>.py`.
+`govstats.py fb 0,1,…` writes the per-log statistics saved as `models_scripts/*_stats.json`. Other scripts:
+`detail.py` (traces), `spool.py` (4.5), `pack.py` (4.1, 4.4), `glitch2.py` (4.6), `coast.py` (4.7), `nocurrent*.py` and
+`lag.py`/`lag2.py` (4.2, 4.3), `rc.py` (4.2), `ffit.py` (4.8).

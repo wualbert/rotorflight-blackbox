@@ -4816,3 +4816,539 @@ test('parameter continuity is explicit, exact-file scoped, persisted and invalid
     other.jq.fire('change','.tuning-ct-evidence-confirm',{}, {checked:true});
     other.jq.fire('click','.tuning-ct-start');assert.deepEqual(plain(controlRequest(other).options.parameterContinuity),[],'invalid range cannot create evidence');
 });
+
+// --- the governor model (docs/GOVERNOR_AUTOTUNE.md section 8): the Governor tab, the worker command governorTune, the CLI file ----
+
+// A result of gov_tune autotune() as the worker gives it (governorTuned): every row family, the recommendation kinds and the plots
+function synthGovTune(over = {}) {
+    const t = Array.from({ length: 200 }, (_, i) => 10 + i * 0.05);
+    const ev = (o) => Object.assign({ text: null, value: null, unit: null, lo: null, hi: null, n: null, se: null, log: null, t0: null, t1: null }, o);
+    const row = (o) => Object.assign({ scope: 'profile', profile: 1, family: 'gains', current: { value: 50, source: 'log header, PID profile 1 at the start of the log' }, status: 'keep', to: null,
+        evidence: [], rule: 'value', method: 'rule', stale: null, cli: [], text: '' }, o);
+    const STALE = { reasons: ['rearm'], text: 'This value is possibly not current. The cause is a second arm in the same log.' };
+    const rows = [
+        row({ name: 'gov_i_gain', status: 'change', to: 60, method: 'simulation', rule: 'search', text: 'The model gives a smaller headspeed error with this value.',
+            evidence: [ev({ text: 'Headspeed error in the test flights', value: 1.2, unit: '%', lo: 0.9, hi: 1.5, n: 12, log: 1, t0: 12.5, t1: 14 })] }),
+        row({ name: 'gov_p_gain', current: { value: 40, source: 'CLI dump, profile 0' }, method: 'simulation', rule: 'search' }),
+        row({ name: 'gov_rpm_filter', scope: 'global', profile: null, family: 'limits', current: { value: 10, source: 'CLI dump' }, status: 'change', to: 15, rule: 'rpmFilter' }),
+        row({ name: 'gov_headspeed', family: 'power', status: 'check', current: { value: 2300, source: 'calculated from the log: governor target' }, rule: 'headroom',
+            evidence: [ev({ text: 'Throttle in ACTIVE', value: 91, se: 0.4, unit: '%', n: 4000 })], stale: STALE }),
+        row({ name: 'gov_spoolup_time', scope: 'global', profile: null, family: 'state', status: 'pending-model', current: { value: null, source: 'unknown', candidates: [100, 120] }, method: 'simulation' }),
+        row({ name: 'gov_bypass_throttle', scope: 'global', profile: null, family: 'state', status: 'check', current: { value: [0, 0, 0, 0, 0, 0, 0, 0, 0], source: 'log header' }, rule: 'bypass' }),
+        row({ name: 'gov_recovery_time', scope: 'global', profile: null, family: 'fallback', current: { value: 30, source: 'log header' }, rule: 'fallback' }),
+        row({ name: 'gov_use_voltage_comp', family: 'battery', status: 'check', current: { value: 'OFF', source: 'log header' }, rule: 'vcomp', text: 'Voltage compensation does not operate with the voltage source ESC.' }),
+        row({ name: 'gov_tta_gain', scope: 'global', profile: null, family: 'tta', status: 'not-applicable', current: { value: 0, source: 'log header' }, rule: 'tta', reason: 'The tail rotor has no motor.' }),
+        row({ name: 'blackbox_log_esc', scope: 'related', profile: null, family: 'state', status: 'not-recorded', current: { value: null, source: 'unknown' }, rule: 'value',
+            record: 'Set "blackbox_log_esc" to ON to record the ESC throttle.' }),
+    ];
+    const rec = (o) => Object.assign({ node: 'governor', area: 'governor', order: 0, rateProfile: null, axis: null, fromSources: null, direction: 'set', blockedBy: [], holds: [], gate: null, causes: [],
+        caveats: [], group: null, groupSize: null, dataset: null, supportedBy: [], ab: [], slope: null, stale: null, sources: ['toolkit rule, no flight test'], evidence: [] }, o);
+    const recommendations = [
+        rec({ id: 'gov:gov_i_gain|1|model', severity: 'action', title: 'Set "gov_i_gain" to 60 (PID profile 1)', text: 'Set "gov_i_gain" on PID profile 1 from 50 to 60. The value at this time is from the log header.',
+            parameter: 'gov_i_gain', scope: 'profile', cliProfile: 0, profile: 1, from: 50, to: 60, fromSource: 'log header', fromSets: { gov_i_gain: 50 }, cli: ['profile 0', 'set gov_i_gain = 60'],
+            evidence: [{ id: 'GT20', module: 'gov_tune', value: 1.2, se: 0.1, unit: '%', text: 'The headspeed error decreases in the model.', log: 1, times: [12.5, 14], profile: 1, pidProfile: 1 }],
+            rule: 'The change must decrease the error by more than 2 SE on the test flights.', confidence: 'predicted' }),
+        rec({ id: 'gov:gov_rpm_filter|g|value', severity: 'action', title: 'Set "gov_rpm_filter" to 15', text: 'Set "gov_rpm_filter" from 10 to 15. The value at this time is from the CLI dump.',
+            parameter: 'gov_rpm_filter', scope: 'global', cliProfile: null, profile: null, from: 10, to: 15, fromSource: 'CLI dump', fromSets: { gov_rpm_filter: 10 }, cli: ['set gov_rpm_filter = 15'],
+            rule: 'The filter must not delay the RPM signal by more than 10 ms.', confidence: 'measured' }),
+        rec({ id: 'gov:gov_bypass_throttle|g|model', severity: 'check', optIn: true, title: 'Set the throttle curve of BYPASS', text: 'The model calculates the throttle for each collective position.',
+            parameter: 'gov_bypass_throttle', scope: 'global', cliProfile: null, profile: null, from: '0,0,0,0,0,0,0,0,0', to: '20,25,30,35,40,45,50,55,60', fromSource: 'log header',
+            cli: ['set gov_bypass_throttle = 20,25,30,35,40,45,50,55,60'], rule: 'The curve gives the steady throttle at the headspeed of the PID profile.', confidence: 'predicted' }),
+        rec({ id: 'gov:gov_headspeed|1|value', severity: 'check', title: 'Examine the headspeed of PID profile 1', text: 'The throttle reserve is less than 15 %.', parameter: 'gov_headspeed',
+            scope: 'profile', profile: 1, cliProfile: 0, cli: [], rule: 'The throttle must be 85 % or less.', confidence: 'measured', stale: STALE }),
+    ];
+    const plots = [{ id: 'map', title: 'Throttle for each collective position', kind: 'xy', x: { label: 'collective' }, y: { label: 'throttle', unit: '%' },
+        series: [{ name: 'recorded throttle', x: [0.1, 0.2, 0.3], y: [50, 55, 61], style: 'points', role: 'measured' }, { name: 'model throttle at full battery', x: [0, 0.5], y: [48, 70], style: 'line', role: 'model' },
+            { name: 'throttle limit', x: [0, 0.5], y: [95, 95], role: 'limit' }] },
+        { id: 'short', title: 'Error at each time after the start', kind: 'xy', x: { label: 'time after the start' }, y: { label: 'error' }, series: [{ name: 'model error', x: [1], y: [2], role: 'model' }] }];
+    const twinPlots = [{ id: 'hs', title: 'Headspeed of log 2, recorded and calculated', kind: 'time', log: 1, x: { label: 'time' }, y: { label: 'headspeed', unit: 'rpm' }, y2: { label: 'throttle' },
+        series: [{ name: 'recorded headspeed', x: t, y: t.map((v) => 2300 + 20 * Math.sin(v)), role: 'measured', style: 'line' },
+            { name: 'calculated headspeed', x: t, y: t.map((v) => 2300 + 18 * Math.sin(v)), role: 'model', style: 'line' },
+            { name: 'governor target', x: t, y: t.map(() => 2300), role: 'baseline', style: 'dash' },
+            { name: 'recorded throttle', x: t, y: t.map(() => 0.6), role: 'measured', axis: 'y2' }],
+        bands: [{ x0: 13, x1: 12, label: 'FALLBACK' }], note: 'The model uses the recorded throttle and collective.' }];
+    return Object.assign({ status: 'validated', reasons: ['The open-loop headspeed error is 0.53 % of the target.'], limitations: ['The analysis starts the motor constant of the governor at 0 in each log.'],
+        twin: { params: { kv: 320.5, tm: 0.41, te: 0.1 }, uncertainty: { kv: [311.7, 336.5], tm: { lo: 0.35, hi: 0.47 }, te: { se: 0.01 } }, validation: {}, plots: twinPlots },
+        rows, recommendations, plots, logs: [1], benchRuns: [0], skipped: [{ log: 2, reason: 'The app cannot read this log.' }], notes: ['The governor analysis does not use bench runs <b>.'],
+        rules: { search: { id: 'GT20', text: 'The search keeps a change only if it decreases the error.' }, rpmFilter: { id: 'GT12', text: 'The RPM filter must keep the delay small.' } } }, over);
+}
+
+const gmWorker = (app) => app.workers.filter((w) => w.sent.length && w.sent[0].msg.cmd === 'governorTune').at(-1);
+function gmTuned(app, over, result) {
+    app.tab('governor');
+    app.jq.fire('click', '.tuning-gm-start', {});
+    const w = gmWorker(app);
+    w.reply({ type: 'governorTuned', result: result || synthGovTune(over) });
+    return w;
+}
+
+test('governor model: "Start the governor analysis" posts governorTune with the inputs of the analysis, then the progress', () => {
+    const r = synthResult();
+    r.hierarchy.nodes.governor.blockedBy = ['rpm'];
+    r.hierarchy.nodes.governor.gatedBy = ['rpm', 'filters'];
+    const app = analysed({ result: r });
+    app.tab('governor');
+    let p = app.pane('governor');
+    assert.ok(p.includes('<section class="tuning-ct-section tuning-gm" aria-label="Governor model">') && p.includes('<h5 class="tuning-h">Governor model</h5>'));
+    assert.ok(p.includes('<button type="button" class="btn btn-primary btn-sm tuning-gm-start">Start the governor analysis</button>'));
+    assert.ok(p.indexOf('Recorded response') < p.indexOf('aria-label="Governor model"'), 'after the recorded response');
+    app.jq.fire('click', '.tuning-gm-start', {});
+    const w = gmWorker(app), { msg, transfer } = w.sent[0];
+    eq([w.url, msg.cmd, msg.fileName, msg.logCount, msg.bytes.byteLength, transfer[0] === msg.bytes], ['js/tuning_worker.js', 'governorTune', '<i>flight</i>.bbl', 3, 400, true], 'the whole file, a copy transferred');
+    eq(plain(msg.options), { flightRpm: 2000, cliText: null, cliName: null, flights: null, logs: [1], blockedBy: ['rpm', 'filters'] }, 'the gates of the Governor step, once each');
+    assert.equal(app.bytes.length, 400, 'the buffer of the viewer stays');
+    p = app.pane('governor');
+    assert.ok(p.includes('The app makes and tests the governor model.') && p.includes('tuning-gm-cancel') && !p.includes('tuning-gm-start'), 'the progress and Cancel');
+    w.reply({ type: 'progress', stage: 'fit', fraction: 0.25, text: 'The app fits the model to 3 flight logs.' });
+    assert.equal(app.jq.node('.tuning-gm-progress-text').text, 'The app fits the model to 3 flight logs. (25 %)');
+    assert.equal(app.jq.node('.tuning-gm-bar').css.width, '25.0%');
+    w.reply({ type: 'progress', text: 'The app tests the governor values.' }, 999);
+    assert.equal(app.jq.node('.tuning-gm-progress-text').text, 'The app fits the model to 3 flight logs. (25 %)', 'a message of another run does not change the progress');
+    // the CLI dump, the flights of the selection and the logs of a file result go with the request
+    const f = fileResult({ selection: { flights: [{ log: 2, flight: 0, t0: 3, t1: 40 }], windows: [], logs: [2], text: '' }, logs: [1, 2] });
+    const a2 = setup({ scope: 'file' });
+    a2.show();
+    a2.workers[0].reply({ type: 'result', result: f });
+    a2.tab('governor');
+    a2.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'configuration.txt', text: '# diff all\nprofile 0\nset gov_headspeed = 2400\n' }] });
+    a2.jq.fire('click', '.tuning-gm-start', {});
+    const o = plain(gmWorker(a2).sent[0].msg.options);
+    eq([o.cliText, o.cliName, o.flights, o.logs], ['# diff all\nprofile 0\nset gov_headspeed = 2400\n', 'configuration.txt', [{ log: 2, flight: 0, t0: 3, t1: 40 }], [1, 2]]);
+    assert.deepEqual(app.errors, []);
+});
+
+test('governor model: the result shows the status with its reasons, the plots of the model quality, all rows in their groups and the recommendations', () => {
+    const app = analysed();
+    const before = app.plots.length;
+    const w = gmTuned(app);
+    assert.equal(w.terminated, true, 'the worker of the run is released');
+    const p = app.pane('governor');
+    for (const s of ['<span class="tuning-badge st-satisfactory">Model checks satisfactory</span>',
+        '<p class="tuning-gm-status"><strong>Model checks satisfactory.</strong> The model agrees with the test flights. The app uses the model to calculate the changes.</p>',
+        '<li><span data-ste="quoted">The open-loop headspeed error is 0.53 % of the target.</span></li>', '<div class="tuning-label">Model limits</div>',
+        '<li><span data-ste="quoted">The analysis starts the motor constant of the governor at 0 in each log.</span></li>', 'Flight test necessary.',
+        'Model and recorded data (3 plots)', '<p class="tuning-plot-caption" data-ste="quoted">The model uses the recorded throttle and collective.</p>',
+        '<span data-ste="quoted">Error at each time after the start</span> Not available: the result has no data for this plot.</p>', 'Model parameters (3)',
+        '<h6 class="tuning-h">Governor parameters (10 rows)</h6>', '<div class="tuning-label">Logs that the governor analysis does not use</div><ul><li>Log 1: Bench run (no analysis).</li><li>Log 3: <span data-ste="quoted">The app cannot read this log.</span></li></ul>',
+        '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul><li>The governor analysis does not use bench runs &lt;b&gt;.</li></ul></details>']) assert.ok(p.includes(s), s);
+    assert.doesNotMatch(p, /tuning-gm-start/, 'no start button for a current result');
+    // the plots of the model quality reach TuningPlot, the generic specs mapped onto its contract
+    const specs = app.plots.slice(before).map((q) => q.spec), hs = specs.find((s) => s.title === 'Headspeed of log 2, recorded and calculated'), map = specs.find((s) => s.title === 'Throttle for each collective position');
+    assert.ok(hs && map, 'both plots attach');
+    eq([hs.x, hs.y, hs.y2], [{ label: 'time', unit: 's' }, { label: 'headspeed', unit: 'rpm' }, { label: 'throttle' }]);
+    eq(hs.series.map((s) => [s.name, s.x.length, s.color, s.axis || 'y', s.dash || null]), [['recorded headspeed', 200, '#fdb462', 'y', null], ['calculated headspeed', 200, '#80b1d3', 'y', null],
+        ['governor target', 200, '#d9d9d9', 'y', [4, 3]], ['recorded throttle', 200, '#ffffb3', 'y2', null]], 'colours by role, the second measured series in its own colour');
+    eq(hs.bands.map((b) => [b.x0, b.x1, b.label]), [[12, 13, 'FALLBACK']]);
+    assert.equal(hs.legend, true);
+    eq(map.series.map((s) => [s.name, !!s.points, s.width, s.dash || null]), [['recorded throttle', true, 0, null], ['model throttle at full battery', false, 1.5, null], ['throttle limit', false, 1, [4, 3]]]);
+    assert.equal(map.onClick, undefined, 'an xy plot does not seek');
+    hs.onClick(12.5);
+    assert.deepEqual(app.calls.seek, [app.flightLog.getMinTime(1) + 12.5e6], 'a time plot shows its time in the log viewer');
+    // all rows, grouped by family in the sequence of the groups, with the value at this time, its source and the result
+    const groups = [...p.matchAll(/<section class="tuning-gm-family" data-family="(\w+)"><h6 class="tuning-h">([^<]+)<\/h6>/g)].map((m) => [m[1], m[2]]);
+    eq(groups, [['gains', 'Gains and precompensation'], ['limits', 'Limits and filters'], ['power', 'Headspeed and power'], ['state', 'Spool-up and governor conditions'],
+        ['fallback', 'FALLBACK and RPM signal'], ['battery', 'Battery and voltage'], ['tta', 'Tail torque assist'], ['related', 'Related parameters']]);
+    const rows = [...p.matchAll(/<tr class="tuning-gm-row" data-status="([a-z-]+)"><td><code>(\w+)<\/code><\/td><td>([^<]+)<\/td>/g)].map((m) => [m[2], m[3], m[1]]);
+    eq(rows, [['gov_i_gain', 'PID profile 1', 'change'], ['gov_p_gain', 'PID profile 1', 'keep'], ['gov_rpm_filter', 'All PID profiles', 'change'], ['gov_headspeed', 'PID profile 1', 'check'],
+        ['gov_spoolup_time', 'All PID profiles', 'pending-model'], ['gov_bypass_throttle', 'All PID profiles', 'check'], ['gov_recovery_time', 'All PID profiles', 'keep'],
+        ['gov_use_voltage_comp', 'PID profile 1', 'check'], ['gov_tta_gain', 'All PID profiles', 'not-applicable'], ['blackbox_log_esc', 'All PID profiles', 'not-recorded']]);
+    for (const s of ['<code>50</code><small class="tuning-muted" data-ste="quoted">log header, PID profile 1 at the start of the log</small>', '<code>0,0,0,0,0,0,0,0,0</code>',
+        '<code>100</code> or <code>120</code><small class="tuning-muted" data-ste="quoted">unknown</small>', '<span class="tuning-badge st-problem">Change</span></td><td><code>60</code></td>',
+        '<span data-ste="quoted">Headspeed error in the test flights</span> <strong>1.2 % (0.9 to 1.5 %), 12 values</strong> <a href="#" class="tuning-gm-seek" data-log="1" data-t="12.5" title="Show this time in the log viewer">Log 2, 12.5 s</a>',
+        '<strong>91.00 ± 0.40 %, 4000 values</strong>', '<strong>GT20</strong><small class="tuning-muted" data-ste="quoted">The search keeps a change only if it decreases the error.</small><small class="tuning-muted">Model test</small>',
+        '<code>headroom</code>', '<span class="tuning-badge st-notaccurate">No model result</span>', '<span class="tuning-badge st-notapplicable">Not applicable</span>',
+        '<p data-ste="quoted">The tail rotor has no motor.</p>', '<p data-ste="quoted">Set &quot;blackbox_log_esc&quot; to ON to record the ESC throttle.</p>',
+        '<span class="tuning-badge st-problem">Change 1</span> <span class="tuning-badge st-satisfactory">Keep 1</span>']) assert.ok(p.includes(s), s);
+    const headspeed = p.split('<tr').find((x) => x.includes('<code>gov_headspeed</code>'));
+    assert.ok(headspeed.includes('<details class="tuning-stale">') && headspeed.includes('This value is possibly not current.'), 'the stale flag of the row');
+    app.jq.fire('click', '.tuning-gm-seek', { 'data-log': 1, 'data-t': 13 });
+    assert.equal(app.calls.seek.at(-1), app.flightLog.getMinTime(1) + 13e6, 'an evidence time shows in the log viewer');
+    // the recommendations: the changes with CLI text selected first, the bypass curve not, the checks without a box
+    const changes = p.slice(p.indexOf('<h6 class="tuning-h">Changes for the CLI file</h6>'));
+    const boxes = [...changes.matchAll(/<input type="checkbox" class="tuning-pick" data-pick="(\d+)"( checked)?( disabled)?>[^<]*<span class="tuning-badge[^>]*>[^<]*<\/span>[^<]*/g)].map((m) => [m[0].replace(/^.*<\/span> /, ''), m[2] ? 'on' : m[3] ? 'off' : 'free']);
+    eq(boxes, [['Set &quot;Governor I&quot; to 60 (PID profile 1)', 'on'], ['Set &quot;Governor RPM filter&quot; to 15', 'on'], ['Set the throttle curve of BYPASS', 'free']]);
+    for (const s of ['The app does not select this change. If you use the governor condition BYPASS, select this change.', '<pre>profile 0\nset gov_i_gain = 60</pre>', '<pre>set gov_rpm_filter = 15</pre>',
+        '<h6 class="tuning-h">Checks and information</h6>', '<h6><span class="tuning-badge st-monitor">Check</span>', 'Examine the headspeed of PID profile 1</h6>',
+        '<div class="tuning-rec-list is-stale"><div class="tuning-label">Values possibly different</div><div class="tuning-stale-text">This value is possibly not current. The cause is a second arm in the same log.</div></div>',
+        '<a href="#" class="tuning-tab-link" data-tab="export">Examine all selected changes</a>']) assert.ok(changes.includes(s), s);
+    assert.ok(changes.indexOf('Checks and information') > changes.indexOf('set gov_rpm_filter = 15'), 'the checks after the changes');
+    assert.equal(app.jq.node('.tuning-tab[data-tab="governor"]').classes.has('st-error'), false);
+    // the plots and the table are disclosures, open first: closing releases the plots, opening draws them again
+    const drawn = app.plots.length;
+    app.detail('governor:gm-plots', false);
+    assert.ok(app.destroyed.includes('Headspeed of log 2, recorded and calculated'), 'closed: released');
+    app.detail('governor:gm-plots', true);
+    assert.ok(app.plots.slice(drawn).some((q) => q.spec.title === 'Headspeed of log 2, recorded and calculated'), 'open: drawn again');
+    app.detail('governor:gm-rows', false);
+    assert.ok(!app.pane('governor').includes('<code>gov_i_gain</code></td>'), 'the table closes');
+    noRawMarkup(app);
+    assert.deepEqual(app.errors, []);
+});
+
+test('governor model: the selected changes go into the CLI file of advice.exportScript, the bypass curve only when the pilot selects it', async () => {
+    const app = analysed();
+    gmTuned(app);
+    app.tab('export');
+    await tick();
+    const x = app.pane('export');
+    assert.ok(x.includes('Set &quot;Governor I&quot; to 60 (PID profile 1)') && x.includes('Set the throttle curve of BYPASS'));
+    let q = app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg;
+    eq(q.picks, ['gov:gov_i_gain|1|model', 'gov:gov_rpm_filter|g|value'], 'the changes with CLI text, not the bypass curve and not the check');
+    let text = advice.exportScript(plain(q.recs), plain(q.picks), plain(q.meta));
+    assert.match(text, /\n# PID profile 1\nprofile 0\nset gov_i_gain = 60\n# Global values\nset gov_rpm_filter = 15\n/);
+    for (const re of [/# Change 1 of 2: Set "gov_i_gain" to 60 \(PID profile 1\)/, /# {3}`gov_i_gain`: from 50 to 60 \(the value at this time is from the log header\)\./,
+        /# {3}Result of check GT20 \(log 2, PID profile 1\): the value is 1\.2 ± 0\.1 %\./, /# {3}`gov_rpm_filter`: from 10 to 15 \(the value at this time is from the CLI dump\)\./, /Rotorflight 4\.6\.0/, /\nsave$/]) assert.match(text, re);
+    assert.doesNotMatch(text, /gov_bypass_throttle|gov_headspeed/);
+    answerExport(app, text);
+    await tick();
+    assert.ok(app.html('.tuning-export-preview').includes(app.internals.esc(text)));
+    assert.ok(app.pane('export').includes('<td><code>gov_i_gain</code></td><td>PID profile 1</td><td><code>50</code></td><td><code>60</code></td><td>Governor</td>'), 'the parameter record of the selection');
+    // the bypass curve: the pilot selects it in the Governor tab, and the selection stays across the tabs
+    app.tab('governor');
+    const box = /<input type="checkbox" class="tuning-pick" data-pick="(\d+)">[^]*?Set the throttle curve of BYPASS/.exec(app.pane('governor'));
+    app.jq.fire('change', '.tuning-pick', { 'data-pick': box[1] }, { checked: true });
+    assert.ok(app.pane('governor').includes('data-pick="' + box[1] + '" checked>'));
+    app.tab('export');
+    await tick();
+    q = app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg;
+    eq(q.picks, ['gov:gov_i_gain|1|model', 'gov:gov_rpm_filter|g|value', 'gov:gov_bypass_throttle|g|model']);
+    text = advice.exportScript(plain(q.recs), plain(q.picks), plain(q.meta));
+    assert.match(text, /\nset gov_rpm_filter = 15\nset gov_bypass_throttle = 20,25,30,35,40,45,50,55,60\n/);
+    // one flight test: the changes of the governor model are one group of "Different flight tests"
+    assert.doesNotMatch(app.pane('export'), /Different flight tests/);
+    // the CLI dump changes: the result is not current, its changes leave the CLI file and the tab says so
+    app.tab('governor');
+    app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'configuration.txt', text: '# diff all\nprofile 0\nset gov_headspeed = 2400\n' }] });
+    app.tab('governor');
+    const g = app.pane('governor');
+    assert.ok(g.includes('This result is for different flights or a different CLI dump. To use the selected inputs, start the governor analysis again.'));
+    assert.ok(g.includes('To select changes of the governor model for the CLI file, start the governor analysis again.') && g.includes('tuning-gm-start'));
+    const part = g.slice(g.indexOf('aria-label="Governor model"'), g.indexOf('data-tuning-detail-key="governor:checks"'));
+    assert.ok(part.includes('Model checks satisfactory.') && !part.includes('class="tuning-pick"') && !part.includes('<pre>'), 'the old result without boxes and CLI text');
+    app.tab('export');
+    assert.ok(!app.pane('export').includes('Set &quot;Governor I&quot; to 60') && !app.pane('export').includes('<code>gov_i_gain</code>'), 'not in the CLI file');
+    assert.deepEqual(app.errors, []);
+});
+
+// check G21 (analysis/rpm-spikes): the lower gov_max_throttle is the change of the RPM prerequisite (advice.cjs node 'rpm'), not a change
+// of a control loop: its CLI text needs no model run, and the CLI file selects it first
+test('G21: the change of the RPM prerequisite is not a change of a control loop; its CLI text is selected first', () => {
+    const app = analysed();
+    const rec = { id: 'G21:gov_max_throttle:p2', node: 'rpm', area: 'governor', severity: 'action', profile: 2, pidProfile: 2, cliProfile: 1, parameter: 'gov_max_throttle', from: 100, to: 97,
+        cli: ['profile 1', 'set gov_max_throttle = 97'], blockedBy: [], causes: [], evidence: [], caveats: [] };
+    assert.equal(app.internals.automaticControlChange(rec), false);
+    assert.equal(app.internals.pickDefault(rec), true);
+    assert.equal(app.internals.pickDefault(Object.assign({}, rec, { blockedBy: ['The prerequisite "RPM signal and motor poles" has a problem.'] })), false, 'a held change is never selected');
+    assert.deepEqual(app.errors, []);
+});
+
+test('governor model: a model that is not satisfactory gives no CLI text for a change from the model; a rule change keeps its CLI text', async () => {
+    const app = analysed();
+    gmTuned(app, { status: 'rejected', reasons: ['The open-loop headspeed error is 2.27 % of the target.'] });
+    const p = app.pane('governor');
+    assert.ok(p.includes('<span class="tuning-badge st-problem">Model checks not satisfactory</span>'));
+    assert.ok(p.includes('The model does not agree with the test flights. Thus, the CLI file gets no change from the model. The rule results stay available.'));
+    assert.match(p, /<input type="checkbox" class="tuning-pick" data-pick="\d+" disabled> <span class="tuning-badge st-problem">Change<\/span> Set &quot;Governor I&quot;/, 'the change from the model cannot be selected');
+    assert.ok(p.includes('The governor model does not agree with the test flights. Thus, this change from the model has no CLI text.'), 'the reason of the governor model');
+    assert.ok(!p.includes('A new digital twin result'), 'not the reason of the 6-DOF digital twin');
+    assert.ok(!p.includes('<pre>profile 0\nset gov_i_gain = 60</pre>') && p.includes('<pre>set gov_rpm_filter = 15</pre>'));
+    app.tab('export');
+    await tick();
+    eq(app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg.picks, ['gov:gov_rpm_filter|g|value']);
+    // the pure guard: a governor recommendation with CLI text needs the authorization of a model run
+    const rec = synthGovTune().recommendations[1];
+    assert.equal(app.internals.automaticControlChange(rec), true);
+    assert.equal(app.internals.pickDefault(Object.assign({}, rec, { cli: [] })), false);
+    // an unavailable model: no plots, the rule results stay
+    const a2 = analysed();
+    gmTuned(a2, { status: 'unavailable', reasons: ['The log has no battery voltage.'], twin: { params: null, uncertainty: null, validation: null, plots: null }, plots: [], rows: [], recommendations: [] });
+    const q = a2.pane('governor');
+    assert.ok(q.includes('<span class="tuning-badge st-nodata">Model not available</span>') && q.includes('The log has no battery voltage.') && !q.includes('Model and recorded data'));
+    assert.ok(q.includes('<h6 class="tuning-h">Governor parameters (0 rows)</h6>') && q.includes('The result has no parameter rows.') && q.includes('The governor analysis has no change with CLI text.'));
+    const a3 = analysed();
+    gmTuned(a3, { status: 'partial' });
+    assert.ok(a3.pane('governor').includes('<span class="tuning-badge st-monitor">Some model checks not satisfactory</span>') && a3.pane('governor').includes('<pre>profile 0\nset gov_i_gain = 60</pre>'), 'a partial model keeps the CLI text');
+    assert.deepEqual(app.errors.concat(a2.errors, a3.errors), []);
+});
+
+test('governor model: cancel, an error of the worker with the error mark of the tab, a bench run and another file', () => {
+    const app = analysed();
+    app.tab('governor');
+    app.jq.fire('click', '.tuning-gm-start', {});
+    let w = gmWorker(app);
+    app.jq.fire('click', '.tuning-gm-cancel', {});
+    assert.equal(w.terminated, true);
+    let p = app.pane('governor');
+    assert.ok(p.includes('<p role="status">You canceled the governor analysis.</p>') && p.includes('tuning-gm-start'));
+    w.reply({ type: 'governorTuned', result: synthGovTune() });
+    assert.ok(!app.pane('governor').includes('Model checks satisfactory'), 'a canceled run gives no result');
+    app.jq.fire('click', '.tuning-gm-start', {});
+    w = gmWorker(app);
+    w.reply({ type: 'error', message: 'The toolkit file "gov_tune.cjs" <b>' });
+    assert.equal(w.terminated, true);
+    p = app.pane('governor');
+    assert.ok(p.includes('The governor analysis stopped because of an error. <span data-ste="quoted">The toolkit file &quot;gov_tune.cjs&quot; &lt;b&gt;</span>'));
+    assert.equal(app.jq.node('.tuning-tab[data-tab="governor"]').classes.has('st-error'), true, 'the tab shows the error');
+    w = gmTuned(app);
+    assert.equal(app.jq.node('.tuning-tab[data-tab="governor"]').classes.has('st-error'), false, 'a new result removes the error');
+    // a script error of the worker
+    app.jq.fire('click', '.tuning-gm-start', {});
+    w = gmWorker(app);
+    w.onerror({ message: 'boom <i>', preventDefault() {} });
+    assert.ok(app.pane('governor').includes('<span data-ste="quoted">boom &lt;i&gt;</span>'));
+    // a bench run: the button is off, with the reason
+    const r = synthResult();
+    r.records = r.records.map((q) => Object.assign({}, q, { flown: false }));
+    const bench = analysed({ result: r });
+    bench.tab('governor');
+    assert.ok(bench.pane('governor').includes('<button type="button" class="btn btn-primary btn-sm tuning-gm-start" disabled>Start the governor analysis</button>'));
+    assert.ok(bench.pane('governor').includes('The logs have no flight. The governor analysis does not use bench runs.'));
+    bench.jq.fire('click', '.tuning-gm-start', {});
+    assert.equal(gmWorker(bench), undefined, 'no run');
+    // a different file: the run stops
+    app.jq.fire('click', '.tuning-gm-start', {});
+    w = gmWorker(app);
+    app.load(Uint8Array.from({ length: 50 }, (_, i) => i), 'other.bbl', app.flightLog);
+    app.show();
+    assert.equal(w.terminated, true, 'a run for another file stops');
+    noRawMarkup(app);
+    assert.deepEqual(app.errors.concat(bench.errors), []);
+});
+
+// review 2026-10-15: the change of check G21 (advice.cjs G21:gov_max_throttle:p<N>) gets the cost of its value in the governor model (the
+// GC6 row of gov_scenarios.cjs, g21Cost) when the model has a result for this analysis; with no result, no sentence
+test('governor model: the cost of the change of check G21 in the model shows on its recommendation', () => {
+    const r = synthResult();
+    const g21 = { id: 'G21:gov_max_throttle:p1', node: 'rpm', area: 'governor', order: 99, severity: 'action', title: 'Decrease the maximum throttle', text: 'At the throttle maximum of 100 %, the headspeed signal has 5 sudden changes.',
+        procedure: null, parameter: 'gov_max_throttle', scope: 'profile', cliProfile: 0, profile: 1, rateProfile: null, axis: null, from: 100, to: 97, fromSource: 'CLI dump', fromSources: null, fromSets: { gov_max_throttle: 100 },
+        direction: 'lower', cli: ['profile 0', 'set gov_max_throttle = 97'], evidence: [], rule: 'Check G21 has a problem if 3 or more sudden changes of the headspeed signal come at the throttle maximum.', sources: [], confidence: null,
+        blockedBy: [], holds: [], gate: null, causes: [], caveats: [], group: null, groupSize: null, dataset: null, supportedBy: [], ab: [], slope: null };
+    r.advice.recommendations = r.advice.recommendations.concat([g21]);
+    const app = analysed({ result: r });
+    app.tab('recs');
+    const cost = 'In the governor model, a maximum of 97 % increases the headspeed decrease from 9.3 % to 10.3 % (the worst 5 % of the time).';
+    assert.ok(app.pane('recs').includes('Decrease the maximum throttle') && !app.pane('recs').includes(cost), 'no model result: no sentence');
+    const base = synthGovTune(), row = (to, p) => ({ name: 'gov_max_throttle', scope: 'profile', profile: p, family: 'power', topic: 'model', status: 'check', current: { value: 100, source: 'CLI dump' }, to: null,
+        evidence: [], rule: 'scnTrial', method: 'simulation', stale: null, cli: [], text: 'Check G21 of the analysis gives "gov_max_throttle" 97 with its CLI text.', id: `gov_max_throttle|${p}|model`,
+        g21Cost: { to, from: 100, droop: 0.103, droopNow: 0.093, text: to === 97 ? cost : 'In the governor model, another value.' } });
+    gmTuned(app, null, Object.assign({}, base, { rows: base.rows.concat([row(95, 1), row(97, 2), row(97, 1)]) }));
+    app.tab('recs');
+    const recs = app.pane('recs');
+    assert.ok(recs.includes(`<p class="tuning-rec-model">${cost}</p>`), 'the sentence of the row of PID profile 1 and 97 %');
+    assert.ok(!recs.includes('In the governor model, another value.'), 'not the row of another value');
+    assert.deepEqual(app.errors, []);
+});
+
+test('governor model: the pure parts (govModelHtml without the dialog, the plot specs, the groups, the numbers)', () => {
+    const app = setup(), I = app.internals, env = { copy: () => 0, plotId: () => 'p', extra: [] };
+    // without the dialog: the plots go to env.extra, the recommendations have no box
+    const out = I.govModelHtml({ state: 'done', result: synthGovTune() }, env, {});
+    eq(env.extra.map((q) => q.spec.title), ['Headspeed of log 2, recorded and calculated', 'Throttle for each collective position']);
+    assert.equal(env.extra[0].spec.onClick, undefined, 'no seek without env.seek');
+    assert.ok(!out.html.includes('class="tuning-pick"') && out.html.includes('Changes for the CLI file'));
+    assert.ok(I.govModelHtml({ state: 'none' }, env, {}).html.includes('tuning-gm-start'));
+    assert.ok(I.govModelHtml({ state: 'running', fraction: 2, text: 'x' }, env, {}).html.includes('style="width: 100.0%"'), 'the fraction is clamped');
+    assert.ok(I.govModelHtml({ state: 'done', result: synthGovTune({ status: 'odd' }) }, env, {}).html.includes('Model not available'), 'a status that the view does not know');
+    // the generic spec: a log of the run for the time plots without their own, the segment, and the bad shapes
+    const seeks = [], e2 = { seekFrame: (li, t, what) => seeks.push([li, t, what.graphs.length]) };
+    I.govPlotSpec({ title: 'A', kind: 'time', series: [{ name: 'a', x: [0, 1], y: [1, null], role: 'nobody' }] }, e2, 3).spec.onClick(0.5);
+    I.govPlotSpec({ title: 'A', kind: 'time', log: 0, series: [{ name: 'a', x: [0, 1], y: [1, 2] }] }, e2, 3).spec.onClick(0.25);
+    eq(seeks, [[3, 0.5, 3], [0, 0.25, 3]], 'the only log of the run, else the log of the plot');
+    assert.equal(I.govPlotSpec({ title: 'A', kind: 'time', log: 0, series: [{ name: 'a', x: [0, 1], y: [1, 2] }] }, { seek() {} }, 3).spec.onClick, undefined, 'never through the index-time map');
+    eq(plain(I.govPlotSpec({ title: 'B', series: [{ name: 'b', x: [0, 1, 2], y: [1, 2] }] }, e2, null).spec.series[0].y), [1, 2], 'x and y of the same length');
+    eq(Array.from(I.govPlotSpec({ title: 'A', series: [{ x: [0, 1], y: [1, null] }] }, {}, null).spec.series[0].y).map(Number.isNaN), [false, true], 'null breaks the line');
+    eq(I.govPlotSpec({ title: 'C', series: [] }, e2, null), { title: 'C', na: 'the result has no data for this plot' });
+    eq(I.govPlotList({ a: { title: 'x', series: [] }, b: 3, c: { title: 'no series' } }).map((p) => p.title), ['x']);
+    eq(I.govPlotList(null), []);
+    // the groups: a family that the file does not know is last, a row without a name is not shown
+    eq(I.govRowGroups([{ name: 'x', family: 'new' }, { name: 'y', family: 'gains' }, { family: 'gains' }, null, { name: 'z', scope: 'related', family: 'battery' }]).map((g) => [g.key, g.rows.length]), [['gains', 1], ['related', 1], ['new', 1]]);
+    assert.ok(I.govRowsHtml([{ name: 'x', family: 'new', status: 'odd' }], { families: { new: 'New group' } }).includes('<h6 class="tuning-h"><span data-ste="quoted">New group</span></h6>'));
+    assert.ok(I.govRowsHtml([], {}).includes('The result has no parameter rows.'));
+    eq([I.govNumbers({ value: 2, unit: 'Hz' }), I.govNumbers({ value: 2, se: 0.25, unit: 'Hz', n: 1 }), I.govNumbers({ value: null, lo: 3 }), I.govNumbers({ value: 'ON', hi: 4, unit: 's' }), I.govNumbers({})],
+        ['2 Hz', '2.00 ± 0.25 Hz, 1 value', '3 or more', 'ON s, 4 s or less', '']);
+    eq([I.govNumbers({ value: 0.13, unit: 'fraction', lo: 0.031, hi: 0.145, n: 3 }), I.govNumbers({ value: 0.009966, se: 0.0021, unit: 'fraction' })], ['13 % (3.1 to 14.5 %), 3 values', '1.00 ± 0.21 %'], 'a fraction in %');
+    eq([I.govValue([1, 2]), I.govValue(true), I.govValue(0), I.govValue(null)], ['1,2', 'ON', '0', '']);
+    eq(plain(I.govTwinParams({ params: { a: 1, b: 'x', c: 2 }, uncertainty: { a: { p5: 0.5, p95: 1.5 } } })), [{ name: 'a', value: 1, range: '0.5 to 1.5' }, { name: 'c', value: 2, range: '' }]);
+    assert.equal(I.govEvidenceHtml([{}, null]), '', 'no empty items');
+});
+
+test('governor model: each opt-in change gives its own cause (the BYPASS condition, the texts of the toolkit, else the text of its parameter); the bands have the color of the governor state', () => {
+    const app = setup(), I = app.internals, lead = 'The app does not select this change. The cause is as follows: ';
+    const base = { severity: 'check', optIn: true, cli: ['profile 1', 'set gov_headspeed = 2290'], caveats: [], group: null };
+    const opt = (o, recs) => I.govOptInHtml(Object.assign({}, base, o), recs);
+    eq(opt({ parameter: 'gov_bypass_throttle', text: 'The curve gives the throttle. Thus, the app does not select this change.' }),
+        '<p class="tuning-muted tuning-gm-optin">The app does not select this change. If you use the governor condition BYPASS, select this change.</p>', 'the BYPASS curve: the choice of the pilot');
+    // the headspeed: the sentence of the toolkit with its condition (the sentence before "Thus")
+    eq(opt({ parameter: 'gov_headspeed', text: 'At 22.46 V, the necessary throttle is 91.6 % or less (90.2 % to 92.9 %). In the logs, the throttle is at its maximum for 0 s in ACTIVE flight of this PID profile. Thus, this is a check and not a change.' }),
+        '<p class="tuning-muted tuning-gm-optin">' + lead + '<span data-ste="quoted">In the logs, the throttle is at its maximum for 0 s in ACTIVE flight of this PID profile. Thus, this is a check and not a change.</span></p>');
+    // the spool-up time: the cause is in the rows of "gov_use_pid_spoolup" of its group
+    const sp = Object.assign({}, base, { parameter: 'gov_spoolup_time', group: 'GC3:spoolup', text: 'With "gov_spoolup_time" 80, the model gives an overshoot of 12.6 % after SPOOLUP (3.1 % to 14.5 %). The log gives 13 %.' });
+    const pid = Object.assign({}, base, { parameter: 'gov_use_pid_spoolup', group: 'GC3:spoolup', text: 'The value is OFF. The test flights have only 1 spool-up for this test, and the minimum is 3. Thus, the app does not select this change.' });
+    const other = Object.assign({}, base, { parameter: 'gov_p_gain', group: 'GS:gains:1', text: 'The log does not record the battery current. Thus, the app does not select this change.' });
+    eq(I.govOptInHtml(sp, [other, sp, pid]), '<p class="tuning-muted tuning-gm-optin">' + lead + '<span data-ste="quoted">The test flights have only 1 spool-up for this test, and the minimum is 3. Thus, the app does not select this change.</span></p>', 'not the cause of another group');
+    // the gains without current: a sentence that starts without "Thus" is the cause alone; a caveat gives it too
+    assert.ok(opt({ parameter: 'gov_p_gain', text: 'The governor model recommends "gov_p_gain" 56. The log does not record the battery current ("Ibat"). Thus, the margin test of a larger gain is possibly not correct, and the app does not select this change. With the versions of the governor model, the change of J is -23.5 % to -8.9 %.' })
+        .includes('<span data-ste="quoted">The log does not record the battery current (&quot;Ibat&quot;). Thus, the margin test of a larger gain is possibly not correct, and the app does not select this change.</span>'));
+    assert.ok(opt({ parameter: 'gov_i_gain', text: 'The governor model recommends 70.', caveats: ['The analysis does not select this change for this test.', 'A note.'] }).includes('<span data-ste="quoted">The analysis does not select this change for this test.</span>'));
+    // no cause in the texts: the text of the parameter (STE of this file, not quoted)
+    eq(opt({ parameter: 'gov_max_throttle', text: 'To find if the RPM signal errors occur only at 100 % throttle, fly one battery with "gov_max_throttle" 98.' }),
+        '<p class="tuning-muted tuning-gm-optin">' + lead + 'This change is for a test flight only. The test finds if the RPM signal errors occur only at 100 % throttle. The change also decreases the power.</p>');
+    assert.ok(opt({ parameter: 'gov_i_gain', text: '' }).endsWith(lead + 'The log does not record the battery current. Thus, the margin test of a larger gain is possibly not correct.</p>'));
+    assert.ok(opt({ parameter: 'gov_use_pid_spoolup', text: null }).endsWith(lead + 'The test flights do not have sufficient spool-ups for a test of this change.</p>'));
+    assert.ok(opt({ parameter: 'gov_headspeed', text: 'The reserve is 8 %.' }).endsWith(lead + 'The logs do not show the throttle at its maximum for sufficient time in this PID profile. Thus, only the reserve rule gives this change.</p>'));
+    assert.ok(opt({ parameter: 'gov_ff_filter' }).endsWith(lead + 'The analysis does not have sufficient data to select this change.</p>'));
+    eq([opt({ optIn: false }), I.govOptInHtml(null)], ['', '']);
+    // a flag with paragraphs (js/tuning_worker.js govJoin: a line break between the parts) shows each paragraph; one paragraph as it is
+    eq([I.staleTextHtml('First part. Two.\nSecond <part>.'), I.staleTextHtml('One part.  Two.'), I.staleTextHtml('')], ['<p>First part. Two.</p><p>Second &lt;part&gt;.</p>', 'One part. Two.', 'The values in this period are possibly different from the log header.']);
+    // the bands of the governor states: the color of the state as in the recorded governor plots, the label on a band of 3 % or more of the axis
+    const spec = I.govPlotSpec({ title: 'A', kind: 'time', log: 0, series: [{ name: 'a', x: [0, 100], y: [1, 2] }],
+        bands: [{ x0: 20, x1: 10, label: 'FALLBACK', state: 'FALLBACK' }, { x0: 30, x1: 31, label: 'SPOOLUP', state: 'SPOOLUP' }, { x0: 40, x1: 50, label: 'other' }, { x0: 60, x1: 70, label: 'x', state: 'ACTIVE' }] }, {}, null).spec;
+    eq(spec.bands.map((b) => [b.x0, b.x1, b.color, b.label]), [[10, 20, 'rgba(251,128,114,0.25)', 'FALLBACK'], [30, 31, 'rgba(128,177,211,0.18)', ''], [40, 50, 'rgba(253,180,98,0.12)', 'other'], [60, 70, 'rgba(253,180,98,0.12)', 'x']]);
+});
+
+// The real governorTuned result of the Fireball dump of 2026-10-05 with its CLI dump of 2026-10-13 (test/tuning_worker.test.cjs with
+// AUTOTUNE_GOV_FIXTURE: the worker and the toolkit on the dump, each plot series thinned to 200 points)
+const GOV_REAL = path.join(__dirname, 'fixtures', 'governor_tuned_fireball.json.gz');
+// js/tuning_plot.js in its own realm with a canvas stand-in: draw(spec) gives the calls with a coordinate that is not finite and the count
+function realPlot() {
+    const realm = vm.constants && vm.constants.DONT_CONTEXTIFY ? vm.createContext(vm.constants.DONT_CONTEXTIFY) : vm.createContext({}), created = [];
+    const METHODS = ['save', 'restore', 'beginPath', 'closePath', 'moveTo', 'lineTo', 'rect', 'arc', 'fill', 'stroke', 'clip', 'fillRect', 'strokeRect', 'clearRect', 'fillText', 'strokeText',
+        'setLineDash', 'setTransform', 'translate', 'rotate', 'drawImage'];
+    const context = () => { const c = { bad: [], n: 0, measureText: (t) => ({ width: String(t).length * 6 }) };
+        for (const m of METHODS) c[m] = (...a) => { c.n++; if (a.some((v) => typeof v === 'number' && !Number.isFinite(v))) c.bad.push(m); }; return c; };
+    const canvas = (w) => { const ctx = context(); return { width: 300, height: 150, style: {}, ctx, get clientWidth() { return w; }, get clientHeight() { return w ? 220 : 0; }, getContext: () => ctx,
+        addEventListener() {}, removeEventListener() {}, getBoundingClientRect: () => ({ left: 0, top: 0, width: w, height: w ? 220 : 0 }) }; };
+    realm.devicePixelRatio = 1;
+    realm.document = { createElement: () => { const c = canvas(0); created.push(c); return c; } };
+    realm.ResizeObserver = class { observe() {} disconnect() {} };
+    vm.runInContext(read('js/tuning_plot.js'), realm, { filename: 'js/tuning_plot.js' });
+    return (spec) => { const main = canvas(800), h = realm.TuningPlot.attach(main, spec), cache = created.at(-1); h.destroy(); return { bad: main.ctx.bad.concat(cache ? cache.ctx.bad : []), calls: main.ctx.n + (cache ? cache.ctx.n : 0) }; };
+}
+
+test('governor model: the real result of the Fireball dump: the panel, each plot through TuningPlot, the cause of each opt-in change and the CLI file of the default picks', { skip: !fs.existsSync(GOV_REAL) && 'no test/fixtures/governor_tuned_fireball.json.gz' }, async () => {
+    const real = JSON.parse(require('node:zlib').gunzipSync(fs.readFileSync(GOV_REAL)).toString('utf8')), app = analysed(), I = app.internals, before = app.plots.length;
+    gmTuned(app, null, real);
+    const p = app.pane('governor');
+    assert.ok(p.includes({ validated: 'Model checks satisfactory', partial: 'Some model checks not satisfactory', rejected: 'Model checks not satisfactory', unavailable: 'Model not available' }[real.status]), real.status);
+    for (const t of real.reasons.concat(real.limitations)) assert.ok(p.includes(I.esc(t)), t);
+    assert.ok(p.includes(`Governor parameters (${real.rows.length} rows)`));
+    assert.equal((p.match(/<tr class="tuning-gm-row"/g) || []).length, real.rows.length, 'a table row for each row of the result');
+    // every plot: the TuningPlot contract (as the plot contract test), the time plots seek, and the real TuningPlot draws it with finite coordinates
+    const all = real.twin.plots.concat(real.plots), titles = new Set(all.map((q) => q.title)), draw = realPlot();
+    const specs = app.plots.slice(before).map((q) => q.spec).filter((s) => titles.has(s.title)); // the pane draws its recorded plots again too
+    eq(specs.map((s) => s.title), all.map((q) => q.title), 'every plot of the result attaches, once');
+    for (const [j, s] of specs.entries()) {
+        assert.ok(s.x && s.y && Array.isArray(s.series) && s.series.length && s.height === undefined, s.title);
+        for (const ser of s.series) assert.ok(ser.y.length > 1 && ser.x.length === ser.y.length && typeof ser.color === 'string', s.title + ' / ' + ser.name);
+        assert.equal(typeof s.onClick, all[j].kind === 'time' ? 'function' : 'undefined', s.title);
+        const d = draw(s);
+        assert.ok(d.calls > 0 && !d.bad.length, `${s.title}: ${d.bad.slice(0, 5).join()}`);
+    }
+    const bands = specs.filter((s, j) => /^twin-hs-/.test(all[j].id)).map((s) => s.bands || []);
+    assert.ok(bands.length && bands.every((b) => b.length && b.every((x) => x.x1 >= x.x0 && x.color !== 'rgba(253,180,98,0.12)')), 'the governor states of each test flight, in the colors of the states');
+    // the cause of each opt-in change: the BYPASS condition for the curve only
+    const recs = real.recommendations, optIn = recs.filter((x) => x.optIn);
+    assert.ok(optIn.length >= 3, optIn.map((x) => x.id).join());
+    for (const x of optIn) {
+        const h = I.govOptInHtml(x, recs);
+        assert.equal(h.includes('If you use the governor condition BYPASS'), x.parameter === 'gov_bypass_throttle', x.id);
+        if (x.parameter !== 'gov_bypass_throttle') assert.ok(h.includes('The cause is as follows:') && p.includes(h), x.id);
+    }
+    // the CLI file: the default picks are the changes with CLI text, not the opt-in checks
+    app.tab('export');
+    await tick();
+    const q = app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg, want = recs.filter((x) => x.severity === 'action' && x.cli.length && !x.optIn && !x.cli.some((l) => /^set gov_headspeed = /.test(l)));
+    eq(q.picks.filter((id) => /^gov:/.test(id)), want.map((x) => x.id));
+    // a headspeed change is never selected first: the decision of the pilot (user, 2026-10-15)
+    assert.ok(!recs.filter((x) => q.picks.includes(x.id)).some((x) => (x.cli || []).concat(x.optIn && x.optIn.cli || []).some((l) => /^set gov_headspeed = /.test(l))), 'no headspeed change in the default picks');
+    const text = advice.exportScript(plain(q.recs), plain(q.picks), plain(q.meta)), lines = text.split('\n');
+    assert.doesNotMatch(text, /Not in the file/);
+    assert.ok(lines.findIndex((l) => /diff all/.test(l)) < lines.findIndex((l) => /^(profile|set) /.test(l)) && lines.at(-1) === 'save', 'the diff all step first, save last');
+    // each set line of a PID profile in the section of its "profile N-1" line (the CLI file writes each section once), a global one after them
+    const section = (p) => { const a = lines.indexOf(`profile ${p - 1}`), b = lines.findIndex((x, j) => j > a && /^(rate)?profile \d/.test(x)); return a < 0 ? [] : lines.slice(a + 1, b < 0 ? lines.length : b); };
+    assert.ok([1, 2, 3].every((p) => lines.filter((l) => l === `profile ${p - 1}`).length <= 1), 'one section for each PID profile');
+    for (const x of want) for (const l of x.cli.filter((c) => /^set /.test(c))) assert.ok(x.profile ? section(x.profile).includes(l) : lines.includes(l), `${x.id}: ${l}`);
+    for (const m of text.matchAll(/The value of `(\w+)`(?: \(PID profile (\d)\))? is unknown/g)) assert.ok(!real.rows.some((r) => r.name === m[1] && (!m[2] || r.profile === +m[2]) && r.current && r.current.value !== null && r.current.value !== undefined), `${m[0]}: the row knows it`);
+    assert.deepEqual(app.errors, []);
+});
+
+test('governor model: a gate of the Governor step holds each change (no CLI text, no export pick), from the worker texts or from the diagram', async () => {
+    // the worker turns options.blockedBy into texts and clears the CLI text of each change (js/tuning_worker.js governorTune)
+    const gate = 'The prerequisite "RPM signal and motor poles" has a problem. Correct it before you tune this tuning block.';
+    const held = synthGovTune();
+    held.recommendations = held.recommendations.map((x) => x.severity === 'action' ? Object.assign({}, x, { blockedBy: [gate], cli: [] }) : x);
+    held.blockedBy = [gate];
+    const a = analysed();
+    gmTuned(a, null, held);
+    let p = a.pane('governor');
+    assert.ok(p.includes('A step before the governor in the tuning sequence has a problem. Thus, the changes have no CLI text until you correct it. <span data-ste="quoted">' + a.internals.esc(gate) + '</span>') && !p.includes(a.internals.esc(gate) + '.'), 'the notice, then the gate (quoted) as its own sentence with one period');
+    assert.match(p, /<h6><span class="tuning-badge st-monitor">Change<\/span> <span class="tuning-badge st-blocked">Blocked<\/span> Set &quot;Governor I&quot;/, 'a held change stays with the changes');
+    assert.ok(p.includes('This recommendation has no CLI text. First, correct the steps in the &quot;Blocked&quot; list. Then start the analysis again.'));
+    assert.ok(!/<pre>(profile 0\nset gov_i_gain|set gov_rpm_filter)/.test(p), 'no CLI text');
+    a.tab('export');
+    await tick();
+    const exports = (app) => app.deriveWorker() ? app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export') : [];
+    assert.ok(!exports(a).some((s) => s.msg.picks.some((id) => /^gov:/.test(id))), 'no governor change in the CLI file');
+    assert.ok(a.pane('export').includes('You did not select a recommendation. Select one or more changes.'));
+    // a worker without the gates: the dialog applies the gates of the diagram (governor.blockedBy and gatedBy) to the changes, with links
+    const r = synthResult();
+    r.hierarchy.nodes.governor.status = 'blocked';
+    r.hierarchy.nodes.governor.blockedBy = ['rpm'];
+    const b = analysed({ result: r });
+    gmTuned(b);
+    p = b.pane('governor');
+    assert.match(p, /<input type="checkbox" class="tuning-pick" data-pick="\d+" disabled> <span class="tuning-badge st-monitor">Change<\/span> <span class="tuning-badge st-blocked">Blocked<\/span> Set &quot;Governor I&quot;/);
+    assert.ok(p.includes('<a href="#" class="tuning-node-link" data-node="rpm">RPM signal and motor poles</a>'), 'the Blocked list links the step');
+    assert.ok(!p.includes('<pre>set gov_rpm_filter = 15</pre>') && !p.includes(' checked>'), 'no CLI text and no selected change');
+    b.tab('export');
+    await tick();
+    assert.ok(!exports(b).some((s) => s.msg.picks.some((id) => /^gov:/.test(id))), 'no export pick');
+    assert.deepEqual(a.errors.concat(b.errors), []);
+});
+
+test('governor model: its changes show once on the Governor tab; the PID profile selection of the Export tab says that it does not apply to them', async () => {
+    const app = analysed();
+    gmTuned(app);
+    app.detail('governor:checks', true);
+    const p = app.pane('governor'), picks = [...p.matchAll(/data-pick="(\d+)"/g)].map((m) => m[1]);
+    eq(picks.length, new Set(picks).size, 'each data-pick once: ' + picks.join());
+    assert.ok(p.includes('The changes of the governor model are in the &quot;Governor model&quot; part of this tab.'), 'the step list says where they are');
+    // the configurations: the selection of each PID profile is for the control changes of the analysis, not for the governor model
+    const r = controlResult();
+    advice.configurationBases(r.datasets);
+    const c = analysed({ result: r });
+    c.tab('export');
+    await tick();
+    assert.ok(!c.pane('export').includes('do not use this selection'), 'no governor result: no text');
+    gmTuned(c);
+    c.tab('export');
+    await tick();
+    assert.ok(c.pane('export').includes('The changes of the governor model do not use this selection. To remove one of them from the CLI file, clear its box in the Governor tab.'));
+    c.jq.fire('change', '.tuning-final-config', { 'data-profile': 1 }, { value: '' });
+    await tick();
+    const q = c.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg;
+    assert.ok(q.picks.includes('gov:gov_i_gain|1|model'), 'as the text says: "No changes" keeps the change of the governor model');
+    assert.deepEqual(app.errors.concat(c.errors), []);
+});
+
+test('governor model: its changes are one flight test of the CLI file, and "Select only this test" keeps them without the filter changes', async () => {
+    const app = analysed();
+    app.tab('filters');
+    app.jq.fire('click', '.tuning-ft-start', {});
+    ftWorker(app).reply({ type: 'filterTuned', result: synthFilterTune() });
+    gmTuned(app);
+    app.tab('export');
+    await tick();
+    const x = app.pane('export'), last = () => app.deriveWorker().sent.filter((s) => s.msg.cmd === 'export').at(-1).msg;
+    assert.ok(x.includes('Different flight tests') && x.includes('Test filter changes before control changes.'));
+    assert.ok(x.includes('<li>Changes of the governor model <button type="button" class="btn btn-default btn-xs tuning-trial-only" data-trial="gov:gov_i_gain|1|model">Select only this test</button></li>'), 'one item for all changes of the model');
+    eq(last().picks, ['FT:global', 'FT:profile0', 'gov:gov_i_gain|1|model', 'gov:gov_rpm_filter|g|value']);
+    app.jq.fire('click', '.tuning-trial-only', { 'data-trial': 'gov:gov_rpm_filter|g|value' });
+    await tick();
+    eq(last().picks, ['gov:gov_i_gain|1|model', 'gov:gov_rpm_filter|g|value'], 'the default changes of the model, not the filter changes and not the bypass curve');
+    assert.doesNotMatch(app.pane('export'), /Different flight tests/);
+    const text = advice.exportScript(plain(last().recs), plain(last().picks), plain(last().meta));
+    assert.doesNotMatch(text, /DYN_NOTCH|roll_d_cutoff/);
+    assert.match(text, /set gov_i_gain = 60[\s\S]*set gov_rpm_filter = 15/);
+    assert.deepEqual(app.errors, []);
+});

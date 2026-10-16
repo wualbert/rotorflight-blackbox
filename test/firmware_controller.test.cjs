@@ -187,3 +187,147 @@ test('servo configuration keeps absent values and optional CLI provenance unreso
     assert.equal(got.verified,false);assert.equal(got.sources[0][0],'cli');assert.equal(got.parameters[0][1],undefined);
     assert.ok(got.unknown.includes('servo 1 min'));assert.equal(F.compatibility({...config(),servos:got}).supported,false);assert.equal(F.servoConfig({}),null);
 });
+
+// ---- governor alone: rf_gov_step, rf_gov_profile, govCreate (docs/GOVERNOR_AUTOTUNE.md 6) ----
+const GOV={gov_mode:3,gov_throttle_type:0,gov_headspeed:3000,gov_startup_time:10,gov_spoolup_time:10,'main_rotor_gear_ratio[0]':1,'main_rotor_gear_ratio[1]':10,battery_cell_count:6,voltage_meter:2};
+// first-order motor and rotor: raw motor rpm from the governor throttle, the battery voltage and a collective load
+const plant=(R,u,coll)=>R+0.001/0.3*(u*1800*22.2-R-9000*Math.abs(coll));
+test('rf_gov_step gives the governor outputs of the full rf_step path for the same mixer inputs',async()=>{
+    const bypass=Array.from({length:9},(_,i)=>'gov_bypass_throttle['+i+']');
+    // the values that the firmware does not read here can be unknown: govCreate gives them the release defaults.
+    // Second case: TTA on a counter-clockwise rotor (the TTA sign comes from main_rotor_dir, govInitTTA).
+    for(const [patch,inactive] of [[{},[...bypass,'gov_pwr_filter','gov_tta_filter','gov_tta_limit']],[{main_rotor_dir:1,gov_tta_gain:50,gov_tta_limit:20,gov_tta_filter:0},[...bypass,'gov_pwr_filter']]]) {
+        const values={...F.defaults(),...GOV,...patch};for(const n of inactive)delete values[n];
+        const full=await F.create({config:{...config({...GOV,...patch}),executeGovernor:true}}),gov=await F.govCreate({values,pidHz:1000});
+        assert.deepEqual(gov.assumed.sort(),inactive.sort());
+        let R=0,u=0,tta=0;const seen=new Set();let loadThrottle=null,beforeLoad=null;
+        for(let n=0;n<14000;n++) {
+            const coll=n<7000?.2:.8,cmd=n<100||n>=12500?0:1,armed=n<13500;
+            const s=input({setpoint:[60*Math.sin(n*.013),40*Math.cos(n*.011),90*Math.sin(n*.007)],gyro:[10*Math.sin(n*.02),0,5*Math.cos(n*.03)],collective:coll,headspeed:R/10,
+                armed,throttleOff:cmd===0,rawMotorRpm:R,batteryVoltage:22.2,throttleCommand:cmd,rcDeflection:[0,0,0,coll],timeS:20+n*.001,govFallback:n===10000});
+            const out=full.step(s),g=gov.step({rawMotorRpm:R,batteryVoltage:22.2,throttleCommand:cmd,throttleOff:cmd===0,armed,timeS:s.timeS,govFallback:s.govFallback,
+                mixer:[out.u[0],out.u[1],out.u[2],out.collective],rcDeflection:s.rcDeflection});
+            assert.deepEqual(g,out.governor,'step '+n);
+            seen.add(g.state);u=g.throttle;R=plant(R,u,coll);tta=Math.max(tta,g.ttaIncrease);
+            if(n===6999)beforeLoad=u;if(n===8000)loadThrottle=u;
+        }
+        for(const state of [0,1,2,3,4,5,6])assert.ok(seen.has(state),'state '+state);
+        assert.ok(loadThrottle>beforeLoad+.05,'the load step raises the throttle: '+beforeLoad+' -> '+loadThrottle);
+        assert.ok(patch.gov_tta_gain?tta>.05:tta===0,'TTA '+tta);
+    }
+});
+test('a PID profile change keeps ACTIVE and the throttle, and ramps the target to the new headspeed (stateResetReq)',async()=>{
+    const values={...F.defaults(),...GOV},gov=await F.govCreate({values,pidHz:1000});
+    let R=0,o;const run=(n,coll=.3)=>{for(let i=0;i<n;i++){o=gov.step({rawMotorRpm:R,batteryVoltage:22.2,throttleCommand:1,throttleOff:false,armed:true,mixer:[.05,.02,.1,coll]});R=plant(R,o.throttle,coll);}return o;};
+    const o0=run(9000);assert.equal(o0.state,4);assert.ok(Math.abs(o0.currentHeadSpeed-3000)<5);
+    // a PID profile has all its governor values: a missing value is unknown, not the value of the previous PID profile
+    assert.throws(()=>gov.profile({gov_headspeed:3300}),/unknown: gov_flags, gov_min_throttle/);
+    assert.throws(()=>gov.profile({...gov.values,gov_headspeed:3300,battery_cell_count:4}),/global value battery_cell_count/);
+    gov.profile({...gov.values,gov_headspeed:3300,gov_collective_weight:60});
+    const o1=run(1);
+    assert.equal(o1.state,4);assert.equal(o1.requestHS,3300);
+    // bumpless: I takes the previous throttle minus the new P, D and F, so the sum moves only by the integrator step C
+    assert.ok(Math.abs(o1.P+o1.I+o1.D+o1.F-o0.throttle)<2e-4,'sum '+(o1.P+o1.I+o1.D+o1.F)+' throttle '+o0.throttle);
+    assert.ok(Math.abs(o1.throttle-o0.throttle)<2e-4);assert.notEqual(o1.F,o0.F);
+    const steps=[o1.targetHS-o0.targetHS];let last=o1;
+    for(let i=0;i<50;i++){const x=run(1);steps.push(x.targetHS-last.targetHS);assert.equal(x.state,4);last=x;}
+    // the target slews at max(headspeed, Kmot) x 10 dT / gov_tracking_time per loop, from the old target
+    assert.ok(steps.every(d=>d>=3300*.0002-1e-3&&Math.abs(d-steps[0])<1e-3),JSON.stringify(steps.slice(0,5)));
+    const o2=run(4000);assert.equal(o2.state,4);assert.equal(o2.targetHS,3300);assert.ok(Math.abs(o2.currentHeadSpeed-3300)<10);
+    // a profile change while the motor is off sets the request, and reset() returns to the first PID profile
+    gov.reset();assert.equal(run(1).requestHS,3000);gov.profile({...gov.values,gov_headspeed:2500});assert.equal(run(1).requestHS,2500);
+});
+test('configuration mapping: battery_meter, gov_mode OFF, cell count 0 and an unknown gear ratio',async()=>{
+    for(const [meter,code] of [['ESC',2],['ADC',1],['NONE',0]])assert.equal(F.fromHeader({},{battery_meter:meter}).values.voltage_meter,code);
+    const cli=F.fromHeader({},{battery_meter:'ESC',gov_mode:'OFF',battery_cell_count:0},{valueSources:{battery_meter:'CLI dump'}});
+    assert.equal(cli.values.gov_mode,0);assert.equal(cli.sources.voltage_meter,'CLI dump');assert.equal(cli.values.battery_cell_count,0);
+    const auto=F.fromHeader({vbatmincellvoltage:330,vbatmaxcellvoltage:430},{battery_cell_count:0},{restVoltage:25.2});
+    assert.equal(auto.values.battery_cell_count,6);assert.match(auto.sources.battery_cell_count,/^calculated from the log/);
+    // cell levels in 0.1 V (the parser default 33/43) or 0.01 V; a header level that the log did not record does not hide the CLI
+    const cells=(header,restVoltage)=>F.fromHeader(header,{battery_cell_count:0,vbat_min_cell_voltage:330,vbat_warning_cell_voltage:350,vbat_max_cell_voltage:430},{restVoltage}).values.battery_cell_count;
+    for(const [v,k] of [[25.1,6],[16.6,4],[4.1,1]]){assert.equal(cells({vbatmincellvoltage:33,vbatmaxcellvoltage:43,loggedHeaderFields:['looptime']},v),k,v+' V');assert.equal(cells({vbatmincellvoltage:33,vbatmaxcellvoltage:43},v),k,v+' V');}
+    assert.equal(cells({vbatmincellvoltage:20,vbatwarningcellvoltage:25,vbatmaxcellvoltage:30,loggedHeaderFields:['looptime']},25.1),6);
+    assert.equal(cells({vbatmincellvoltage:20,vbatwarningcellvoltage:25,vbatmaxcellvoltage:30,loggedHeaderFields:['vbatcellvoltage']},25.1),10);
+    assert.equal(F.govCells({cellCount:6}).cells,6);assert.equal(F.govCells({cellCount:0,restVoltage:16.6}).cells,4);
+    assert.equal(F.govCells({cellCount:0,restVoltage:25.2,maxCell:4.2}).cells,6);
+    const none=F.govCells({cellCount:0});assert.equal(none.cells,0);assert.equal(none.source,'unknown');assert.ok(none.note);
+    // gear unknown: 1:1 and the headspeed as the motor speed give the result of the configured ratio with motor rpm
+    const v={...F.defaults(),...GOV};delete v['main_rotor_gear_ratio[0]'];delete v['main_rotor_gear_ratio[1]'];
+    const a=await F.govCreate({values:{...F.defaults(),...GOV},pidHz:1000}),b=await F.govCreate({values:v,pidHz:1000,voltageSource:'ESC'});
+    assert.equal(a.notes.length,0);assert.equal(b.notes.length,1);assert.deepEqual([b.values['main_rotor_gear_ratio[0]'],b.values['main_rotor_gear_ratio[1]']],[1,1]);
+    let R=0;for(let n=0;n<4000;n++){const s={batteryVoltage:22.2,throttleCommand:1,throttleOff:false,armed:true,mixer:[0,0,0,.3]};
+        const x=a.step({...s,rawMotorRpm:R}),y=b.step({...s,rawMotorRpm:R/10});assert.equal(x.state,y.state);assert.ok(Math.abs(x.throttle-y.throttle)<1e-5,'step '+n);R=plant(R,x.throttle,.3);}
+    // voltage compensation needs the flag, the ADC meter and ELECTRIC: then the cell count is required, and 0 (unknown) is refused
+    await assert.rejects(F.govCreate({values:{...F.defaults(),...GOV,gov_flags:8,battery_cell_count:0},pidHz:1000,voltageSource:'ADC'}),/unknown: battery_cell_count/);
+    const auto6=await F.govCreate({values:{...F.defaults(),...GOV,gov_flags:8,battery_cell_count:0},pidHz:1000,voltageSource:'ADC',restVoltage:25.1});
+    assert.equal(auto6.values.battery_cell_count,6);assert.equal(auto6.notes.length,0);assert.ok(auto6.required.includes('battery_cell_count'));
+    // the flag with an unknown voltage source: the source is required, not assumed to be ADC
+    await assert.rejects(F.govCreate({values:(({voltage_meter,...x})=>x)({...F.defaults(),...GOV,gov_flags:8}),pidHz:1000}),/unknown: voltage_meter/);
+    for(const [patch,source] of [[{},'ESC'],[{gov_mode:2},'ADC']]){
+        const off=await F.govCreate({values:{...F.defaults(),...GOV,gov_flags:8,battery_cell_count:0,...patch},pidHz:1000,voltageSource:source});
+        assert.equal(off.notes.length,0);assert.ok(!off.required.includes('battery_cell_count'));}
+    // a later PID profile cannot make an unknown or assumed global value known
+    const later=await F.govCreate({values:{...F.defaults(),...GOV,battery_cell_count:0},pidHz:1000,voltageSource:'ADC'});
+    assert.throws(()=>later.profile({...later.values,gov_flags:8}),/unknown: battery_cell_count/);
+    const assumedMeter=await F.govCreate({values:(({voltage_meter,gov_pwr_filter,...x})=>x)({...F.defaults(),...GOV}),pidHz:1000});
+    assert.deepEqual(assumedMeter.assumed.filter(n=>!/bypass|tta/.test(n)).sort(),['gov_pwr_filter','voltage_meter']);
+    assert.throws(()=>assumedMeter.profile({...assumedMeter.values,gov_flags:8,voltage_meter:2,gov_pwr_filter:5}),/global value voltage_meter/);
+    assert.throws(()=>assumedMeter.profile({...assumedMeter.values,gov_flags:8,voltage_meter:1,gov_pwr_filter:5}),/unknown: gov_pwr_filter, voltage_meter/);
+});
+test('govCreate refuses a motorized tail when the governor uses the yaw, and needs the rotor direction for TTA',async()=>{
+    const v={...F.defaults(),...GOV,tail_rotor_mode:1};
+    await assert.rejects(F.govCreate({values:v,pidHz:1000}),/motorized tail/);
+    for(const patch of [{gov_yaw_weight:0},{gov_f_gain:0}]){
+        const g=await F.govCreate({values:{...v,...patch},pidHz:1000});
+        assert.throws(()=>g.profile({...g.values,gov_yaw_weight:10,gov_f_gain:10}),/motorized tail/);
+        assert.throws(()=>g.profile({...g.values,gov_tta_gain:50,gov_tta_limit:20}),/motorized tail/);
+    }
+    // the log header does not record the tail mode or the rotor direction: each is required only when the governor reads it
+    const t=(({main_rotor_dir,tail_rotor_mode,...x})=>x)({...F.defaults(),...GOV});
+    await assert.rejects(F.govCreate({values:t,pidHz:1000}),/unknown: tail_rotor_mode\./);
+    const g=await F.govCreate({values:{...t,gov_yaw_weight:0},pidHz:1000});assert.deepEqual(g.assumed.filter(n=>/rotor/.test(n)).sort(),['main_rotor_dir','tail_rotor_mode']);
+    await assert.rejects(F.govCreate({values:{...t,gov_yaw_weight:0,gov_tta_gain:50,gov_tta_limit:20},pidHz:1000}),/unknown: main_rotor_dir, tail_rotor_mode\./);
+    assert.throws(()=>g.profile({...g.values,gov_tta_gain:50,gov_tta_limit:20}),/unknown: main_rotor_dir, tail_rotor_mode\./);
+    const ccw=await F.govCreate({values:{...t,gov_yaw_weight:0,gov_tta_gain:50,gov_tta_limit:20,main_rotor_dir:1,tail_rotor_mode:0},pidHz:1000});assert.deepEqual(ccw.assumed.filter(n=>/rotor|tta/.test(n)),[]);
+    for(const mode of [1,4]){const x=await F.govCreate({values:{...t,gov_yaw_weight:0,gov_mode:mode,gov_tta_gain:50},pidHz:1000});assert.ok(!x.required.includes('main_rotor_dir')&&!x.required.includes('gov_tta_limit'),'mode '+mode);}
+});
+test('govCreate and profile refuse unknown and out-of-range governor values with a clear error',async()=>{
+    const v={...F.defaults(),...GOV};
+    for(const [patch,re] of [[{gov_p_gain:300},/gov_p_gain is out of its range \(0 to 250\): 300/],[{gov_collective_curve:50},/gov_collective_curve.*5 to 40/],
+        [{gov_headspeed:2.5},/gov_headspeed/],[{gov_mode:7},/gov_mode/],[{voltage_meter:3,gov_flags:8},/voltage_meter.*0 to 2/],[{battery_cell_count:30},/battery_cell_count.*0 to 24/],[{main_rotor_dir:2},/main_rotor_dir.*0 to 1/]])
+        await assert.rejects(F.govCreate({values:{...v,...patch},pidHz:1000}),re);
+    const missing={...v};delete missing.gov_headspeed;delete missing.gov_i_gain;
+    await assert.rejects(F.govCreate({values:missing,pidHz:1000}),/unknown: gov_headspeed, gov_i_gain/);
+    await assert.rejects(F.govCreate({values:v,pidHz:3000}),/cannot use this PID loop rate/);
+    const g=await F.govCreate({values:v,pidHz:2000});assert.equal(g.values.pid_looptime,500);
+    assert.throws(()=>g.profile({...g.values,gov_f_limit:120}),/gov_f_limit is out of its range/);
+    assert.throws(()=>g.profile({...g.values,gov_rpm_filter:20}),/global value gov_rpm_filter/);
+    const t={...v};for(const n of ['gov_tta_filter','gov_tta_limit','gov_bypass_throttle[0]'])delete t[n];const h=await F.govCreate({values:t,pidHz:1000});
+    assert.throws(()=>h.profile({...h.values,gov_tta_gain:20}),/unknown: gov_tta_filter, gov_tta_limit/);
+    // a global value given to profile() does not make an assumed value known
+    assert.throws(()=>h.profile({...h.values,gov_tta_gain:20,gov_tta_limit:30,gov_tta_filter:0}),/unknown: gov_tta_filter$|unknown: gov_tta_filter\./);
+    h.profile({...h.values,gov_tta_gain:20,gov_tta_limit:0});
+    const s={rawMotorRpm:1,batteryVoltage:22,throttleCommand:1,throttleOff:false,armed:true,mixer:[0,0,0,0]};
+    assert.throws(()=>g.step({...s,mixer:[0,0,0]}),/mixer input/);
+    assert.throws(()=>h.step({...s,govBypass:true,rcDeflection:[0,0,0,.8]}),/gov_bypass_throttle" are unknown/);
+    // BYPASS maps the collective stick, not the mixer: the stick input is required
+    assert.throws(()=>g.step({...s,govBypass:true}),/"rcDeflection" is necessary for "govBypass"/);
+    assert.throws(()=>g.step({...s,govBypass:true,rcDeflection:[0,0,.8]}),/stick input of the governor is not correct/);
+    assert.equal(g.step({...s,govBypass:true,rcDeflection:[0,0,0,.8]}).state,9);
+    const bridge=fs.readFileSync(path.join(__dirname,'../tools/autotune/firmware/bridge.c'),'utf8'),part=bridge.slice(bridge.indexOf('void rf_gov_profile'));
+    F.SCHEMA.forEach((f,i)=>{if(f.member.startsWith('profile.governor.'))assert.ok(part.includes(f.member+' = config['+i+'];'),f.member);});
+    assert.ok(['rf_gov_step','rf_gov_profile'].every(x=>require('../tools/autotune/firmware/controller.json').exports.includes(x)));
+});
+test('the firmware time is exact and does not stop or wrap after 2^32 microseconds',async()=>{
+    const values={...F.defaults(),...GOV},runs=[];
+    for(const t0 of [100,4294,4300,5000]) {
+        const g=await F.govCreate({values,pidHz:1000}),out=[];let R=0;
+        for(let n=0;n<6000;n++){const o=g.step({rawMotorRpm:R,batteryVoltage:22.2,throttleCommand:1,throttleOff:false,armed:true,mixer:[0,0,0,.3],timeS:t0+n*.001});out.push(o);R=plant(R,o.throttle,.3);}
+        assert.equal(out[5999].state,4,'t0 '+t0);runs.push(out);
+    }
+    for(let k=1;k<runs.length;k++)assert.deepEqual(runs[k],runs[0]);
+    const g=await F.govCreate({values,pidHz:1000}),s={rawMotorRpm:0,batteryVoltage:22,throttleCommand:0,throttleOff:true,armed:true,mixer:[0,0,0,0]};
+    g.step({...s,timeS:10});assert.throws(()=>g.step({...s,timeS:9.9995}),/before the time of the previous step/);
+    assert.throws(()=>g.step({...s,timeS:4400}),/out of the range of the firmware clock/);assert.throws(()=>g.step({...s,timeS:NaN}),/not correct/);
+    g.reset();g.step({...s,timeS:5});g.step(s);assert.throws(()=>g.step({...s,timeS:5.0005}),/before/);g.step({...s,timeS:5.001});
+});

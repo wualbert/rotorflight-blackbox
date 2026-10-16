@@ -13,6 +13,7 @@ const L = require('../tools/autotune/health_limits.cjs');
 const bbl = require('./helpers/bbl_encode.cjs');
 
 const app = lib.loadApp(), tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'limits-')), RATE = 1000;
+process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
 const EXTRA = [...new Set(L.EXTRA.concat(require('../tools/autotune/health_rescue.cjs').EXTRA))];
 const at = (s) => Math.round(s * RATE);
 const within = (got, want, tol, what) => assert.ok(typeof got === 'number' && Math.abs(got - want) <= tol, `${what}: got ${got}, want ${want} +- ${tol}`);

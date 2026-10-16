@@ -289,7 +289,7 @@ test('SPEC3 I: the areas of the overview; the worker\'s f.area first, else the a
     const catalog = require('../tools/autotune/catalog.cjs');
     const differ = Object.keys(catalog.CHECKS).filter((id) => catalog.CHECKS[id].area && typeof catalog.CHECKS[id].area !== 'function' && catalog.CHECKS[id].area !== a(id));
     eq(differ, [], 'the fallback areas of the view agree with catalog.cjs');
-    eq(['G1', 'G12'].map((id) => a(id)), ['rpm', 'rpm']);
+    eq(['G1', 'G12', 'G20', 'G21'].map((id) => a(id)), ['rpm', 'rpm', 'rpm', 'rpm']);
     eq(['F1', 'F5', 'F7', 'F10', 'F11', 'C11', 'C15', 'T4'].map((id) => a(id)), Array(8).fill('vibration'));
     eq(['C1', 'C5', 'C12', 'C13', 'C14'].map((id) => a(id)).concat([a('C7', 'pitch')]), Array(6).fill('cyclic'));
     eq(['T1', 'T5', 'T14', 'T15'].map((id) => a(id)).concat([a('C7', 'yaw')]), Array(5).fill('tail'));

@@ -23,10 +23,15 @@
     "pg/governor.c": "a14ae8b43cb603674cbc35d9a1d153f014cdeb616401cfc887e4e961718fc208",
     "flight/servos.c": "eb4da76a35bcdc7e26787bb2df7f2f866a62f62ae01a0edd220b762caa30b376",
     "flight/servos.h": "beac521b9de101bb3a883c07fb66a0616eaae98eae88a6888ee3222e682fa2de",
-    "pg/servos.h": "b7de17cd2bc866e3012099cdf216657e48a809b87727dd846f40265a58f73390"
+    "pg/servos.h": "b7de17cd2bc866e3012099cdf216657e48a809b87727dd846f40265a58f73390",
+    "common/sdft.h": "c3015a21405d14dc265b59a2277408676296feb4dfb903417c3d199b7637c071",
+    "common/sdft.c": "7bc7c7feaa30388cbb6706d72e935f846e9639c6d457bb48e8a657ff196c1312",
+    "flight/dyn_notch_filter.c": "97d0811f2c7d35ad193647cf03e09bd4db191f7481e5aa4f2519d5e63daf76c1",
+    "flight/rpm_filter.c": "6d7ccb1588e5e59ef85d6643d6a5dfdb232730d52e1957d5f6be5a286a13e906",
+    "sensors/gyro_filter_impl.c": "8b3e6ae69e25a0050cde26511e370ff44de9a74a1ea694d9e171d2347a9535ce"
   },
-  "artifactSha256": "d1aa792dad08bb1ae68fd8128f4493667dcd4ea97db758570fcaec6d3091022e",
-  "adaptationSha256": "19d6c1fd5bfa60cb12e44d4bf2ec8962997480120f9be99bdb5fa327387485da",
+  "artifactSha256": "20e593e358ee34ffe14a9843b591039cfcd55951f281708421b7957db215f37a",
+  "adaptationSha256": "d5823d46ac8ab68e8ce184cc4ad254e51a001dcb037cfd0066c8c41bf90df4ee",
   "compiler": "clang version 19.1.5-wasi-sdk (https://github.com/llvm/llvm-project ab4b5a2db582958af1ee308a790cfdb42bd24720)",
   "exports": [
     "memory",
@@ -39,6 +44,8 @@
     "rf_seed",
     "rf_step",
     "rf_servo_config",
-    "rf_map_mixer"
+    "rf_map_mixer",
+    "rf_gov_step",
+    "rf_gov_profile"
   ]
 }

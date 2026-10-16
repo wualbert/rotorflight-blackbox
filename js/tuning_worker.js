@@ -20,6 +20,8 @@
  *                   { cmd: 'export', id, recs, picks: [recommendation ids] | null (advice defaults), meta }   (advice.exportScript)
  *                   { cmd: 'filterTune', id, bytes (the whole file), fileName, options: { cliText, cliName, flightRpm, logs, flights,
  *                     blockedBy (hierarchy node ids or STE texts), budgetMs, loo } }   (round 3 M2: filterTune below)
+ *                   { cmd: 'governorTune', id, bytes (the whole file), fileName, options: { cliText, cliName, flightRpm, logs, flights,
+ *                     budgetMs, blockedBy } }   (docs/GOVERNOR_AUTOTUNE.md section 8: governorTune below)
  *   options         { flightRpm: number | null (auto), cliText, cliName, excludeAbnormal: true, phases: true (health_phase.cjs:
  *                     bench runs left out, attitude checks on the flight phases), curves: true,
  *                     gains: false (file only: extract.cjs + report.cjs), keepMetrics: false (tests: full records),
@@ -37,6 +39,8 @@
  *                   | { id, type: 'ready', result: { modules, notes } } | { id, type: 'derived', result } | { id, type: 'exported', result: CLI text }
  *                   | { id, type: 'filterTuned', result } (the filter search: filter_tune.cjs tune() with text, recommendations (each with stale:
  *                     filterStale), logs, blockedBy)
+ *                   | { id, type: 'governorTuned', result } (the governor model and autotune: gov_tune.cjs autotune() as JSON, with
+ *                     logs, benchRuns, skipped, blockedBy, notes, timing, and the stale of each recommendation and row: govStale)
  *
  * result (TuningResult): { version: 1, scope, selection (null, or the flight selection of options.flights: { flights: [{ log, flight, t0, t1 }],
  *   windows: [{ log, t0, t1 }] the time analysed, logs, all: the logs with every flight, text }), fileName, logIndex, logs, flightRpm: { value, source: user | govTarget | headspeed | default, basis,
@@ -123,7 +127,8 @@ var TuningWorker = (function () {
         hierarchy: 'the tuning sequence', evidence: 'the part of the log that gave each result', datasets: 'the configurations of the flights',
         epochs: 'the parts of the log in which the values are possibly not the values of the log header' }; // without that module
     const ON_DEMAND = ['filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune',
-        'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline'];
+        'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline',
+        'gov_twin', 'gov_data', 'gov_params', 'gov_sim', 'gov_fit', 'gov_search', 'gov_scenarios', 'gov_tune']; // gov_*: the governor model (governorTune)
     const CORE = ['setup', 'gov', 'loop'];                                 // health.cjs MODULES, in its order
     const JUDGED = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power']; // the new modules, judged after health_report.cjs
     const ALL_PHASE = new Set(['rescue', 'limits', 'config', 'power']);    // modules that use all phases of a flight log, rescue included, with no guard time
@@ -475,7 +480,9 @@ var TuningWorker = (function () {
     // The masks of health_gov in a flight log (SPEC2 D13 correction: the governor, motor, ESC and power checks use all
     // phases of a flight log, with a rule for each phase), from the phases of health_phase.cjs:
     //   - all: every sample in a phase (idle, spool-up, ground, flight, spool-down). The battery voltage, the main rotor line
-    //     against the headspeed (motor_poles, the RPM sensor) and the time in each governor state (GOV_ALL) use it. FALLBACK
+    //     against the headspeed (motor_poles, the RPM sensor), the sudden changes of the headspeed signal against the throttle
+    //     maximum (G21: with GOVSTATE the governor states select the samples, not the mask) and the time in each governor state
+    //     (GOV_ALL) use it. FALLBACK
     //     entries are of the whole log in every mask (health_gov G1). Motor kicks and the handover from SPOOLUP to ACTIVE out
     //     of the flight are checks G16 and G17 of health_phase.cjs, which gets every phase;
     //   - rotor: the ground and flight phases, the rotor governed. The RPM glitch proxy of G1 (GOV_ROTOR) uses it: at IDLE a
@@ -488,7 +495,7 @@ var TuningWorker = (function () {
     //     (Fireball 2026-09-29 #3, 376.3-377.2 s: 2446 rpm against 3500 at full throttle, a G6 run, which G2 would count as
     //     a steady error of -30 %).
     // { all, rotor, tracking, seconds: { all, rotor, tracking } }
-    const GOV_ALL = ['D5', 'G13', 'G12', 'states'];   // health_gov metrics measured over all phases
+    const GOV_ALL = ['D5', 'G13', 'G12', 'G21', 'states'];   // health_gov metrics measured over all phases (G21: the governor states decide)
     const GOV_ROTOR = ['G1'];                         // over the ground and flight phases, at any headspeed
     const TRACK_PHASES = ['ground', 'flight'];
     const PHASE_USE = { all: ['idle', 'spoolup', 'ground', 'flight', 'spooldown'], tracking: TRACK_PHASES, flight: ['flight'] };
@@ -1051,10 +1058,24 @@ var TuningWorker = (function () {
             // per-profile CLI values (health.cjs cliContext: gov_headspeed, gov_max_throttle) for the labels of their PID profile
             const byLabel = (o) => { const out = {}; for (const [L, x] of J.dsReg.info) if (x.pid > 0 && o[x.pid] !== undefined) out[L] = o[x.pid]; return out; };
             p.ctxPid = p.ctx; // the ctx of the PID profiles (armingCore reads its gov_headspeed of each PID profile)
+            const mt = p.ctx.maxThrottle ? cliMaxThrottle(J, li, p.ctx.maxThrottle) : null;
             p.ctx = Object.assign({}, p.ctx, { profile: lab, pidLabels: p.ctx.profile, pidProfileOf: pidOf },
-                p.ctx.govHeadspeed ? { govHeadspeed: byLabel(p.ctx.govHeadspeed) } : {}, p.ctx.maxThrottle ? { maxThrottle: byLabel(p.ctx.maxThrottle) } : {});
+                p.ctx.govHeadspeed ? { govHeadspeed: byLabel(p.ctx.govHeadspeed) } : {}, p.ctx.maxThrottle ? { maxThrottle: mt ? byLabel(mt) : null } : {});
         }
         if (over) J.notes.add(`The file has more than ${MAX_LABELS} configurations. Thus, the results of the other configurations show no configuration.`, li);
+    }
+    // The CLI gov_max_throttle of each PID profile (o: health.cjs cliContext maxThrottle) that the modules can use for log li, null for
+    // none: a CLI dump that no analysed log header agrees with (result.cliStatus used false), or with no section that agrees with the
+    // header of this log (D4), does not describe the log, and a section whose gov_headspeed the logged PID profile changes contradict is
+    // older than the log (cliCheck stale). The log wins (user rule "No access to the flight controller"): check G21 then uses the throttle
+    // maximum that it calculates from the log (review 2026-10-15)
+    function cliMaxThrottle(J, li, o) {
+        const core = J.armCore && J.armCore.get(li);
+        if (core && core.d4 && !core.d4.agree.length) return null;
+        const { stale, used } = cliCheck(J, coresOf(J, dsBench(J)));
+        if (!used) return null;
+        const out = {}; for (const [q, v] of Object.entries(o)) if (!stale.includes(+q)) out[q] = v;
+        return Object.keys(out).length ? out : null;
     }
     // the ctx with the PID profile labels (health_setup, the curves of the views)
     const pidCtx = (c) => c && c.pidLabels ? Object.assign({}, c, { profile: c.pidLabels }) : c;
@@ -1106,9 +1127,15 @@ var TuningWorker = (function () {
     // the label fields of a finding of a module that pooled by configuration: profile (a label) -> the PID profile label, with the
     // configuration (dataset); in other (T4), events, the evidence and its spans and context; the toolkit text names the
     // configuration where it names the label ("profile 3", "PID profile 3")
+    // A span or an event: its label, its PID profile label (pidProfile: 1-6, null when not known; evidence.cjs gives a span a label of
+    // 1-6 as its PID profile, review 2026-10-15) and its configuration
+    function pidLabelConv(J, o) {
+        if (!o || typeof o !== 'object' || !Number.isInteger(o.profile) || o.profile < 0) return;
+        const d = o.profile > 0 && J.dsMap ? J.dsMap.get(o.profile) || null : null; o.profile = pidLabelOf(J, o.profile); o.dataset = d ? d.id : null;
+        if ('pidProfile' in o) o.pidProfile = o.profile > 0 ? o.profile : null;
+    }
     function asPidLabels(J, f) {
-        const conv = (o) => { if (!o || typeof o !== 'object' || !Number.isInteger(o.profile) || o.profile < 0) return;
-            const d = o.profile > 0 && J.dsMap ? J.dsMap.get(o.profile) || null : null; o.profile = pidLabelOf(J, o.profile); o.dataset = d ? d.id : null; };
+        const conv = (o) => pidLabelConv(J, o);
         const L = f.datasetLabel;
         f.profile = L > 0 ? pidLabelOf(J, L) : L === 0 ? 0 : f.profile;
         if (f.other) conv(f.other);
@@ -1117,6 +1144,15 @@ var TuningWorker = (function () {
             for (const q of [].concat(e.spans || [], e.context || [])) conv(q); }
         // D8 describes actual PID profile transitions from ctx.pidLabels, not the pooled configuration labels.
         if (f.id !== 'D8' && typeof f.text === 'string' && J.dsMap) f.text = f.text.replace(/(?<!\b(?:CLI|rate) )\b(PID )?profile (\d+)\b/g, (m, pid, n) => { const d = J.dsMap.get(+n); return d ? configText(d) : m; });
+        // the result is one configuration, not all of its PID profile (check G21: "This PID profile has only 1 sudden change", review 2026-10-15)
+        if (L > 0 && J.dsMap && J.dsMap.get(L) && typeof f.text === 'string') f.text = f.text.replace(/\bThis PID profile\b/g, 'This configuration').replace(/\bthis PID profile\b/g, 'this configuration');
+    }
+    // A result of a module with the labels of the configurations but with no label of its own (G1 and G20: one result for each log):
+    // its events and the spans of its evidence have labels, as PID profile labels (review 2026-10-15: "PID profile 5" for the label of
+    // configuration E of PID profile 2). A label with no configuration is "PID profile unknown" (profile 0, pidProfile null)
+    function eventPidLabels(J, f) {
+        for (const e of Array.isArray(f.events) ? f.events : []) pidLabelConv(J, e);
+        if (f.evidence && typeof f.evidence === 'object') for (const q of [].concat(f.evidence.spans || [], f.evidence.context || [])) pidLabelConv(J, q);
     }
 
     // records, curves, header and fields of one decoded log; parser errors are kept apart (health.cjs puts them last). With
@@ -1497,6 +1533,7 @@ var TuningWorker = (function () {
             if (K.catalog && typeof K.catalog.areaOf === 'function') try { f.area = K.catalog.areaOf(f); } catch (e) { fail('find the subsystem', f, e); }
             if (K.evidence) try { f.evidence = K.evidence.forFinding(f, { record: recs[i], others: byLog, curves: curvesOf(recs[i]), findings }) || null; } catch (e) { fail('find the part of the log', f, e); }
             if (f.datasetLabel !== undefined) asPidLabels(J, f); // after the evidence: it reads the metrics by the label of the module
+            else if (J.dsMap && relabelOn(J) && DS_MODULES.has(f.module)) eventPidLabels(J, f);
             // the summary after the evidence: it reads the facts of the metrics (F5 notch axes and prominence, D5 kind, ...),
             // as evidence.summary does, so the two agree (review V5)
             if (K.catalog) try { f.summary = K.catalog.summary(f); } catch (e) { fail('make the summary', f, e); }
@@ -1510,7 +1547,7 @@ var TuningWorker = (function () {
     // The labels (advice.cjs "Profiles"): the log profile (1-based INFLIGHT_ADJUSTMENT value; 0 or 'arm' the profile at the
     // start of the log: the confirmed arming profile of its logs, the same in each of them, else unknown); the CLI index for
     // D4; 'start profile N' for H; an axis name for F4
-    const GOV_ALL_IDS = new Set(['D5', 'G13', 'G12']); // the health_gov checks of GOV_ALL: all phases (annotate); the others ground and flight
+    const GOV_ALL_IDS = new Set(['D5', 'G13', 'G12', 'G21']); // the health_gov checks of GOV_ALL: all phases (annotate); the others ground and flight
     function pidProfileOf(J, f) {
         const p = f.profile, logs = logsOf(f), ok = (v) => Number.isInteger(v) && v >= 1 && v <= 6 ? v : null;
         if (f.datasetLabel !== undefined) return f.datasetLabel > 0 ? ok(pidLabelOf(J, f.datasetLabel)) : null; // the PID profile of its configuration
@@ -1601,7 +1638,7 @@ var TuningWorker = (function () {
             if (out && J.dsOut) { out.byDataset = {};
                 for (const d of J.dsOut.datasets.filter(x => x.analysed)) {
                     const F = findings.filter(f => !f.dataset || f.dataset === d.id), R = advice.byDataset && advice.byDataset[d.id] || advice.recommendations.filter(r => r.dataset === d.id || (r.supportedBy || []).includes(d.id) || (!r.dataset && !(r.supportedBy || []).length));
-                    const st = JSON.parse(toJson(H.status(F, R, { logs, coverage: advice.coverage, profile: d.pidProfile > 0 ? d.pidProfile : 0 })));
+                    const st = JSON.parse(toJson(H.status(F, R, { logs, coverage: advice.coverage, profile: d.pidProfile > 0 ? d.pidProfile : 0, all: findings })));
                     out.byDataset[d.id] = { pidProfile: d.pidProfile, nodes: st.nodes, startHere: st.startHere, prereqProblems: st.prereqProblems }; } }
             return out; }
         catch (e) { J.notes.add(`The app cannot calculate the tuning sequence. The error is "${message(e)}".`); return null; }
@@ -1681,7 +1718,7 @@ var TuningWorker = (function () {
         F1: FILTERS, F2: FILTERS, F3: FILTERS, F5: FILTERS, F6: FILTERS, F7: FILTERS, F8: FILTERS, F9: FILTERS, F11: FILTERS, C15: FILTERS,
         F4: ['{ax}_d_cutoff'], F10: AX_GAINS.concat(['{ax}_d_cutoff'], FILTERS), C11: AX_GAINS.concat(['{ax}_d_cutoff'], FILTERS),
         D5: VBAT, G13: VBAT, P1: VBAT, P2: VBAT,
-        G0: ['gov_mode'], G1: ['gov_mode', 'motor_poles'], G12: ['motor_poles'], G14: ['gov_mode', 'gov_autorotation_timeout'], G15: ['gov_mode', 'gov_spoolup_time'],
+        G0: ['gov_mode'], G1: ['gov_mode', 'motor_poles'], G12: ['motor_poles'], G21: ['gov_mode', 'gov_max_throttle', 'motor_poles'], G14: ['gov_mode', 'gov_autorotation_timeout'], G15: ['gov_mode', 'gov_spoolup_time'],
         G16: ['gov_mode', 'gov_handover_throttle'], G17: ['gov_mode', 'gov_spoolup_time'], G18: ['gov_mode', 'gov_idle_throttle'],
         G2: GOV_READS, G3: GOV_READS, G4: GOV_READS, G5: GOV_READS, G6: GOV_READS, G7: GOV_READS, G8: GOV_READS, G9: GOV_READS, G10: GOV_READS.concat(YAW_GAINS), G11: GOV_READS,
         G19: GOV_READS.concat(['rescue_mode', 'rescue_climb_collective', 'rescue_hover_collective']), G20: GOV_READS.concat(['motor_poles']),
@@ -1698,6 +1735,16 @@ var TuningWorker = (function () {
         L1: ['@global', 'gov_max_throttle', 'gov_min_throttle'], L2: ['@global'], L4: ['@global'], L5: ['@global'], L7: ['collective_rc_rate', 'collective_srate', 'collective_expo'],
         C7: AX_GAINS, 'F:filters': FILTERS, 'F:filters:profile': ['{ax}_gyro_cutoff', '{ax}_d_cutoff'], // C7: report.cjs; F:filters: the filter search (filterStale)
     };
+    // the governor model (governorTune, govStale): 'G:gov' reads every governor parameter (the 42 CLI names of gov_tune.cjs REGISTRY: a
+    // simulation of the governor uses all of them), 'G:<name>' one parameter (a rule row reads only its own value)
+    const GOV_NAMES = ['gov_mode', 'gov_throttle_type', 'gov_startup_time', 'gov_spoolup_time', 'gov_tracking_time', 'gov_recovery_time', 'gov_spooldown_time',
+        'gov_throttle_hold_timeout', 'gov_autorotation_timeout', 'gov_idle_throttle', 'gov_auto_throttle', 'gov_handover_throttle', 'gov_bypass_throttle', 'gov_pwr_filter',
+        'gov_rpm_filter', 'gov_tta_filter', 'gov_ff_filter', 'gov_d_filter', 'gov_use_fallback_precomp', 'gov_use_voltage_comp', 'gov_use_pid_spoolup', 'gov_use_dyn_min_throttle',
+        'gov_headspeed', 'gov_min_throttle', 'gov_max_throttle', 'gov_gain', 'gov_p_gain', 'gov_i_gain', 'gov_d_gain', 'gov_f_gain', 'gov_p_limit', 'gov_i_limit', 'gov_d_limit',
+        'gov_f_limit', 'gov_tta_gain', 'gov_tta_limit', 'gov_yaw_ff_weight', 'gov_cyclic_ff_weight', 'gov_collective_ff_weight', 'gov_collective_curve', 'gov_fallback_drop',
+        'gov_dyn_min_throttle'];
+    READS['G:gov'] = GOV_NAMES; READS['G:global'] = ['@global']; // G:global: a related global value (battery_meter, a feature, a blackbox setting)
+    for (const n of GOV_NAMES) READS[`G:${n}`] = [n];
     const AXIS_NAMES = ['roll', 'pitch', 'yaw'];
     const baseName = (n) => String(n).replace(/\[\d+\]$/, '');
     // the scope of a parameter name (datasets.cjs scopeOf), null without datasets.cjs
@@ -1812,22 +1859,29 @@ var TuningWorker = (function () {
     // The source of the values of a span (CLAUDE.md: each flag gives the source of the values that the app uses for that part, or
     // "unknown"): the switched PID profile and rate profile, the values that an adjustment changed, then the other values (the header of
     // this log). room: the sentences, 1 or more
+    // A source is 'cli', 'log N' (0-based), 'recovered', 'calculated' (the values that the analysis calculated from the flights: governorTune),
+    // 'none', or { list: [sources], unknown } (governorTune: the values of a PID profile from more than one source, and some unknown values)
     function sourceSentences(c, s, src, adjusted, room) {
         const N = s.pidProfile, Rp = s.rateProfile;
-        const phrase = (v, what, p) => v === 'cli' ? `for ${what}, the app uses the values of ${c.cliOld(p) ? 'a CLI dump that does not agree with the log' : 'the CLI dump'}`
-            : /^log \d+$/.test(v) ? `for ${what}, the app uses the values of the log header of log ${+v.slice(4) + 1}`
+        const obj = (v, p) => v === 'cli' ? `the values of ${c.cliOld(p) ? 'a CLI dump that does not agree with the log' : 'the CLI dump'}` : /^log \d+$/.test(v) ? `the values of the log header of log ${+v.slice(4) + 1}`
+            : v === 'calculated' ? 'the values that it calculated from the flights' : null;
+        const phrase = (v, what, p) => v && typeof v === 'object' && Array.isArray(v.list) ? `for ${what}, the app uses ${and(v.list.map(k => obj(k, p)).filter(Boolean))}`
+            : v === 'cli' || /^log \d+$/.test(v) || v === 'calculated' ? `for ${what}, the app uses ${obj(v, p)}`
                 : v === 'recovered' ? `for ${what}, the app uses the gains that it calculated from the flights` : v === 'none' ? `the values of ${what} are unknown` : null;
-        const a = phrase(src.pid, N > 0 ? `PID profile ${N}` : 'the PID profile', N), b = phrase(src.rate, Rp > 0 ? `rate profile ${Rp}` : 'the rate profile', 0);
+        const pw = N > 0 ? `PID profile ${N}` : 'the PID profile', a = phrase(src.pid, pw, N), b = phrase(src.rate, Rp > 0 ? `rate profile ${Rp}` : 'the rate profile', 0);
         const parts = [a, b].filter(Boolean), cap = (t) => t.charAt(0).toUpperCase() + t.slice(1), out = [];
         if (parts.length) out.push(parts.length === 2 ? `${cap(parts[0])}, and ${parts[1]}.` : `${cap(parts[0])}.`);
+        if (src.pid && typeof src.pid === 'object' && src.pid.unknown) out.push(`Some values of ${pw} are unknown.`);
         if (adjusted) out.push('For the values that an in-flight adjustment changed, the app uses the values of the log.');
         out.push(out.length ? `For the other values, the app uses the log header of log ${c.li + 1}.` : `The app uses the values of the log header of log ${c.li + 1}.`);
         return out.slice(0, Math.max(1, room));
     }
     // the source sentences of a span for a result that reads R (readsOf): the PID profile or the rate profile that it does not read has
     // the values of the header for it, and the adjustment sentence only when an adjustment counts (eff: reasonsFor)
-    function sourceFor(meta, R, eff) {
-        const src = { pid: R && !R.none && !R.scopes.has('profile') ? 'header' : meta.src.pid, rate: R && !R.none && !R.scopes.has('rate') ? 'header' : meta.src.rate };
+    // pidSource (governorTune: govSources): the source of the values of a switched PID profile that the app does not find for the span
+    function sourceFor(meta, R, eff, pidSource) {
+        const own = pidSource && meta.pidSw && meta.src.pid === 'none' ? pidSource(meta.span, meta.c.li) : null;
+        const src = { pid: R && !R.none && !R.scopes.has('profile') ? 'header' : own || meta.src.pid, rate: R && !R.none && !R.scopes.has('rate') ? 'header' : meta.src.rate };
         return sourceSentences(meta.c, meta.span, src, eff.includes('adjusted'), 3).join(' ');
     }
 
@@ -1902,11 +1956,12 @@ var TuningWorker = (function () {
     // { reasons, text, source, spans: [{ log, t0, t1 }] (3 or less, the largest overlap first) } of the touched spans, or null. what:
     // 'result' (a finding), 'period' (a period of a limits check) or 'recommendation' (the filter search). R: what the check reads
     // (readsOf; null: every cause): a span counts with the reasons that can change a value that it reads
-    function staleFrom(J, hits, what, R) {
+    // own: the source sentences of a check that reads no value of the log header (OWN_SOURCE), in place of the sources of the spans
+    function staleFrom(J, hits, what, R, pidSource, own) {
         const items = mergeHits(hits).map(h => { const meta = J.spanMeta.get(h.span); return { h, meta, eff: meta ? reasonsFor(meta, R) : h.span.reasons.slice() }; }).filter(x => x.eff.length);
         if (!items.length) return null;
         const reasons = REASONS.filter(k => items.some(x => x.eff.includes(k))), byOv = items.sort((a, b) => b.h.ov - a.h.ov);
-        const source = sourceOf(byOv.map(x => x.meta ? sourceFor(x.meta, R, x.eff) : ''), 'Other parts have other sources.');
+        const source = own || sourceOf(byOv.map(x => x.meta ? sourceFor(x.meta, R, x.eff, pidSource) : ''), 'Other parts have other sources.');
         const text = [STALE_LEAD[what] || STALE_LEAD.result, causeText(reasons)].concat(source ? [source] : []).join(' ');
         return { reasons, text, source, spans: byOv.slice(0, 3).map(x => ({ log: x.h.log, t0: x.h.span.t0, t1: x.h.span.t1 })) };
     }
@@ -1926,8 +1981,17 @@ var TuningWorker = (function () {
             hits.push(...touched(E, li, cutTo(placesIn(J, f, li, single), cfg ? stretchesOf(J, f, li) : null), mine));
             hits.push(...touched(E, li, measuredIn(J, f, li), (s) => s.armed && mine(s)));
         }
-        return staleFrom(J, hits, 'result', R);
+        return staleFrom(J, hits, 'result', R, null, OWN_SOURCE[f.id] ? OWN_SOURCE[f.id](f) : null);
     }
+    // The source of the values of a check whose values the log header does not record (CLAUDE.md: each flag gives the source of the
+    // values that the app uses, or "unknown"). G21 (review 2026-10-15): gov_max_throttle of each ceiling (health_gov ceilingsOf: 'cli' the
+    // CLI dump, 'pile' and 'top' calculated from the log, 'assumed' unknown, 100 %), not the log header
+    const OWN_SOURCE = {
+        G21: (f) => { const k = new Set((Array.isArray(f.ceilings) ? f.ceilings : []).map(c => c && c.kind)), list = [];
+            if (k.has('cli')) list.push('the CLI dump'); if (k.has('pile') || k.has('top')) list.push('the value that it calculates from the log');
+            const unknown = k.has('assumed') ? `${list.length ? 'In some parts, the' : 'The'} value of gov_max_throttle is unknown, and the app uses 100 %.` : '';
+            return list.length || unknown ? [list.length ? `For gov_max_throttle, the app uses ${and(list)}.` : '', unknown].filter(Boolean).join(' ') : null; },
+    };
     // the stale of each period of a limits check (L1-L7: f.events, frame seconds tS, t1S)
     function staleEvents(J, f) {
         if (f.module !== 'limits' || !Array.isArray(f.events)) return;
@@ -2686,6 +2750,253 @@ var TuningWorker = (function () {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // governorTune (docs/GOVERNOR_AUTOTUNE.md section 8): the governor model and the governor autotune of gov_tune.cjs on the
+    // flight logs of a file, on demand
+    // ---------------------------------------------------------------------------------------------
+
+    // msg: { cmd: 'governorTune', id, bytes (the whole file), fileName, options: { cliText, cliName (optional: the log is the only
+    // necessary input), flightRpm (else auto, as analyseFile: the flight phases need it), logs: [log indices] (else every log), flights
+    // (SPEC3 D: the logs of the selected flights, each one whole, because the model starts at the arm), budgetMs, blockedBy (the ids of
+    // the steps that gate the Governor step: hierarchy nodes governor.blockedBy and gatedBy, or texts) } } -> { id, type:
+    // 'governorTuned', result }: gov_tune.cjs autotune(runs, { cli, progress(text, fraction), budgetMs, cancelled() }) as JSON
+    // ({ status: 'validated' | 'partial' | 'rejected' | 'unavailable', reasons, twin, rows, recommendations, limitations, plots }), with
+    // fileName, logs (the flight logs of the runs), benchRuns, skipped [{ log, reason }], flightRpm, selection, cliName, blockedBy (STE
+    // texts of the gates: each change, severity 'action', gets them in blockedBy and no CLI text, as advice.filterRecommendations),
+    // notes, timing.
+    // The runs (gov_data.cjs fromSegment): each segment of each flight log with all its phases (health_phase.cjs), class 'flight' (the
+    // class of the log: segmentClass keeps the class of the segment), the DISARM events in the time of the segment, the adjustment events
+    // of the whole log, the PID profile of each sample, and before the first logged change the PID profile at the start of the log when
+    // the log confirms it (armingFinal with the headspeeds of every log of the file, as the analysis; else 0, "PID profile unknown"). A
+    // run without the headspeed, the motor output or the governor fields is left out (its reasons in the notes). A log that the decoder
+    // cannot read for a missing field gives the field and the setting that records it. With no run left, the status is 'unavailable'
+    // with the reasons, and gov_tune.cjs does not run
+    const GOV_PROGRESS = { decode: [0.15, 0.4], headspeed: [0.4, 0.45], model: [0.45, 0.99] };
+    const GOV_DISARM = 15; // FlightLogEvent.DISARM: the arm state of the runs (gov_data.cjs arming)
+    const GOV_TEXT = {
+        noFlight: 'The selected logs have no flight. The governor analysis does not use bench runs.',
+        noRead: 'The app cannot read this log.',
+        noData: 'The log has no data that the app can read.',
+        noPhase: 'The app cannot find the flight phases of this log.',
+        noRun: 'The log does not record all the values that the governor model uses.',
+        partFields: 'The governor analysis does not use all parts of this log. The other parts do not record all the values that the governor model uses.',
+        partPhase: 'The app cannot find the flight phases of a part of this log. Thus, the governor analysis does not use that part.',
+        // a log that lib.segments cannot read: the missing fields (quoted) and the settings that record them
+        noFields: (fields, settings) => `The log does not record ${fields.length > 1 ? 'the fields' : 'the field'} ${and(fields.map(x => `"${x}"`))}. Thus, the app cannot read the log for the governor analysis. ` +
+            `To record ${fields.length > 1 ? 'them' : 'it'}, set ${and(settings.map(x => `"${x}"`))} to ON.`,
+        noHsRecord: 'To record the headspeed, set "blackbox_log_rpm" to ON.',
+        lead: 'This value is possibly not the same in all logs.', // the lead of a flag of gov_tune.cjs (row.stale) when the worker has none
+        bench: (n) => `The governor analysis does not use bench runs (${n === 1 ? '1 log' : `${n} logs`}).`,
+    };
+    const GOV_FIELDS = [['setpoint', 'blackbox_log_setpoint', 3], ['gyroADC', 'blackbox_log_gyro', 3], ['mixer', 'blackbox_log_mixer', 3], ['axisP', 'blackbox_log_pid', 3],
+        ['axisI', 'blackbox_log_pid', 3], ['axisD', 'blackbox_log_pid', 3], ['axisF', 'blackbox_log_pid', 3], ['headspeed', 'blackbox_log_rpm', 0]];
+    // The cause of a log with no segment that the decoder can read (lib.segments: 'log lacks setpoint, gyro, mixer, PID or headspeed
+    // fields'): the fields of the log header that are missing. gov_data TEXT.noHs and the setting for a missing headspeed, else the
+    // missing fields and their settings; null when the header has all of them or the parser cannot open the log
+    function govLacks(GD, bytes) {
+        let log = null;
+        try { log = new FlightLog(bytes); if (!log.getLogCount() || !log.openLog(0)) return null; } catch (e) { return null; }
+        const has = (name) => { try { return log.getMainFieldIndexByName(name) !== undefined; } catch (e) { return true; } };
+        const miss = GOV_FIELDS.filter(([b, , k]) => k ? [0, 1, 2].some(a => !has(`${b}[${a}]`)) : !has(b));
+        if (!miss.length) return null;
+        if (miss.length === 1 && miss[0][0] === 'headspeed') return `${GD.TEXT.noHs} ${GOV_TEXT.noHsRecord}`;
+        return GOV_TEXT.noFields(miss.map(q => q[0]), [...new Set(miss.map(q => q[1]))]);
+    }
+    // options.blockedBy as STE texts (the titles of the hierarchy graph, the words of advice.cjs gate), texts as they are
+    function govGates(J) {
+        const K = J.K, list = Array.isArray(J.o.blockedBy) ? J.o.blockedBy : [];
+        if (!list.length) return [];
+        const G = K.hierarchy && typeof K.hierarchy.graph === 'function' ? (() => { try { return K.hierarchy.graph(); } catch (e) { return null; } })() : null;
+        const byId = new Map(G ? [].concat((G.prereq || []).map(n => [n.id, Object.assign({ prereq: true }, n)]), (G.blocks || []).map(n => [n.id, Object.assign({ prereq: false }, n)])) : []);
+        return [...new Set(list.map(b => { const n = typeof b === 'string' ? byId.get(b) : null;
+            if (n) return n.prereq ? `The prerequisite "${n.title}" has a problem. Correct it before you tune this tuning block.` : `Step ${n.step}, "${n.title}", has a problem. This step comes first in the tuning sequence.`;
+            return typeof b === 'string' && /\s/.test(b) ? b : null; }).filter(Boolean))];
+    }
+    const govModule = (K, name) => { try { return K.require(`./${name}.cjs`); } catch (e) { throw new Error(`The app cannot load the toolkit file "${name}.cjs". The error is "${message(e)}".`); } };
+    async function governorTune(msg, post) {
+        const J = await begin(Object.assign({}, msg, { options: Object.assign({}, msg.options || {}, { datasets: false, curves: false }) }), post, 'file');
+        const idx = new FlightLogIndex(J.bytes), count = idx.getLogCount(), slice = (i) => J.bytes.subarray(idx.getLogBeginOffset(i), idx.getLogBeginOffset(i + 1));
+        const sel = flightsWanted(J, count), list = Array.isArray(J.o.logs) && J.o.logs.length ? J.o.logs.filter(l => Number.isInteger(l) && l >= 0 && l < count) : [...Array(count).keys()];
+        J.logs = sel ? [...sel.keys()].filter(l => list.includes(l)).sort((a, b) => a - b) : list; J.logCount = count; J.logIndex = J.logs[0] || 0;
+        if (sel && [...sel.values()].some(s => !s.has(ALL))) J.notes.add('The governor analysis uses all of each log with a selected flight, because the governor model starts when the pilot arms the helicopter.');
+        const rpm = userRpm(J); if (rpm) settle(J, rpm); else await firstPass(J, count, slice, 0.02, GOV_PROGRESS.decode[0], J.logs, true);
+        const K = J.K;
+        if (!K.phase) throw new Error('For the governor analysis, the flight phases of "health_phase.cjs" are necessary, and that file is not available.');
+        const GD = govModule(K, 'gov_data'), GT = govModule(K, 'gov_tune');
+        if (typeof GT.autotune !== 'function') throw new Error('The toolkit file "gov_tune.cjs" has no function "autotune".');
+        const extra = [...new Set(GD.EXTRA.concat(K.phase.EXTRA || [], ['time', 'govRequest']))]; // govRequest: the stale (epochCollect)
+        const need = [GD.TEXT.noHs, GD.TEXT.noMotor, GD.TEXT.noGov], runs = [], bench = [], skipped = [], blockers = new Set(), read = new Set(), noV = new Set(), [d0, d1] = GOV_PROGRESS.decode;
+        for (const [k, li] of J.logs.entries()) {
+            await checkpoint(J.id);
+            J.progress(`The app loads log ${li + 1} of ${count} for the governor analysis.`, 'decode', d0 + (d1 - d0) * k / Math.max(1, J.logs.length));
+            const d = timedDecode(J, K, slice(li), li, extra);
+            read.add(li);
+            if (d.error) { skipped.push({ log: li, reason: GOV_TEXT.noRead }); continue; }
+            hsCollect(J, d, li); // D12: the headspeed of each PID profile at the changes, bench runs and logs with no flight too
+            const live = d.segs.filter(w => !w.skipped && w.n > 0);
+            if (!live.length) { // the cause from the log header (CLAUDE.md: tell the pilot which values the log does not record)
+                const lacks = d.segs.some(w => w.skipped) ? govLacks(GD, slice(li)) : null;
+                if (lacks) blockers.add(lacks);
+                skipped.push({ log: li, reason: lacks || GOV_TEXT.noData }); continue; }
+            epochCollect(J, d, li); armWhole(J, d.segs, d.events, li); // the PID profile at the start of the log and the stale: the whole log
+            const airborneEvents = live.some(w => w.airborneAt.some(v => !v));
+            // a part whose phases stop is left out of the governor analysis (GOV_TEXT.partPhase), not analysed on its airborne time: the
+            // note of phasesOf keeps the error without its consequence for the checks
+            const notes = J.notes, PHASE_NOTE = / Thus, the app does not find the flight phases of the log, and the checks use all of the airborne time\.$/;
+            J.notes = { add: (t, l) => notes.add(typeof t === 'string' ? t.replace(PHASE_NOTE, '') : t, l), list: notes.list };
+            let preps;
+            try { preps = live.map((w, s) => prepare(K, w, { segment: s, cli: J.cliText, cliParsed: J.cliParsed, phases: true, airborneEvents }, J)); } finally { J.notes = notes; }
+            const cls = classOf(preps.map(p => p.ph));
+            if (cls === 'bench') { bench.push(li); continue; } // one note with the count after the loop (the result lists them: benchRuns)
+            if (cls !== 'flight') { skipped.push({ log: li, reason: GOV_TEXT.noPhase }); continue; }
+            // frame s from the log start, the clock of fromS. The adjustment events of the whole log (an adjustment before a part applies to
+            // it: gov_params), the DISARM events of the part only (gov_data arming puts an earlier one at sample 0 of a later part)
+            const disarms = d.epochEvents.filter(e => e.event === GOV_DISARM);
+            let lost = 0, noPhase = 0, kept = 0;
+            preps.forEach((p, s) => {
+                if (!p.ph) { noPhase++; return; } // phasesOf stopped: a note
+                const t = p.w.extra && p.w.extra.time, t0 = p.w.fromS, t1 = t && p.w.n ? p.w.fromS + (t[p.w.n - 1] - t[0]) / 1e6 : p.w.fromS + p.w.n / (p.w.flight.actualRate || p.w.rate), tol = 0.5 / (p.w.flight.actualRate || p.w.rate);
+                const events = d.events.concat(disarms.filter(e => e.t >= t0 - tol && e.t <= t1 + tol));
+                const run = GD.fromSegment(p.w, { phases: p.ph.P, segment: s, events, name: `log ${li + 1}, part ${s + 1}` }), miss = need.filter(x => run.reasons.includes(x));
+                // a run of a flight log is a flight run, all its phases included (GOVERNOR_AUTOTUNE.md section 2: one run per segment of a flight
+                // log); the class of the segment alone (a part with no flight of its own is 'bench') stays in segmentClass
+                run.segmentClass = run.class || (p.ph.flight ? 'flight' : 'bench'); run.class = 'flight';
+                for (const x of run.reasons) if (x === GD.TEXT.noVbat) noV.add(li); else J.notes.add(x, li); // noVbat: after the model (modelLogs)
+                if (miss.length) { lost++; miss.forEach(x => blockers.add(x)); return; }
+                runs.push(run); kept++;
+            });
+            if (!kept) skipped.push({ log: li, reason: lost ? GOV_TEXT.noRun : GOV_TEXT.noPhase });
+            else { if (lost) J.notes.add(GOV_TEXT.partFields, li); if (noPhase) J.notes.add(GOV_TEXT.partPhase, li); }
+        }
+        // the bench runs: one note with their count (a list of 36 logs is a sentence of more than 25 words; the dialog lists each one)
+        if (bench.length) J.notes.add(GOV_TEXT.bench(bench.length));
+        // D12: the PID profile at the start of a log comes from the headspeeds of every log of the file (hsMap), as in the analysis. A
+        // selection of logs reads the others too, with govRequest only, when a run needs it (no logged PID profile at its first frame)
+        const [h0, h1] = GOV_PROGRESS.headspeed, other = [...Array(count).keys()].filter(li => !J.hsLogs.has(li) && !read.has(li));
+        if (runs.some(q => { const c = J.armCore.get(q.log); return c && !c.done; }) && other.length) for (const [k, li] of other.entries()) {
+            await checkpoint(J.id);
+            J.progress(`The app reads the headspeed of log ${li + 1} of ${count}.`, 'decode', h0 + (h1 - h0) * k / other.length);
+            try { hsCollect(J, timedDecode(J, K, slice(li), li, ['govRequest']), li); } catch (e) { J.notes.add(`The app cannot read the headspeed of the log. The error is "${message(e)}".`, li); }
+        }
+        // the PID profile at the start of each log (D12: armingFinal with the headspeeds of every log read) in the samples before the first
+        // logged change, as gov_data.cjs fromColumns fills meta.armingProfile (profileFilled: the samples that it filled)
+        for (const run of runs) {
+            const a = armingFinal(J.armCore.get(run.log), hsFor(J, run.log)), p = a && a.confirmed && a.profile > 0 ? a.profile : 0;
+            run.armingProfile = p;
+            if (p) for (let i = 0; i < run.n && run.profile[i] === 0; i++) { run.profile[i] = p; run.profileFilled++; }
+        }
+        const used = [...new Set(runs.map(q => q.log))].sort((a, b) => a - b), ranges = new Map(); // frame seconds of each run, for govStale
+        for (const q of runs) (ranges.get(q.log) || ranges.set(q.log, []).get(q.log)).push([q.fromS + q.time[0], q.fromS + q.time[q.n - 1]]);
+        const tModel = Date.now(), [m0, m1] = GOV_PROGRESS.model;
+        let out;
+        // no run: the missing values, else no flight (bench runs only, or no log), else the causes of the logs left out
+        const why = blockers.size ? [...blockers] : bench.length || !skipped.length ? [GOV_TEXT.noFlight] : [...new Set(skipped.map(q => q.reason))];
+        if (!runs.length) out = { status: 'unavailable', reasons: why, twin: null, rows: [], recommendations: [], limitations: [], plots: [] };
+        else {
+            await checkpoint(J.id);
+            J.progress(`The app makes the governor model from ${used.length === 1 ? '1 flight log' : `${used.length} flight logs`}.`, 'governor', m0);
+            const opts = { cli: J.cliText || null, cancelled: () => cancelled.has(J.id),
+                progress: (text, f) => J.progress(typeof text === 'string' && text ? text : 'The app calculates the governor model.', 'governor', finite(f) ? m0 + (m1 - m0) * Math.min(1, Math.max(0, f)) : null) };
+            if (num0(J.o.budgetMs) > 0) opts.budgetMs = +J.o.budgetMs;
+            const res = await GT.autotune(runs, opts);
+            runs.length = 0; // the samples: not in the result
+            await checkpoint(J.id);
+            out = JSON.parse(toJson(res && typeof res === 'object' ? res : {}));
+        }
+        for (const k of ['reasons', 'rows', 'recommendations', 'limitations', 'plots']) if (!Array.isArray(out[k])) out[k] = [];
+        // the logs with no battery voltage: a log that the model leaves out (gov_tune modelRunsOf: the other logs record the voltage) gets
+        // noVbatLeft, not the constant voltage of the model
+        const left = Array.isArray(out.modelLogs) ? used.filter(li => !out.modelLogs.includes(li)) : [];
+        for (const li of [...noV].sort((a, b) => a - b)) J.notes.add(left.includes(li) && GD.TEXT.noVbatLeft ? GD.TEXT.noVbatLeft : GD.TEXT.noVbat, li);
+        govStale(J, out, used, ranges);
+        // the gates of the Governor step (options.blockedBy): a change waits for them, with no CLI text (advice.cjs: a blockedBy entry, no CLI)
+        const blockedBy = govGates(J);
+        if (blockedBy.length) for (const x of out.recommendations) if (x && typeof x === 'object' && x.severity === 'action') {
+            x.blockedBy = [...new Set((Array.isArray(x.blockedBy) ? x.blockedBy : []).concat(blockedBy))]; x.cli = []; }
+        return Object.assign(out, { fileName: J.fileName, logs: used, benchRuns: bench, skipped, flightRpm: J.rpm, cliName: J.cliText ? J.o.cliName || null : null, blockedBy,
+            selection: sel ? { logs: J.logs.slice(), whole: true } : null, // the logs of the selected flights, each one whole
+            notes: [...new Set([...(Array.isArray(out.notes) ? out.notes : []), ...J.notes.list()])],
+            // model: the timing of gov_tune.cjs autotune (identifyS, validateS, scenariosS, searchS, nomadBudgetS: NOMAD has a time budget)
+            timing: { decodeS: seconds(J.ms.decode), modelS: seconds(Date.now() - tModel), totalS: seconds(Date.now() - J.t0), model: out.timing && typeof out.timing === 'object' ? out.timing : null } });
+    }
+    // the evidence times of a row ({ log, t0, t1 }) or of a recommendation ({ log, times: [t0, t1] }) as Map(log -> [[t0, t1]]), null when none
+    function govTimes(ev) {
+        const m = new Map();
+        for (const e of Array.isArray(ev) ? ev : []) {
+            if (!e || !Number.isInteger(e.log)) continue;
+            const t = Array.isArray(e.times) ? e.times : [e.t0, e.t1], a = finite(t[0]) ? t[0] : null, b = finite(t[1]) ? t[1] : a;
+            if (a !== null) (m.get(e.log) || m.set(e.log, []).get(e.log)).push([a, Math.max(a, b)]);
+        }
+        return m.size ? m : null;
+    }
+    // x.stale of each recommendation and row of the governor model (CLAUDE.md "Values that are possibly not current"): the spans of each
+    // flight log of the runs (paramEpochs, with the PID profile at the start of the whole log) that its time touches while armed, in the
+    // stretches of its PID profile. Its time: the runs (ranges), or for a measured result with evidence times, those times. The reasons
+    // count that can change what it reads (readsOf): every governor value ('G:gov') for a result of the model (method 'model' or
+    // 'simulation', confidence 'predicted'), else its parameter ('G:<name>', 'G:global' for a related global value). The flag of
+    // gov_tune.cjs (x.stale: the gov_params.cjs flags of a value that changes between logs, a CLI dump that disagrees) joins it (govJoin)
+    function govStale(J, res, used, ranges) {
+        const PE = J.K.epochs; J.epochs = new Map(); J.spanMeta = new Map();
+        if (PE && typeof PE.paramEpochs === 'function') for (const li of used) if (J.epochIn.has(li)) { const a = armingFinal(J.armCore.get(li), hsFor(J, li)); epochsOfLog(J, PE, li, a && a.confirmed && a.profile > 0 ? a.profile : 0, new Set()); }
+        const on = J.epochs.size > 0;
+        const one = (x, what) => {
+            if (!x || typeof x !== 'object') return;
+            const name = x.parameter || x.name || null, model = x.confidence === 'predicted' || x.method === 'model' || x.method === 'simulation';
+            const key = model || !name ? 'G:gov' : READS[`G:${name}`] ? `G:${name}` : scopeOfName(J, name) === 'global' ? 'G:global' : 'G:gov';
+            const profile = x.scope === 'profile' && Number.isInteger(x.profile) && x.profile > 0 ? x.profile : null, at = model ? null : govTimes(x.evidence), hits = [];
+            // a result of the model reads the flight logs of the model only (gov_tune modelLogs: the logs with the battery voltage when some logs do not record it)
+            const logs = model && Array.isArray(res.modelLogs) ? used.filter(li => res.modelLogs.includes(li)) : used;
+            if (on) for (const li of logs) { const E = J.epochs.get(li), r = at ? at.get(li) : ranges.get(li); if (E && r) hits.push(...touched(E, li, r, (s) => s.armed && (profile === null || s.pidProfile === profile))); }
+            // the source of a switched PID profile: the values that this result uses (its name, else all the names of that PID profile)
+            const pidSource = (span, li) => src(key === `G:${name}` ? name : null, span.pidProfile, Number.isInteger(li) ? li : null);
+            x.stale = govJoin(on ? staleFrom(J, hits, what, readsOf(J, key, null), pidSource) : null, x.stale, on);
+        };
+        const src = govSources(res);
+        for (const x of res.recommendations) one(x, 'recommendation');
+        for (const x of res.rows) one(x, 'result');
+    }
+    // The source of the governor values of PID profile p in a part of log li that flies p and does not start with it (CLAUDE.md: each flag
+    // gives the source of the values that the app uses, or "unknown"; spanInfo has no source for it without the configurations of
+    // datasets.cjs). The rows of the result give it (row.current.from): 'cli' (also a value of the log that the CLI dump gives the same),
+    // 'header' (the log header of a log that starts with p: 'log N', the last such log before li, else the first), 'log' (the analysis of
+    // the log: 'calculated'), else unknown. name: one name (a rule row reads only its value), null: all the names of PID profile p (a result
+    // of the model). -> (name, p, li) -> a source of sourceSentences, null when the result has no row of p
+    function govSources(res) {
+        const by = new Map(), put = (k, kind, logs) => { const x = by.get(k) || by.set(k, { kinds: new Set(), logs: new Set() }).get(k); x.kinds.add(kind); for (const l of logs || []) x.logs.add(l); };
+        for (const r of Array.isArray(res.rows) ? res.rows : []) {
+            const c = r && r.current; if (!c || r.scope !== 'profile' || !(r.profile > 0)) continue;
+            const hdr = c.from === 'header' && Array.isArray(c.logs) && c.logs.some(Number.isInteger), kind = c.from === 'cli' || c.cli === 'same' ? 'cli' : hdr ? 'header' : c.from === 'log' ? 'calculated' : 'none';
+            for (const k of [`${r.name}|${r.profile}`, `*|${r.profile}`]) put(k, kind, kind === 'header' ? c.logs.filter(Number.isInteger) : null);
+        }
+        return (name, p, li) => {
+            const x = by.get(`${name || '*'}|${p}`); if (!x) return null;
+            const L = [...x.logs].sort((a, b) => a - b), before = L.filter(q => li === null || q <= li), hdr = `log ${before.length ? before[before.length - 1] : L[0]}`;
+            const known = ['cli', 'header', 'calculated'].filter(k => x.kinds.has(k)).map(k => k === 'header' ? hdr : k);
+            if (!known.length) return 'none';
+            return known.length === 1 && !x.kinds.has('none') ? known[0] : { list: known, unknown: x.kinds.has('none') };
+        };
+    }
+    // the stale of the worker (mine: staleFrom) and the flag of gov_tune.cjs (own: { reasons, flags: [{ reason, name, logs, text }], source,
+    // text }) as one. With the parts of the log (on), the worker gives a second arm, a logging pause and a PID profile other than at the start
+    // of the log (paramEpochs), so the flags of gov_tune.cjs for these causes are left out. The others (a value that changes between logs, an
+    // in-flight adjustment, a CLI dump that disagrees) add their sentences: for a name with a summary flag of gov_tune.cjs (logs []), the
+    // summary only, else each text once. Each part is a paragraph (a "\n" between them: STE Rule 6.6, 6 sentences or less in a paragraph; the
+    // dialog shows them as paragraphs, the CLI file as comment lines). { reasons, text, source, spans, flags, valueSource } or null
+    const GOV_EPOCH_CAUSES = ['rearm', 'resume', 'switched'];
+    function govJoin(mine, own, on) {
+        own = own && typeof own === 'object' && typeof own.text === 'string' && own.text ? own : null;
+        if (!own || !on) return mine || own;
+        const all = Array.isArray(own.flags) ? own.flags.filter(f => f && typeof f === 'object') : [], keep = all.filter(f => !GOV_EPOCH_CAUSES.includes(f.reason));
+        if (!keep.length && all.length) return mine;
+        // a flag of one log with no PID profile (an older result) matches the summary of its name in any PID profile
+        const summary = (f) => Array.isArray(f.logs) && !f.logs.length, sums = keep.filter(f => f.name && summary(f)), named = new Set(sums.map(f => `${f.name}|${f.profile || 0}`)), names = new Set(sums.map(f => f.name));
+        const short = keep.filter(f => summary(f) || !f.name || !named.has(`${f.name}|${f.profile || 0}`) && !named.has(`${f.name}|0`) && !(f.profile === undefined && names.has(f.name)));
+        const texts = keep.length < all.length || mine ? [...new Set(short.map(f => f.text).filter(t => typeof t === 'string' && t))] : [own.text];
+        const reasons = [...new Set((mine ? mine.reasons : []).concat(keep.length ? keep.map(f => f.reason) : own.reasons || []))].filter(Boolean);
+        const lead = mine ? mine.text : keep.length < all.length ? GOV_TEXT.lead : null;
+        return { reasons, text: [lead].concat(texts).filter(Boolean).join('\n'), source: mine ? mine.source : '', spans: mine ? mine.spans : [], flags: keep, valueSource: own.source || null };
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // derive: filters, spectra and window statistics of raw log data for the Tuning view and the log lens. No decode: the
     // main thread reads the frames (js/tuning_snippet.js) and sends the columns, raw logged values as the viewer's FlightLog
     // gives them (setpoint and gyro in deg/s, mixer and axis terms in permille, headspeed and govTarget in rpm).
@@ -3097,14 +3408,14 @@ var TuningWorker = (function () {
     function onmessage(ev) {
         const msg = ev.data || {}, id = msg.id, post = (m) => self.postMessage(m);
         if (msg.cmd === 'cancel') { cancelled.add(id); return; }
-        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune, filterReplay, controlTune, systemIdentify }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned', systemIdentify:'systemIdentified' }[msg.cmd] || 'result';
+        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune, filterReplay, controlTune, systemIdentify, governorTune }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned', systemIdentify:'systemIdentified', governorTune: 'governorTuned' }[msg.cmd] || 'result';
         queue = queue.then(() => job ? job(msg, post) : Promise.reject(new Error(`The command "${msg.cmd}" is unknown.`)))
             .then(result => post({ id, type, result }))
             .catch(e => post({ id, type: 'error', message: message(e), stack: String(e && e.stack || '') }))
             .then(() => { cancelled.delete(id); delete self.__bytes; });
     }
 
-    return { onmessage, sources, kit, controlInputs, bindParameterContinuity, deriveKit, rpmEvidence, autoRpm, rpmWhy, viewerText, timeMapOf, hsInfo, hsMap, RPM, TIMEMAP, WINDOW, HS, READS, fresh: { readsOf, reasonsFor, measuredIn, placesIn, cutTo }, CANCELED }; // all but onmessage for tests
+    return { onmessage, sources, kit, controlInputs, bindParameterContinuity, deriveKit, rpmEvidence, autoRpm, rpmWhy, viewerText, timeMapOf, hsInfo, hsMap, RPM, TIMEMAP, WINDOW, HS, READS, fresh: { readsOf, reasonsFor, measuredIn, placesIn, cutTo }, gov: { GOV_NAMES, GOV_TEXT, govJoin, govTimes }, CANCELED }; // all but onmessage for tests
 })();
 
 self.onmessage = TuningWorker.onmessage;

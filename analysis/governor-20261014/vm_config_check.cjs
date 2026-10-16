@@ -1,0 +1,11 @@
+const fs=require('fs'),R='/Users/albertwu/exp/rotorflight-blackbox/tools/autotune/';
+const S=require(R+'health_setup.cjs'),FW=require(R+'firmware_controller.cjs');
+const cli=S.parseCli(fs.readFileSync(process.argv[2],'utf8'));
+const values=Object.assign({},cli.global,cli.profiles[1]||{});
+const cfg=FW.fromHeader({firmwareVersion:'4.6.0',firmwareRevision:'Rotorflight 4.6.0 (118e912)'},values,{executeGovernor:true});
+const req=FW.requiredFields(cfg,{step:'governor'});
+const gov=req.required.filter(n=>/gov|battery|voltage|gear/.test(n));
+console.log('governor-required fields:',gov.length);
+console.log('missing among them:',gov.filter(n=>!(typeof cfg.values[n]==='number')));
+console.log('values: battery_meter=',values.battery_meter,'battery_cell_count=',values.battery_cell_count,'cfg.voltage_meter=',cfg.values.voltage_meter,'cfg.battery_cell_count=',cfg.values.battery_cell_count, 'gov_flags', cfg.values.gov_flags);
+const c=FW.compatibility(cfg,{step:'governor'});console.log(c.reasons);

@@ -13,6 +13,7 @@ const S = require('../tools/autotune/health_setup.cjs');
 const bbl = require('./helpers/bbl_encode.cjs');
 
 const app = lib.loadApp(), tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'config-'));
+process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
 const only = (F, p) => { const l = F.filter(f => f.id === 'D9' && f.profile === p); assert.equal(l.length, 1, `D9 p${p}: one finding, got ${l.length}`); return l[0]; };
 const FIELDS = ['id', 'severity', 'log', 'profile', 'value', 'se', 'n', 'threshold', 'source', 'unit', 'phase', 'thin', 'text'];
 

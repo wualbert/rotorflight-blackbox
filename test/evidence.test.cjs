@@ -389,3 +389,30 @@ for (const o of ENTRIES) test(`locate parity on ${path.basename(o.file)}${o.logs
         assert.ok(q.spans.G2 > 0 && q.spans.C11 + q.spans.C10 > 0, `log ${q.log}: spans ${JSON.stringify(q.spans)}`);
     }
 });
+
+// G21 (health_gov judge pools the flights): each sudden change of the headspeed signal and each FALLBACK is a span of its own log, at its
+// time; a FALLBACK after a sudden change ranks first (it holds the change that comes 1 ms before it)
+test('G21: a span for each sudden change and FALLBACK in its own log; a FALLBACK after a sudden change first', () => {
+    const mk = (log) => ({ log, segment: 0, fromS: 0, seconds: 300, n: 300000, actualRate: 1000, header: {}, metrics: {} }), r11 = mk(11), r13 = mk(13);
+    const f = { fid: 'gov|G21|11+13|0|2||0', id: 'G21', severity: 'flag', log: [11, 13], profile: 2, value: 3, n: 4, unit: 'count', text: '', atMaxS: 20, governedS: 1000, share: 0.02, p: 1e-5, basis: 'profile',
+        fallbacks: { n: 1, atMax: 1, afterSpike: 1 },
+        events: [{ log: 11, t: 54.621, kind: 'spike', atMax: true, rate: 293.1, value: 293100 }, { log: 11, t: 54.622, kind: 'FALLBACK', atMax: true, value: 100, spike: { t: 54.621, dtS: 0.001 } },
+            { log: 13, t: 105.81, kind: 'spike', atMax: false, rate: 60, value: 60000 }, { log: 13, t: 205.81, t1: 206.04, kind: 'spike', atMax: true, rate: 120, value: 120000, pulses: 2 }] };
+    const ev = E.forFinding(f, { record: r11, others: { 11: [r11], 13: [r13] }, findings: [f] });
+    assert.deepEqual(ev.spans.map(s => [s.log, s.label, s.t0, s.t1, s.pidProfile]), [[11, 'FALLBACK', 54.122, 55.122, 2],
+        [13, 'Sudden change of the headspeed signal', 205.61, 206.24, 2], [13, 'Sudden change of the headspeed signal', 105.61, 106.01, 2]], 'the change at the maximum before the change under it; a burst spans its start to its end (t1)');
+    assert.deepEqual([ev.view.log, ev.view.graphs, ev.plot.kind, ev.plot.curve], [11, [['headspeed', 'govTarget'], ['motor[0]'], ['govSum']], 'governor', 'more.gov']);
+    assert.equal(ev.expected, 'The headspeed signal changes smoothly, also with the throttle at its maximum.');
+    assert.match(ev.summary, /^The headspeed signal changes suddenly when the throttle is at its maximum\./);
+    // review 2026-10-15 (configuration B of the Fireball dump of 2026-10-05): every sudden change at the maximum is a span, also the
+    // fourth one (log 12 at 94.67 s, the slowest): 3 spans left it out. A change under the maximum after them
+    const B = Object.assign({}, f, { value: 4, n: 5, fallbacks: { n: 2, atMax: 2, afterSpike: 2 }, events: [
+        { log: 11, t: 54.621, kind: 'spike', atMax: true, rate: 293.1 }, { log: 11, t: 54.622, kind: 'FALLBACK', atMax: true, value: 100, spike: { t: 54.621, dtS: 0.001 } },
+        { log: 11, t: 94.668, kind: 'spike', atMax: true, rate: 50.7 }, { log: 11, t: 159.536, kind: 'spike', atMax: true, rate: 241.7 },
+        { log: 11, t: 159.549, kind: 'FALLBACK', atMax: true, value: 100, spike: { t: 159.536, dtS: 0.013 } }, { log: 13, t: 205.807, kind: 'spike', atMax: true, rate: 265.2 },
+        { log: 13, t: 105.81, kind: 'spike', atMax: false, rate: 60 }] });
+    const evB = E.forFinding(B, { record: r11, others: { 11: [r11], 13: [r13] }, findings: [B] });
+    assert.deepEqual(evB.spans.map(s => [s.log, s.label, +(s.t0 + 0.2).toFixed(3)]).filter(q => q[1] !== 'FALLBACK'), [[13, 'Sudden change of the headspeed signal', 205.807], [11, 'Sudden change of the headspeed signal', 94.668],
+        [13, 'Sudden change of the headspeed signal', 105.81]], JSON.stringify(evB.spans));
+    assert.deepEqual(evB.spans.filter(s => s.label === 'FALLBACK').map(s => s.t0 + 0.5).map(t => +t.toFixed(3)).sort((a, b) => a - b), [54.622, 159.549]);
+});

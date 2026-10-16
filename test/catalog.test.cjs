@@ -13,8 +13,9 @@ const NEW = ['D7', 'G15', 'G16', 'G17', 'G18', 'C15'];   // health_phase.cjs (SP
 const RESCUE = ['G19', 'T15', 'D8', 'G20'];                     // health_rescue.cjs
 const LIMITS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7']; // health_limits.cjs (CLAUDE.md "Control limits")
 const ROUND2 = ['D9', 'P1', 'P2'];                          // health_config.cjs and health_power.cjs (SPEC3 A, I)
+const RPM = ['G21'];                                        // health_gov.cjs: the RPM signal at the throttle maximum (analysis/rpm-spikes)
 const IDS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'H', 'SETUP', 'R1', 'C7'].concat(Array.from({ length: 11 }, (_, i) => `F${i + 1}`), Array.from({ length: 15 }, (_, i) => `G${i}`),
-    Array.from({ length: 14 }, (_, i) => `C${i + 1}`).filter(id => id !== 'C7'), Array.from({ length: 14 }, (_, i) => `T${i + 1}`), NEW, RESCUE, LIMITS, ROUND2);
+    Array.from({ length: 14 }, (_, i) => `C${i + 1}`).filter(id => id !== 'C7'), Array.from({ length: 14 }, (_, i) => `T${i + 1}`), NEW, RESCUE, LIMITS, ROUND2, RPM);
 const SOURCES = ['events', 'blocks', 'windows', 'runs', 'header', 'flight'];
 const KINDS = ['time', 'spectrum', 'transmission', 'phase', 'governor', 'events', 'scatter', 'table'];
 
@@ -478,4 +479,34 @@ test('issues: one for each check and axis, the size against the limit, the rank,
     const same = C.issues([F[0], Object.assign({}, F[0], { fid: 'k', log: 3, value: 0.6001 })]).issues[0];
     assert.deepEqual([same.range.text, same.count], ['60 %', 2]);
     for (const x of out.issues) for (const s of x.summary.split(/(?<=\.)\s+(?=[A-Z])/)) assert.ok(words(s).length <= 25, `${x.key}: ${s}`);
+});
+
+// review 2026-10-15: the G21 issue names its strongest result (the most sudden changes at the maximum, or the smallest p), never
+// the result with basis 'pooled' (1 of 1 sudden change, a problem only by the test of all PID profiles together). The summary of a
+// result of one configuration says the configuration; a result with no change at the maximum has no test value
+test('G21 issue (review 2026-10-15): the strongest result is the headline; a configuration and k = 0 in the summary', () => {
+    const base = { module: 'gov', id: 'G21', severity: 'flag', profile: 2, pidProfile: 2, unit: 'count', threshold: null, governedS: 900, fallbacks: { n: 2, atMax: 2, afterSpike: 2 } };
+    const B = Object.assign({}, base, { fid: 'B', dataset: 'B', basis: 'profile', value: 4, n: 4, atMaxS: 13.14, share: 0.01408, p: 3.93e-8, log: [5, 10, 11, 13] });
+    const E = Object.assign({}, base, { fid: 'E', dataset: 'E', basis: 'pooled', value: 1, n: 1, atMaxS: 3.77, share: 0.01271, p: 0.0127, log: [14, 15], pooled: { k: 5, N: 6, share: 0.01605, p: 6.31e-9, pass: true } });
+    assert.ok(C.sizeOf(B, 'problem') > C.sizeOf(E, 'problem'), `${C.sizeOf(B, 'problem')} > ${C.sizeOf(E, 'problem')}`);
+    assert.equal(C.sizeOf(E, 'problem'), 1, 'a pooled result is at its limit');
+    assert.ok(Math.abs(C.sizeOf(B, 'problem') - Math.log(3.93e-8) / Math.log(0.001)) < 1e-9, 'B: its own test value against 0.001');
+    // more changes at the maximum, or a smaller p with the same changes, is a larger result
+    assert.ok(C.sizeOf(Object.assign({}, B, { value: 9, p: 1e-5 }), 'problem') > C.sizeOf(Object.assign({}, B, { value: 3, p: 1e-5 }), 'problem'));
+    for (const order of [[B, E], [E, B]]) {
+        const out = C.issues(order).issues.find(x => x.id === 'G21');
+        assert.deepEqual([out.status, out.count, out.small], ['problem', 2, false]);
+        assert.match(out.summary, /The largest result is 4 of 4 sudden changes at the throttle maximum, in 1\.41 % of the time\./, out.summary);
+    }
+    // the summary of one configuration: "In configuration E (PID profile 2)", not all of PID profile 2
+    assert.match(C.summary(E), /In configuration E \(PID profile 2\), the headspeed signal has 1 of its 1 sudden change at the throttle maximum/);
+    assert.match(C.summary(Object.assign({}, B, { dataset: null })), /In PID profile 2, the headspeed signal has 4 of its 4 sudden changes/);
+    // the FALLBACK entries in the words of checks G20 and G21
+    assert.match(C.summary(B), /Of the 2 FALLBACK entries, 2 start during a sudden change or 30 ms or less after its end, and 2 start at the throttle maximum\./);
+    // no change at the maximum: a plain sentence, no test value
+    const A = Object.assign({}, base, { fid: 'A', dataset: null, pidProfile: 1, profile: 1, severity: 'note', basis: null, value: 0, n: 1, atMaxS: 4.02, share: 0.0695, p: 1, fallbacks: { n: 0, atMax: 0, afterSpike: 0 } });
+    const sa = C.summary(A);
+    assert.match(sa, /In PID profile 1, the headspeed signal has no sudden change at the throttle maximum, and 1 sudden change at less than the maximum\. The throttle is at its maximum for 6\.95 % of the time\./);
+    assert.doesNotMatch(sa, /`p` is `1`/);
+    for (const s of sentences(sa)) assert.ok(words(s).length <= 25, s);
 });

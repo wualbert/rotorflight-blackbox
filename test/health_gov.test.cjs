@@ -506,3 +506,192 @@ test('raw G3 and G5 text distinguishes a conditional gain test from unobserved r
     assert.equal(held.governorResponse.lowF,false);
     assert.match(held.text,/does not identify an F gain change/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// G21: the sudden changes of the headspeed signal against the time at the throttle maximum (analysis/rpm-spikes)
+// ---------------------------------------------------------------------------------------------
+
+// the clean simulation with the throttle at its maximum (motor[0] 100 %, the governor command 110 %: the pile of motor[0] gives the
+// maximum) in the windows atMax [[t0, t1]], and a sudden change of the headspeed signal (one sample, +400 rpm: 8.9 % of 4500 rpm
+// in 3 ms) at each time of spikes
+function g21Run({ atMax = [], spikes = [], fallbackAfter = null } = {}, extraCtx) {
+    const s = simulate({}), x = s.w.extra, at = (t) => Math.round(t * RATE);
+    for (const [a, b] of atMax) for (let i = at(a); i < at(b); i++) { x['motor[0]'][i] = 1000; x.govSum[i] = 1100; }
+    for (const t of spikes) s.w.hs[at(t)] += 400;
+    if (fallbackAfter !== null) for (let i = at(fallbackAfter + 0.01); i < at(fallbackAfter + 0.3); i++) s.ctx.govState[i] = FALLBACK;
+    const metrics = hg.analyse(s.w, Object.assign(s.ctx, extraCtx || {}));
+    const findings = hg.judge([{ log: 0, start: 'sim', header: s.w.flight.header, metrics: JSON.parse(JSON.stringify(metrics)) }], hg.DEFAULT_RULES);
+    return { metrics, findings, G21: findings.filter(f => f.id === 'G21') };
+}
+
+test('G21: sudden changes only at the throttle maximum are a problem; the detector, the bands, the pile and the test', () => {
+    const r = g21Run({ atMax: [[30, 32], [60, 62], [90, 92]], spikes: [30.5, 31.5, 60.7, 91.2], fallbackAfter: 91.2 }), m = r.metrics.G21, q = m.byProfile[1];
+    assert.equal(m.samples, 3); assert.equal(m.thresholdRpmMs, 40, `the rate limit is the floor: the fastest rotor acceleration is ${m.accelRpmMs} rpm/ms`);
+    assert.ok(m.accelRpmMs > 0 && m.accelRpmMs < 4, `rotor acceleration ${m.accelRpmMs} rpm/ms`);
+    assert.deepEqual([q.ceiling, q.ceilingKind], [1000, 'pile'], q.ceilingSource);
+    assert.deepEqual([m.spikesTotal, q.spikes, q.atMax, q.max.up, q.max.down], [4, 4, 4, 4, 0], 'one up change for each sample (the step down 3 ms later is the same change)');
+    assert.ok(Math.abs(q.atMaxS - 6) < 0.01, `time at the maximum ${q.atMaxS}`);
+    assert.ok(q.bands.every(b => b.up + b.down === 0) && q.bands.map(b => b.to).join() === '80,90,95,99.5', JSON.stringify(q.bands));
+    assert.ok(m.spikes.every(s => s.atMax && s.throttle === 100 && s.up && s.rate > 100), JSON.stringify(m.spikes));
+    // the change at 91.2 s: the increase and the decrease 3 ms later are one episode; the FALLBACK at 91.21 s is 10 ms after its start
+    assert.deepEqual(m.fallbacks.map(f => [f.atMax, f.spike && f.spike.dtS, f.spike && f.spike.t]), [[true, 0.01, 91.2]], 'the FALLBACK 10 ms after a sudden change at the maximum');
+    // review 2026-10-15: the start and the end of the episode against the entry (s before it; negative after it): it starts 10 ms and
+    // ends 7 ms before the FALLBACK (its last fast sample is the step down 3 ms after the start)
+    assert.deepEqual(m.fallbacks.map(f => [f.spike.startS, f.spike.endS]), [[0.01, 0.007]]);
+    assert.ok(m.spikes.every(s => s.pulses === 1 && Math.abs(s.t1 - s.t - 0.003) < 1e-9), JSON.stringify(m.spikes.map(s => [s.t, s.t1, s.pulses])));
+    const f = r.G21[0];
+    assert.deepEqual([r.G21.length, f.severity, f.basis, f.value, f.n, f.unit], [1, 'flag', 'profile', 4, 4, 'count']);
+    const share = f.atMaxS / f.governedS; assert.ok(Math.abs(f.share - share) < 1e-4);
+    assert.ok(Math.abs(f.p - share ** 4) / share ** 4 < 0.01, `binomial P(X >= 4 | 4, ${share}) = ${f.p}`);
+    assert.equal(f.rateBelow, 0); assert.ok(Math.abs(f.rateAtMax - 40) < 0.1, `4 in 6 s: 40 in each minute, ${f.rateAtMax}`);
+    assert.deepEqual(f.fallbacks, { n: 1, atMax: 1, afterSpike: 1 });
+    assert.ok(f.events.filter(e => e.kind === 'spike').length === 4 && f.events.some(e => e.kind === 'FALLBACK' && e.spike) && f.events.every(e => e.log === 0), 'each sudden change and FALLBACK is evidence with its log and time');
+    assert.ok(f.demand && f.demand.s.length > 10 && f.demand.from === 85, 'the histogram of the governor command for the cost of a lower maximum');
+    assert.match(f.text, /^At the throttle maximum \(100 %\), the headspeed signal has 4 sudden changes in 6 s\. With the throttle less than the maximum, it has 0 sudden changes in [\d.]+ s\./);
+    assert.match(f.text, /The test value is `P\(X >= 4\) = [\d.e-]+` for `X ~ Binomial\(4, 0\.05\d*\)`\./);
+    assert.match(f.text, /Thus, the errors of the RPM signal are related to the throttle maximum\./);
+    assert.match(f.text, /The logs have 1 FALLBACK entry\. Of these, 1 starts with the throttle at its maximum, and 1 starts during a sudden change or 30 ms or less after its end\./);
+    assert.match(f.text, /If the time between two changes is 300 ms or less, the analysis counts them as one sudden change\. In 99\.9 % of the 100 ms periods in ACTIVE, the rotor acceleration is \d+ rpm\/s or less\./);
+    // the pile: the samples at the maximum in ACTIVE (the FALLBACK of 0.29 s is not ACTIVE)
+    assert.match(f.text, /Throttle maximum source: "calculated from the log: motor\[0\] stays at 100 % in 5710 of 5710 samples while the governor command is more\."\.$/);
+    // the CLI gov_max_throttle that the log does not contradict is the maximum; a CLI value under the recorded throttle is not used
+    assert.deepEqual([g21Run({ atMax: [[30, 32]] }, { maxThrottle: { 1: 100 }, maxThrottleSource: 'CLI gov_max_throttle (diff)' }).metrics.G21.byProfile[1].ceilingKind], ['cli']);
+    assert.equal(g21Run({ atMax: [[30, 32]] }, { maxThrottle: { 1: 90 } }).metrics.G21.byProfile[1].ceilingKind, 'pile');
+});
+
+test('G21: sudden changes in every band are a value to monitor; no time at the maximum is "not measured"; no sudden change is satisfactory', () => {
+    const every = g21Run({ atMax: [[30, 32], [60, 62], [90, 92]], spikes: [30.5, 31.5, 60.7, 91.2, 10, 20, 40, 50, 70, 80, 100, 110] }).G21[0];
+    assert.deepEqual([every.severity, every.value, every.n], ['note', 4, 12]); assert.ok(every.p > 1e-3, `p ${every.p}`);
+    assert.match(every.text, /This test does not show that the sudden changes are related to the throttle maximum\./);
+    // no sudden change at the maximum (k = 0): a plain sentence, no test value (review 2026-10-15: "P(X >= 0) = 1" and "0 % of the
+    // sudden changes occur in 6.95 % of the time"), and the time at the maximum against minOkS
+    const below = g21Run({ atMax: [[30, 32]], spikes: [10] }).G21[0];
+    assert.deepEqual([below.severity, below.value, below.n], ['note', 0, 1]);
+    assert.doesNotMatch(below.text, /P\(X >= 0\)|0 % of the sudden changes/);
+    assert.match(below.text, /\nThe throttle is at its maximum for [\d.]+ % of the time, and no sudden change occurs at the maximum\. In each minute at less than the maximum, the signal has [\d.]+ sudden changes\.\n/);
+    assert.match(below.text, /\nThe sudden changes occur only at less than the throttle maximum\. Examine the RPM signal\. The time at the throttle maximum is less than 12 s\. Thus, the logs cannot show that the headspeed signal has no errors at the maximum\.\n/);
+    const none = g21Run({ spikes: [10, 20] }).G21[0];
+    assert.deepEqual([none.severity, none.atMaxS, none.n], ['note', 0, 2]); assert.match(none.text, /Thus, the logs cannot show that the sudden changes are related to the throttle maximum\./);
+    const notMeasured = g21Run({}).G21[0];
+    assert.deepEqual([notMeasured.severity, notMeasured.atMaxS, notMeasured.n], ['skipped', 0, 0]); assert.match(notMeasured.text, /Thus, the logs cannot show this check\.$/m);
+    // no sudden change: satisfactory with minOkS (12 s) or more at the maximum; with less, not measured (review 2026-10-15: 0.8 s at the
+    // maximum cannot show a signal with no errors there)
+    const ok = g21Run({ atMax: [[30, 43]] }).G21[0]; assert.equal(ok.severity, 'ok', ok.text);
+    const short = g21Run({ atMax: [[30, 30.8]] }).G21[0];
+    assert.deepEqual([short.severity, short.value, short.n, short.minAtMaxS], ['skipped', 0, 0, 12]);
+    assert.match(short.text, /The time at the throttle maximum is less than 12 s\. Thus, the logs cannot show that the headspeed signal has no errors at the maximum\./);
+    assert.equal(clean.of('G21')[0].severity, 'skipped', 'the clean baseline never gets to the throttle maximum');
+    // a PID profile with fewer than 3 sudden changes at its maximum: the test of all PID profiles together (basis pooled)
+    const sim = (spikes, p) => { const r = g21Run({ atMax: [[30, 32], [60, 62]], spikes }); r.metrics.G21.byProfile = { [p]: r.metrics.G21.byProfile[1] }; for (const s of r.metrics.G21.spikes) s.profile = p; return r.metrics; };
+    const pooled = hg.judge([{ log: 0, metrics: sim([30.5, 31.5], 1) }, { log: 1, metrics: sim([60.5, 61.5], 2) }]).filter(f => f.id === 'G21');
+    assert.deepEqual(pooled.map(f => [f.profile, f.severity, f.basis, f.value]), [[1, 'flag', 'pooled', 2], [2, 'flag', 'pooled', 2]]);
+    assert.match(pooled[0].text, /This PID profile has only 2 sudden changes at its maximum\. Thus, the test uses all PID profiles together: `P\(X >= 4\)/);
+    // a PID profile with 3 sudden changes at its maximum and 5 under it fails its own test (p): it has enough changes for its own test,
+    // thus it does not take the pooled test and stays a value to monitor, also when the pooled test passes
+    const mixed = hg.judge([{ log: 0, metrics: sim([30.5, 31.5, 60.5, 10, 20, 40, 50, 70], 1) }, { log: 1, metrics: sim([30.5, 31.5, 60.5, 61.5], 2) }]).filter(f => f.id === 'G21');
+    assert.deepEqual(mixed.map(f => [f.profile, f.severity, f.basis, f.value, f.n]), [[1, 'note', null, 3, 8], [2, 'flag', 'profile', 4, 4]]);
+    assert.ok(mixed[0].p >= 1e-3 && mixed[0].pooled.pass, `own p ${mixed[0].p}, pooled ${JSON.stringify(mixed[0].pooled)}`);
+    // no sample with the governor in RECOVERY, ACTIVE or FALLBACK: not measured, with the cause
+    const idle = simulate({}); idle.ctx.govState.fill(1);
+    const sk0 = hg.judge([{ log: 0, metrics: hg.analyse(idle.w, idle.ctx) }]).filter(f => f.id === 'G21');
+    assert.deepEqual(sk0.map(f => [f.severity, f.text]), [['skipped', 'The logs have no samples with the governor in RECOVERY, ACTIVE or FALLBACK and the motor on. Thus, the logs cannot show this check.']]);
+    // a log that does not record motor[0]
+    const s = simulate({}); s.w.extra['motor[0]'] = null;
+    const sk = hg.judge([{ log: 0, metrics: hg.analyse(s.w, s.ctx) }]).filter(f => f.id === 'G21');
+    assert.deepEqual(sk.map(f => [f.severity, f.text]), [['skipped', 'The log does not record motor[0].']]);
+});
+
+// the whole path on the synthetic flight: health_gov analyse and judge, then advice.cjs (the recommendation, its CLI text, the CLI file)
+test('G21 to advice: sudden changes only at the maximum give gov_max_throttle 97 with CLI text; sudden changes everywhere give no recommendation', () => {
+    const advice = require('../tools/autotune/advice.cjs');
+    const recsOf = (r) => { let k = 0; const F = r.findings.map(q => Object.assign({ module: 'gov', fid: `f${k++}` }, q));
+        return advice.advise({ findings: F, decisions: null, header: {}, cli: null, logs: [{ log: 0, flown: true }], fields: null, headerProfile: 0, headerLog: 0 }).recommendations; };
+    const at = recsOf(g21Run({ atMax: [[30, 32], [60, 62], [90, 92]], spikes: [30.5, 31.5, 60.7, 91.2] })), r = at.find(x => x.id === 'G21:gov_max_throttle:p1');
+    assert.deepEqual([r.node, r.severity, r.from, r.to, r.cli, r.blockedBy], ['rpm', 'action', 100, 97, ['profile 0', 'set gov_max_throttle = 97'], []]);
+    assert.deepEqual(at.filter(x => /^G21/.test(x.id)).map(x => [x.id, x.severity]), [['G21:gov_max_throttle:p1', 'action'], ['G21:signal', 'check']]);
+    const cmds = advice.exportScript(at, advice.defaultPicks(at), { date: '2026-10-15' }).split('\n').filter(l => l && !l.startsWith('#'));
+    assert.deepEqual(cmds, ['batch start', 'profile 0', 'set gov_max_throttle = 97', 'save']);
+    const every = recsOf(g21Run({ atMax: [[30, 32], [60, 62], [90, 92]], spikes: [30.5, 31.5, 60.7, 91.2, 10, 20, 40, 50, 70, 80, 100, 110] }));
+    assert.deepEqual(every.filter(x => /^G21/.test(x.id)), [], 'a value to monitor: no recommendation');
+});
+
+// review 2026-10-15: one sudden change is one episode of the signal, the throttle of a change is the throttle before it starts, and a
+// PID profile takes the pooled test only when its own rates agree with the association
+test('G21 review: a glitch burst is one change; the throttle before the start; the pooled basis needs the rate rule of the PID profile', () => {
+    // one burst at 100 % throttle: 7 pulses 60 ms apart (log 17 of 2026-09-26, the synthetic burst of the review). The binomial test
+    // counts independent trials: one burst is one change, with its 7 pulses, and one change cannot pass the test
+    const burst = Array.from({ length: 7 }, (_, j) => 30.5 + 0.06 * j);
+    const b = g21Run({ atMax: [[30, 33]], spikes: burst }), mb = b.metrics.G21;
+    assert.deepEqual(mb.spikes.map(x => [x.t, x.pulses, x.atMax, x.up]), [[30.5, 7, true, true]]);
+    assert.ok(Math.abs(mb.spikes[0].t1 - 30.863) < 1e-6, `the burst ends at its last fast sample: ${mb.spikes[0].t1}`);
+    assert.deepEqual([b.G21[0].value, b.G21[0].n, b.G21[0].severity], [1, 1, 'note']);
+    assert.match(b.G21[0].text, /If the time between two changes is 300 ms or less, the analysis counts them as one sudden change\./);
+    // two bursts 1 s apart are two changes; three bursts in 3 windows at the maximum pass the test
+    assert.equal(g21Run({ atMax: [[30, 33]], spikes: [30.5, 30.56, 31.5, 31.56] }).metrics.G21.spikesTotal, 2);
+    const three = g21Run({ atMax: [[30, 32], [60, 62], [90, 92]], spikes: [30.5, 30.56, 30.62, 60.5, 60.56, 90.5] }).G21[0];
+    assert.deepEqual([three.value, three.n, three.severity], [3, 3, 'flag']);
+    // a slow start under the minStep (129 rpm in 3 ms, 43 rpm/ms) at 100 % throttle, the governor cuts the throttle to 97.9 %, and the
+    // fast return: one increase at the maximum (log 12 of 2026-09-26: the earlier detector gave a decrease at 97.9 %)
+    const s = simulate({}), x = s.w.extra, at = (t) => Math.round(t * RATE), i0 = at(40.5);
+    for (let i = at(40); i < at(42); i++) { x['motor[0]'][i] = 1000; x.govSum[i] = 1100; }
+    for (let j = 0; j < 10; j++) s.w.hs[i0 + j] += 43 * j;
+    for (let j = 10; j < 15; j++) s.w.hs[i0 + j] += 387;
+    for (let i = i0 + 8; i < i0 + 100; i++) x['motor[0]'][i] = 979;
+    const m = hg.analyse(s.w, s.ctx).G21;
+    assert.deepEqual(m.spikes.map(q => [q.up, q.throttle, q.atMax, q.t]), [[true, 100, true, 40.503]], JSON.stringify(m.spikes));
+    // the pooled basis: PID profile 1 has 6 changes at its maximum; PID profile 2 has 1 at its maximum and 9 under it (the rate under the
+    // maximum is 18 % of the rate at the maximum, more than 10 %): a value to monitor, not a problem, and no recommendation
+    const sim = (spikes, p) => { const r = g21Run({ atMax: [[30, 32], [60, 62]], spikes }); r.metrics.G21.byProfile = { [p]: r.metrics.G21.byProfile[1] }; for (const q of r.metrics.G21.spikes) q.profile = p; return r.metrics; };
+    const pool = hg.judge([{ log: 0, metrics: sim([30.5, 31.5, 60.5, 61.5], 1) }, { log: 1, metrics: sim([30.5, 10, 15, 20, 40, 50, 70, 80, 100, 110], 2) }]);
+    const g = pool.filter(q => q.id === 'G21');
+    assert.deepEqual(g.map(q => [q.profile, q.severity, q.basis, q.value, q.n]), [[1, 'flag', 'profile', 4, 4], [2, 'note', null, 1, 10]]);
+    assert.ok(g[1].pooled.pass && g[1].rateBelow * 10 > g[1].rateAtMax, JSON.stringify([g[1].rateBelow, g[1].rateAtMax]));
+    const advice = require('../tools/autotune/advice.cjs'); let k = 0;
+    const out = advice.advise({ findings: pool.map(q => Object.assign({ module: 'gov', fid: `f${k++}` }, q)), decisions: null, header: {}, cli: null, logs: [{ log: 0, flown: true }, { log: 1, flown: true }], fields: null, headerProfile: 0, headerLog: 0 });
+    assert.deepEqual(out.recommendations.filter(r => /^G21:gov_max_throttle/.test(r.id)).map(r => r.id), ['G21:gov_max_throttle:p1']);
+});
+
+test('G21: binomTail and g21Test against closed forms', () => {
+    assert.ok(Math.abs(hg.binomTail(19, 21, 0.0121) - 7e-35) / 7e-35 < 0.2, `${hg.binomTail(19, 21, 0.0121)}: the Fireball dumps (analysis/rpm-spikes)`);
+    assert.equal(hg.binomTail(0, 5, 0.3), 1); assert.equal(hg.binomTail(6, 5, 0.3), 0);
+    assert.ok(Math.abs(hg.binomTail(1, 2, 0.5) - 0.75) < 1e-12 && Math.abs(hg.binomTail(2, 3, 0.5) - 0.5) < 1e-12);
+    const t = hg.g21Test(6, 7, 23.4, 1496); assert.equal(t.pass, true); assert.ok(t.p < 1e-9);
+    assert.equal(hg.g21Test(2, 2, 10, 1000).pass, false, 'fewer than 3 sudden changes');
+    const fast = hg.g21Test(10, 30, 50, 1000); assert.ok(fast.p < 1e-3 && !fast.pass, `the rate at less than the maximum is more than 10 % of the rate at the maximum: ${JSON.stringify(fast)}`);
+});
+
+// The Fireball dump of 2026-10-05 (AUTOTUNE_RESCUE_LOG) and the Gaui X4 II dump of 2026-10-04 (AUTOTUNE_REAL_LOG): check G21 over the
+// flight logs as health.cjs gives them (analysis/rpm-spikes: on the Fireball 6 of 7 sudden changes at 100 % throttle; the Gaui never gets
+// to more than 95 %)
+const HC = require('../tools/autotune/health.cjs'), fs = require('node:fs');
+// the flight rpm: health.cjs RULE.flight (3000 rpm), 2000 rpm for the Gaui X4 II (2300 to 2700 rpm)
+function realG21(file, rpm = HC.RULE.flight.headspeed) {
+    const app = lib.loadApp(), flights = [], EXTRA = [...new Set(hg.EXTRA.concat(['govTarget']))], rule = Object.assign({}, HC.RULE.flight, { headspeed: rpm });
+    for (const w of lib.segments(app, file, { whole: true, extra: EXTRA })) {
+        if (w.skipped) continue;
+        const fl = w.flight, { p: profile } = lib.profilesOf(w, w.extra.govTarget || w.hs, rpm), { flying, flown } = HC.flightMask(w, fl.actualRate, rule);
+        if (flown) flights.push({ log: fl.log, metrics: JSON.parse(JSON.stringify(hg.analyse(w, HC.buildCtx(w, fl, { flying, profile, cli: null, cliParsed: null, app })))) });
+    }
+    return hg.judge(flights).filter(f => f.id === 'G21');
+}
+const RESCUE_LOG = process.env.AUTOTUNE_RESCUE_LOG, REAL_LOG = process.env.AUTOTUNE_REAL_LOG;
+test('real: G21 on the Fireball dump 2026-10-05 is a problem of PID profile 2', { skip: !RESCUE_LOG || !fs.existsSync(RESCUE_LOG) ? 'set AUTOTUNE_RESCUE_LOG to the Fireball dump of 2026-10-05' : false }, () => {
+    const F = realG21(RESCUE_LOG), p2 = F.find(f => f.profile === 2);
+    // one sudden change is one episode (review 2026-10-15): the burst of log 14 at 205.81 s to 205.97 s (pulses at .807 and .965) counts once
+    assert.deepEqual([p2.severity, p2.basis, p2.value, p2.n], ['flag', 'profile', 5, 5]); assert.ok(p2.p < 1e-9, `p ${p2.p}`);
+    assert.deepEqual([p2.pooled.k, p2.pooled.N], [5, 6]); assert.ok(p2.pooled.p < 1e-8 && p2.pooled.pass, JSON.stringify(p2.pooled));
+    assert.deepEqual(p2.fallbacks, { n: 3, atMax: 3, afterSpike: 3 }, 'the 3 FALLBACK entries of logs 12 and 15 come at 100 % throttle, 1 ms to 22 ms after a sudden change');
+    const sp = p2.events.filter(e => e.kind === 'spike');
+    assert.deepEqual(sp.map(e => `${e.log}@${e.t.toFixed(2)}`), ['11@54.62', '11@94.67', '11@159.54', '13@205.81', '14@193.66']);
+    assert.ok(sp.every(e => e.up && e.atMax && e.throttle === 100), JSON.stringify(sp)); assert.deepEqual(sp.map(e => e.pulses), [1, 1, 1, 2, 1]);
+    assert.ok(sp[3].t1 > 205.96 && sp[3].t1 - sp[3].t < 0.3, `the burst (pulses at 205.81 s and 205.97 s) ends at ${sp[3].t1} s`);
+    // PID profiles 1 and 3: no sudden change in less than 12 s at the maximum: not measured, not satisfactory
+    assert.ok(F.filter(f => f.profile === 1 || f.profile === 3).every(f => f.severity === 'skipped' && f.atMaxS > 0 && f.atMaxS < 12), F.map(f => `${f.profile} ${f.severity} ${f.atMaxS}`).join());
+    assert.ok(p2.ceilings.every(c => c.value === 100 && c.kind === 'pile'), JSON.stringify(p2.ceilings));
+    assert.ok(F.filter(f => f.profile !== 2).every(f => f.severity !== 'flag'), F.map(f => `${f.profile} ${f.severity}`).join());
+});
+test('real: G21 on the Gaui X4 II dump 2026-10-04 is not a problem', { skip: !REAL_LOG || !fs.existsSync(REAL_LOG) ? 'set AUTOTUNE_REAL_LOG to the Gaui X4 II dump RTFL_BLACKBOX_LOG_20261004_113720.BBL' : false }, () => {
+    const F = realG21(REAL_LOG, 2000);
+    assert.ok(F.length > 0 && F.every(f => f.severity !== 'flag'), F.map(f => `${f.profile} ${f.severity} ${f.value}/${f.n}`).join());
+    assert.ok(F.every(f => !(f.atMaxS > 0)), 'the Gaui never gets to its throttle maximum: the logs cannot show check G21');
+});

@@ -218,8 +218,13 @@ var TuningDialog = (function () {
         dshot_bidir: "Bidirectional DShot", main_rotor_dir: "Main rotor direction",
         swash_geo_correction: "Swash geometry correction", rates_type: "Rate type",
         gov_use_voltage_comp: "Governor voltage compensation", gov_use_pid_spoolup: "Governor PID during spool-up",
-        gov_use_fallback_precomp: "Governor fallback precompensation", gov_auto_throttle: "Autorotation throttle",
-        gov_pwr_filter: "Governor power filter", gov_ff_filter: "Governor feedforward filter",
+        gov_use_fallback_precomp: "Governor FALLBACK precompensation", gov_auto_throttle: "Autorotation throttle",
+        gov_pwr_filter: "Governor power filter", gov_ff_filter: "Governor feedforward filter", gov_bypass_throttle: "Governor throttle curve for BYPASS",
+        // the governor names and the related settings of the governor model (gov_tune.cjs REGISTRY, RELATED) whose words are not STE
+        gov_fallback_drop: "Governor FALLBACK throttle decrease", gov_recovery_time: "Governor RECOVERY time", gov_tracking_time: "Governor headspeed change time",
+        gov_use_dyn_min_throttle: "Governor minimum throttle that changes (ON or OFF)", gov_dyn_min_throttle: "Governor minimum throttle that changes",
+        battery_meter: "Battery voltage source", freq_input_pull: "RPM sensor input pull", freq_input_edge: "RPM sensor input edge",
+        blackbox_log_esc: "ESC data in the log", blackbox_log_battery: "Battery data in the log",
         "feature RPM_FILTER": "RPM notch filters", "feature DYN_NOTCH": "Dynamic notch filter",
         "feature FREQ_SENSOR": "RPM sensor", "mixer input SR": "Roll output range", "mixer input SP": "Pitch output range",
         "mixer input SC": "Collective output range", "mixer input SY": "Tail output range"
@@ -556,6 +561,8 @@ var TuningDialog = (function () {
         if (isBlocked(rec)) return 'This recommendation has no CLI text. First, correct the steps in the "Blocked" list. Then start the analysis again.';
         if (heldByCause(rec)) return "This recommendation has no CLI text. Correct the cause first. Then start the analysis again.";
         if (profileNo(rec) === 0) return "The PID profile of this recommendation is unknown. Thus, it has no CLI text.";
+        var authorized = controlCliAuthorization.get(rec); // a change of the governor model: its own reason (gmDraftRecs)
+        if (automaticControlChange(rec) && authorized && typeof authorized.why === "function") return authorized.why();
         if (automaticControlChange(rec)) return "A new digital twin result that agrees with all model checks is necessary for control gain commands.";
         return "This recommendation has no CLI text.";
     }
@@ -1296,16 +1303,23 @@ var TuningDialog = (function () {
         });
         if (periods.length > FRESH_SHOWN) ps.push('<span class="tuning-muted">+' + (periods.length - FRESH_SHOWN) + "</span>");
         return '<details class="tuning-stale"><summary>' + staleBadge(s || { text: FRESH.period }) + "</summary>" +
-            '<div class="tuning-stale-text">' + esc(text) + "</div>" +
+            '<div class="tuning-stale-text">' + (s ? staleTextHtml(s.text) : esc(text)) + "</div>" +
             (links ? '<div class="tuning-stale-links">' + (spans.length > 1 || many ? esc("Show in the log: ") : "") + links + "</div>" : "") +
             (ps.length ? '<div class="tuning-stale-links">' + esc(periods.length + " of " + plural(periodCount(f), "period") + (periods.length === 1 ? " is" : " are") + " in these parts: ") + ps.join(", ") + "</div>" : "") +
             "</details>";
     }
 
+    // The text of a flag: one paragraph as it is; more paragraphs (a line break between them: the flags of the governor model, js/tuning_worker.js
+    // govJoin) each in a <p>
+    function staleTextHtml(t) {
+        var ps = String(t === null || t === undefined ? "" : t).split(/\n+/).map(oneLine).filter(Boolean);
+        return ps.length > 1 ? ps.map(function (q) { return "<p>" + esc(q) + "</p>"; }).join("") : esc(ps[0] || FRESH.period);
+    }
+
     // The caveat of a recommendation with r.stale (the union over its results): the mark and its text, "" without r.stale
     function staleRecHtml(rec) {
         var s = staleOf(rec);
-        return s ? '<div class="tuning-rec-list is-stale"><div class="tuning-label">' + esc(FRESH.badge) + '</div><div class="tuning-stale-text">' + esc(oneLine(s.text) || FRESH.period) + "</div></div>" : "";
+        return s ? '<div class="tuning-rec-list is-stale"><div class="tuning-label">' + esc(FRESH.badge) + '</div><div class="tuning-stale-text">' + staleTextHtml(s.text) + "</div></div>" : "";
     }
 
     // result.epochs, the logs with their parts (spans with a time), or null
@@ -1810,6 +1824,16 @@ var TuningDialog = (function () {
     }
 
     // A blockedBy item: a step of the tuning sequence (a link to it in the diagram), else advice's own text
+    // the gates of the governor notice, each as a sentence after the notice: a gate text of the worker is a sentence, and a step of
+    // the diagram gets "The step ... has a problem."
+    function gateList(by, graph) {
+        return by.map(function (b) {
+            var n = graph && typeof b === "string" && graph.byId[b];
+            if (n) return "The step " + blockedItem(b, graph) + " has a problem.";
+            var t = oneLine(b);   // a text of the worker or the toolkit: quoted (CLAUDE.md, STE)
+            return quoted(esc(/[.!?]$/.test(t) ? t : t + "."));
+        }).join(" ");
+    }
     function blockedItem(b, graph) {
         var n = graph && typeof b === "string" && graph.byId[b];
         return n ? '<a href="#" class="tuning-node-link" data-node="' + esc(n.id) + '">' + esc(n.title) + "</a>" : esc(oneLine(b));
@@ -1872,6 +1896,13 @@ var TuningDialog = (function () {
             ftParas(rec.text) + '</details>' : ftParas(rec.text);
     }
 
+    // A sentence of the governor model for a recommendation of the analysis (env.modelNote: the cost of the change of check G21 in the
+    // model, gov_scenarios.cjs GC6 g21Cost), when the model has a result for this analysis; else nothing
+    function modelNoteHtml(rec, entry, env) {
+        var t = env && typeof env.modelNote === "function" ? env.modelNote(rec, entry) : "";
+        return typeof t === "string" && t ? '<p class="tuning-rec-model">' + mdCode(t) + "</p>" : "";
+    }
+
     function recCard(rec, i, entry, env) {
         var sev = REC_SEVERITY[rec.severity] || REC_SEVERITY.info, area = REC_AREA_LABEL[rec.area] || cap(rec.area), graph = graphOf(entry.result);
         var held = isBlocked(rec) ? "blocked" : causesOf(rec).length ? "possible" : sev.status;
@@ -1879,7 +1910,7 @@ var TuningDialog = (function () {
             '<div class="tuning-rec-head"><div class="tuning-rec-badges">' + recBadges(rec) + '</div><div class="tuning-rec-title">' + esc(recommendationTitle(rec)) + "</div>" +
                 '<div class="tuning-muted">' + esc([area, profileText(rec), typeof rec.dataset === "string" && rec.dataset ? configLabel(rec.dataset) : "", confidenceText(rec.confidence),
                     groupOf(rec) ? "Group " + groupLabel(groupOf(rec)) : ""].filter(Boolean).join(" · ")) + "</div></div>" +
-            recommendationBody(rec) +
+            recommendationBody(rec) + modelNoteHtml(rec, entry, env) +
             (rec.parameter ? '<div class="tuning-rec-param">' + parameterHtml(rec.parameter) + " " + esc(paramText(rec)) + "</div>" : "") +
             staleRecHtml(rec) + // r.stale: the caveat with its text (CLAUDE.md "Values that are possibly not current")
             recConfigHtml(rec, entry.result) +
@@ -2682,7 +2713,12 @@ var TuningDialog = (function () {
     // A recommendation goes in the CLI file only with CLI text: a change with CLI text is selected first; a check, an item to
     // monitor and an item for information have none
     function pickDefault(rec) {
-        return rec.severity === "action" && hasCli(rec);
+        // optIn: a choice of the pilot (the governor bypass curve, a headspeed). A headspeed change is never ticked first (user, 2026-10-15)
+        return rec.severity === "action" && !rec.optIn && hasCli(rec) && !setsHeadspeed(rec);
+    }
+    function setsHeadspeed(rec) {
+        var cli = rec && rec.optIn && rec.optIn.cli ? rec.optIn.cli : rec && rec.cli;
+        return !!cli && cli.some(function (l) { return /^set gov_headspeed = /.test(String(l)); });
     }
 
     // The group of a recommendation (advice.cjs group, "C7:<axis>:<bin>": the gains that report.cjs changes together), or null
@@ -2784,9 +2820,11 @@ var TuningDialog = (function () {
 
     function stepPicksHtml(entry, key, env) {
         var recs = env.exportRecs ? env.exportRecs(entry) : recsOf(entry.result), picks = env.picks(entry);
-        var mine = recs.map(function(r,i){return {rec:r,index:i};}).filter(function(x){return (x.rec.node || (x.rec.filterSearch ? 'filters' : x.rec.area)) === key;});
+        var all = recs.map(function(r,i){return {rec:r,index:i};}).filter(function(x){return (x.rec.node || (x.rec.filterSearch ? 'filters' : x.rec.area)) === key;});
+        var mine = all.filter(function(x){return !x.rec.govDraft;}); // the changes of the governor model: in the "Governor model" panel only (govRecsHtml)
         return '<section class="tuning-step-picks"><h5 class="tuning-h">Changes for export</h5><p>Select the changes for the CLI file.</p>' +
-            (mine.length ? mine.map(function(x){var can=canPick(recs,x.index);return '<label class="tuning-step-pick"><input type="checkbox" class="tuning-pick" data-pick="' + x.index + '"' + (can && picks[x.index] ? ' checked' : '') + (can ? '' : ' disabled') + '> ' + esc(recommendationTitle(x.rec)) + '</label>' + (can ? '' : '<p class="tuning-muted">' + esc(noCliText(x.rec)) + '</p>');}).join('') : '<p class="tuning-muted">No parameter change is available from this step.</p>') +
+            (mine.length < all.length ? '<p class="tuning-muted">' + esc(GM.inPanel) + '</p>' : '') +
+            (mine.length ? mine.map(function(x){var can=canPick(recs,x.index);return '<label class="tuning-step-pick"><input type="checkbox" class="tuning-pick" data-pick="' + x.index + '"' + (can && picks[x.index] ? ' checked' : '') + (can ? '' : ' disabled') + '> ' + esc(recommendationTitle(x.rec)) + '</label>' + (can ? '' : '<p class="tuning-muted">' + esc(noCliText(x.rec)) + '</p>');}).join('') : all.length ? '' : '<p class="tuning-muted">No parameter change is available from this step.</p>') +
             '<a href="#" class="tuning-tab-link" data-tab="export">Examine all selected changes</a></section>';
     }
 
@@ -4250,6 +4288,359 @@ var TuningDialog = (function () {
         }).map(function(p){return Object.assign({},p,{results:p.results.filter(function(q){return check.test(q.check);})});});
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // The governor model (docs/GOVERNOR_AUTOTUNE.md section 8). The worker command governorTune (js/tuning_worker.js) runs
+    // gov_tune.cjs autotune() on the flight logs of the analysis and gives { status: validated | partial | rejected | unavailable,
+    // reasons, twin: { params, uncertainty, validation, plots }, rows, recommendations (advice.exportScript format, node
+    // 'governor'), limitations, plots }. A plot is a generic spec: { id, title, kind: 'time' | 'xy', x: { label, unit }, y, y2,
+    // series: [{ name, x, y, axis: 'y2', style: 'line' | 'points' | 'dash', role: 'measured' | 'model' | 'baseline' | 'candidate' |
+    // 'limit' | 'other' }], bands: [{ x0, x1, label }], note, log (0-based) }. The times are frame seconds from the log start (the
+    // clock of the viewer: gov_data.cjs fromS + the logged time, no index-time map), and a time plot with a log (its own, else the
+    // only log of the run) shows that time in the log viewer on a click (env.seekFrame), as each evidence time does.
+    // govModelHtml draws the view model of TuningDialog gmModel(): { state: none | running | done | failed | canceled, result,
+    // stale, fraction, text, error, unavailable, disabled, picks: [{ rec, index (in exportRecsOf), checked, can }] }. The texts of
+    // the worker and the toolkit are quoted; the texts of this file are STE
+
+    var GM = {
+        title: "Governor model",
+        about: "The app makes a model of the motor, the ESC, the rotor load and the battery from the flight logs. " +
+            "Then the app uses the model and the governor code of the firmware to test the governor parameters.",
+        start: "Start the governor analysis",
+        running: "The app makes and tests the governor model.",
+        canceled: "You canceled the governor analysis.",
+        failed: "The governor analysis stopped because of an error.",
+        stale: "This result is for different flights or a different CLI dump. To use the selected inputs, start the governor analysis again.",
+        staleRecs: "To select changes of the governor model for the CLI file, start the governor analysis again.",
+        noFile: "The log file is not open in the log viewer.",
+        otherFile: "The analysis on display is for a different file. Start the analysis again.",
+        noFlight: "The logs have no flight. The governor analysis does not use bench runs.",
+        flightTest: "The model calculates the effect of a change. A new flight must test each change.",
+        table: "Parameter table",
+        rows: "The table shows each governor parameter for each PID profile. It shows the value at this time, the source of the value and the result of the analysis.",
+        noRows: "The result has no parameter rows.",
+        changes: "Changes for the CLI file",
+        picks: "Select the changes for the CLI file. The app selects each change with CLI text first. It does not select a check. You can select a check that has CLI text.",
+        noChange: "The governor analysis has no change with CLI text.",
+        optIn: "The app does not select this change. If you use the governor condition BYPASS, select this change.",
+        optInLead: "The app does not select this change. The cause is as follows:",
+        checks: "Checks and information",
+        exportLink: "Examine all selected changes",
+        plots: "Model and recorded data",
+        plotsAbout: "The plots compare the model with the recorded data. Click a time plot to show that time in the log viewer.",
+        params: "Model parameters",
+        reasons: "Causes",
+        limits: "Model limits",
+        unused: "Logs that the governor analysis does not use",
+        trial: "Changes of the governor model",
+        blocked: "A step before the governor in the tuning sequence has a problem. Thus, the changes have no CLI text until you correct it.",
+        noCliModel: "The governor model does not agree with the test flights. Thus, this change from the model has no CLI text.",
+        noCliOld: "This result of the governor model is for different flights or a different CLI dump. Thus, this change has no CLI text. To get CLI text, start the governor analysis again.",
+        inPanel: "The changes of the governor model are in the \"Governor model\" part of this tab.",
+        notByConfig: "The changes of the governor model do not use this selection. To remove one of them from the CLI file, clear its box in the Governor tab."
+    };
+    // The cause that the app does not select an opt-in change, by parameter, when the texts of the toolkit do not give it (govOptInHtml)
+    var GM_OPT_IN = {
+        gov_headspeed: "The logs do not show the throttle at its maximum for sufficient time in this PID profile. Thus, only the reserve rule gives this change.",
+        gov_spoolup_time: "The test flights do not have sufficient spool-ups for a test of this change.",
+        gov_max_throttle: "This change is for a test flight only. The test finds if the RPM signal errors occur only at 100 % throttle. The change also decreases the power.",
+        gains: "The log does not record the battery current. Thus, the margin test of a larger gain is possibly not correct.",
+        other: "The analysis does not have sufficient data to select this change."
+    };
+    GM_OPT_IN.gov_use_pid_spoolup = GM_OPT_IN.gov_spoolup_time;
+    ["gov_gain", "gov_p_gain", "gov_i_gain", "gov_d_gain", "gov_f_gain"].forEach(function (k) { GM_OPT_IN[k] = GM_OPT_IN.gains; });
+    // a sentence of the toolkit that says why the app does not select a change (gov_scenarios, gov_search)
+    var GM_OPT_IN_CAUSE = /does not select this change|is a check and not a change/;
+    // [label, badge status, description]
+    var GM_STATUS = {
+        validated: ["Model checks satisfactory", "satisfactory", "The model agrees with the test flights. The app uses the model to calculate the changes."],
+        partial: ["Some model checks not satisfactory", "monitor", "The model agrees with some checks only. Examine the causes before you use a change from the model."],
+        rejected: ["Model checks not satisfactory", "problem", "The model does not agree with the test flights. Thus, the CLI file gets no change from the model. The rule results stay available."],
+        unavailable: ["Model not available", "nodata", "The app cannot make a governor model from these logs. The rule results stay available."]
+    };
+    // the groups of the parameter table (gov_tune.cjs FAMILIES, and "related" for the settings that are not governor parameters)
+    var GM_FAMILIES = [["gains", "Gains and precompensation"], ["limits", "Limits and filters"], ["power", "Headspeed and power"], ["state", "Spool-up and governor conditions"],
+        ["fallback", "FALLBACK and RPM signal"], ["battery", "Battery and voltage"], ["tta", "Tail torque assist"], ["related", "Related parameters"]];
+    var GM_ROW_STATUS = { change: ["Change", "problem"], check: ["Check", "monitor"], "pending-model": ["No model result", "notaccurate"], keep: ["Keep", "satisfactory"],
+        "not-recorded": ["Not recorded", "information"], "not-applicable": ["Not applicable", "notapplicable"] };
+    var GM_METHOD = { model: "Model", simulation: "Model test", rule: "Rule", firmware: "Firmware", data: "Measured" };
+    var GM_LOOK = [["headspeed", "govTarget"], ["motor[0]"], ["setpoint[3]"]];
+
+    function govStrings(list) {
+        return (Array.isArray(list) ? list : []).filter(function (t) { return typeof t === "string" && oneLine(t); });
+    }
+
+    // A value as the CLI writes it: a list with commas, a flag ON or OFF, else the value; "" when there is none
+    function govValue(v) {
+        if (v === null || v === undefined || v === "") return "";
+        if (Array.isArray(v)) return v.map(govValue).join(",");
+        if (typeof v === "boolean") return v ? "ON" : "OFF";
+        return typeof v === "number" ? num(v) : String(v);
+    }
+
+    // The numbers of an evidence item: the value with its SE, its interval and its count. A fraction of the toolkit (unit "fraction")
+    // shows in % (the word "fraction" is not STE)
+    function govNumbers(e) {
+        if (e && e.unit === "fraction") e = Object.assign({}, e, { unit: "%" }, ["value", "se", "lo", "hi"].reduce(function (o, k) { if (isNum(e[k])) o[k] = +(e[k] * 100).toPrecision(12); return o; }, {}));
+        var unit = e.unit ? " " + e.unit : "", s = isNum(e.value) ? (isNum(e.se) && e.se > 0 ? valueSe(e.value, e.se, e.unit || null) : num(e.value) + unit) :
+            govValue(e.value) === "" ? "" : govValue(e.value) + unit;
+        if (isNum(e.lo) && isNum(e.hi)) s += (s ? " " : "") + "(" + num(e.lo) + " to " + num(e.hi) + unit + ")";
+        else if (isNum(e.lo)) s += (s ? ", " : "") + num(e.lo) + unit + " or more";
+        else if (isNum(e.hi)) s += (s ? ", " : "") + num(e.hi) + unit + " or less";
+        if (isNum(e.n) && e.n > 0) s += (s ? ", " : "") + plural(e.n, "value");
+        return s;
+    }
+
+    // The evidence of a row or of a recommendation: its text (quoted), its numbers and a link to its time in the log viewer
+    function govEvidenceHtml(list) {
+        var items = (Array.isArray(list) ? list : []).filter(function (e) { return e && typeof e === "object"; }).map(function (e) {
+            var t0 = isNum(e.t0) ? e.t0 : Array.isArray(e.times) && isNum(e.times[0]) ? e.times[0] : null, log = Array.isArray(e.log) ? e.log[0] : e.log, nums = govNumbers(e);
+            var link = t0 !== null && isNum(log) ? ' <a href="#" class="tuning-gm-seek" data-log="' + esc(log) + '" data-t="' + esc(t0) + '" title="Show this time in the log viewer">' +
+                esc("Log " + logLabel(log) + ", " + secs(t0)) + "</a>" : "";
+            return (e.text ? quoted(esc(oneLine(e.text))) : "") + (nums ? (e.text ? " " : "") + "<strong>" + esc(nums) + "</strong>" : "") + link;
+        }).filter(Boolean);
+        return items.length ? '<ul class="tuning-gm-evidence">' + items.map(function (x) { return "<li>" + x + "</li>"; }).join("") + "</ul>" : "";
+    }
+
+    // The rule of a row: its number and its text (result.rules of gov_tune, quoted), else its key in code font
+    function govRuleHtml(key, rules) {
+        if (!key) return "";
+        var R = rules && typeof rules === "object" ? rules[key] : null;
+        return R && typeof R === "object" && (R.id || R.text) ? (R.id ? "<strong>" + esc(R.id) + "</strong>" : "") + (R.text ? '<small class="tuning-muted" data-ste="quoted">' + esc(oneLine(R.text)) + "</small>" : "") :
+            "<code>" + esc(key) + "</code>";
+    }
+
+    // The value at this time of a row and its source (gov_tune current: value, else candidates, lo or hi; source)
+    function govCurrentHtml(cur) {
+        cur = cur && typeof cur === "object" ? cur : {};
+        var v = govValue(cur.value), text = v !== "" ? "<code>" + esc(v) + "</code>" :
+            Array.isArray(cur.candidates) && cur.candidates.length ? cur.candidates.map(function (c) { return "<code>" + esc(govValue(c)) + "</code>"; }).join(" or ") :
+            isNum(cur.lo) ? "<code>" + esc(num(cur.lo)) + "</code> or more" : isNum(cur.hi) ? "<code>" + esc(num(cur.hi)) + "</code> or less" : "Unknown";
+        return text + (typeof cur.source === "string" && oneLine(cur.source) ? '<small class="tuning-muted" data-ste="quoted">' + esc(oneLine(cur.source)) + "</small>" : "");
+    }
+
+    // The group of a row: "related" for a setting that is not a governor parameter, else its family
+    function govFamily(row) {
+        return row.scope === "related" || row.family === "related" ? "related" : String(row.family || "other");
+    }
+
+    // The rows in groups, in the sequence of GM_FAMILIES; a family that this file does not know comes last
+    function govRowGroups(rows) {
+        var out = [], by = {}, order = GM_FAMILIES.map(function (f) { return f[0]; });
+        (Array.isArray(rows) ? rows : []).forEach(function (r) {
+            if (!r || typeof r !== "object" || !r.name) return;
+            var k = govFamily(r);
+            if (!by[k]) out.push(by[k] = { key: k, rows: [] });
+            by[k].rows.push(r);
+        });
+        return out.sort(function (a, b) { var i = order.indexOf(a.key), j = order.indexOf(b.key); return (i < 0 ? order.length : i) - (j < 0 ? order.length : j); });
+    }
+
+    function govRowHtml(r, rules) {
+        var st = GM_ROW_STATUS[r.status], scope = r.scope === "profile" ? profileLabel(isNum(r.profile) ? r.profile : 0) : "All PID profiles";
+        var texts = [r.text, r.reason !== r.text ? r.reason : null, r.record].filter(function (t) { return typeof t === "string" && oneLine(t); });
+        return '<tr class="tuning-gm-row" data-status="' + esc(r.status) + '"><td><code>' + esc(r.name) + "</code></td><td>" + esc(scope) + "</td><td>" + govCurrentHtml(r.current) + staleHtml(r) +
+            "</td><td>" + (st ? badge(st[0], st[1]) : quoted(esc(r.status))) + "</td><td>" + (r.status !== "keep" && govValue(r.to) !== "" ? "<code>" + esc(govValue(r.to)) + "</code>" : "") + // a change, or the curve of a check
+            "</td><td>" + texts.map(function (t) { return '<p data-ste="quoted">' + esc(oneLine(t)) + "</p>"; }).join("") + govEvidenceHtml(r.evidence) +
+            "</td><td>" + govRuleHtml(r.rule, rules) + (GM_METHOD[r.method] ? '<small class="tuning-muted">' + esc(GM_METHOD[r.method]) + "</small>" : "") + "</td></tr>";
+    }
+
+    // The parameter table: one table for each group, with the count of each result
+    function govRowsHtml(rows, res) {
+        var groups = govRowGroups(rows), rules = res && res.rules, fam = res && res.families && typeof res.families === "object" ? res.families : {};
+        if (!groups.length) return '<p class="tuning-na">' + esc(GM.noRows) + "</p>";
+        return groups.map(function (g) {
+            var own = GM_FAMILIES.filter(function (f) { return f[0] === g.key; })[0], counts = {};
+            g.rows.forEach(function (r) { counts[r.status] = (counts[r.status] || 0) + 1; });
+            var label = own ? esc(own[1]) : typeof fam[g.key] === "string" ? quoted(esc(fam[g.key])) : "Other parameters";
+            return '<section class="tuning-gm-family" data-family="' + esc(g.key) + '"><h6 class="tuning-h">' + label + "</h6>" +
+                '<p class="tuning-gm-counts">' + Object.keys(GM_ROW_STATUS).filter(function (s) { return counts[s]; }).map(function (s) { return badge(GM_ROW_STATUS[s][0] + " " + counts[s], GM_ROW_STATUS[s][1]); }).join(" ") + "</p>" +
+                '<div class="tuning-table-wrap"><table class="tuning-table tuning-gm-table"><thead><tr><th>Parameter</th><th>PID profile</th><th>Value at this time</th><th>Condition</th>' +
+                "<th>Recommended value</th><th>Data</th><th>Rule</th></tr></thead><tbody>" + g.rows.map(function (r) { return govRowHtml(r, rules); }).join("") + "</tbody></table></div></section>";
+        }).join("");
+    }
+
+    // The plot specs of a result: an array, or an object of specs
+    function govPlotList(x) {
+        var list = Array.isArray(x) ? x : x && typeof x === "object" ? Object.keys(x).map(function (k) { return x[k]; }) : [];
+        return list.filter(function (p) { return p && typeof p === "object" && Array.isArray(p.series); });
+    }
+
+    var GM_ROLE = { measured: [C.orange, C.yaw, C.roll], model: [C.blue, C.purple, C.pitch], baseline: [C.grey], candidate: [C.green, C.pitch], limit: [C.limit], other: SERIES_COLORS };
+
+    // A generic plot spec as a TuningPlot item ({ spec }, or { title, na } when no series has data). log: the log of a time plot
+    // without its own
+    function govPlotSpec(p, env, log) {
+        var kind = p.kind === "xy" ? "xy" : "time", used = {};
+        function axis(a, label) {
+            var o = { label: a && typeof a.label === "string" ? a.label : label };
+            if (a && typeof a.unit === "string") o.unit = a.unit;
+            if (a && a.log === true) o.log = true;
+            if (a && isNum(a.min)) o.min = a.min;
+            if (a && isNum(a.max)) o.max = a.max;
+            return o;
+        }
+        function nums(v) { return v && typeof v.length === "number" ? Array.prototype.map.call(v, function (q) { return typeof q === "number" ? q : q === null || q === undefined ? NaN : Number(q); }) : []; }
+        var series = p.series.filter(function (s) { return s && typeof s === "object"; }).map(function (s) {
+            var role = GM_ROLE[s.role] ? s.role : "other", colors = GM_ROLE[role], k = used[role] = (used[role] || 0) + 1, x = nums(s.x), y = nums(s.y), n = Math.min(x.length, y.length);
+            var extra = { width: s.style === "points" ? 0 : role === "limit" || role === "baseline" ? 1 : 1.5 };
+            if (s.style === "points") extra.points = true;
+            if (s.style === "dash" || (role === "limit" && s.style !== "line")) extra.dash = [4, 3];
+            if (s.axis === "y2") extra.axis = "y2";
+            return line(String(s.name || ""), x.slice(0, n), y.slice(0, n), colors[(k - 1) % colors.length], extra);
+        });
+        var spec = { title: String(p.title || ""), x: axis(p.x, kind === "time" ? "time" : ""), y: axis(p.y, ""), series: series };
+        if (kind === "time" && !spec.x.unit) spec.x.unit = "s";
+        if (p.y2 && typeof p.y2 === "object") spec.y2 = axis(p.y2, "");
+        // a band of a governor state (b.state: a name of GOV_STATES) has the color of that state, as in the recorded governor plots; its
+        // label shows only on a band of 3 % or more of the time axis
+        var lo = Infinity, hi = -Infinity;
+        series.forEach(function (s) { for (var i = 0; i < s.x.length; i++) if (isNum(s.x[i])) { lo = Math.min(lo, s.x[i]); hi = Math.max(hi, s.x[i]); } });
+        var span = hi > lo ? hi - lo : 0;
+        var bands = (Array.isArray(p.bands) ? p.bands : []).filter(function (b) { return b && isNum(b.x0) && isNum(b.x1); }).slice(0, 400).map(function (b) {
+            var k = typeof b.state === "string" ? GOV_STATES.indexOf(b.state) : -1, x0 = Math.min(b.x0, b.x1), x1 = Math.max(b.x0, b.x1);
+            return { x0: x0, x1: x1, color: k >= 0 && STATE_BAND[k] ? STATE_BAND[k] : C.band, label: typeof b.label === "string" && !(span > 0 && x1 - x0 < 0.03 * span) ? b.label : "" };
+        });
+        if (bands.length) spec.bands = bands;
+        var li = isNum(p.log) ? p.log : isNum(log) ? log : null;
+        if (kind === "time" && li !== null && env && typeof env.seekFrame === "function") spec.onClick = function (x) { env.seekFrame(li, x, { graphs: GM_LOOK, title: spec.title }); };
+        return item(spec, "the result has no data for this plot");
+    }
+
+    // The identified parameters of the model with their uncertainty (an interval [lo, hi], { lo, hi }, { p5, p95 } or { se })
+    function govTwinParams(twin) {
+        var p = twin && twin.params && typeof twin.params === "object" ? twin.params : null, u = twin && twin.uncertainty && typeof twin.uncertainty === "object" ? twin.uncertainty : {};
+        return p ? Object.keys(p).filter(function (k) { return isNum(p[k]); }).map(function (k) {
+            var q = u[k], lo = Array.isArray(q) ? q[0] : q && typeof q === "object" ? (isNum(q.lo) ? q.lo : q.p5) : null, hi = Array.isArray(q) ? q[1] : q && typeof q === "object" ? (isNum(q.hi) ? q.hi : q.p95) : null;
+            return { name: k, value: p[k], range: isNum(lo) && isNum(hi) ? num(lo) + " to " + num(hi) : q && isNum(q.se) ? "± " + num(q.se) : "" };
+        }) : [];
+    }
+
+    // The sentences of a text (a period, then a space and an upper-case letter, a quotation mark or a parenthesis)
+    function govSentences(t) {
+        return typeof t === "string" && oneLine(t) ? oneLine(t).split(/(?<=\.)\s+(?=[A-Z"(])/) : [];
+    }
+
+    // The cause in the texts of the toolkit: the sentence that says that the app does not select the change, with the sentence before it
+    // when it starts with "Thus" (the condition). The text and the caveats of the recommendation first, then of the other changes of its
+    // group (the spool-up time has the cause in the rows of "gov_use_pid_spoolup"); "" when no text gives it
+    function govOptInCause(rec, recs) {
+        var list = [rec].concat((Array.isArray(recs) ? recs : []).filter(function (q) { return q && q !== rec && rec.group && q.group === rec.group; }));
+        for (var i = 0; i < list.length; i++) {
+            var texts = [list[i].text].concat(govStrings(list[i].caveats));
+            for (var k = 0; k < texts.length; k++) {
+                var s = govSentences(texts[k]);
+                for (var j = 0; j < s.length; j++) if (GM_OPT_IN_CAUSE.test(s[j])) return s.slice(/^Thus\b/.test(s[j]) && j > 0 ? j - 1 : j, j + 1).join(" ");
+            }
+        }
+        return "";
+    }
+
+    // The note of an opt-in change (rec.optIn: a check with CLI text that the pilot can select): the throttle curve of BYPASS is the choice of
+    // the pilot. Each other opt-in change gives its own cause: the sentences of the toolkit (quoted), else the text of its parameter
+    function govOptInHtml(rec, recs) {
+        if (!rec || !rec.optIn) return "";
+        if (rec.parameter === "gov_bypass_throttle") return '<p class="tuning-muted tuning-gm-optin">' + esc(GM.optIn) + "</p>";
+        var cause = govOptInCause(rec, recs);
+        return '<p class="tuning-muted tuning-gm-optin">' + esc(GM.optInLead) + " " + (cause ? quoted(esc(cause)) : esc(GM_OPT_IN[rec.parameter] || GM_OPT_IN.other)) + "</p>";
+    }
+
+    function govProgressText(m) {
+        var frac = isNum(m.fraction) ? Math.max(0, Math.min(1, m.fraction)) : null;
+        return (m.text ? oneLine(m.text) : GM.running) + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "");
+    }
+
+    // One recommendation of the model: the box of the CLI file (a change with CLI text and an index in exportRecsOf), its text,
+    // evidence, rule, notes and CLI text
+    function govRecHtml(x, env, opts, recs) {
+        var rec = x.rec, cli = Array.isArray(rec.cli) && rec.cli.length > 0, box = cli && isNum(x.index) && x.index >= 0;
+        var head = recBadges(rec) + " " + esc(recommendationTitle(rec)), graph = opts && opts.graph || null;
+        return '<article class="tuning-ct-reason tuning-gm-rec">' +
+            (box ? '<label class="tuning-step-pick"><input type="checkbox" class="tuning-pick" data-pick="' + x.index + '"' + (x.can && x.checked ? " checked" : "") + (x.can ? "" : " disabled") + "> " + head + "</label>" : "<h6>" + head + "</h6>") +
+            '<p class="tuning-muted">' + esc(profileText(rec)) + (rec.parameter ? " · " + parameterHtml(rec.parameter) : "") + "</p>" +
+            govOptInHtml(rec, recs) +
+            (typeof rec.text === "string" && oneLine(rec.text) ? '<p data-ste="quoted">' + esc(oneLine(rec.text)) + "</p>" : "") + govEvidenceHtml(rec.evidence) + staleRecHtml(rec) +
+            (ruleText(rec) ? '<div class="tuning-rec-rule"><div class="tuning-label">Rule</div><div data-ste="quoted">' + esc(ruleText(rec)) + "</div></div>" : "") + sourcesHtml(rec) +
+            bulletList((Array.isArray(rec.blockedBy) ? rec.blockedBy : []).map(function (b) { return blockedItem(b, graph); }), "Blocked", "is-blocked") +
+            bulletList(govStrings(rec.caveats).map(function (c) { return quoted(esc(oneLine(c))); }), "Note", "is-caveat") +
+            (cli && hasCli(rec) ? cliBlock(rec.cli.join("\n"), env, rec) : cli || isBlocked(rec) ? '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>" : "") + "</article>";
+    }
+
+    function govRecsHtml(m, env, opts) {
+        var recs = (Array.isArray(m.result.recommendations) ? m.result.recommendations : []).filter(function (r) { return r && typeof r === "object"; });
+        if (m.stale) return recs.length ? '<p class="tuning-muted">' + esc(GM.staleRecs) + "</p>" : "";
+        var list = Array.isArray(m.picks) ? m.picks : recs.map(function (r) { return { rec: r, index: -1, checked: false, can: false }; });
+        // the changes: with CLI text, or held by a gate of the Governor step (the worker clears the CLI text of a held change)
+        var withCli = list.filter(function (x) { return Array.isArray(x.rec.cli) && x.rec.cli.length || x.rec.severity === "action" && isBlocked(x.rec); }), other = list.filter(function (x) { return withCli.indexOf(x) < 0; });
+        var by = [];
+        withCli.forEach(function (x) { if (x.rec.severity === "action") (x.rec.blockedBy || []).forEach(function (b) { if (by.indexOf(b) < 0) by.push(b); }); });
+        var html = '<section class="tuning-gm-recs"><h6 class="tuning-h">' + esc(GM.changes) + '</h6><p class="tuning-muted">' + esc(GM.picks) + "</p>" +
+            (by.length ? notice("warn", esc(GM.blocked) + " " + gateList(by, opts && opts.graph || null)) : "") +
+            (withCli.length ? withCli.map(function (x) { return govRecHtml(x, env, opts, recs); }).join("") : '<p class="tuning-muted">' + esc(GM.noChange) + "</p>");
+        if (other.length) html += '<h6 class="tuning-h">' + esc(GM.checks) + "</h6>" + other.map(function (x) { return govRecHtml(x, env, opts, recs); }).join("");
+        return html + '<a href="#" class="tuning-tab-link" data-tab="export">' + esc(GM.exportLink) + "</a></section>";
+    }
+
+    // The "Governor model" panel of the Governor tab: { html, plots }. The plots of the model quality are in a disclosure (open
+    // first): with env.details they go to the plots of the pane, else to env.extra. opts: { log (the only log of the analysis, for
+    // the time plots without their own when the result does not name its only log), graph (the tuning sequence, for the links of
+    // "Blocked"), plotsOpen }
+    function govModelHtml(m, env, opts) {
+        m = m || { state: "none" }; env = env || {}; opts = opts || {};
+        var res = m.result && typeof m.result === "object" ? m.result : null, running = m.state === "running", st = res ? GM_STATUS[res.status] || GM_STATUS.unavailable : null;
+        var log = res && Array.isArray(res.logs) && res.logs.length === 1 && isNum(res.logs[0]) ? res.logs[0] : isNum(opts.log) ? opts.log : null; // the logs of the runs (worker)
+        var html = '<section class="tuning-ct-section tuning-gm" aria-label="' + esc(GM.title) + '"><div class="tuning-ct-section-head"><h5 class="tuning-h">' + esc(GM.title) + "</h5>" +
+            (st && !running && !m.stale ? badge(st[0], st[1]) : "") + "</div>" + '<p class="tuning-muted">' + esc(GM.about) + '</p><div class="tuning-ft-actions">';
+        if (running) {
+            var frac = isNum(m.fraction) ? Math.max(0, Math.min(1, m.fraction)) : null;
+            html += '<div class="tuning-ft-progress" role="status"><div class="tuning-progress-track"><div class="tuning-progress-bar tuning-gm-bar" style="width: ' + (frac === null ? 100 : frac * 100).toFixed(1) + '%"></div></div>' +
+                '<span class="tuning-ft-progress-text tuning-gm-progress-text">' + esc(govProgressText(m)) + "</span></div>" +
+                '<button type="button" class="btn btn-default btn-sm tuning-gm-cancel">Cancel</button>';
+        } else if (!res || m.stale || m.state === "failed" || m.state === "canceled") {
+            html += '<button type="button" class="btn btn-primary btn-sm tuning-gm-start"' + (m.disabled || m.unavailable ? " disabled" : "") + ">" + esc(GM.start) + "</button>";
+        }
+        html += "</div>";
+        if (m.unavailable && !running) html += '<p class="tuning-na">' + esc(m.unavailable) + "</p>";
+        if (m.state === "canceled") html += '<p role="status">' + esc(GM.canceled) + "</p>";
+        if (m.state === "failed") html += notice("error", esc(GM.failed) + (m.error && (m.error.detail || m.error.message) ? " " + quoted(esc(oneLine(m.error.detail || m.error.message))) : ""));
+        if (!res) return { html: html + "</section>", plots: [] };
+        if (m.stale) html += notice("warn", esc(GM.stale));
+        html += '<p class="tuning-gm-status"><strong>' + esc(st[0]) + ".</strong> " + esc(st[2]) + "</p>" +
+            bulletList(govStrings(res.reasons).map(function (t) { return quoted(esc(oneLine(t))); }), GM.reasons, "is-caveat") +
+            '<p class="tuning-ct-limit"><strong>Flight test necessary.</strong> ' + esc(GM.flightTest) + "</p>" +
+            bulletList(govStrings(res.limitations).map(function (t) { return quoted(esc(oneLine(t))); }), GM.limits, "is-caveat");
+        // the logs of the file that the run did not use (the worker: bench runs, logs that it cannot read or that do not record the
+        // values of the model), and the notes of the worker and the toolkit
+        var unused = (Array.isArray(res.benchRuns) ? res.benchRuns : []).filter(isNum).map(function (li) { return esc("Log " + logLabel(li) + ": " + BENCH + "."); })
+            .concat((Array.isArray(res.skipped) ? res.skipped : []).filter(function (q) { return q && isNum(q.log); }).map(function (q) {
+                return esc("Log " + logLabel(q.log) + ":") + (q.reason ? " " + quoted(esc(oneLine(q.reason))) : "");
+            }));
+        html += bulletList(unused, GM.unused, "is-caveat");
+        var notes = govStrings(res.notes);
+        if (notes.length) html += '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul>' + notes.map(function (n) { return "<li>" + esc(oneLine(n)) + "</li>"; }).join("") + "</ul></details>";
+        var twin =res.twin && typeof res.twin === "object" ? res.twin : {}, params = govTwinParams(twin), list = govPlotList(twin.plots).concat(govPlotList(res.plots));
+        if (list.length) html += deferredDetails(env, "governor:gm-plots", esc(GM.plots + " (" + plural(list.length, "plot") + ")"), "tuning-ct-details tuning-gm-plots", opts.plotsOpen !== false, function () {
+            var own = [], body = list.map(function (p) {
+                var it = govPlotSpec(p, env, log), caption = typeof p.note === "string" && oneLine(p.note) ? '<p class="tuning-plot-caption" data-ste="quoted">' + esc(oneLine(p.note)) + "</p>" : "";
+                if (!it.spec) return '<div class="tuning-gm-plot"><p class="tuning-na">' + quoted(esc(it.title)) + " " + esc("Not available: " + it.na + ".") + "</p></div>";
+                var id = env.plotId ? env.plotId() : "tuning-gm-plot-" + own.length;
+                own.push({ id: id, spec: it.spec });
+                return '<div class="tuning-gm-plot"><div class="tuning-plot"><canvas class="tuning-plot-canvas" id="' + id + '"></canvas></div>' + caption + "</div>";
+            }).join("");
+            return { html: '<p class="tuning-muted">' + esc(GM.plotsAbout) + '</p><div class="tuning-plots">' + body + "</div>", plots: own };
+        });
+        if (params.length) html += deferredDetails(env, "governor:gm-params", esc(GM.params + " (" + params.length + ")"), "tuning-ct-details", false, function () {
+            return { html: '<div class="tuning-table-wrap"><table class="tuning-table"><thead><tr><th>Parameter</th><th>Value</th><th>Uncertainty</th></tr></thead><tbody>' +
+                params.map(function (q) { return "<tr><td><code>" + esc(q.name) + '</code></td><td class="tuning-num">' + esc(num(q.value)) + '</td><td class="tuning-num">' + esc(q.range) + "</td></tr>"; }).join("") +
+                "</tbody></table></div>", plots: [] };
+        });
+        var rows = Array.isArray(res.rows) ? res.rows : Array.isArray(res.parameters) ? res.parameters : [];
+        // all rows (42 names, each profile name for each PID profile, and the related parameters): open first, the pilot can close it
+        html += '<section class="tuning-gm-rows"><h6 class="tuning-h">' + esc("Governor parameters (" + plural(rows.length, "row") + ")") + '</h6><p class="tuning-muted">' + esc(GM.rows) + "</p>" +
+            deferredDetails(env, "governor:gm-rows", esc(GM.table), "tuning-ct-details", true, function () { return { html: govRowsHtml(rows, res), plots: [] }; }) + "</section>" +
+            govRecsHtml({ result: res, stale: m.stale, picks: m.picks }, env, opts);
+        return { html: html + "</section>", plots: [] };
+    }
+
     function controlWorkspaceHtml(entry, step, view, env, panel) {
         var r = entry.result, d = configOf(r,view.dataset), m = env.controlModel ? env.controlModel(step) : {state:'none'}, res = m.stale ? null : m.result,
             running = m.state === 'running', title = TABS.find(function(t){return t.key === step;}).title,
@@ -4594,6 +4985,12 @@ var TuningDialog = (function () {
             });
         } else html += plot({na:whyMissing(r,null,step === 'governor' ? 'governor' : step === 'tail' ? 'tail' : 'tracking error')});
         html += '</section>';
+        // the governor model of the flight logs (docs/GOVERNOR_AUTOTUNE.md section 8): govModelHtml, its plots with the plots of the pane
+        if (step === 'governor' && env.governorModel) {
+            var gmOut = env.governorModel(entry);
+            html += gmOut.html;
+            gmOut.plots.forEach(function(q){plots.push(q);});
+        }
         if (pair) html += detail('history','Compare recorded configurations',function(){
             var html = '<label>Other recorded configuration <select class="form-control input-sm tuning-ct-reference">' +
                 options(pairs.map(function(p){var id = p.a === view.dataset ? p.b : p.a;return [id,configLabel(id) + ' (recorded)'];}),reference) + '</select></label>' +
@@ -5026,6 +5423,7 @@ var TuningDialog = (function () {
             fselOpen = { list: null, sub: {} }, // the open state of the flight lists for the session (toggleList)
             settingsListeners = [],         // the Analysis view: cb() after each change of the settings of the analysis (onSettings)
             ft = { job: null, worker: null, workerKey: null, seq: 0, cache: [], failure: null, cancelled: null, sources: {}, limits: {}, drafts: {}, auto: {} }, // one filter draft per log/flight
+            gm = { job: null, seq: 0, cache: [], failure: null, cancelled: null }, // the governor model (gmStart): one run at a time, results by gmKey
             derive = { worker: null, seq: 0, waiting: {} };
 
         body.html(SKELETON);
@@ -5079,9 +5477,18 @@ var TuningDialog = (function () {
             details: detailHtml,
             filter: resultFilter,
             seek: function (li, t, what, segment) { seekTo(li, shown ? frameOf(shown.result, li, t, segment) : t, what); },
+            seekFrame: function (li, t, what) { seekTo(li, t, what); }, // a time in frame seconds (the governor model)
             copy: function (text, rec) { copyTexts.push({text:String(text),rec:rec}); return copyTexts.length - 1; },
             plotId: function () { return uid + "-plot-" + (++plotSeq); },
             recId: function (i) { return uid + "-rec-" + i; },
+            // the cost of the change of check G21 (advice.cjs G21:gov_max_throttle:p<N>) in the governor model: the GC6 row of that PID
+            // profile and value (gov_scenarios.cjs g21Cost), from the result of the governor model of this analysis
+            modelNote: function (rec, entry) {
+                var m = /(?:^|:)G21:gov_max_throttle:p([1-6])$/.exec(String(rec && rec.id || "")), c = m && entry ? gmFor(entry) : null;
+                var rows = c && c.result && Array.isArray(c.result.rows) ? c.result.rows : [];
+                var row = rows.filter(function (r) { return r && r.g21Cost && r.profile === +m[1] && (!isNum(rec.to) || r.g21Cost.to === rec.to); })[0];
+                return row && typeof row.g21Cost.text === "string" ? row.g21Cost.text : "";
+            },
             // a finding of the result, from its key or fid, or the finding behind a recommendation's evidence row
             findingOf: function (x) {
                 var ix = indexOf(shown && shown.result);
@@ -5117,6 +5524,11 @@ var TuningDialog = (function () {
                     graph: shown ? graphOf(shown.result) : null });
                 out.plots.forEach(function (q) { env.extra.push(q); });
                 return out.html;
+            },
+            // the "Governor model" panel of the Governor tab (gmModel): of the result on display, the file is the unit of the run
+            governorModel: function () {
+                var logs = shown ? gmLogs(shown.result) : [];
+                return govModelHtml(gmModel(shown), env, { log: logs.length === 1 ? logs[0] : null, graph: shown ? graphOf(shown.result) : null });
             },
             extra: [] // plots of the pane being drawn that are not in its tab's own list (the compare panels)
         };
@@ -5571,7 +5983,7 @@ var TuningDialog = (function () {
             return view.tab==='export' ? finalIds(entry) : [view.dataset];
         }
         function exportRecsOf(entry) {
-            return [].concat.apply([],contextIds(entry).map(function(id){return draftRecs(entry,id);})).concat(filterDraftRecs(entry));
+            return [].concat.apply([],contextIds(entry).map(function(id){return draftRecs(entry,id);})).concat(filterDraftRecs(entry),gmDraftRecs(entry));
         }
         function draftPicks(entry,id,recs) {
             var state=tuningState(entry), draft=state.drafts[id]||(state.drafts[id]={selected:{}}), out={};
@@ -5587,25 +5999,30 @@ var TuningDialog = (function () {
             contextIds(entry).forEach(function(id){var recs=draftRecs(entry,id), picks=draftPicks(entry,id,recs);Object.keys(picks).forEach(function(k){out[+k+offset]=true;});offset+=recs.length;});
             var filters=filterDraftRecs(entry), selected=draftPicks(entry,'filter:'+ftKey(true),filters);
             Object.keys(selected).forEach(function(k){out[+k+offset]=true;});
+            offset+=filters.length;
+            var gov=gmDraftRecs(entry), govPicks=draftPicks(entry,gmDraftId(entry),gov);
+            Object.keys(govPicks).forEach(function(k){out[+k+offset]=true;});
             entry.picks=out;
             return out;
         }
         function savePicks(entry,recs,picks) {
             var state=tuningState(entry);
-            recs.forEach(function(r,i){var id=r.filterDraft || (configOf(entry.result,r.dataset) ? r.dataset : 'all'), draft=state.drafts[id]||(state.drafts[id]={selected:{}});draft.selected[r.id+'|'+(r.cli||[]).join(';')]=!!picks[i];});
+            recs.forEach(function(r,i){var id=r.filterDraft || r.govDraft || (configOf(entry.result,r.dataset) ? r.dataset : 'all'), draft=state.drafts[id]||(state.drafts[id]={selected:{}});draft.selected[r.id+'|'+(r.cli||[]).join(';')]=!!picks[i];});
         }
         function compiledPlan(entry) {
             var ids=configList(entry.result).length ? finalIds(entry) : ['all'], records=[], picks={}, missing=[];
             var filters=filterDraftRecs(entry), filterPicks=draftPicks(entry,'filter:'+ftKey(true),filters), filterPlan=pendingPlan(filters,filterPicks);
+            var gov=gmDraftRecs(entry), govPicks=draftPicks(entry,gmDraftId(entry),gov), govPlan=pendingPlan(gov,govPicks);
             ids.forEach(function(id){
                 var recs=draftRecs(entry,id), selected=draftPicks(entry,id,recs), offset=records.length, d=configOf(entry.result,id);
                 records=records.concat(recs); Object.keys(selected).forEach(function(i){picks[+i+offset]=true;});
                 if (!d || !d.exportBase) return;
-                var own=pendingPlan(recs,selected), overwritten=new Set(own.rows.concat(filterPlan.rows).filter(function(q){return q.scope==='profile'&&q.index===d.pidProfile-1;}).map(function(q){return q.name;}));
+                var own=pendingPlan(recs,selected), overwritten=new Set(own.rows.concat(filterPlan.rows,govPlan.rows).filter(function(q){return q.scope==='profile'&&q.index===d.pidProfile-1;}).map(function(q){return q.name;}));
                 (d.exportBase.records||[]).forEach(function(r){if(!overwritten.has(r.parameter)){recordedConfigurationCli.add(r);picks[records.length]=true;records.push(r);}});
                 (d.exportBase.unsupported||[]).forEach(function(q){if(!overwritten.has(q.name)) missing.push({configuration:id,name:q.name,reason:q.reason});});
             });
             var offset=records.length; records=records.concat(filters); Object.keys(filterPicks).forEach(function(i){picks[+i+offset]=true;});
+            offset=records.length; records=records.concat(gov); Object.keys(govPicks).forEach(function(i){picks[+i+offset]=true;});
             var plan=pendingPlan(records,picks);plan.records=records;plan.picks=picks;plan.unsupported=missing;plan.configurations=ids;
             plan.signature+=JSON.stringify([ids,missing]);entry.pending=plan;return plan;
         }
@@ -5622,17 +6039,17 @@ var TuningDialog = (function () {
             var plan=compiledPlan(entry), groups=[], seen={};
             plan.records.forEach(function(r,i){
                 if (!plan.picks[i] || !hasCli(r) || CONTROL_STEPS.indexOf(r.node || r.area)<0) return;
-                var key=r.group || r.id;
+                var key=r.govDraft || r.group || r.id; // the changes of the governor model are one flight test
                 if (!seen[key]) {seen[key]=true;groups.push(r);}
             });
             var hasFilters=plan.records.some(function(r,i){return plan.picks[i] && hasCli(r) && (r.node || r.area)==='filters';});
             if (groups.length>1 || groups.length && hasFilters) filterNote += '<section class="tuning-final-trials"><h5 class="tuning-h">Different flight tests</h5>' +
                 '<p>The selection contains different flight tests. Test one control change group in each flight.</p>' +
                 (hasFilters ? '<p>Test filter changes before control changes. Record a new flight between these steps.</p>' : '') +
-                '<ul>' + groups.map(function(r){return '<li>' + mdCode(r.title) + ' · ' + esc(profileText(r)) +
+                '<ul>' + groups.map(function(r){return '<li>' + (r.govDraft ? esc(GM.trial) : mdCode(r.title) + ' · ' + esc(profileText(r))) +
                     ' <button type="button" class="btn btn-default btn-xs tuning-trial-only" data-trial="' + esc(r.id) + '">Select only this test</button></li>';}).join('') + '</ul></section>';
             if (!list.length) return filterNote;
-            return filterNote + '<section class="tuning-final-profiles"><h5 class="tuning-h">Control configuration for each PID profile</h5><p>Select one recorded configuration for the control changes of each PID profile. The filter tune uses the log or flight above.</p><p class="tuning-muted">The export also includes recorded values that are different from the newest configuration of that PID profile. Global values apply to all PID profiles.</p>'+profiles.map(function(p){return '<label>'+esc(profileLabel(+p))+'<select class="form-control input-sm tuning-final-config" data-profile="'+p+'">'+options([['','No changes']].concat(list.filter(function(d){return d.pidProfile===+p;}).map(function(d){var rs=draftRecs(entry,d.id),ps=draftPicks(entry,d.id,rs);return [d.id,configLabel(d.id)+' — '+Object.keys(ps).length+' selected changes'];})),state.finalByProfile[p])+'</select></label>';}).join('')+(list.some(function(d){return !d.pidProfile;}) ? '<p class="tuning-muted">A configuration with an unknown PID profile is available for analysis only.</p>' : '')+'</section>';
+            return filterNote + '<section class="tuning-final-profiles"><h5 class="tuning-h">Control configuration for each PID profile</h5><p>Select one recorded configuration for the control changes of each PID profile. The filter tune uses the log or flight above.</p>'+(gmDraftRecs(entry).length ? '<p class="tuning-muted">'+esc(GM.notByConfig)+'</p>' : '')+'<p class="tuning-muted">The export also includes recorded values that are different from the newest configuration of that PID profile. Global values apply to all PID profiles.</p>'+profiles.map(function(p){return '<label>'+esc(profileLabel(+p))+'<select class="form-control input-sm tuning-final-config" data-profile="'+p+'">'+options([['','No changes']].concat(list.filter(function(d){return d.pidProfile===+p;}).map(function(d){var rs=draftRecs(entry,d.id),ps=draftPicks(entry,d.id,rs);return [d.id,configLabel(d.id)+' — '+Object.keys(ps).length+' selected changes'];})),state.finalByProfile[p])+'</select></label>';}).join('')+(list.some(function(d){return !d.pidProfile;}) ? '<p class="tuning-muted">A configuration with an unknown PID profile is available for analysis only.</p>' : '')+'</section>';
         }
 
         // The script of the selected recommendations: { sig, state: "none" | "loading" | "ready" | "na", text, why (a message
@@ -5830,11 +6247,20 @@ var TuningDialog = (function () {
         function selectTrial(entry,id,configuration) {
             var rs=configuration ? draftRecs(entry,configuration) : exportRecsOf(entry), index=rs.findIndex(function(r){return r.id===id;});
             if (index<0 || !canPick(rs,index)) return;
-            var selected=rs[index], d=configOf(entry.result,selected.dataset), state=tuningState(entry);
-            if (d) Object.keys(state.finalByProfile).forEach(function(p){state.finalByProfile[p]=+p===d.pidProfile ? d.id : '';});
-            var mine=draftRecs(entry,d ? d.id : 'all'), picks={};
-            mine.forEach(function(r,i){if(r.id===selected.id || selected.group && r.group===selected.group)picks[i]=true;});
-            savePicks(entry,mine,picks);
+            var selected=rs[index], d=configOf(entry.result,selected.dataset), state=tuningState(entry), gov=gmDraftRecs(entry), picks={};
+            if (selected.govDraft) {
+                // the changes of the governor model are one flight test: its default changes and the selected one, no other change
+                Object.keys(state.finalByProfile).forEach(function(p){state.finalByProfile[p]='';});
+                if (!configList(entry.result).length) savePicks(entry,draftRecs(entry,'all'),{});
+                gov.forEach(function(r,i){if(r.id===selected.id || pickDefault(r))picks[i]=true;});
+                savePicks(entry,gov,picks);
+            } else {
+                if (d) Object.keys(state.finalByProfile).forEach(function(p){state.finalByProfile[p]=+p===d.pidProfile ? d.id : '';});
+                var mine=draftRecs(entry,d ? d.id : 'all');
+                mine.forEach(function(r,i){if(r.id===selected.id || selected.group && r.group===selected.group)picks[i]=true;});
+                savePicks(entry,mine,picks);
+                savePicks(entry,gov,{});
+            }
             savePicks(entry,filterDraftRecs(entry),{});
             entry.exported=null;TABS.forEach(function(t){rendered[t.key]=null;});showTab('export');
         }
@@ -6010,6 +6436,172 @@ var TuningDialog = (function () {
             ftRefresh();
         }
 
+        // --- the governor model (docs/GOVERNOR_AUTOTUNE.md section 8): its own worker (governorTune), one run at a time, on the
+        // logs and flights of the result on display. A result belongs to gmKey: the analysis (its file, logs, flights and CLI dump)
+        // and the CLI dump of the run. Its recommendations go to the CLI file (exportRecsOf) while the result is current
+
+        function gmLogs(r) {
+            return Array.isArray(r.logs) ? r.logs.filter(isNum) : isNum(r.logIndex) ? [r.logIndex] : [];
+        }
+        function gmKey(entry) {
+            var info = fileInfo(), c = usedCli();
+            return entry && info && entry.fileKey === info.key ? ["governor", entry.key, c ? c.hash : "no-cli"].join("|") : null;
+        }
+        function gmUnavailable(entry) {
+            var info = fileInfo(), recs = entry && entry.result.records;
+            if (!info || !viewerLog()) return GM.noFile;
+            if (!entry || entry.fileKey !== info.key) return GM.otherFile;
+            return Array.isArray(recs) && recs.length && !recs.some(function (q) { return q && q.flown; }) ? GM.noFlight : "";
+        }
+        function gmFor(entry) {
+            var key = gmKey(entry);
+            return key ? gm.cache.filter(function (e) { return e.key === key; })[0] || null : null;
+        }
+        function gmCurrent(c) {
+            return !!c && gm.cache.indexOf(c) >= 0 && c.key === gmKey(shown);
+        }
+        function gmDraftId(entry) {
+            var c = gmFor(entry);
+            return "governor:" + (c ? c.key : "none");
+        }
+        function gmFailed() {
+            return !!(gm.failure && gm.failure.key === gmKey(shown));
+        }
+        // The recommendations of the current result for the CLI file. The pilot started the run, so its CLI text is authorized
+        // (automaticControlChange) while the result is current: a rule change always, a change from the model (confidence
+        // "predicted") only with the model status validated or partial
+        // A gate of a held change: the Governor step of the result on display, hierarchy blockedBy and gatedBy (a gate of a change also
+        // when the governor has no problem: the steps before it with a problem). Ids of the tuning sequence, once each
+        function gmGates(entry) {
+            var h = entry && hierFor(entry.result, "all", "all"), G = h && h.nodes && h.nodes.governor, out = [];
+            ((G && (G.blockedBy || []).concat(G.gatedBy || [])) || []).forEach(function (g) { if (out.indexOf(String(g)) < 0) out.push(String(g)); });
+            return out;
+        }
+        // A change (severity "action") gets the gates in blockedBy when the worker did not give them (the worker turns options.blockedBy
+        // into texts): then hasCli and pickDefault leave it out, and its "Blocked" list links the steps
+        function gmDraftRecs(entry) {
+            var c = gmFor(entry);
+            if (!c) return [];
+            var trusted = c.result.status === "validated" || c.result.status === "partial", gates = gmGates(entry);
+            return (Array.isArray(c.result.recommendations) ? c.result.recommendations : []).filter(function (r) {
+                return r && typeof r === "object" && (r.node || r.area) === "governor";
+            }).map(function (r) {
+                var q = Object.assign({}, r, { dataset: null, supportedBy: [], govDraft: "governor:" + c.key });
+                if (q.severity === "action" && gates.length && !isBlocked(q)) q.blockedBy = gates.slice();
+                var authorized = function () { return gmCurrent(c) && (q.confidence !== "predicted" || trusted); };
+                authorized.why = function () { return gmCurrent(c) ? GM.noCliModel : GM.noCliOld; }; // noCliText
+                controlCliAuthorization.set(q, authorized);
+                return q;
+            });
+        }
+
+        // The view model of govModelHtml: the run, else the result of gmKey, else the newest result of the open file (stale), with
+        // an error or a cancel of gmKey; picks: the recommendations of the current result with their index in exportRecsOf
+        function gmModel(entry) {
+            var info = fileInfo(), key = gmKey(entry), j = gm.job, hit = gmFor(entry);
+            var mine = info ? gm.cache.filter(function (e) { return e.fileKey === info.key; }) : [], e = hit || mine[mine.length - 1] || null;
+            var m = { state: "none", result: e ? e.result : null, stale: !!e && !hit, picks: [] };
+            if (j && info && j.fileKey === info.key) {
+                m.state = "running";
+                m.fraction = j.last && isNum(j.last.fraction) ? j.last.fraction : null;
+                m.text = j.last && typeof j.last.text === "string" ? j.last.text : "";
+            } else if (gm.failure && gm.failure.key === key) {
+                m.state = "failed";
+                m.error = gm.failure;
+            } else if (gm.cancelled && gm.cancelled.key === key) {
+                m.state = "canceled";
+            } else if (e) {
+                m.state = "done";
+            }
+            m.unavailable = gmUnavailable(entry);
+            m.disabled = !!m.unavailable || !!j;
+            if (hit && entry) {
+                var recs = exportRecsOf(entry), picks = picksOf(entry);
+                recs.forEach(function (r, i) { if (r.govDraft) m.picks.push({ rec: r, index: i, checked: !!picks[i], can: canPick(recs, i) }); });
+            }
+            return m;
+        }
+
+        function gmRefresh() {
+            TABS.forEach(function (t) { rendered[t.key] = null; });
+            if (shown) showTab(view.tab);
+        }
+
+        // A progress message: the bar and the text only
+        function gmProgress() {
+            var last = gm.job && gm.job.last || {}, frac = isNum(last.fraction) ? Math.max(0, Math.min(1, last.fraction)) : null;
+            body.find(".tuning-gm-progress-text").text(govProgressText({ text: last.text, fraction: frac }));
+            body.find(".tuning-gm-bar").css("width", (frac === null ? 100 : frac * 100).toFixed(1) + "%");
+        }
+
+        function gmStop() {
+            var j = gm.job;
+            gm.job = null;
+            if (j) { try { j.worker.terminate(); } catch (e) { /* already gone */ } }
+        }
+
+        function gmFail(j, detail) {
+            if (j !== gm.job) return;
+            gm.failure = { key: j.key, detail: oneLine(detail || "") };
+            gmStop();
+            gmRefresh();
+        }
+
+        // "Start the governor analysis": the whole file (a copy, transferred) and the logs, flights, flight rpm and gates of the
+        // result on display (the Governor step of the tuning sequence: blockedBy and gatedBy), and the CLI dump when there is one
+        function gmStart() {
+            var info = fileInfo(), log = viewerLog(), entry = shown, key = gmKey(entry);
+            if (!info || !log || !key || gmUnavailable(entry)) return false;
+            gmStop();
+            gm.failure = gm.cancelled = null;
+            var r = entry.result, c = usedCli(), gates = gmGates(entry), w;
+            var msg = { cmd: "governorTune", id: ++gm.seq, bytes: info.bytes.slice().buffer, fileName: info.name, logCount: log.getLogCount(),
+                options: { flightRpm: r.flightRpm && isNum(r.flightRpm.value) ? r.flightRpm.value : null, cliText: c ? c.text : null, cliName: c ? c.name : null,
+                    flights: r.selection && r.selection.flights || null, logs: gmLogs(r), blockedBy: gates } };
+            try {
+                w = new Worker("js/tuning_worker.js");
+            } catch (e) {
+                gm.failure = { key: key, detail: e && e.message || String(e) };
+                gmRefresh();
+                return false;
+            }
+            var j = gm.job = { id: msg.id, key: key, fileKey: info.key, worker: w, started: Date.now(), last: null };
+            w.onmessage = function (e) {
+                var m = e.data || {};
+                if (j !== gm.job || m.id !== j.id) return;
+                if (m.type === "progress") {
+                    j.last = m;
+                    gmProgress();
+                } else if (m.type === "error") {
+                    gmFail(j, m.message);
+                } else if ((m.type === "governorTuned" || m.type === "result") && m.result) {
+                    gm.cache = gm.cache.filter(function (x) { return x.key !== j.key; }).concat([{ key: j.key, fileKey: j.fileKey, result: m.result, finishedAt: Date.now() }]).slice(-4);
+                    gmStop();
+                    if (shown) shown.exported = null;
+                    gmRefresh();
+                }
+            };
+            w.onerror = function (e) {
+                if (e && e.preventDefault) e.preventDefault();
+                gmFail(j, e && e.message || "script error");
+            };
+            try {
+                w.postMessage(msg, [msg.bytes]);
+            } catch (e) {
+                gmFail(j, e && e.message || String(e));
+                return false;
+            }
+            gmRefresh();
+            return true;
+        }
+
+        function gmCancel() {
+            if (!gm.job) return;
+            gm.cancelled = { key: gm.job.key };
+            gmStop();
+            gmRefresh();
+        }
+
         // --- panes and plots
 
         function detailBody(model) {
@@ -6157,6 +6749,7 @@ var TuningDialog = (function () {
                 states[step] = findingsAt(r, step, nodeState(hier, step).entry, env).filter(function (f) { return inView(f, view); }).map(findingStatus);
                 if (ctModel(step).state === 'failed') states[step].push('error');
             });
+            if (gmFailed()) states.governor.push('error'); // the governor model stopped because of an error
             if (!current) ['overview'].concat(CONTROL_STEPS).forEach(function (key) { states[key].push('insufficient'); });
             var plan = compiledPlan(shown), conflicts = plan.conflicts.length + plan.unsupported.length + partGroups(plan.records, plan.picks).length;
             var filterRefused = model.state === 'done' && !model.dirty && !model.stale && filterCliUnavailable(model.result);
@@ -6234,6 +6827,7 @@ var TuningDialog = (function () {
             var selected = selectedConfig(entry.result, view.dataset);
             view.dataset = selected ? selected.id : "all";
             if (ft.workerKey && ft.workerKey !== ftKey(true)) ftStop();
+            if (gm.job && gm.job.fileKey !== entry.fileKey) gmStop(); // the governor model of another file
             if (selected) view.profile=selected.pidProfile||0;
             compares = {};
             cmpSlots = {};
@@ -6744,7 +7338,7 @@ var TuningDialog = (function () {
         function settingsChanged() {
             var hit = !job && cached(currentKey());
             // the filter calculation of these settings (or none) for the Filters tab, the side panel and the CLI file
-            if (ft.cache.length || ft.job || ft.failure || ft.cancelled) TABS.forEach(function (t) { rendered[t.key] = null; });
+            if (ft.cache.length || ft.job || ft.failure || ft.cancelled || gm.cache.length || gm.failure || gm.cancelled) TABS.forEach(function (t) { rendered[t.key] = null; }); // and the governor model (gmKey has the CLI dump)
             if (hit && hit !== shown) display(hit);
             else renderChrome(); // display() renders the chrome too, and renderChrome tells the Analysis view
             if (shown && shown.control) ctRefresh();
@@ -6954,6 +7548,14 @@ var TuningDialog = (function () {
             view.ctDetails[this.getAttribute('data-ct-detail')]=!this.parentNode.open;
         });
         dialog.on("click", ".tuning-ft-start", function (e) { if (e && e.preventDefault) e.preventDefault(); ftStart(); });
+        // the governor model (Governor tab): start, cancel, and a time of its evidence in the log viewer
+        dialog.on("click", ".tuning-gm-start", function (e) { if (e && e.preventDefault) e.preventDefault(); gmStart(); });
+        dialog.on("click", ".tuning-gm-cancel", function (e) { if (e && e.preventDefault) e.preventDefault(); gmCancel(); });
+        dialog.on("click", ".tuning-gm-seek", function (e) {
+            if (e && e.preventDefault) e.preventDefault();
+            var li = +this.getAttribute("data-log"), t = +this.getAttribute("data-t");
+            if (isNum(li) && isNum(t)) env.seekFrame(li, t, { graphs: GM_LOOK, title: GM.title }); // frame seconds
+        });
         dialog.on('change', '.tuning-ft-source-select', deferredSelectChange(function () {
             var info=fileInfo(), source=ftSources().find(function(s){return s.key===this.value;},this);
             if (!info || !source || ft.sources[info.key]===source.key) return;
@@ -7111,6 +7713,7 @@ var TuningDialog = (function () {
             var info = fileInfo();
             if (job && (!info || job.fileKey !== info.key)) endJob(); // another file was opened meanwhile
             if (ft.worker && ft.workerKey !== ftKey(true)) ftStop();
+            if (gm.job && (!info || gm.job.fileKey !== info.key)) gmStop();
             if (shown && (!info || shown.fileKey !== info.key)) drop();
             if (reader && reader.sync) reader.sync(); // the log of another file that it kept
             var key = !job && currentKey(), hit = key && cached(key);
@@ -7266,6 +7869,8 @@ var TuningDialog = (function () {
         twinAssessment: twinAssessment, twinClosedItems: twinClosedItems, twinLoopNotes: twinLoopNotes, TWIN_OUTPUTS: TWIN_OUTPUTS,
         tabStatus: tabStatus, filterTabStates: filterTabStates,
         controlWorkspaceHtml: controlWorkspaceHtml, controlPairs: controlPairs, flightPlanHtml: flightPlanHtml,
+        govModelHtml: govModelHtml, govPlotSpec: govPlotSpec, govOptInHtml: govOptInHtml, govOptInCause: govOptInCause, staleTextHtml: staleTextHtml, govPlotList: govPlotList, govRowGroups: govRowGroups, govRowsHtml: govRowsHtml, govEvidenceHtml: govEvidenceHtml,
+        govNumbers: govNumbers, govValue: govValue, govTwinParams: govTwinParams, GM: GM, GM_STATUS: GM_STATUS, GM_FAMILIES: GM_FAMILIES, GM_ROW_STATUS: GM_ROW_STATUS, pickDefault: pickDefault,
         esc: esc, parameterLabel: parameterLabel, parameterHtml: parameterHtml, num: num, valueSe: valueSe, threshold: threshold, logLabel: logLabel, paramText: paramText, findingStatus: findingStatus,
         areaOf: areaOf, findingWhere: findingWhere, findingAxis: findingAxis, rpmText: rpmText, lookFor: lookFor, toFrame: toFrame,
         graphOf: graphOf, columnsOf: columnsOf, flowHtml: flowHtml, prereqHtml: prereqHtml, prereqState: prereqState, checkRows: checkRows, stepNo: stepNo, nodeState: nodeState, curvePath: curvePath, curveSeries: curveSeries,

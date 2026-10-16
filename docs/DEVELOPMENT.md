@@ -826,7 +826,9 @@ with a `sourceURL` so that stack traces name the file:
   others and loaded on demand by `filterTune` and `filterReplay` (`K.require`). `control_tune` is fetched with them
   and loaded on demand by `controlTune` or by `advice.exportScript` when it builds the flight maneuver list.
   `system_id`, `helicopter_model`, `control_pipeline`, `firmware_controller` and `firmware/schema` are also registered for
-  lazy loading by the control pipeline. The compiled `firmware/controller.wasm` is fetched as bytes and hash-checked by
+  lazy loading by the control pipeline. The governor modules (`gov_twin`, `gov_data`, `gov_params`, `gov_sim`, `gov_fit`,
+  `gov_search`, `gov_scenarios`, `gov_tune`) are fetched with them and loaded on demand by `governorTune`.
+  The full on-demand list is `ON_DEMAND` in `js/tuning_worker.js`; `test/tuning_worker.test.cjs` (T0) counts it. The compiled `firmware/controller.wasm` is fetched as bytes and hash-checked by
   the firmware adapter before instantiation. All firmware resources are included in the production distribution.
 - Rules for anyone editing `tools/autotune`:
   - no Node API calls when a module loads (the `require('node:*')` lines are fine);
@@ -889,7 +891,7 @@ Our modules mark a result with too little data with `thin: true` (not a text tha
 
 ### Catalog
 
-`catalog.cjs` has one entry for each check id: D1-D9, H, SETUP, F1-F11, G0-G20, C1-C15, T1-T15, R1, C7, L1-L7, P1 and P2. Each
+`catalog.cjs` has one entry for each check id: D1-D9, H, SETUP, F1-F11, G0-G21, C1-C15, T1-T15, R1, C7, L1-L7, P1 and P2. Each
 entry gives an STE noun of three words or fewer, the display unit and scale, its home item, its subsystem, its Tuning tab, the
 evidence spec (source, pads, fields, analyser field, plot kind and reference lines, expected behaviour), the lead texts and a
 summary template. Limits come from the finding's `threshold` and the modules' `DEFAULT_RULES`; a threshold that is only a string
@@ -941,7 +943,7 @@ the firmware and the old wiki (SPEC3 A, B, K1). Every item and edge has its sour
 `{ prereq, blocks, edges, rules, nodes }`.
 
 - **Prerequisites** ("Before you tune", done before the maiden flight): Blackbox log (D1-D4, H), RPM signal and motor poles (G1,
-  G12, G20; the gear ratios in the configuration are correct), Battery and power (D5, G13, G11, P1, P2), Mechanical parts (F7, C15,
+  G12, G20, G21; the gear ratios in the configuration are correct; its parameters include `gov_max_throttle`, the remedy of G21), Battery and power (D5, G13, G11, P1, P2), Mechanical parts (F7, C15,
   T4, the cyclic I rule of SETUP), Rescue (D9, D8, D6), Flight controller (`pid_mode`, `rates_type`, D7, R1, L7). They are assumed
   to be correct: a status `ok` ("No problem found", with `checksRun`), `problem` (a clearly measurable issue: a flag with an
   action or a check; D4 never, D2 only for a loss of frames) or `noData`. Never "Blocked", never "Start here". Their problems are
@@ -973,7 +975,10 @@ problems upstream along the gate edges (`fromChecks` applied, scope not applied)
 proposed change still waits for them. The filter autotune sends the filters' `blockedBy` and `gatedBy`, and the worker applies the
 `rpm > filters` scope to the proposal: it waits for the RPM signal only when it changes an RPM-driven value (`rpmDriven` in
 `filter_autotune.cjs`: the RPM notch banks, the dynamic LPF1 and `motor_rpm_lpf`; with the dynamic LPF1 recorded on, also the
-LPF1 type and base cutoff). `causesOf` gives the K rules that make a
+LPF1 type and base cutoff). The `rpm` gates have `fromChecks` G1, G12, G20, SETUP and C7, not G21 (user, 2026-10-15: the RPM signal
+errors at the throttle maximum are sparse, and their remedy, a lower `gov_max_throttle`, does not change the other tuning). A G1 flag
+whose FALLBACK entries all come 0.05 s or less after a G20 `signal` event at the throttle maximum, with a G21 flag in the findings
+(`spikeFallbacks`, `opts.all` for one configuration), does not gate either, and advice guard 2 does not hold a change for it. `causesOf` gives the K rules that make a
 finding or a recommendation a possible result of upstream flags (same log, compatible PID profile and axis). `LEGACY` maps the
 ids of round 1 (setup, servos, mixer, tailmech, rotor, rpm, gears, log, notches, lowpass, dnoise, govset, govgain, tta, rates,
 rescue, result) to the new ones.
@@ -1225,7 +1230,8 @@ validated in flight. Flags that have a standard error must pass a 2-SE test.
 | D9 | `rescue_mode` of each PID profile (`health_config.cjs`): the CLI dump (`profile` sections; a `diff` without the line is the default OFF, firmware 4.6.0 pg_pid.c), else a rescue state in the log (the firmware runs the rescue only when `rescue_mode` is not OFF, rescue.c), else a header value (not in 4.6). The PID profiles that the analysis cannot read are listed | flag: a PID profile with `rescue_mode` OFF |
 | P1 | at each load step (motor[0] up by 10 points or more in 0.5 s with the governor ACTIVE): the voltage before the step (0.3 s median) against the lowest 0.1 s median in the step (Vbat lags motor[0] by 68 ms), for each cell; the lowest cell voltage at a step; cells from the CLI or the firmware rule (battery.c) | flag ("possibly a weak battery"): a step from the warning level (`vbat_warning_cell_voltage`) or more to less than the minimum (`vbat_min_cell_voltage`), the levels of the log header; monitor: the lowest cell voltage at a step under the warning level |
 | P2 | with `Ibat`: the voltage decrease for each 1 A at the steps with 10 A or more, for each battery (a new battery when the start voltage is 0.15 V for each cell or more over the end of the previous flight log) | information; monitor when 1.3 x the median of the other batteries by 2 SE |
-| G20 | at each change to FALLBACK (LOST_HEADSPEED before 4.6), with or without a rescue: overload (the G19 overload test: the throttle at 95 % or more, a headspeed fall of 2 % or more, 0.3 s or less before the change), signal (the glitch rule of governor.c with the throttle under 95 %, before the change) or none | information. `G1:overload` describes coincident output limits; G1 remains an unresolved RPM prerequisite because timing does not establish a correct RPM signal |
+| G20 | at each change to FALLBACK (LOST_HEADSPEED before 4.6), with or without a rescue: signal (the glitch rule of governor.c with the throttle under 95 % before the change; else a sudden change of check G21, the same detector `health_gov.spikeScan`, 30 ms or less before the change at any throttle: critique C12, the Fireball FALLBACK entries come at 100 % throttle 1-22 ms after one), overload (the G19 overload test: the throttle at 95 % or more, a headspeed fall of 2 % or more, 0.3 s or less before the change) or none; `causes` lists signal and overload when both apply. `value` counts the entries with an overload sign, also with a signal error (`overloadOnly`: the overload alone), and the summary names both causes; `signal.startS`/`endS` give the first and last fast sample of the sudden change against the change (negative: after it), the words of G21 "during a sudden change or 30 ms or less after its end" (review 2026-10-15) | information. `G1:overload` describes coincident output limits (not for a FALLBACK that G20 gives to the signal, also when G19 finds an overload); G1 remains an unresolved RPM prerequisite because timing does not establish a correct RPM signal |
+| G21 | `health_gov.cjs` (analyse: `spikeScan`, `ceilingsOf`, `vcompBlocks`; judge: `g21Pool`, `g21Test`): the sudden changes of the headspeed signal in each throttle band against the governed time at the throttle maximum, and each FALLBACK entry with its throttle and the change before it (docs/TUNING_KNOWLEDGE.md 10.2). With GOVSTATE the governor states select the samples, not the mask: the worker takes it from the mask of all phases (`GOV_ALL`), and the result is the same in every mask | problem: k ≥ 3 changes at the maximum, binomial p < 0.001 and the rate under the maximum 1/10 or less of the rate at the maximum, for a PID profile, or for all PID profiles together when a PID profile has 1-2 changes at its maximum and its own rates keep the 1/10 rule (`basis: 'pooled'`); note: changes with no such relation; skipped ("not measured"): no time at the maximum, no change in less than `minOkS` (12 s) at the maximum, or no sample with the governor in RECOVERY, ACTIVE or FALLBACK. A PID profile with 3 or more changes at its maximum always takes its own test. One change is one episode (review 2026-10-15: the binomial test needs independent trials): the samples faster than 40 rpm/ms with gaps of 300 ms or less (the 200 ms FALLBACK detect delay and 100 ms), 1 s long or less, with one sample or more over the limits; its throttle is the maximum of `motor[0]` in the 20 ms before its start, its sign the sign at its start, and `pulses` its runs over the limits. On the four governed Fireball dumps (38 unique flight logs): 17 of 19 changes at the maximum in 59.3 s of 5619 s (p = 4e-32), all upward, 0 in 47 s at 95-99.5 %. `DEFAULT_RULES.G21` (and `health_report.cjs` RULES) |
 | L1-L7 | each sample at 0.5 % of its limit or nearer, gaps of less than 50 ms joined; for each period the frame times, the phase, the PID profile, the rescue state, the other outputs at their limits (a servo that follows its mixer input, correlation 0.9 or more, is the same output), the headspeed error, the rate error and the tracking ratio at the best time delay (C12) | Monitor for a period; flag for a period of 100 ms or more, an error more than G3, T6 or C12, or two outputs at their limits at the same time. Limits: L1 gov_max_throttle (CLI) or the firmware 100 %; L2 collectiveRange of the header (else `mixer input SC`); L3 the clamp in the flight data (the C2 rule, else `mixer input SR, SP`); L4 the T8 limits (else the clamp in the flight data, else `mixer input SY`); L5 the `servo` lines of the CLI dump only (the extreme of a servo in the data is the servo at the stick end, Gaui X4 #50); L6 SCALE.I x I gain x error_limit (CLI section, else the header for the PID profile at the start); L7 rcCommand[3] at ±500 (rc.c), in flight and in a rescue. Else "limit unknown" (skipped). The firmware has no PID sum limit: the mixer input limits are the output limits of the axes |
 
 ### The rescue checks and the control limits
@@ -1241,6 +1247,19 @@ validated in flight. Flags that have a standard error must pass a 2-SE test.
   prerequisite, L2, L3 and the cyclic servos (L5) "Cyclic gains", the tail servo (L5 with axis yaw) with L4, L6 the cyclic or tail
   gains by axis, L7 the Flight controller prerequisite (a command of the pilot). K22-K27 link them to the checks that their errors
   can cause. G20 (every FALLBACK) provides RPM and output-limit context without clearing G1.
+- G21 (the RPM signal at the throttle maximum, user rule 2026-10-15: for every helicopter): `advice.cjs` gives for each PID profile
+  with a problem `G21:gov_max_throttle:p<N>` (`gov_max_throttle` = the maximum − `DEFAULT_RULES.G21.margin` 3, CLI `profile N-1` and
+  `set gov_max_throttle = X`; the from-value: the CLI section, else the maximum that health_gov calculates from the log, else no CLI;
+  a CLI value that the log contradicts (motor[0] gets to more than it) gives the log value as the from-value, with no CLI text, and the
+  worker gives the modules no CLI `gov_max_throttle` of a dump that the log does not agree with (`cliMaxThrottle`); a PID profile whose
+  results together break the 1/10 rate rule gets no change; the stale flag of a G21 result names the source of `gov_max_throttle`
+  (`OWN_SOURCE`: the CLI dump, the value from the log, or unknown), not the log header;
+  evidence k, N, p, the rates, the FALLBACK entries and the cost in the logs: the time with the governor command at the new maximum or
+  more, and the time at the maximum now, for each flight) and one check `G21:signal` (the sensor wire, its supply and ground,
+  `freq_input_*`, `debug_mode` `RPM_SOURCE`). Its home is the RPM prerequisite (`homeOf`), so no gate holds it (a prerequisite is
+  never blocked), and guard 2 exempts it (`RPM_REMEDY`); the other governor changes stay held by the RPM prerequisite. The governor
+  model (`gov_tune.cjs` GT13, `gov_scenarios.cjs` GC6) uses the same detector and test: with a G21 problem, the GC6 row of
+  `gov_max_throttle` gives the model cost of that value as a check with no CLI text of its own (no second set line in the export).
 - The verdict has a card "Control limits" for L1-L7; the lens shows their periods (up to 10 spans each, `evidence.maxSpans`).
 
 ### Flight selection
@@ -1599,6 +1618,108 @@ Real files, no dump, file scope (2026-10-06): Fireball 2026-10-05: tail 4.0019 �
 76/19 = 4.0000), F6 "not measured" 18 -> 0, F9 "Monitor" 6 -> 0, and the F checks and their recommendations equal the run with
 the dump. Gaui X4 113720 (2000 rpm): tail 4.056 ± 0.0064 (4 flight logs, -33 dB), F6 "not measured" 12 -> 0, F9 "Monitor" 4 -> 0.
 The fit adds 1-2.5 s.
+
+### The governor model and the governor autotune
+
+The design, the model, the 42 governor parameters, the search and the acceptance rules are in
+[Governor autotune](GOVERNOR_AUTOTUNE.md). The toolkit files are `gov_twin.cjs` (the plant), `gov_data.cjs` (the run objects),
+`gov_params.cjs` (the configuration recovered from the log), `gov_sim.cjs` (the native 4.6 governor of `firmware_controller.cjs`
+in closed loop with the twin), `gov_fit.cjs` (identification and validation), `gov_search.cjs`, `gov_scenarios.cjs` and
+`gov_tune.cjs` (one row for each parameter, the recommendations, and the entry point `autotune`).
+
+`{ cmd: 'governorTune', id, bytes, fileName, options: { cliText, cliName, flightRpm, logs, flights, budgetMs, blockedBy } }` returns
+`{ id, type: 'governorTuned', result }` (`js/tuning_worker.js` `governorTune`):
+- Input: the whole file. `options.logs` and `options.flights` select the logs; a selected flight gives its whole log (a note),
+  because the model starts at the arm. The flight rpm is the user's or the automatic one of `analyseFile` (the flight phases
+  need it). The CLI dump is optional and goes to `autotune` as text; without it, `cli` is null.
+- Decode: each log with `gov_data.EXTRA`, the columns of `health_phase.cjs` and `govRequest`. `hsCollect`, `epochCollect` and
+  `armWhole` read the whole log (the PID profile at the start of the log and the stale). `health_phase.cjs` classifies each log
+  (`classOf`): a bench run is left out (`benchRuns`, one note with their count: "The governor analysis does not use bench runs (36
+  logs)."; the panel lists each one), a log that does not parse or has no flight phases goes to `skipped` with its reason. A log that `lib.segments` cannot read for a
+  missing field (`govLacks`, from the field list of the log header) gives the field and the setting that records it:
+  `gov_data.TEXT.noHs` and `blackbox_log_rpm` for the headspeed, else `blackbox_log_setpoint`, `_gyro`, `_mixer` or `_pid`
+  (rotorflight-firmware `blackbox.c` field conditions). That reason is also a reason of `unavailable`.
+- The PID profile at the start of a log uses the headspeeds of every log of the file (`hsMap`), as `analyseFile` does. With a
+  selection of logs, when a run has no logged PID profile at its first frame, the worker reads the other logs with `govRequest`
+  only (progress "The app reads the headspeed of log N of M.", fractions 0.40 to 0.45).
+- Runs: `gov_data.fromSegment(w, { phases, segment, events, name })` for each segment of a flight log, all phases. The events: the
+  INFLIGHT_ADJUSTMENT events of the whole log (an adjustment before a part applies to it, `gov_params`), and the DISARM events
+  (`d.epochEvents`, event 15, frame seconds) in the time of that part only (`gov_data.arming` puts an earlier DISARM at sample 0
+  of a later part). Each run of a flight log has `class: 'flight'` (one run per segment of a flight log, GOVERNOR_AUTOTUNE.md
+  section 2); `segmentClass` keeps the class of the segment alone ('bench' for a part with no flight of its own).
+  The PID profile of each sample is `profileAt`. Before the first logged change it is the PID profile at the start of the log
+  only when `armingFinal` confirms it (`run.armingProfile`, `profileFilled`), else 0 ("PID profile unknown"). A run without the
+  headspeed, `motor[0]` or the governor fields is left out, and the reasons of `gov_data.TEXT` go to the notes with the log numbers
+  (information only: they name the setting that records the value, they are not instructions, STE Rule 5.5).
+  A part whose flight phases stop is left out with the note "The app cannot find the flight phases of a part of this log. Thus,
+  the governor analysis does not use that part." (the error note of `phasesOf` loses its sentence about the airborne time).
+- No run left: `status: 'unavailable'` with the reasons: the missing values (for example `gov_data.TEXT.noGov`, which says that the
+  log records them only with `blackbox_log_governor` ON), else "The selected logs have no flight." when bench runs are the cause or no log
+  is left, else the reasons of the logs in `skipped`. `autotune` does not run.
+- Model: `gov_tune.autotune(runs, { cli, progress(text, fraction), budgetMs, cancelled() })`, a value or a promise of
+  `{ status: 'validated' | 'partial' | 'rejected' | 'unavailable', reasons, twin: { params, uncertainty, validation, plots }, rows,
+  recommendations, limitations, plots }`. Its progress texts map to the fractions 0.45 to 0.99 (stage `governor`). `cancelled()`
+  is true after `{ cmd: 'cancel', id }`; `autotune` must yield (`await`) for the cancel to arrive, and the worker stops at the
+  next checkpoint. The result goes through `toJson` (typed arrays to arrays), so it is JSON data (2.0-2.5 MB on the real dumps).
+  The model uses the flight logs with the battery voltage when some logs do not record it and 2 or more do (`gov_tune.modelRunsOf`,
+  `RUN.minVoltageLogs`; a limitation names the logs left out, `result.modelLogs` the logs of the model). The rule rows use every
+  flight log. Without it, one flight log without `Vbat` removes the voltage from the whole model, and the model is rejected (the
+  Gaui dump of 2026-10-04 23:34 has 4 such logs: GOVERNOR_AUTOTUNE.md section 8.4).
+- Stale (`govStale`): each recommendation (`'recommendation'`) and each row (`'result'`) gets the parts of the log
+  (`paramEpochs`) that its time touches while armed, in the stretches of its PID profile. A result of the model (`confidence:
+  'predicted'`, method `model` or `simulation`) reads every governor value (`READS['G:gov']`, the 42 names) over the runs of the logs of
+  the model (`modelLogs`, else all). A rule
+  row reads its own parameter (`READS['G:<name>']`, `'G:global'` for a related global value) over its evidence times. The flag
+  of `gov_tune.cjs` (the `gov_params.cjs` flags of a value that changes between logs, a CLI dump that disagrees) joins it
+  (`govJoin`). The worker's parts give the second arm, the logging pause and the PID profile switch, so those flags of
+  `gov_tune.cjs` are left out. A name and PID profile with a summary flag (`logs: []`, from `staleOf` and `simStale`) gives the summary
+  only (each flag of one log has the PID profile of its summary), and each part of the text is a paragraph (a line break between them:
+  STE Rule 6.6, 6 sentences or less; `staleTextHtml` of the dialog shows each one in a `<p>`, `advice.cjs` writes a comment line for
+  each sentence). The source of a part that flies another PID profile than at the start of its log (`spanInfo` has none without the
+  configurations of `datasets.cjs`) comes from the rows of the result (`govSources`, `row.current.from`: the CLI dump, the log header
+  of a log that starts with that PID profile, the values that the analysis calculated, "Some values of PID profile N are unknown."), so
+  the flag names the source that the result uses (GOVERNOR_AUTOTUNE.md section 8.1).
+- Notes: the note of a log without `Vbat` comes after the model: `gov_data TEXT.noVbat` for a log of the model, `TEXT.noVbatLeft` for a
+  flight log that `modelRunsOf` leaves out.
+- Gates (`govGates`): `options.blockedBy` holds the ids of the steps that gate the Governor step (hierarchy `nodes.governor.blockedBy`
+  and `gatedBy`: `rpm` and `power`) or texts. The ids become the texts of `advice.cjs` gate ("The prerequisite "RPM signal and motor
+  poles" has a problem. Correct it before you tune this tuning block."). Each recommendation with `severity: 'action'` gets them in
+  `blockedBy` and an empty `cli`, as `advice.filterRecommendations` does; checks keep their fields. `result.blockedBy` has the texts.
+- The result also has `fileName`, `logs` (the flight logs of the runs), `benchRuns`, `skipped`, `flightRpm`, `cliName`, `selection`
+  (`{ logs, whole: true }` with a flight selection), `blockedBy`, `notes`, `modelLogs` and `timing { decodeS, modelS, totalS }`.
+- Time: every time of the result (the plots, the evidence `t0`/`t1`, `events[].t`) is in frame seconds, `run.fromS + run.time`, as
+  `env.seekFrame` of the dialog needs (`log.getMinTime() + x` s). `run.time` alone is the time from the start of a part: wrong after a
+  logging pause.
+
+The Governor tab shows the result in the "Governor model" panel after "Recorded response" (`js/tuning_dialog.js`
+`govModelHtml`, exported in `TuningDialog.internals`; `gmStart` posts the command with the gates of `gmGates`). Its
+recommendations go to the CLI file (`gmDraftRecs`, appended to `exportRecsOf`, `picksOf` and `compiledPlan`):
+- A change that a gate holds: `gmDraftRecs` also adds the gate ids of the result on display when the worker gave none, so
+  `hasCli` and `pickDefault` leave it out and its "Blocked" list links the steps. The panel shows a notice with the gates.
+- `controlCliAuthorization` permits the CLI text while the result is current: a rule change always, a change from the model
+  (`confidence: 'predicted'`) only with the status validated or partial. `noCliText` gives the governor reason (`authorized.why`),
+  not the reason of the 6-DOF digital twin.
+- The panel lists these changes. The "Changes for export" list of the Governor step leaves them out (`stepPicksHtml`, `govDraft`).
+- They are one flight test of "Different flight tests". The PID profile menus of the Export tab select the configuration of the
+  control changes of the analysis only: the governor model uses the logs of the analysis, as the filter tune uses its log, and
+  the Export tab says so.
+
+The plots of the panel (`govPlotSpec`): the plots of each test flight have the logged governor states other than OFF, ACTIVE and
+BYPASS as bands (`gov_fit.stateBands`, `b.state`), in the colors of `STATE_BAND`; a label only on a band of 3 % or more of the axis.
+An opt-in check (`rec.optIn`) gives its own cause (`govOptInHtml`): the BYPASS condition for the BYPASS curve, else the sentence of the
+toolkit that says why the app does not select it (with the sentence before it when it starts with "Thus"), from the recommendation or
+the other changes of its group, else `GM_OPT_IN` of its parameter.
+
+Tests: `test/tuning_worker.test.cjs` runs the command on the simulated file with a stand-in `gov_tune.cjs` (the runs that it gets,
+the protocol, progress, cancel, the unavailable path and its reasons, the stale and `govJoin`, the gates, the class and the DISARM events
+of each part, a phase failure, the PID profile at the start from the other logs of the file), and runs the real `autotune` with a budget
+of 3 s on the simulated file. With `AUTOTUNE_GOV_LOG=<dump>` (and `AUTOTUNE_GOV_CLI`, `AUTOTUNE_GOV_RPM`, `AUTOTUNE_GOV_OUT`,
+`AUTOTUNE_GOV_FIXTURE`) it runs the command on a real dump (about 4 min): the status, the 42 names, JSON of 8 MB or less, the profile
+lines, and the frame clock of the headspeed plots against the log. `test/tuning_dialog.test.cjs` tests the panel with a fake worker
+(the start message, the result, the export, the gates, the statuses, cancel and errors, the opt-in causes, the band colors) and with the
+real Fireball result of `test/fixtures/governor_tuned_fireball.json.gz` (each plot through the real `TuningPlot`, the CLI file of the
+default picks). `test/ste_text.test.cjs` lints the sentences of every `tools/autotune/gov_*.cjs`, and with `AUTOTUNE_GOV_LOG` (or
+`AUTOTUNE_REAL_LOG`) the `governorTuned` results of the worker test.
 
 ### Issues of the overview (round 3 M3) and logs with no data (M4)
 
