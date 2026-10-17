@@ -1983,9 +1983,19 @@ in closed loop with the twin), `gov_fit.cjs` (identification and validation), `g
   `env.seekFrame` of the dialog needs (`log.getMinTime() + x` s). `run.time` alone is the time from the start of a part: wrong after a
   logging pause.
 
-The Governor tab shows the result in the "Governor model" panel after "Recorded response" (`js/tuning_dialog.js`
-`govModelHtml`, exported in `TuningDialog.internals`; `gmStart` posts the command with the gates of `gmGates`). Its
-recommendations go to the CLI file (`gmDraftRecs`, appended to `exportRecsOf`, `picksOf` and `compiledPlan`):
+The Governor tab has three numbered parts (`govPartHtml`, user 2026-10-17: what is wrong in the logs, how well the model agrees with
+them, what the model recommends). `govModelHtml` (exported in `TuningDialog.internals`; `gmStart` posts the command with the gates of
+`gmGates`) gives the result in three pieces `{ data, fit, tune }` that `controlWorkspaceHtml` places:
+1. "Problems in the logs": "Recorded problems", then `data` ("Governor checks of the logs": the recommendations whose row has the method
+   rule, data or firmware, `govSource`), then "Recorded response". No part of it uses the model.
+2. "Governor model checks": `fit`, the status with the table of `twin.validation.checks` (not satisfactory first), the plots of one test
+   flight at a time (the menu "Test flight", `view.ctTwin['governor:gm-flight']`) with its closed-loop errors
+   (`validation.closedLoop.runs`), the other model plots with a caption (`GM_PLOT_ABOUT`), the model limits and parameters.
+3. "Changes from the governor model": `tune`, the changes of the rows with the method model or simulation, the plots of the autotune
+   in groups of the parameters that they test (`GM_TESTS`, `govTests`), the checks of the model, and all rows (closed first).
+The evidence, the sources and the notes of a change are in its closed "Data, sources and notes"; its flag "Values possibly different"
+stays in its title. The cyclic and tail tabs keep their order (the next action, "Tuning result", then "Recorded problems").
+The recommendations go to the CLI file (`gmDraftRecs`, appended to `exportRecsOf`, `picksOf` and `compiledPlan`):
 - A change that a gate holds: `gmDraftRecs` also adds the gate ids of the result on display when the worker gave none, so
   `hasCli` and `pickDefault` leave it out and its "Blocked" list links the steps. The panel shows a notice with the gates.
 - `controlCliAuthorization` permits the CLI text while the result is current: a rule change always, a change from the model

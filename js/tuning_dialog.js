@@ -2909,7 +2909,7 @@ var TuningDialog = (function () {
     function stepPicksHtml(entry, key, env) {
         var recs = env.exportRecs ? env.exportRecs(entry) : recsOf(entry.result), picks = env.picks(entry);
         var all = recs.map(function(r,i){return {rec:r,index:i};}).filter(function(x){return (x.rec.node || (x.rec.filterSearch ? 'filters' : x.rec.area)) === key;});
-        var mine = all.filter(function(x){return !x.rec.govDraft;}); // the changes of the governor model: in the "Governor model" panel only (govRecsHtml)
+        var mine = all.filter(function(x){return !x.rec.govDraft;}); // the changes of the governor autotune: in parts 1 and 3 of the Governor tab only (govRecsHtml)
         return '<section class="tuning-step-picks"><h5 class="tuning-h">Changes for export</h5><p>Select the changes for the CLI file.</p>' +
             (mine.length < all.length ? '<p class="tuning-muted">' + esc(GM.inPanel) + '</p>' : '') +
             (mine.length ? mine.map(function(x){var can=canPick(recs,x.index);return '<label class="tuning-step-pick"><input type="checkbox" class="tuning-pick" data-pick="' + x.index + '"' + (can && picks[x.index] ? ' checked' : '') + (can ? '' : ' disabled') + '> ' + esc(recommendationTitle(x.rec)) + '</label>' + (can ? '' : '<p class="tuning-muted">' + esc(noCliText(x.rec)) + '</p>');}).join('') : all.length ? '' : '<p class="tuning-muted">No parameter change is available from this step.</p>') +
@@ -4416,8 +4416,28 @@ var TuningDialog = (function () {
         optInLead: "The app does not select this change. The cause is as follows:",
         checks: "Checks and information",
         exportLink: "Examine all selected changes",
-        plots: "Model and recorded data",
-        plotsAbout: "The plots compare the model with the recorded data. Click a time plot to show that time in the log viewer.",
+        // the three parts of the Governor tab (user, 2026-10-17): the problems in the logs, the checks of the model, the changes of the model
+        partData: "1. Problems in the logs",
+        partDataAbout: "These results come from the logs only. They do not use the governor model.",
+        partFit: "2. Governor model checks",
+        partFitAbout: "These checks show if the model agrees with the logs. If a model check is not satisfactory, examine its cause before you use a change from the model.",
+        partTune: "3. Changes from the governor model",
+        partTuneAbout: "The model tests each change on the recorded flights. Select the changes of the model for the CLI file here.",
+        noModel: "To make the governor model and get its changes, click \"Autotune\".",
+        dataChecks: "Governor checks of the logs",
+        dataAbout: "The governor autotune examines each governor parameter in the logs.",
+        noData: "To examine each governor parameter in the logs, click \"Autotune\".",
+        noDataRecs: "The governor checks of the logs found no problem.",
+        noDataRun: "The governor autotune did not examine the logs. The causes are in part 2.",
+        fitChecks: "Model checks",
+        plots: "Test flights: model and log",
+        plotsAbout: "If the model is correct, the lines of the model are near the line \"Log\". To remove a line, click its name in the legend. To show that time in the log viewer, click the plot.",
+        flight: "Test flight",
+        fitMore: "Other model checks",
+        tests: "Model tests",
+        testsAbout: "Each group shows the model tests of some governor parameters. The changes above come from these tests.",
+        modelChecks: "Checks and information from the model tests",
+        allRows: "All governor parameters",
         params: "Model parameters",
         reasons: "Causes",
         limits: "Model limits",
@@ -4426,7 +4446,7 @@ var TuningDialog = (function () {
         blocked: "A step before the governor in the tuning sequence has a problem. Thus, the changes have no CLI text until you correct it.",
         noCliModel: "The governor model does not agree with the test flights. Thus, this change from the model has no CLI text.",
         noCliOld: "This result of the governor model is for different flights or a different CLI dump. Thus, this change has no CLI text. To get CLI text, click \"Autotune\" again.",
-        inPanel: "The changes of the governor model are in the \"Governor model\" part of this tab.",
+        inPanel: "The changes of the governor autotune are in \"Governor checks of the logs\" above and in part 3 \"Changes from the governor model\".",
         notByConfig: "The changes of the governor model do not use this selection. To remove one of them from the CLI file, clear its box in the Governor tab."
     };
     // The cause that the app does not select an opt-in change, by parameter, when the texts of the toolkit do not give it (govOptInHtml)
@@ -4658,41 +4678,167 @@ var TuningDialog = (function () {
         return (m.text ? oneLine(m.text) : GM.running) + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "");
     }
 
-    // One recommendation of the model: the box of the CLI file (a change with CLI text and an index in exportRecsOf), its text,
-    // evidence, rule, notes and CLI text
-    function govRecHtml(x, env, opts, recs) {
-        var rec = x.rec, cli = Array.isArray(rec.cli) && rec.cli.length > 0, box = cli && isNum(x.index) && x.index >= 0;
+    // One recommendation of the governor autotune: the box of the CLI file (a change with CLI text and an index in exportRecsOf), its
+    // text, rule and CLI text, with its evidence, the source of its values that are possibly not current, its sources and its notes in a
+    // closed disclosure (the mark "Values possibly different" is in its title). compact: a recommendation without a box is a closed
+    // disclosure with its title (the lists of checks), with all of it in the disclosure
+    function govRecHtml(x, env, opts, recs, compact) {
+        var rec = x.rec, cli = Array.isArray(rec.cli) && rec.cli.length > 0, box = cli && isNum(x.index) && x.index >= 0, fold = compact && !box;
         var head = recBadges(rec) + " " + esc(recommendationTitle(rec)), graph = opts && opts.graph || null;
+        var cause = rec.optIn && rec.parameter !== "gov_bypass_throttle" ? govOptInCause(rec, recs) : "", text = typeof rec.text === "string" ? oneLine(rec.text) : "";
+        if (cause && text.indexOf(cause) >= 0) text = oneLine(text.replace(cause, " ")); // the note of the opt-in change gives the cause once
+        var more = govEvidenceHtml(rec.evidence) + staleRecHtml(rec) + sourcesHtml(rec) + bulletList(govStrings(rec.caveats).map(function (c) { return quoted(esc(oneLine(c))); }), "Note", "is-caveat");
+        var n = (Array.isArray(rec.evidence) ? rec.evidence.length : 0) + govStrings(rec.caveats).length;
+        var body = '<p class="tuning-muted">' + esc(profileText(rec)) + (rec.parameter ? " · " + parameterHtml(rec.parameter) : "") + "</p>" +
+            govOptInHtml(rec, recs) +
+            (text ? '<p data-ste="quoted">' + esc(text) + "</p>" : "") +
+            (ruleText(rec) ? '<div class="tuning-rec-rule"><div class="tuning-label">Rule</div><div data-ste="quoted">' + esc(ruleText(rec)) + "</div></div>" : "") +
+            (fold || !more ? more : '<details class="tuning-gm-more"><summary>' + esc("Data, sources and notes" + (n ? " (" + n + ")" : "")) + "</summary>" + more + "</details>") +
+            bulletList((Array.isArray(rec.blockedBy) ? rec.blockedBy : []).map(function (b) { return blockedItem(b, graph); }), "Blocked", "is-blocked") +
+            (cli && hasCli(rec) ? cliBlock(rec.cli.join("\n"), env, rec) : cli || isBlocked(rec) ? '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>" : "");
+        if (fold) return '<details class="tuning-gm-check"><summary>' + head + ' <span class="tuning-muted">· ' + esc(profileText(rec)) + "</span></summary>" +
+            '<div class="tuning-ct-reason tuning-gm-rec">' + body + "</div></details>";
         return '<article class="tuning-ct-reason tuning-gm-rec">' +
             (box ? '<label class="tuning-step-pick"><input type="checkbox" class="tuning-pick" data-pick="' + x.index + '"' + (x.can && x.checked ? " checked" : "") + (x.can ? "" : " disabled") + "> " + head + "</label>" : "<h6>" + head + "</h6>") +
-            '<p class="tuning-muted">' + esc(profileText(rec)) + (rec.parameter ? " · " + parameterHtml(rec.parameter) : "") + "</p>" +
-            govOptInHtml(rec, recs) +
-            (typeof rec.text === "string" && oneLine(rec.text) ? '<p data-ste="quoted">' + esc(oneLine(rec.text)) + "</p>" : "") + govEvidenceHtml(rec.evidence) + staleRecHtml(rec) +
-            (ruleText(rec) ? '<div class="tuning-rec-rule"><div class="tuning-label">Rule</div><div data-ste="quoted">' + esc(ruleText(rec)) + "</div></div>" : "") + sourcesHtml(rec) +
-            bulletList((Array.isArray(rec.blockedBy) ? rec.blockedBy : []).map(function (b) { return blockedItem(b, graph); }), "Blocked", "is-blocked") +
-            bulletList(govStrings(rec.caveats).map(function (c) { return quoted(esc(oneLine(c))); }), "Note", "is-caveat") +
-            (cli && hasCli(rec) ? cliBlock(rec.cli.join("\n"), env, rec) : cli || isBlocked(rec) ? '<div class="tuning-muted tuning-cli-none">' + esc(noCliText(rec)) + "</div>" : "") + "</article>";
+            body + "</article>";
     }
 
-    function govRecsHtml(m, env, opts) {
-        var recs = (Array.isArray(m.result.recommendations) ? m.result.recommendations : []).filter(function (r) { return r && typeof r === "object"; });
-        if (m.stale) return recs.length ? '<p class="tuning-muted">' + esc(GM.staleRecs) + "</p>" : "";
-        var list = Array.isArray(m.picks) ? m.picks : recs.map(function (r) { return { rec: r, index: -1, checked: false, can: false }; });
-        // the changes: with CLI text, or held by a gate of the Governor step (the worker clears the CLI text of a held change)
+    // The source of a recommendation of the governor autotune: "model" when its row (rec.row: the id of a row of the result) is a result
+    // of the model or of a model test, else "data" (a rule or a measurement of the logs). Without its row: "model" for a predicted value
+    function govSource(rec, rows) {
+        var row = rec && rec.row ? (Array.isArray(rows) ? rows : []).filter(function (r) { return r && r.id === rec.row; })[0] : null;
+        var method = row ? row.method : rec && rec.confidence === "predicted" ? "model" : "rule";
+        return method === "model" || method === "simulation" ? "model" : "data";
+    }
+
+    // The recommendations of one source ("data" or "model", govSource): { changes (with CLI text, or held by a gate of the Governor step:
+    // the worker clears the CLI text of a held change), checks (as closed disclosures) }, "" when the source has none of them
+    function govRecsHtml(m, env, opts, source) {
+        var rows = m.result.rows, recs = (Array.isArray(m.result.recommendations) ? m.result.recommendations : []).filter(function (r) { return r && typeof r === "object"; });
+        if (m.stale) return { changes: recs.some(function (r) { return govSource(r, rows) === source; }) ? '<p class="tuning-muted">' + esc(GM.staleRecs) + "</p>" : "", checks: "" };
+        var list = (Array.isArray(m.picks) ? m.picks : recs.map(function (r) { return { rec: r, index: -1, checked: false, can: false }; }))
+            .filter(function (x) { return govSource(x.rec, rows) === source; });
         var withCli = list.filter(function (x) { return Array.isArray(x.rec.cli) && x.rec.cli.length || x.rec.severity === "action" && isBlocked(x.rec); }), other = list.filter(function (x) { return withCli.indexOf(x) < 0; });
+        withCli = withCli.filter(function (x) { return x.rec.severity === "action"; }).concat(withCli.filter(function (x) { return x.rec.severity !== "action"; })); // the changes, then the opt-in checks
         var by = [];
         withCli.forEach(function (x) { if (x.rec.severity === "action") (x.rec.blockedBy || []).forEach(function (b) { if (by.indexOf(b) < 0) by.push(b); }); });
-        var html = '<section class="tuning-gm-recs"><h6 class="tuning-h">' + esc(GM.changes) + '</h6><p class="tuning-muted">' + esc(GM.picks) + "</p>" +
-            (by.length ? notice("warn", esc(GM.blocked) + " " + gateList(by, opts && opts.graph || null)) : "") +
-            (withCli.length ? withCli.map(function (x) { return govRecHtml(x, env, opts, recs); }).join("") : '<p class="tuning-muted">' + esc(GM.noChange) + "</p>");
-        if (other.length) html += '<h6 class="tuning-h">' + esc(GM.checks) + "</h6>" + other.map(function (x) { return govRecHtml(x, env, opts, recs); }).join("");
-        return html + '<a href="#" class="tuning-tab-link" data-tab="export">' + esc(GM.exportLink) + "</a></section>";
+        return { changes: withCli.length ? '<h6 class="tuning-h">' + esc(GM.changes + " (" + withCli.length + ")") + '</h6><p class="tuning-muted">' + esc(GM.picks) + "</p>" +
+                (by.length ? notice("warn", esc(GM.blocked) + " " + gateList(by, opts && opts.graph || null)) : "") + withCli.map(function (x) { return govRecHtml(x, env, opts, recs); }).join("") :
+                source === "model" ? '<p class="tuning-muted">' + esc(GM.noChange) + "</p>" : "",
+            checks: other.length ? '<h6 class="tuning-h">' + esc((source === "model" ? GM.modelChecks : GM.checks) + " (" + other.length + ")") + "</h6>" +
+                other.map(function (x) { return govRecHtml(x, env, opts, recs, true); }).join("") : "" };
     }
 
-    // The "Governor model" panel of the Governor tab: { html, plots }. The plots of the model quality are in a disclosure (open
-    // first): with env.details they go to the plots of the pane, else to env.extra. opts: { log (the only log of the analysis, for
-    // the time plots without their own when the result does not name its only log), graph (the tuning sequence, for the links of
-    // "Blocked"), plotsOpen }
+    // The model tests of the autotune (gov_tune tunePlots, by plot id): the governor parameters that each group tests and what to look for
+    var GM_TESTS = [
+        { key: "power", id: /^tune-battery/, title: "Headspeed and throttle reserve", params: ["gov_headspeed"],
+            about: "The model calculates the time at the maximum throttle and the headspeed decrease at each battery voltage. A lower battery voltage gives less throttle reserve." },
+        { key: "spool", id: /^tune-spool$/, title: "Spool-up", params: ["gov_spoolup_time", "gov_use_pid_spoolup"],
+            about: "The model calculates the headspeed overshoot after SPOOLUP for each spool-up time. A value below the line \"Limit\" is satisfactory." },
+        { key: "fallback", id: /^tune-fallback$/, title: "RPM signal errors", params: ["gov_fallback_drop", "gov_use_fallback_precomp", "gov_recovery_time"],
+            about: "The model flies one recorded RPM signal error with the values at this time and with other values. The legend gives each set of values. " +
+                "The analysis selects the values from the mean headspeed decrease at all errors of the flights, not at this error only. Thus, other values can show a smaller decrease in this plot." },
+        // gov_search.cjs NAMES: the values of the analysis on the longest test flight (its S.plot)
+        { key: "flight", id: /^tune-(hs|u)$/, title: "Test flight with the values of the analysis",
+            params: ["gov_gain", "gov_p_gain", "gov_i_gain", "gov_d_gain", "gov_f_gain", "gov_collective_ff_weight", "gov_cyclic_ff_weight", "gov_yaw_ff_weight", "gov_collective_curve",
+                "gov_rpm_filter", "gov_ff_filter", "gov_d_filter", "gov_p_limit", "gov_i_limit", "gov_d_limit", "gov_f_limit"],
+            about: "The model flies the longest test flight with the values at this time and with the values from the analysis. The legend shows if the analysis recommends these values." },
+        { key: "gains", id: /^tune-margin-\d+$/, title: "Margin of the governor gains", params: ["gov_gain", "gov_p_gain", "gov_i_gain", "gov_d_gain"],
+            about: "The margin test uses 2 times the P, I and D gains. The model increases the collective for a short time and then decreases it to the previous value. " +
+                "Each of these two changes gives one error peak. If the error then goes to a peak in the opposite direction, that peak must be much smaller. " +
+                "The row of each gain gives the ratio of the peaks and its limit." }
+    ];
+    var GM_TEST_OTHER = { key: "other", title: "Other model tests", params: [], about: "" };
+    // What to look for in a plot of the model checks, by its id (gov_tune twinPlots)
+    var GM_PLOT_ABOUT = {
+        "twin-horizon": "At each start point, the model starts with the recorded condition. Then it uses only the recorded inputs. A good model has a smaller error than the line \"Hold the start value\".",
+        "twin-steady": "The lines show the throttle that the model must have at each collective position. The points show the recorded throttle in periods of 1 s. If the model is correct, the points are near the lines of their headspeed."
+    };
+
+    // The plots of the model checks (twin.plots of gov_tune): the plots of each test flight (twin-hs|u|v-<log>-<segment>), in the
+    // sequence of the result, and the other plots
+    function govFitPlots(list) {
+        var runs = [], other = [];
+        list.forEach(function (p) {
+            var k = /^twin-(?:hs|u|v)-(\d+)-(\d+)$/.exec(String(p.id || "")), run = k && runs.filter(function (r) { return r.key === k[1] + "-" + k[2]; })[0];
+            if (!k) return other.push(p);
+            if (!run) runs.push(run = { key: k[1] + "-" + k[2], log: +k[1], segment: +k[2], plots: [] });
+            run.plots.push(p);
+        });
+        runs.forEach(function (r) { r.label = "Log " + logLabel(r.log) + (runs.some(function (q) { return q !== r && q.log === r.log; }) ? ", part " + (r.segment + 1) : ""); });
+        return { runs: runs, other: other };
+    }
+
+    // The status sentences of gov_fit (TEXT.validated, partial, rejected): the status line of the panel gives them
+    var GM_STATUS_REASON = /^The governor model (agrees with the test flights in (all|some) checks|does not agree with the test flights\.)/;
+
+    // The result of a group of model tests: the rows of the model and of the model tests for its parameters, one line for each result
+    // (GM_ROW_STATUS) with the parameters and the PID profiles; the table "All governor parameters" has each row
+    function govTestResultHtml(g, rows) {
+        var by = {}, uniq = function (a) { return a.filter(function (v, i) { return a.indexOf(v) === i; }); };
+        (Array.isArray(rows) ? rows : []).forEach(function (r) {
+            if (r && g.params.indexOf(r.name) >= 0 && /^(model|simulation)$/.test(r.method) && GM_ROW_STATUS[r.status]) (by[r.status] = by[r.status] || []).push(r);
+        });
+        var lines = Object.keys(GM_ROW_STATUS).filter(function (k) { return by[k]; }).map(function (k) {
+            var ps = uniq(by[k].map(function (r) { return r.scope === "profile" && isNum(r.profile) ? r.profile : 0; })).sort(function (a, b) { return a - b; });
+            return "<li>" + badge(GM_ROW_STATUS[k][0], GM_ROW_STATUS[k][1]) + " " + uniq(by[k].map(function (r) { return r.name; })).map(function (n) { return "<code>" + esc(n) + "</code>"; }).join(", ") +
+                ' <span class="tuning-muted">· ' + esc(ps.indexOf(0) >= 0 ? "All PID profiles" : ps.map(profileLabel).join(", ")) + "</span></li>";
+        });
+        return lines.length ? '<ul class="tuning-gm-test-result">' + lines.join("") + "</ul>" : "";
+    }
+
+    // The plots of the model tests in their groups (GM_TESTS, then the other plots)
+    function govTests(list) {
+        var groups = GM_TESTS.concat([GM_TEST_OTHER]).map(function (g) { return Object.assign({ plots: [] }, g); });
+        list.forEach(function (p) {
+            var g = groups.filter(function (q) { return q.id && q.id.test(String(p.id || "")); })[0] || groups[groups.length - 1];
+            g.plots.push(p);
+        });
+        return groups.filter(function (g) { return g.plots.length; });
+    }
+
+    // The errors of the closed loop in one test flight (validation.closedLoop.runs of gov_tune, gov_fit validate: hsRms and baseRms in %, uRms
+    // a fraction, all in ACTIVE; baseRms is the error of a model that always has the target headspeed, as check clSkill); "" without them
+    function govRunText(q) {
+        if (!q || !isNum(q.hsRms)) return "";
+        var p = function (v) { return num(+v.toPrecision(3)); };
+        return "In this test flight, the closed-loop headspeed error of the model is " + p(q.hsRms) + " % (RMS in ACTIVE)." +
+            (isNum(q.baseRms) ? " A model that always has the target headspeed of the log has an error of " + p(q.baseRms) + " %." : "") +
+            (isNum(q.uRms) ? " The closed-loop throttle error is " + p(q.uRms * 100) + " % (RMS in ACTIVE)." : "");
+    }
+
+    // The plots of a list as canvases with their captions: { html, plots }. note: false keeps the note of the toolkit for the caller
+    function govPlotsHtml(list, env, log, note) {
+        var own = [], html = list.map(function (p) {
+            var it = govPlotSpec(p, env, log), about = GM_PLOT_ABOUT[p.id] ? '<p class="tuning-plot-caption">' + esc(GM_PLOT_ABOUT[p.id]) + "</p>" : "",
+                caption = note !== false && typeof p.note === "string" && oneLine(p.note) ? '<p class="tuning-plot-caption" data-ste="quoted">' + esc(oneLine(p.note)) + "</p>" : "";
+            if (!it.spec) return '<div class="tuning-gm-plot"><p class="tuning-na">' + quoted(esc(it.title)) + " " + esc("Not available: " + it.na + ".") + "</p></div>";
+            var id = env.plotId ? env.plotId() : "tuning-gm-plot-" + own.length;
+            own.push({ id: id, spec: it.spec });
+            return '<div class="tuning-gm-plot"><div class="tuning-plot"><canvas class="tuning-plot-canvas" id="' + id + '"></canvas></div>' + about + caption + "</div>";
+        }).join("");
+        return { html: '<div class="tuning-plots">' + html + "</div>", plots: own };
+    }
+
+    // The checks of the model (twin.validation.checks of gov_tune: { rule, value, limit, pass, text }), the checks that are not
+    // satisfactory first. Each text has the value and the limit
+    function govChecksHtml(checks) {
+        var list = (Array.isArray(checks) ? checks : []).filter(function (q) { return q && typeof q.text === "string" && oneLine(q.text); });
+        if (!list.length) return "";
+        list = list.filter(function (q) { return q.pass === false; }).concat(list.filter(function (q) { return q.pass !== false; }));
+        return '<h6 class="tuning-h">' + esc(GM.fitChecks) + '</h6><div class="tuning-table-wrap"><table class="tuning-table tuning-gm-checks"><thead><tr><th>Result</th><th>Check</th></tr></thead><tbody>' +
+            list.map(function (q) {
+                return "<tr><td>" + (q.pass === true ? badge("Satisfactory", "satisfactory") : q.pass === false ? badge("Not satisfactory", "problem") : badge("No result", "nodata")) +
+                    '</td><td data-ste="quoted">' + esc(oneLine(q.text)) + "</td></tr>";
+            }).join("") + "</tbody></table></div>";
+    }
+
+    // One part of the Governor tab: its number and title, what it shows, and its sections
+    function govPartHtml(n, title, about, body) {
+        return '<section class="tuning-gm-part" data-part="' + n + '" aria-label="' + esc(title) + '"><h4 class="tuning-h tuning-gm-part-head">' + esc(title) + "</h4>" +
+            '<p class="tuning-muted tuning-gm-part-about">' + esc(about) + "</p>" + body + "</section>";
+    }
+
     // The autotune bar of the Governor tab (autotuneBarHtml) from the model of govModelHtml
     function govBarHtml(m) {
         m = m || { state: "none" };
@@ -4700,52 +4846,90 @@ var TuningDialog = (function () {
             disabled: !!(m.disabled || m.unavailable), reason: m.unavailable || "" });
     }
 
+    // The governor model of the Governor tab in the three parts of the tab (user, 2026-10-17): { data (part 1: the checks of each governor
+    // parameter in the logs, without the model), fit (part 2: the status and the checks of the model, the test flights), tune (part 3: the
+    // changes of the model, the model tests that give them, the checks of the model, all parameter rows), html (the three), plots }. The plots are in disclosures (open first): with
+    // env.details they go to the plots of the pane, else to env.extra. opts: { log (the only log of the analysis, for the time plots
+    // without their own when the result does not name its only log), graph (the tuning sequence, for the links of "Blocked"), plotsOpen,
+    // flight (the index of the test flight on display) }
     function govModelHtml(m, env, opts) {
         m = m || { state: "none" }; env = env || {}; opts = opts || {};
         var res = m.result && typeof m.result === "object" ? m.result : null, running = m.state === "running", st = res ? GM_STATUS[res.status] || GM_STATUS.unavailable : null;
         var log = res && Array.isArray(res.logs) && res.logs.length === 1 && isNum(res.logs[0]) ? res.logs[0] : isNum(opts.log) ? opts.log : null; // the logs of the runs (worker)
-        var html = '<section class="tuning-ct-section tuning-gm" aria-label="' + esc(GM.title) + '"><div class="tuning-ct-section-head"><h5 class="tuning-h">' + esc(GM.title) + "</h5>" +
+        var open = opts.plotsOpen !== false, ask = !running && !m.unavailable && !m.disabled;
+        var fit = '<section class="tuning-ct-section tuning-gm" aria-label="' + esc(GM.title) + '"><div class="tuning-ct-section-head"><h5 class="tuning-h">' + esc(GM.title) + "</h5>" +
             (st && !running && !m.stale ? badge(st[0], st[1]) : "") + "</div>" + '<p class="tuning-muted">' + esc(GM.about) + "</p>";
+        var data = '<section class="tuning-ct-section tuning-gm-data"><div class="tuning-ct-section-head"><h5 class="tuning-h">' + esc(GM.dataChecks) + "</h5></div>";
+        var tune = '<section class="tuning-ct-section tuning-gm-recs">';
         // the button, the progress and the reason of a disabled button: the autotune bar of the tab heading (govBarHtml)
-        if (m.state === "canceled") html += '<p role="status">' + esc(GM.canceled) + "</p>";
-        if (m.state === "failed") html += notice("error", esc(GM.failed) + (m.error && (m.error.detail || m.error.message) ? " " + quoted(esc(oneLine(m.error.detail || m.error.message))) : ""));
-        if (!res) return { html: html + "</section>", plots: [] };
-        if (m.stale) html += notice("warn", esc(GM.stale));
-        html += '<p class="tuning-gm-status"><strong>' + esc(st[0]) + ".</strong> " + esc(st[2]) + "</p>" +
-            bulletList(govStrings(res.reasons).map(function (t) { return quoted(esc(oneLine(t))); }), GM.reasons, "is-caveat") +
-            '<p class="tuning-ct-limit"><strong>Flight test necessary.</strong> ' + esc(GM.flightTest) + "</p>" +
-            bulletList(govStrings(res.limitations).map(function (t) { return quoted(esc(oneLine(t))); }), GM.limits, "is-caveat");
-        // the logs of the file that the run did not use (the worker: bench runs, logs that it cannot read or that do not record the
-        // values of the model), and the notes of the worker and the toolkit
-        var unused = (Array.isArray(res.benchRuns) ? res.benchRuns : []).filter(isNum).map(function (li) { return esc("Log " + logLabel(li) + ": " + BENCH + "."); })
-            .concat((Array.isArray(res.skipped) ? res.skipped : []).filter(function (q) { return q && isNum(q.log); }).map(function (q) {
-                return esc("Log " + logLabel(q.log) + ":") + (q.reason ? " " + quoted(esc(oneLine(q.reason))) : "");
-            }));
-        html += bulletList(unused, GM.unused, "is-caveat");
-        var notes = govStrings(res.notes);
-        if (notes.length) html += '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul>' + notes.map(function (n) { return "<li>" + esc(oneLine(n)) + "</li>"; }).join("") + "</ul></details>";
-        var twin =res.twin && typeof res.twin === "object" ? res.twin : {}, params = govTwinParams(twin), list = govPlotList(twin.plots).concat(govPlotList(res.plots));
-        if (list.length) html += deferredDetails(env, "governor:gm-plots", esc(GM.plots + " (" + plural(list.length, "plot") + ")"), "tuning-ct-details tuning-gm-plots", opts.plotsOpen !== false, function () {
-            var own = [], body = list.map(function (p) {
-                var it = govPlotSpec(p, env, log), caption = typeof p.note === "string" && oneLine(p.note) ? '<p class="tuning-plot-caption" data-ste="quoted">' + esc(oneLine(p.note)) + "</p>" : "";
-                if (!it.spec) return '<div class="tuning-gm-plot"><p class="tuning-na">' + quoted(esc(it.title)) + " " + esc("Not available: " + it.na + ".") + "</p></div>";
-                var id = env.plotId ? env.plotId() : "tuning-gm-plot-" + own.length;
-                own.push({ id: id, spec: it.spec });
-                return '<div class="tuning-gm-plot"><div class="tuning-plot"><canvas class="tuning-plot-canvas" id="' + id + '"></canvas></div>' + caption + "</div>";
-            }).join("");
-            return { html: '<p class="tuning-muted">' + esc(GM.plotsAbout) + '</p><div class="tuning-plots">' + body + "</div>", plots: own };
+        if (m.state === "canceled") fit += '<p role="status">' + esc(GM.canceled) + "</p>";
+        if (m.state === "failed") fit += notice("error", esc(GM.failed) + (m.error && (m.error.detail || m.error.message) ? " " + quoted(esc(oneLine(m.error.detail || m.error.message))) : ""));
+        if (!res) {
+            data = ask ? data + '<p class="tuning-muted">' + esc(GM.noData) + "</p></section>" : "";
+            tune = ask ? tune + '<p class="tuning-muted">' + esc(GM.noModel) + "</p></section>" : "";
+            fit += "</section>";
+            return { html: data + fit + tune, data: data, fit: fit, tune: tune, plots: [] };
+        }
+        if (m.stale) { fit += notice("warn", esc(GM.stale)); data += notice("warn", esc(GM.stale)); tune += notice("warn", esc(GM.stale)); }
+        // part 2: the status, the checks of the model and the causes that the checks do not give, the test flights, the limits
+        var twin = res.twin && typeof res.twin === "object" ? res.twin : {}, params = govTwinParams(twin), val = twin.validation && typeof twin.validation === "object" ? twin.validation : {};
+        var checks = Array.isArray(val.checks) ? val.checks : [], texts = checks.map(function (q) { return q && typeof q.text === "string" ? oneLine(q.text) : ""; });
+        fit += '<p class="tuning-gm-status"><strong>' + esc(st[0]) + ".</strong> " + esc(st[2]) + "</p>" + govChecksHtml(checks) +
+            bulletList(govStrings(res.reasons).filter(function (t) { return texts.indexOf(oneLine(t)) < 0 && !GM_STATUS_REASON.test(oneLine(t)); }).map(function (t) { return quoted(esc(oneLine(t))); }), GM.reasons, "is-caveat");
+        var shown = govFitPlots(govPlotList(twin.plots)), runs = shown.runs, k = isNum(opts.flight) && opts.flight >= 0 && opts.flight < runs.length ? opts.flight : 0, run = runs[k];
+        if (run) fit += deferredDetails(env, "governor:gm-plots", esc(GM.plots + " (" + plural(runs.length, "flight") + ")"), "tuning-ct-details tuning-gm-plots", open, function () {
+            var cl = val.closedLoop && Array.isArray(val.closedLoop.runs) ? val.closedLoop.runs : [], q = cl.filter(function (x) { return x && x.log === run.log && (x.segment || 0) === run.segment; })[0];
+            var note = run.plots.map(function (p) { return typeof p.note === "string" ? oneLine(p.note) : ""; }).filter(Boolean)[0], drawn = govPlotsHtml(run.plots, env, log, false);
+            return { html: (runs.length > 1 ? '<div class="tuning-plot-toolbar"><label>' + esc(GM.flight) + ' <select class="form-control input-sm tuning-ct-twin-select" data-twin="gm-flight">' +
+                    options(runs.map(function (r, i) { return [String(i), r.label]; }), String(k)) + "</select></label></div>" : '<p class="tuning-gm-run">' + esc(GM.flight + ": " + run.label) + "</p>") +
+                (govRunText(q) ? '<p class="tuning-gm-run"><strong>' + esc(govRunText(q)) + "</strong></p>" : "") +
+                (note ? '<p class="tuning-muted" data-ste="quoted">' + esc(note) + "</p>" : "") + '<p class="tuning-muted">' + esc(GM.plotsAbout) + "</p>" + drawn.html, plots: drawn.plots };
         });
-        if (params.length) html += deferredDetails(env, "governor:gm-params", esc(GM.params + " (" + params.length + ")"), "tuning-ct-details", false, function () {
+        if (shown.other.length) fit += deferredDetails(env, "governor:gm-fit-more", esc(GM.fitMore + " (" + plural(shown.other.length, "plot") + ")"), "tuning-ct-details tuning-gm-plots", open, function () {
+            return govPlotsHtml(shown.other, env, log);
+        });
+        fit += bulletList(govStrings(res.limitations).map(function (t) { return quoted(esc(oneLine(t))); }), GM.limits, "is-caveat");
+        if (params.length) fit += deferredDetails(env, "governor:gm-params", esc(GM.params + " (" + params.length + ")"), "tuning-ct-details", false, function () {
             return { html: '<div class="tuning-table-wrap"><table class="tuning-table"><thead><tr><th>Parameter</th><th>Value</th><th>Uncertainty</th></tr></thead><tbody>' +
                 params.map(function (q) { return "<tr><td><code>" + esc(q.name) + '</code></td><td class="tuning-num">' + esc(num(q.value)) + '</td><td class="tuning-num">' + esc(q.range) + "</td></tr>"; }).join("") +
                 "</tbody></table></div>", plots: [] };
         });
+        var notes = govStrings(res.notes);
+        if (notes.length) fit += '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul>' + notes.map(function (n) { return "<li>" + esc(oneLine(n)) + "</li>"; }).join("") + "</ul></details>";
+        fit += "</section>";
+        // part 1: the checks of the logs (the rules and the measurements of each parameter), and the logs of the file that the run did not
+        // use (the worker: bench runs, logs that it cannot read or that do not record the values of the model)
+        var recIn = { result: res, stale: m.stale, picks: m.picks }, dr = govRecsHtml(recIn, env, opts, "data"), dataRecs = dr.changes + dr.checks;
+        var unused = (Array.isArray(res.benchRuns) ? res.benchRuns : []).filter(isNum).map(function (li) { return esc("Log " + logLabel(li) + ": " + BENCH + "."); })
+            .concat((Array.isArray(res.skipped) ? res.skipped : []).filter(function (q) { return q && isNum(q.log); }).map(function (q) {
+                return esc("Log " + logLabel(q.log) + ":") + (q.reason ? " " + quoted(esc(oneLine(q.reason))) : "");
+            }));
+        // without a recommendation: "found no problem" only when a rule or a measurement of the logs has a result (not for a stale result)
         var rows = Array.isArray(res.rows) ? res.rows : Array.isArray(res.parameters) ? res.parameters : [];
-        // all rows (42 names, each profile name for each PID profile, and the related parameters): open first, the pilot can close it
-        html += '<section class="tuning-gm-rows"><h6 class="tuning-h">' + esc("Governor parameters (" + plural(rows.length, "row") + ")") + '</h6><p class="tuning-muted">' + esc(GM.rows) + "</p>" +
-            deferredDetails(env, "governor:gm-rows", esc(GM.table), "tuning-ct-details", true, function () { return { html: govRowsHtml(rows, res), plots: [] }; }) + "</section>" +
-            govRecsHtml({ result: res, stale: m.stale, picks: m.picks }, env, opts);
-        return { html: html + "</section>", plots: [] };
+        var examined = rows.some(function (r) { return r && !/^(model|simulation)$/.test(r.method) && !/^(not-recorded|not-applicable)$/.test(r.status); });
+        data += '<p class="tuning-muted">' + esc(GM.dataAbout) + "</p>" + (dataRecs || m.stale ? dataRecs : '<p class="tuning-muted">' + esc(examined ? GM.noDataRecs : GM.noDataRun) + "</p>") +
+            (unused.length ? deferredDetails(env, "governor:gm-unused", esc(GM.unused + " (" + unused.length + ")"), "tuning-ct-details", false, function () {
+                return { html: "<ul>" + unused.map(function (t) { return "<li>" + t + "</li>"; }).join("") + "</ul>", plots: [] };
+            }) : "") + "</section>";
+        // part 3: the changes of the model, the model tests that give them, the checks of the model, all rows (42 names, each profile name
+        // for each PID profile, and the related parameters: closed first, the pilot can open it)
+        var tests = govTests(govPlotList(res.plots));
+        var mr = govRecsHtml(recIn, env, opts, "model");
+        tune += '<p class="tuning-ct-limit"><strong>Flight test necessary.</strong> ' + esc(GM.flightTest) + "</p>" + mr.changes;
+        if (tests.length) tune += deferredDetails(env, "governor:gm-tests", esc(GM.tests + " (" + plural(tests.reduce(function (n, g) { return n + g.plots.length; }, 0), "plot") + ")"),
+            "tuning-ct-details tuning-gm-plots", open, function () {
+                var own = [], html = '<p class="tuning-muted">' + esc(GM.testsAbout) + "</p>" + tests.map(function (g) {
+                    var d = govPlotsHtml(g.plots, env, log);
+                    own = own.concat(d.plots);
+                    return '<section class="tuning-gm-test" data-test="' + esc(g.key) + '"><h6 class="tuning-h">' + esc(g.title) + "</h6>" +
+                        (govTestResultHtml(g, rows) || (g.params.length ? '<p class="tuning-muted">' + g.params.map(parameterHtml).join(", ") + "</p>" : "")) + (g.about ? "<p>" + esc(g.about) + "</p>" : "") + d.html + "</section>";
+                }).join("");
+                return { html: html, plots: own };
+            });
+        tune += mr.checks + deferredDetails(env, "governor:gm-rows", esc(GM.allRows + " (" + plural(rows.length, "row") + ")"), "tuning-ct-details tuning-gm-rows", false, function () {
+            return { html: '<p class="tuning-muted">' + esc(GM.rows) + "</p>" + govRowsHtml(rows, res), plots: [] };
+        }) + '<a href="#" class="tuning-tab-link" data-tab="export">' + esc(GM.exportLink) + "</a></section>";
+        return { html: data + fit + tune, data: data, fit: fit, tune: tune, plots: [] };
     }
 
     function controlWorkspaceHtml(entry, step, view, env, panel) {
@@ -4803,6 +4987,7 @@ var TuningDialog = (function () {
         if (m.state === 'canceled') html += '<p role="status">The control analysis was canceled.</p>';
         // Keep the next action above the supporting measurements. Diagnostics
         // are available immediately, without requiring an Autotune click.
+        var beforeProcedures = html.length;
         if (!res && !m.stale && d) {
             var procedures = recsOf(r, d.id).filter(function(rec) { return (rec.node || rec.area) === step && rec.procedure; });
             var seenProcedures = [];
@@ -4837,13 +5022,20 @@ var TuningDialog = (function () {
         html += '</section>';
         var recordedProblems = html.slice(beforeProblems);
         html = html.slice(0, beforeProblems);
-        html += '<section class="tuning-ct-section tuning-ct-recommendations"><h5 class="tuning-h">Tuning result</h5>';
-        if (!model && env.governorModel) { // the governor model of the flight logs (docs/GOVERNOR_AUTOTUNE.md section 8): govModelHtml, its plots with the plots of the pane
-            var gmOut = env.governorModel(entry);
-            html += gmOut.html;
+        // The Governor tab in three parts (user, 2026-10-17): the problems in the logs, the checks of the governor model, its changes
+        // (govModelHtml of the flight logs, docs/GOVERNOR_AUTOTUNE.md section 8; its plots with the plots of the pane)
+        // The parts are placed at the end (the recorded data of part 1: the next steps, the recorded problems and response, the recorded
+        // configurations and checks)
+        var gmOut = !model && env.governorModel ? env.governorModel(entry) : null, nextSteps = '';
+        if (gmOut) {
             gmOut.plots.forEach(function(q){plots.push(q);});
-        } else if (res) html += '<p role="status">' + esc(res.reason) + '</p>';
-        else if (!disabled && !running) html += '<p class="tuning-muted">Click &quot;Autotune&quot; to make a helicopter model from the selected flight data. The app tests control values with this model.</p>';
+            nextSteps = html.slice(beforeProcedures);
+            html = html.slice(0, beforeProcedures);
+        } else {
+            html += '<section class="tuning-ct-section tuning-ct-recommendations"><h5 class="tuning-h">Tuning result</h5>';
+            if (res) html += '<p role="status">' + esc(res.reason) + '</p>';
+            else if (!disabled && !running) html += '<p class="tuning-muted">Click &quot;Autotune&quot; to make a helicopter model from the selected flight data. The app tests control values with this model.</p>';
+        }
         if (res && res.twin) {
             var twin=res.twin, current=twinIsCurrent(twin), validation=twin.validation && twin.validation.test, coverage=twin.coverage || {},
                 excluded=coverage.excluded || [], accepted=coverage.intervals || [];
@@ -5093,23 +5285,27 @@ var TuningDialog = (function () {
             });
         }
         if (res && res.deferred && res.deferred.length) html += detail('deferred','Changes that must wait','<ul>' + res.deferred.map(function(q){return '<li><strong>' + mdCode(q.title) + '</strong><p>' + esc(q.reason) + '</p></li>';}).join('') + '</ul>');
-        html += '</section>' + recordedProblems + '<section class="tuning-ct-section"><h5 class="tuning-h">Recorded response</h5>';
-        var curves = curvesInView(r,view);
-        html += '<div class="tuning-plot-toolbar">';
-        if (step === 'cyclic') html += '<div class="btn-group btn-group-xs">' + ['roll','pitch'].map(function(a){return '<button type="button" class="btn btn-default tuning-axis' + (axis === a ? ' active' : '') + '" data-axis="' + a + '">' + cap(a) + '</button>';}).join('') + '</div>';
-        if (curves.length > 1) html += '<label>Recorded period <select class="form-control input-sm tuning-segment">' + options(curves.map(function(c,i){return [String(i),'Log ' + logLabel(c.log) + ': ' + secs(c.fromS) + ' to ' + secs((c.fromS||0)+(c.seconds||0))];}),String(curves.indexOf(curve))) + '</select></label>';
-        html += (curve ? '<span class="tuning-muted">Log ' + esc(logLabel(curve.log)) + '. Click a time plot to show that time in the log viewer.</span>' : '') + '</div>';
-        if (curve) {
-            var items = step === 'governor' ? govPlots(curve,axis,r,env) : trackPlots(curve,axis,r,env);
-            html += plot(items[0]);
-            html += '<p class="tuning-plot-caption">These signals show the response with the recorded parameter values.</p>';
-            html += detail('signals','More recorded signals',function () {
-                var extra = step === 'tail' ? tailPlots(curve,axis,r,env) : items.slice(1);
-                return '<div class="tuning-plots">' + extra.map(plot).join('') + '</div>';
-            });
-        } else html += plot({na:whyMissing(r,null,step === 'governor' ? 'governor' : step === 'tail' ? 'tail' : 'tracking error')});
-        html += '</section>';
-        if (pair) html += detail('history','Compare recorded configurations',function(){
+        if (!gmOut) html += '</section>' + recordedProblems + responseHtml();
+        // The recorded response of the step (the Governor tab: in part 1)
+        function responseHtml() {
+            var html = '<section class="tuning-ct-section"><h5 class="tuning-h">Recorded response</h5>', curves = curvesInView(r,view);
+            html += '<div class="tuning-plot-toolbar">';
+            if (step === 'cyclic') html += '<div class="btn-group btn-group-xs">' + ['roll','pitch'].map(function(a){return '<button type="button" class="btn btn-default tuning-axis' + (axis === a ? ' active' : '') + '" data-axis="' + a + '">' + cap(a) + '</button>';}).join('') + '</div>';
+            if (curves.length > 1) html += '<label>Recorded period <select class="form-control input-sm tuning-segment">' + options(curves.map(function(c,i){return [String(i),'Log ' + logLabel(c.log) + ': ' + secs(c.fromS) + ' to ' + secs((c.fromS||0)+(c.seconds||0))];}),String(curves.indexOf(curve))) + '</select></label>';
+            html += (curve ? '<span class="tuning-muted">Log ' + esc(logLabel(curve.log)) + '. Click a time plot to show that time in the log viewer.</span>' : '') + '</div>';
+            if (curve) {
+                var items = step === 'governor' ? govPlots(curve,axis,r,env) : trackPlots(curve,axis,r,env);
+                html += plot(items[0]);
+                html += '<p class="tuning-plot-caption">These signals show the response with the recorded parameter values.</p>';
+                html += detail('signals','More recorded signals',function () {
+                    var extra = step === 'tail' ? tailPlots(curve,axis,r,env) : items.slice(1);
+                    return '<div class="tuning-plots">' + extra.map(plot).join('') + '</div>';
+                });
+            } else html += plot({na:whyMissing(r,null,step === 'governor' ? 'governor' : step === 'tail' ? 'tail' : 'tracking error')});
+            return html + '</section>';
+        }
+        var tail = '';
+        if (pair) tail += detail('history','Compare recorded configurations',function(){
             var html = '<label>Other recorded configuration <select class="form-control input-sm tuning-ct-reference">' +
                 options(pairs.map(function(p){var id = p.a === view.dataset ? p.b : p.a;return [id,configLabel(id) + ' (recorded)'];}),reference) + '</select></label>' +
                 '<p>The two configurations were flown. Different stick inputs and flight conditions can change the result.</p>' + comparisonsHtml({comparisons:[pair]},view.dataset);
@@ -5124,7 +5320,7 @@ var TuningDialog = (function () {
             var diff = pair.names.map(function(name){var v = pair.values[name], reverse = pair.a !== view.dataset;return {name:name,from:v[reverse?1:0],to:v[reverse?0:1],source:'Recorded configurations'};});
             return html + (diff.length ? parameterTable(diff,configLabel(reference)) : '');
         });
-        html += detail('checks','All recorded checks and recommendations',function () {
+        tail += detail('checks','All recorded checks and recommendations',function () {
             var related = PLOT_TABS[step], measurements = related ? (r.findings || []).filter(function(f){
                 return inView(f,view) && related.checks.test(String(f.id)) && (!curve || onLog(f,curve.log));
             }).sort(SORTS.severity) : fs;
@@ -5132,7 +5328,9 @@ var TuningDialog = (function () {
             return (typeof panel === 'function' ? panel() : panel || '') +
                 '<h5 class="tuning-h">Recorded measurements</h5>' + filterBar(env.filter ? env.filter() : {},shown,false) +
                 findingsTable(shown.list,{where:step},Object.assign({},env,{compareOpen:function(){return false;}})) + stepPicksHtml(entry,step,env);
-        }) + '</section>';
+        });
+        html += (gmOut ? govPartHtml(1, GM.partData, GM.partDataAbout, nextSteps + recordedProblems + gmOut.data + responseHtml() + tail) +
+            govPartHtml(2, GM.partFit, GM.partFitAbout, gmOut.fit) + govPartHtml(3, GM.partTune, GM.partTuneAbout, gmOut.tune) : tail) + '</section>';
         return {html:html,plots:plots};
     }
 
@@ -5674,7 +5872,8 @@ var TuningDialog = (function () {
             governorBar: function () { return govBarHtml(gmModel(shown)); },
             governorModel: function () {
                 var logs = shown ? gmLogs(shown.result) : [];
-                return govModelHtml(gmModel(shown), env, { log: logs.length === 1 ? logs[0] : null, graph: shown ? graphOf(shown.result) : null });
+                return govModelHtml(gmModel(shown), env, { log: logs.length === 1 ? logs[0] : null, graph: shown ? graphOf(shown.result) : null,
+                    flight: view.ctTwin ? view.ctTwin["governor:gm-flight"] : null }); // the test flight of the model checks (.tuning-ct-twin-select)
             },
             extra: [] // plots of the pane being drawn that are not in its tab's own list (the compare panels)
         };
@@ -8239,7 +8438,7 @@ var TuningDialog = (function () {
         twinAssessment: twinAssessment, twinClosedItems: twinClosedItems, twinLoopNotes: twinLoopNotes, TWIN_OUTPUTS: TWIN_OUTPUTS,
         tabStatus: tabStatus, filterTabStates: filterTabStates,
         controlWorkspaceHtml: controlWorkspaceHtml, controlPairs: controlPairs, flightPlanHtml: flightPlanHtml,
-        govModelHtml: govModelHtml, govBarHtml: govBarHtml, autotuneBarHtml: autotuneBarHtml, govPlotSpec: govPlotSpec, govOptInHtml: govOptInHtml, govOptInCause: govOptInCause, staleTextHtml: staleTextHtml, govPlotList: govPlotList, govRowGroups: govRowGroups, govRowsHtml: govRowsHtml, govEvidenceHtml: govEvidenceHtml,
+        govModelHtml: govModelHtml, govBarHtml: govBarHtml, autotuneBarHtml: autotuneBarHtml, govPlotSpec: govPlotSpec, govOptInHtml: govOptInHtml, govOptInCause: govOptInCause, staleTextHtml: staleTextHtml, govPlotList: govPlotList, govSource: govSource, govPartHtml: govPartHtml, recommendationTitle: recommendationTitle, govFitPlots: govFitPlots, govTests: govTests, govRunText: govRunText, govChecksHtml: govChecksHtml, govRowGroups: govRowGroups, govRowsHtml: govRowsHtml, govEvidenceHtml: govEvidenceHtml,
         govNumbers: govNumbers, govValue: govValue, govTwinParams: govTwinParams, GM: GM, GM_STATUS: GM_STATUS, GM_FAMILIES: GM_FAMILIES, GM_ROW_STATUS: GM_ROW_STATUS, pickDefault: pickDefault,
         esc: esc, parameterLabel: parameterLabel, parameterHtml: parameterHtml, num: num, valueSe: valueSe, threshold: threshold, logLabel: logLabel, paramText: paramText, findingStatus: findingStatus,
         areaOf: areaOf, findingWhere: findingWhere, findingAxis: findingAxis, rpmText: rpmText, lookFor: lookFor, toFrame: toFrame,

@@ -795,10 +795,14 @@ together pass, and no value that a row shows as known is "unknown" in the CLI fi
 
 ### 8.2 The "Governor model" panel (`js/tuning_dialog.js` `govModelHtml`, `css/tuning_dialog.css`)
 
-- The start button, the progress and Cancel; the status (`GM_STATUS`) with the reasons of the validation, the model limits, the logs that
-  the analysis does not use (bench runs and `skipped`), and the notes of the worker and the toolkit ("Analysis information").
-- The plots (`govPlotSpec`, the generic spec of section 7.1, drawn by `TuningPlot`): the test flights of the model, the horizon curve, the
-  steady-state map and the plots of the autotune. **Time base**: x of a time plot is in frame seconds from the log start, `fromS + time`
+- The Governor tab has three parts (user, 2026-10-17; `govPartHtml`, DEVELOPMENT.md section 13): 1 the problems in the logs (the
+  recorded problems, the recommendations of the rule and data rows, `govSource`, the logs that the analysis does not use, the recorded
+  response), 2 the model checks, 3 the changes of the model with the model tests and all rows. Each part says what it uses.
+- The start button, the progress and Cancel (the bar of the tab heading); the status (`GM_STATUS`) with the table of the validation checks
+  and the reasons that the table does not give, the model limits, and the notes of the worker and the toolkit ("Analysis information").
+- The plots (`govPlotSpec`, the generic spec of section 7.1, drawn by `TuningPlot`): in part 2 the test flights of the model (one flight
+  at a time, with its closed-loop errors), the horizon curve and the steady-state map; in part 3 the plots of the autotune in the groups
+  of `GM_TESTS` (headspeed reserve, spool-up, RPM signal errors, gains), each with the parameters it tests and what to look for. **Time base**: x of a time plot is in frame seconds from the log start, `fromS + time`
   of the run, the clock of the log viewer: a click calls `env.seekFrame(log, x)`, which seeks to `log.getMinTime() + x` s (as each
   evidence time). `gov_fit.plotData` (the plot time and `stateBands`), `gov_fit.events` (`t`), `gov_search` (the margin window, its
   step response, the FALLBACK reference of `gov_rpm_filter`, the plot of the closed loop) and `gov_scenarios` (the FALLBACK plot, the

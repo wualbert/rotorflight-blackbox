@@ -1578,6 +1578,7 @@ const AUTO = {
         horizonTitle: 'Headspeed error of the model against the time after the start point', steadyTitle: 'Throttle for the load against the collective',
         curve: (h, k) => `${h} rpm, ${k === 'full' ? 'full battery' : k === 'end' ? 'end of the battery' : 'model'}`,
         candHs: (l) => `Headspeed with the recommended values (log ${N(l)})`, candThr: (l) => `Throttle with the recommended values (log ${N(l)})`,
+        testHs: (l) => `Headspeed with other values (log ${N(l)})`, testThr: (l) => `Throttle with other values (log ${N(l)})`,
         battTitle: 'Time at the maximum throttle against the battery voltage', droopTitle: 'Headspeed decrease against the battery voltage', prof: (p, h) => `${prof(p)} (${h} rpm)`,
         spoolTitle: 'Overshoot after SPOOLUP against the spool-up time', spoolCase: (p, v, pid) => `${prof(p)}, ${isNum(v) ? `${fmt(v, 1)} V` : 'recorded voltage'}${pid ? ', PID spool-up' : ''}`,
         fbTitle: (l) => `Headspeed after an RPM signal error (log ${N(l)})`, marginTitle: (p) => `Margin test of ${prof(p)}: headspeed error after a collective step`,
@@ -1629,9 +1630,9 @@ function tunePlots(S, SS) {
     const P = AUTO.plot, out = [], T = { label: P.time, unit: 's' };
     const pl = S && S.plot, tr = pl && pl.trace;
     if (tr) {
-        const cand = pl.candidate === 'accepted' ? P.cand : P.searched;
-        out.push(plotSpec('tune-hs', P.candHs(pl.log), 'time', T, { label: P.hs, unit: 'rpm' }, [ser(P.log, 'measured', tr.t, tr.hs), ser(P.now, 'baseline', tr.t, tr.hsBase), ser(cand, 'candidate', tr.t, tr.hsCand), ser(P.target, 'limit', tr.t, tr.target)], { log: pl.log }));
-        out.push(plotSpec('tune-u', P.candThr(pl.log), 'time', T, { label: P.thr, unit: '%' }, [ser(P.now, 'baseline', tr.t, scale(tr.uBase, 100)), ser(cand, 'candidate', tr.t, scale(tr.uCand, 100))], { log: pl.log }));
+        const ok = pl.candidate === 'accepted', cand = ok ? P.cand : P.searched;   // the titles: the recommended values only when the search accepts them
+        out.push(plotSpec('tune-hs', (ok ? P.candHs : P.testHs)(pl.log), 'time', T, { label: P.hs, unit: 'rpm' }, [ser(P.log, 'measured', tr.t, tr.hs), ser(P.now, 'baseline', tr.t, tr.hsBase), ser(cand, 'candidate', tr.t, tr.hsCand), ser(P.target, 'limit', tr.t, tr.target)], { log: pl.log }));
+        out.push(plotSpec('tune-u', (ok ? P.candThr : P.testThr)(pl.log), 'time', T, { label: P.thr, unit: '%' }, [ser(P.now, 'baseline', tr.t, scale(tr.uBase, 100)), ser(cand, 'candidate', tr.t, scale(tr.uCand, 100))], { log: pl.log }));
     }
     const pw = SS && SS.power, curve = pw && pw.curve || [];
     if (curve.length) {
