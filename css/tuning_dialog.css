@@ -2093,3 +2093,41 @@
 .tuning-next-action li { margin: 7px 0; padding-left: 3px; }
 .tuning-action-measurements { margin: 12px 0; }
 .tuning-action-measurements > summary { cursor: pointer; color: #24566d; font-weight: 600; }
+
+/* "Change recommended" on a tab (renderTabStatus): the step has changes that the app selects first, whatever its status */
+.tuning-tab-change {
+    display: block;
+    width: max-content;
+    margin-top: 3px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: #245577;
+    color: #fff;
+    font-size: calc(12 * var(--rf-px));
+    line-height: 1.5;
+    font-weight: 600;
+}
+
+.tuning-tab-change:empty { display: none; }
+
+/* "Selected parameter changes" of the Export tab (pendingDiffHtml): a table for each PID profile, the check box of each row, and the
+   rows whose change uses values that are possibly not current. The flag is a caution here, not only a tag */
+.tuning-pending-diff h6.tuning-h { margin: 14px 0 4px; }
+.tuning-plan-table td:first-child:not(:only-child) { width: 1%; text-align: center; }
+.tuning-plan-table tr.is-off td { color: #808080; }
+.tuning-plan-table tr.is-off code { text-decoration: line-through; }
+.tuning-plan-table tr.is-stale > td { border-bottom: 0; }
+.tuning-plan-table tr.is-stale > td:first-child { box-shadow: inset 4px 0 0 #c9483f; }
+.tuning-plan-stale > td {
+    padding-top: 0;
+    background: #fff4e0;
+    box-shadow: inset 4px 0 0 #c9483f;
+}
+.tuning-plan-stale .tuning-stale-text { color: #6b3f00; font-weight: 600; }
+.tuning-stale-caution { border-left-color: #c9483f; background: #fff4e0; }
+.tuning-stale-caution strong { color: #a3362e; }
+.tuning-pick-row.is-stale { box-shadow: inset 4px 0 0 #c9483f; padding-left: 8px; }
+.tuning-plan-off { margin-top: 10px; }
+.tuning-plan-off tr.is-stale > td:first-child,
+.tuning-plan-off .tuning-plan-stale > td { box-shadow: none; background: #fafafa; }
+.tuning-plan-off .tuning-plan-stale .tuning-stale-text { color: #808080; font-weight: normal; }

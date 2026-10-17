@@ -1315,6 +1315,13 @@ The diff shows recorded and candidate values with their configuration or flight 
 conflicting global or same-profile commands prevent export. An edited filter draft contributes no commands until replay
 passes. The worker independently rejects a request containing two recorded configurations of the same PID profile.
 
+"Selected parameter changes" (`pendingDiffHtml`) has one table for each PID profile, then each rate profile, then "Values for
+all PID profiles" (the CLI order). The check box of a row selects or removes the recommendations of that parameter (with
+their groups); "Changes that are not selected" lists the others to select again. A recorded configuration value has no check
+box. A row with `r.stale` has its text in a highlighted row, and a CAUTION above the tables counts them. The "Source" link
+opens the tuning step (and the configuration) of the change. Each step tab shows "Change recommended" (`.tuning-tab-change`,
+`renderTabStatus`) when it has a change that `pickDefault` selects, whatever its status and the selection.
+
 When the chosen configuration predates LUA changes in the same profile, `advice.configurationBases` adds the known
 profile values needed to restore that configuration, then applies its selected tuning changes. Selected filter commands
 replace restoration values for the same parameters. Complete arrays and enum

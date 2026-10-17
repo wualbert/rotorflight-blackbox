@@ -5201,7 +5201,7 @@ test('governor model: the selected changes go into the CLI file of advice.export
     answerExport(app, text);
     await tick();
     assert.ok(app.html('.tuning-export-preview').includes(app.internals.esc(text)));
-    assert.ok(app.pane('export').includes('<td><code>gov_i_gain</code></td><td>PID profile 1</td><td><code>50</code></td><td><code>60</code></td><td>Governor</td>'), 'the parameter record of the selection');
+    assert.match(app.pane('export'), /<h6 class="tuning-h">PID profile 1<\/h6>(?:(?!<h6)[^])*<td><code>gov_i_gain<\/code><\/td><td><code>50<\/code><\/td><td><code>60<\/code><\/td><td>Governor<\/td>/, 'the parameter record of the selection, in the group of its PID profile');
     // the bypass curve: the pilot selects it in the Governor tab, and the selection stays across the tabs
     app.tab('governor');
     const box = /<input type="checkbox" class="tuning-pick" data-pick="(\d+)">[^]*?Set the throttle curve of BYPASS/.exec(app.pane('governor'));
@@ -5639,4 +5639,53 @@ test('the autotune bar is the same on the Filters, Governor and control tabs', (
     assert.match(I.autotuneBarHtml({ cls: 'ft', state: 'none', disabled: true, reason: 'Open a log.' }), /disabled>Autotune<\/button><span class="tuning-at-why">Open a log\.<\/span>/);
     assert.match(I.autotuneBarHtml({ cls: 'gm', current: true }), /<span class="tuning-at-done">Autotune completed\. The result is below\.<\/span>/);
     assert.deepEqual(app.errors, []);
+});
+
+test('a step tab with a recommended change shows "Change recommended" next to its status, also on the Export tab and after a deselection', async () => {
+    const r = controlResult();
+    r.findings = [{fid:'tab-b', id:'C12', node:'cyclic', dataset:'C', pidProfile:1, status:'monitor'}];
+    const app = analysed({result:r}), tab = key => app.jq.node('.tuning-tab[data-tab="' + key + '"]');
+    const mark = key => app.jq.node('.tuning-tab[data-tab="' + key + '"] .tuning-tab-change').text;
+    app.dialog.setConfiguration('C');
+    app.tab('cyclic');
+    assert.equal(mark('cyclic'), '', 'no change before the autotune');
+    app.jq.fire('click', '.tuning-ct-start'); answerControl(app); await tick();
+    assert.equal(app.jq.node('.tuning-tab[data-tab="cyclic"] .tuning-tab-status').text, 'Monitor (1)', 'the status of the checks stays');
+    assert.equal(mark('cyclic'), 'Change recommended');
+    assert.match(tab('cyclic').attrs['aria-label'], /Cyclic gains: Monitor \(1\)\. Change recommended\./);
+    assert.equal(mark('tail'), '');
+    assert.equal(mark('export'), '', 'the Export tab counts the selected changes in its status');
+    app.tab('export');
+    assert.equal(mark('cyclic'), 'Change recommended', 'also while the Export tab shows');
+    assert.match(app.pane('export'), /class="tuning-plan-pick" data-picks="\d+" checked/);
+    const before = app.jq.node('.tuning-tab[data-tab="export"] .tuning-tab-status').text;
+    const ix = /class="tuning-plan-pick" data-picks="([\d,]+)" checked/.exec(app.pane('export'))[1];
+    app.jq.fire('change', '.tuning-plan-pick', {'data-picks':ix}, {checked:false});
+    assert.notEqual(app.jq.node('.tuning-tab[data-tab="export"] .tuning-tab-status').text, before, 'the check box of a row removes its change from the selection');
+    assert.match(app.pane('export'), /<summary>Changes that are not selected \(\d+\)<\/summary>/);
+    assert.equal(mark('cyclic'), 'Change recommended', 'a recommendation, not a selection');
+    app.jq.fire('click', '.tuning-plan-source', {'data-tab':'cyclic', 'data-config':'C'});
+    assert.ok(tab('cyclic').classes.has('active'), 'the source of a row opens its step');
+    assert.deepEqual(app.errors, []);
+});
+
+test('selected parameter changes: a table for each PID profile, the values for all PID profiles last, a caution for values possibly different, a check box for each row', () => {
+    const I = setup().internals;
+    const STALE = 'This recommendation uses a part of the log in which the values are possibly not the values of the log header.';
+    const rec = (id, scope, p, name, value, extra = {}) => ({id, scope, profile:p, severity:'action', node:'filters', cli:(scope === 'profile' ? ['profile ' + (p - 1)] : []).concat(['set ' + name + ' = ' + value]), ...extra});
+    const recs = [rec('G', 'global', null, 'gyro_lpf1_static_hz', 90), rec('P2', 'profile', 2, 'roll_d_cutoff', 40, {stale:{reasons:['rearm'], text:STALE}}),
+        rec('P1', 'profile', 1, 'roll_d_cutoff', 20), rec('N', 'profile', 1, 'pitch_d_cutoff', 30)];
+    const picks = {0:true, 1:true, 2:true};
+    const html = I.pendingDiffHtml(I.pendingPlan(recs, picks), recs, picks, I.pendingPlan(recs, {3:true}));
+    eq([...html.matchAll(/<h6 class="tuning-h">([^<]*)<\/h6>/g)].map(m => m[1]), ['PID profile 1', 'PID profile 2', 'Values for all PID profiles', 'PID profile 1']);
+    assert.doesNotMatch(html, /<th>Scope<\/th>/);
+    assert.match(html, /<strong>CAUTION:<\/strong> Before you use a change with the mark &quot;Values possibly different&quot;, read its text and examine its values\./);
+    assert.match(html, /1 selected parameter change in the table has this mark\./);
+    assert.match(html, /<tr class="tuning-ft-changed is-stale">[^]*?<code>roll_d_cutoff<\/code>[^]*?<tr class="tuning-plan-stale"><td colspan="6">[^]*?possibly not the values of the log header/);
+    assert.match(html, /data-picks="2" checked/);
+    assert.match(html, /<summary>Changes that are not selected \(1\)<\/summary>[^]*<tr class="is-off"><td><input type="checkbox" class="tuning-plan-pick" data-picks="3" aria-label/);
+    assert.doesNotMatch(I.pendingDiffHtml(I.pendingPlan(recs, {0:true})), /CAUTION|tuning-plan-pick/, 'no caution without the mark, no check box without the recommendations');
+    assert.match(html, /<td>Filters<\/td><td><a href="#" class="tuning-plan-source" data-tab="filters" title="Show the tuning step of this change">Filters<\/a><\/td>/, 'the source opens its step');
+    const rpm = [{id:'G21', scope:'profile', profile:2, severity:'action', node:'rpm', area:'governor', dataset:'E', cli:['profile 1', 'set gov_max_throttle = 97']}];
+    assert.match(I.pendingDiffHtml(I.pendingPlan(rpm, {0:true})), /<td>Before you tune<\/td><td><a href="#" class="tuning-plan-source" data-tab="overview" data-config="E"/, 'a prerequisite step by its name, not its key');
 });

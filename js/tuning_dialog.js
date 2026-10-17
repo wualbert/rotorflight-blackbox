@@ -2846,18 +2846,64 @@ var TuningDialog = (function () {
         return {rows:list,selected:selected,conflicts:list.filter(function(q){return q.conflict;}),signature:JSON.stringify(list)};
     }
 
-    function pendingDiffHtml(plan) {
+    // The groups of the rows of a plan, in the order of the CLI file: each PID profile, each rate profile, then the values for all PID profiles
+    var SCOPE_ORDER = ['profile', 'rateprofile', 'global'];
+    function scopeGroups(rows) {
+        var out = [];
+        rows.slice().sort(function (a, b) { return SCOPE_ORDER.indexOf(a.scope) - SCOPE_ORDER.indexOf(b.scope) || (a.index || 0) - (b.index || 0); }).forEach(function (q) {
+            var last = out[out.length - 1];
+            if (last && last.scope === q.scope && last.index === q.index) last.rows.push(q);
+            else out.push({ scope: q.scope, index: q.index, rows: [q] });
+        });
+        return out;
+    }
+
+    var STALE_CAUTION = ['Before you use a change with the mark "' + FRESH.badge + '", read its text and examine its values.',
+        'This change uses parts of the log with values that are possibly not the values of the log header.',
+        'Thus, the new value can be incorrect and can cause oscillations that you cannot control.'];
+
+    // The selected changes, by PID profile. recs and picks (optional): the recommendations of the Export tab, for the check box of each row.
+    // off (optional): the plan of the changes with CLI text that are not selected
+    function pendingDiffHtml(plan, recs, picks, off) {
         var changed=plan.rows.filter(function(q){return q.conflict || q.from==null || String(q.from)!==String(q.to);});
         var retained=plan.rows.filter(function(q){return changed.indexOf(q)<0;});
-        function table(rows) {
-            return '<div class="tuning-table-wrap"><table class="tuning-table"><thead><tr><th>Parameter</th><th>Scope</th><th>Before</th><th>After</th><th>Tuning step</th><th>Source</th></tr></thead><tbody>' + rows.map(function(q){
-                return '<tr class="' + (q.conflict ? 'tuning-ft-regression' : changed.indexOf(q)>=0 ? 'tuning-ft-changed' : '') + '"><td><code>' + esc(q.name) + '</code></td><td>' + esc(q.scope === 'global' ? 'All PID profiles' : q.scope === 'profile' ? profileLabel(q.index + 1) : 'Rate profile ' + (q.index + 1)) + '</td><td><code>' + esc(q.from == null ? 'Unknown' : String(q.from)) + '</code></td><td><code>' + esc(q.values.map(String).join(' / ')) + '</code>' + (q.conflict ? ' Different values' : '') + '</td><td>' + esc(q.steps.map(function(k){var t=TABS.find(function(t){return t.key===k;});return k==='configuration'?'Recorded configuration values':t?t.title:k;}).join(', ')) + q.stale.map(function(t){return '<p class="tuning-muted">' + esc(t) + '</p>';}).join('') + '</td><td>' + esc(q.configurations.map(configLabel).concat(q.filterSources || []).join(', ')) + '</td></tr>';
-            }).join('') + '</tbody></table></div>';
+        var stale=changed.filter(function(q){return q.stale.length;}).length;
+        // The indexes of the recommendations of a row, or null: a recorded configuration value is not in recs and has no check box
+        function pickIndexes(q) {
+            if (!recs) return null;
+            var ix=q.recommendations.map(function(id){return recs.findIndex(function(r){return r.id===id;});});
+            return ix.length && ix.every(function(i){return i>=0;}) ? ix : null;
         }
+        // The tab of a tuning step: a prerequisite (rpm, logging ...) is in the band "Before you tune" of the overview
+        function stepTab(k) { return TABS.some(function(t){return t.key===k;}) ? k : k === 'configuration' ? 'configs' : 'overview'; }
+        function stepName(k) { var t=TABS.find(function(t){return t.key===k;}); return k === 'configuration' ? 'Recorded configuration values' : t ? t.title : 'Before you tune'; }
+        // The source of a row opens the step of its change, with its configuration
+        function sourceLink(q) {
+            var text = q.configurations.map(configLabel).concat(q.filterSources || []).join(', ') || stepName(q.steps[0]);
+            return '<a href="#" class="tuning-plan-source" data-tab="' + esc(stepTab(q.steps[0])) + '"' + (q.configurations.length ? ' data-config="' + esc(q.configurations[0]) + '"' : '') +
+                ' title="Show the tuning step of this change">' + esc(text) + '</a>';
+        }
+        function table(rows, isOff) {
+            var cols = recs ? 6 : 5;
+            return scopeGroups(rows).map(function (g) {
+                return '<h6 class="tuning-h">' + esc(g.scope === 'global' ? 'Values for all PID profiles' : g.scope === 'profile' ? profileLabel(g.index + 1) : 'Rate profile ' + (g.index + 1)) + '</h6>' +
+                    '<div class="tuning-table-wrap"><table class="tuning-table tuning-plan-table"><thead><tr>' + (recs ? '<th>Selected</th>' : '') + '<th>Parameter</th><th>Before</th><th>After</th><th>Tuning step</th><th>Source</th></tr></thead><tbody>' + g.rows.map(function(q){
+                    var ix = pickIndexes(q), on = !isOff && ix && ix.every(function(i){return picks[i];});
+                    return '<tr class="' + (isOff ? 'is-off' : q.conflict ? 'tuning-ft-regression' : changed.indexOf(q)>=0 ? 'tuning-ft-changed' : '') + (q.stale.length ? ' is-stale' : '') + '">' +
+                        (recs ? '<td>' + (ix ? '<input type="checkbox" class="tuning-plan-pick" data-picks="' + ix.join(',') + '"' + (on ? ' checked' : '') + ' aria-label="Select ' + esc(q.name) + '">' : '') + '</td>' : '') +
+                        '<td><code>' + esc(q.name) + '</code></td><td><code>' + esc(q.from == null ? 'Unknown' : String(q.from)) + '</code></td><td><code>' + esc(q.values.map(String).join(' / ')) + '</code>' + (q.conflict ? ' Different values' : '') + '</td><td>' + esc(q.steps.map(stepName).join(', ')) + '</td><td>' + sourceLink(q) + '</td></tr>' +
+                        (q.stale.length ? '<tr class="tuning-plan-stale"><td colspan="' + cols + '">' + staleBadge({ text: q.stale[0] }) + ' ' + q.stale.map(function(t){return '<span class="tuning-stale-text">' + staleTextHtml(t) + '</span>';}).join(' ') + '</td></tr>' : '');
+                }).join('') + '</tbody></table></div>';
+            }).join('');
+        }
+        var offChanged = off ? off.rows.filter(function(q){return !plan.rows.some(function(p){return p.key===q.key && p.values.map(String).join('/')===q.values.map(String).join('/');});}) : [];
         return '<section class="tuning-pending-diff"><h5 class="tuning-h">Selected parameter changes</h5><p>These values come from all tuning steps. The CLI file uses this same selection.</p>' +
+            (recs ? '<p>If you do not agree with a change, remove its selection. The CLI file then does not contain it. The changes of a group stay together.</p>' : '') +
+            (stale ? '<div class="tuning-disclaimer tuning-stale-caution"><p><strong>CAUTION:</strong> ' + esc(STALE_CAUTION.join(' ')) + '</p><p>' + esc(plural(stale, 'selected parameter change') + ' in the table ' + (stale === 1 ? 'has' : 'have') + ' this mark.') + '</p></div>' : '') +
             (plan.rows.some(function(q){return q.steps.indexOf('configuration')>=0;}) ? '<p>The CLI file also sets the recorded configuration values below. These values can be different from the newest configuration.</p>' : '') +
-            (plan.conflicts.length ? '<p class="tuning-na">Two selected changes give different values for the same parameter. Select one before export.</p>' : '') + table(changed) +
-            (retained.length ? '<details><summary>Values that do not change in the CLI file (' + retained.length + ')</summary>' + table(retained) + '</details>' : '') + '</section>';
+            (plan.conflicts.length ? '<p class="tuning-na">Two selected changes give different values for the same parameter. Select one before export.</p>' : '') + (changed.length ? table(changed) : '<p class="tuning-muted">No parameter change is selected.</p>') +
+            (retained.length ? '<details><summary>Values that do not change in the CLI file (' + retained.length + ')</summary>' + table(retained) + '</details>' : '') +
+            (offChanged.length ? '<details class="tuning-plan-off"><summary>Changes that are not selected (' + offChanged.length + ')</summary>' + table(offChanged, true) + '</details>' : '') + '</section>';
     }
 
     function stepPicksHtml(entry, key, env) {
@@ -2888,21 +2934,22 @@ var TuningDialog = (function () {
     function renderExport(entry, view, env) {
         var r = entry.result, recs = env.exportRecs ? env.exportRecs(entry) : recsOf(r);
         if (!adviceRan(r) && recs.length === recsOf(r).length) return { html: '<p class="tuning-na-text">The recommendations are not available: ' + quoted(esc(whyNoAdvice(r))) + ".</p>", plots: [] };
-        var picks = env.picks(entry), n = recs.filter(function (rec, i) { return picks[i] && canPick(recs, i); }).length;
+        var picks = env.picks(entry), n = recs.filter(function (rec, i) { return picks[i] && canPick(recs, i); }).length, off = {};
+        recs.forEach(function (rec, i) { if (!picks[i] && canPick(recs, i)) off[i] = true; }); // the changes that the pilot can select again
         var html = '<div class="tuning-disclaimer"><p><strong>WARNING:</strong> ' + esc(EXPORT_WARNING[0]) + "<code>diff all</code>" + esc(EXPORT_WARNING[1]) + " " + esc(EXPORT_WARNING[2]) + "</p>" +
             "<p><strong>NOTE:</strong> " + esc(EXPORT_NOTE) + "</p></div>" +
-            (env.finalProfiles ? env.finalProfiles(entry) : '') + pendingDiffHtml(env.pending ? env.pending(entry) : pendingPlan(recs,picks)) + '<div class="tuning-export"><div class="tuning-export-picks"><h5 class="tuning-h">Recommendations</h5>' +
+            (env.finalProfiles ? env.finalProfiles(entry) : '') + pendingDiffHtml(env.pending ? env.pending(entry) : pendingPlan(recs,picks), recs, picks, pendingPlan(recs, off)) + '<div class="tuning-export"><div class="tuning-export-picks"><h5 class="tuning-h">Recommendations</h5>' +
             '<p class="tuning-muted">' + esc("Select the recommendations for the CLI file. The app selects each change that has CLI text first. " +
                 "A check, an item to monitor and an item for information have no CLI text. " + plural(n, "recommendation") + " of " + recs.length + " selected.") + "</p>" +
             (recs.length ? '<ul class="tuning-pick-list">' + recs.map(function (rec, i) {
                 var can = canPick(recs, i), g = groupOf(rec);
-                return '<li class="tuning-pick-row' + (can ? "" : " is-off") + (g ? " is-group" : "") + '"' + (g ? ' data-group="' + esc(g) + '"' : "") +
+                return '<li class="tuning-pick-row' + (can ? "" : " is-off") + (g ? " is-group" : "") + (staleOf(rec) ? " is-stale" : "") + '"' + (g ? ' data-group="' + esc(g) + '"' : "") +
                     '><label class="tuning-pick-label"><input type="checkbox" class="tuning-pick" data-pick="' + i + '"' +
                     (can && picks[i] ? " checked" : "") + (can ? "" : " disabled") + "> " + recBadges(rec) + " " + esc(recommendationTitle(rec)) + "</label>" +
                     '<div class="tuning-muted">' + esc(profileText(rec) + ". " + (REC_AREA_LABEL[rec.area] || cap(rec.area)) + "." + (rec.filterSearch ? " The app calculated these filter values." : "")) +
                     (rec.parameter ? " " + parameterHtml(rec.parameter) + " " + esc(paramText(rec).replace(/^\([^)]*\)(: )?/, "") + ".") : "") +
                     (hasCli(rec) ? "" : " " + esc(noCliText(rec))) + "</div>" +
-                    (g ? '<div class="tuning-muted tuning-pick-group">' + esc(groupText(recs, i)) + "</div>" : "") + "</li>";
+                    (g ? '<div class="tuning-muted tuning-pick-group">' + esc(groupText(recs, i)) + "</div>" : "") + staleRecHtml(rec) + "</li>";
             }).join("") + "</ul>" : '<p class="tuning-muted">No recommendation.</p>') + "</div>" +
             '<div class="tuning-export-out"><h5 class="tuning-h">Commands</h5><div class="tuning-export-preview">' + exportPreview(entry, env) + "</div></div></div>";
         return { html: html, plots: [] };
@@ -5489,7 +5536,7 @@ var TuningDialog = (function () {
         '<div class="tuning-notices"></div>' +
         '<section class="tuning-log-preview analysis-compare tuning-hide" aria-label="Data from the log" tabindex="-1"></section>' +
         '<div class="tuning-tabs tuning-hide">' + TABS.filter(function (t) { return !t.auxiliary; }).map(function (t) {
-            return '<a href="#" class="tuning-tab" data-tab="' + t.key + '">' + esc(t.title) + '<span class="tuning-tab-count"></span><span class="tuning-tab-status"></span>' +
+            return '<a href="#" class="tuning-tab" data-tab="' + t.key + '">' + esc(t.title) + '<span class="tuning-tab-count"></span><span class="tuning-tab-status"></span><span class="tuning-tab-change"></span>' +
                 '<span class="tuning-tab-bar" aria-hidden="true"><span></span></span></a>'; // the progress of its autotune (autoBars)
         }).join("") + "</div>" +
         '<div class="tuning-panes tuning-hide">' + TABS.map(function (t) { return '<div class="tuning-pane" data-pane="' + t.key + '"></div>'; }).join("") + "</div>" +
@@ -6164,12 +6211,13 @@ var TuningDialog = (function () {
             var state=tuningState(entry);
             return Object.keys(state.finalByProfile).sort(function(a,b){return +a-+b;}).map(function(p){return state.finalByProfile[p];}).filter(Boolean);
         }
-        function contextIds(entry) {
+        // step: the recommendations of the step tabs (the configuration on display), also while the Export tab shows
+        function contextIds(entry,step) {
             if (!configList(entry.result).length) return ['all'];
-            return view.tab==='export' ? finalIds(entry) : [view.dataset];
+            return view.tab==='export' && !step ? finalIds(entry) : [view.dataset];
         }
-        function exportRecsOf(entry) {
-            return [].concat.apply([],contextIds(entry).map(function(id){return draftRecs(entry,id);})).concat(filterDraftRecs(entry),gmDraftRecs(entry));
+        function exportRecsOf(entry,step) {
+            return [].concat.apply([],contextIds(entry,step).map(function(id){return draftRecs(entry,id);})).concat(filterDraftRecs(entry),gmDraftRecs(entry));
         }
         function draftPicks(entry,id,recs) {
             var state=tuningState(entry), draft=state.drafts[id]||(state.drafts[id]={selected:{}}), out={};
@@ -7024,6 +7072,14 @@ var TuningDialog = (function () {
             var plan = compiledPlan(shown), conflicts = plan.conflicts.length + plan.unsupported.length + partGroups(plan.records, plan.picks).length;
             var filterRefused = model.state === 'done' && !model.dirty && !model.stale && filterCliUnavailable(model.result);
             var changes = plan.records.filter(function (rec, i) { return plan.picks[i] && hasCli(rec); }).length;
+            // The changes that the app recommends (selected first), by tab: a step can show "Monitor" and recommend a change
+            var stepRecs = exportRecsOf(shown, true), asked = { overview: 0 };
+            stepRecs.forEach(function (rec, i) {
+                if (!pickDefault(rec) || !canPick(stepRecs, i)) return;
+                var step = rec.node || (rec.filterSearch ? 'filters' : rec.area);
+                asked[step] = (asked[step] || 0) + 1;
+                asked.overview++;
+            });
             TABS.filter(function (t) { return !t.auxiliary; }).forEach(function (t) {
                 var summary = tabStatus(states[t.key] || []), scope = t.key === 'filters' ? (model.source ? model.source.title + '. ' : '') :
                     t.key === 'overview' ? 'Selected control configuration and filter flight. ' :
@@ -7034,13 +7090,15 @@ var TuningDialog = (function () {
                         label: conflicts ? 'Cannot export' : changes ? plural(changes, 'change') + ' to examine' : filterRefused ? 'Filter CLI not available' : 'No changes'};
                     scope = 'Selected changes from all tuning steps. ';
                 }
-                var selector = '.tuning-tab[data-tab="' + t.key + '"]', tab = body.find(selector);
-                var description = (t.title + ': ' + summary.label + '. ' + scope).trim();
+                var selector = '.tuning-tab[data-tab="' + t.key + '"]', tab = body.find(selector), n = t.key === 'export' ? 0 : asked[t.key] || 0;
+                var mark = n ? (n === 1 ? 'Change recommended' : n + ' changes recommended') : '';
+                var description = (t.title + ': ' + summary.label + '. ' + (mark ? mark + '. ' : '') + scope).trim();
                 // Avoid replacing navigation text during routine progress refreshes.
                 if (tab.attr('title') === description) return;
                 Object.keys(STATUS).forEach(function (s) { tab.toggleClass('st-' + cls(s), s === summary.key); });
                 tab.attr('title', description).attr('aria-label', description);
                 body.find(selector + ' .tuning-tab-status').text(summary.label);
+                body.find(selector + ' .tuning-tab-change').text(mark);
             });
         }
 
@@ -7928,17 +7986,28 @@ var TuningDialog = (function () {
         dialog.on("click", ".tuning-config-pick", function (e) { if (e && e.preventDefault) e.preventDefault(); setConfig(this.getAttribute("data-config")); });
         dialog.on("click", ".tuning-config-diff", function (e) { if (e && e.preventDefault) e.preventDefault(); showTab("configs"); });
         // a change of a group (C7) selects or removes all the changes of the group
-        dialog.on("change", ".tuning-pick", function () {
+        function onPick() {
             if (!shown) return;
-            var i = +this.getAttribute("data-pick"), picks = picksOf(shown), on = !!this.checked;
-            membersOf(exportRecsOf(shown), i).forEach(function (k) {
-                if (on) picks[k] = true;
-                else delete picks[k];
+            var picks = picksOf(shown), on = !!this.checked, recs = exportRecsOf(shown);
+            var list = this.getAttribute("data-picks"); // a row of "Selected parameter changes": the recommendations of its parameter
+            (list !== null ? String(list).split(",") : [this.getAttribute("data-pick")]).forEach(function (i) {
+                membersOf(recs, +i).forEach(function (k) {
+                    if (on) picks[k] = true;
+                    else delete picks[k];
+                });
             });
-            savePicks(shown,exportRecsOf(shown),picks);
+            savePicks(shown,recs,picks);
             compiledPlan(shown);
             TABS.forEach(function(t){rendered[t.key]=null;});
             showTab(view.tab); // one selection and parameter record across the step pages
+        }
+        dialog.on("change", ".tuning-pick", onPick);
+        dialog.on("change", ".tuning-plan-pick", onPick);
+        dialog.on("click", ".tuning-plan-source", function (e) {
+            if (e && e.preventDefault) e.preventDefault();
+            var c = this.getAttribute("data-config");
+            if (c) setConfig(c);
+            showTab(this.getAttribute("data-tab"));
         });
         dialog.on("change", ".tuning-final-config", deferredSelectChange(function () {
             if (!shown) return;
