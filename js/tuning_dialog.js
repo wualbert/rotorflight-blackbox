@@ -959,12 +959,12 @@ var TuningDialog = (function () {
         opts = opts || {};
         var c = selectionCounts(rows), none = !c.flightsOn && !c.otherOn, open = typeof opts.open === "boolean" ? opts.open : none, sub = opts.subOpen || {};
         var head = selectionHead(c), at = head.indexOf(": ");
-        // opts.scan: the scan of the flights of each log (ensureScan): { running, text } or { failed }. Without it, the logs whose
+        // opts.scan: the scan of the flights of each log (ensureScan): { running } or { failed }. Without it, the logs whose
         // flights the app does not know have no scan (a host without workers) or a scan that has no result for them
         var scan = opts.scan || null;
         var help = !c.other ? esc('Select the flights for the analysis. Then click "Start analysis". The analysis does not use bench runs.') :
-            scan && scan.running ? esc("The app finds the flights in each log." + (scan.text ? " " + scan.text : "") + " Before the list shows the flights of a log, you can select only the full log.") :
-            scan && scan.failed ? esc("The app cannot find the flights in the logs. The error is") + " " + quoted(esc(scan.failed)) + esc(". Select the full logs.") :
+            scan && scan.running ? esc("The app loads the flights of each log. Before the list shows the flights of a log, you can select only the full log.") :
+            scan && scan.failed ? esc("The app cannot load the flights of the logs. The error is") + " " + quoted(esc(scan.failed)) + esc(". Select the full logs.") :
             esc("The app does not know the flights of " + (hasKnown ? "some logs" : "the logs") + ". For these logs, select the full log.");
         var table = '<div class="tuning-fsel-wrap"><table class="tuning-table tuning-fsel-table"><thead><tr><th></th><th>Log</th><th>Date</th><th>Length</th><th>Flights</th></tr></thead><tbody>' +
             rows.map(function (r) {
@@ -5849,16 +5849,17 @@ var TuningDialog = (function () {
             scan = null;
         }
 
-        // The state of the scan for the flight list: { running, text } (the progress), { failed } or null
+        // The state of the scan for the flight list: { running }, { failed } or null. The pilot sees the scan as the load of the
+        // flights, a step before the analysis: its texts say "loads", never the steps of the worker
         function scanState() {
             var info = fileInfo();
             if (!scan || !info || scan.fileKey !== info.key) return null;
-            if (scan.worker) return { running: true, text: scan.last && scan.last.text ? oneLine(scan.last.text) : "" };
+            if (scan.worker) return { running: true };
             return scan.error ? { failed: scan.error } : null;
         }
 
         // "Start analysis" waits for the scan: the flight list and the flight counts are not complete before it ends
-        var SCAN_WAIT = 'The app finds the flights in each log. When this is complete, click "Start analysis".';
+        var SCAN_WAIT = 'The app loads the flights of each log. When this is complete, click "Start analysis".';
         function scanning() {
             var st = view.scope !== "log" && scanState(); // "This log" uses no flight list
             return !!(st && st.running);
@@ -7374,7 +7375,7 @@ var TuningDialog = (function () {
             } else if (scanState() && scanState().running) { // the scan of the flights (ensureScan): its progress, no result yet
                 var sm = scan.last || {};
                 frac = isNum(sm.fraction) ? Math.max(0, Math.min(1, sm.fraction)) : null;
-                text = (sm.text ? oneLine(sm.text) : "The app finds the flights in each log.") + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "");
+                text = "The app loads the flights of each log" + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "") + ".";
                 state = frac === null ? "is-busy" : "is-running";
             } else {
                 text = viewerLog() ? "No result" : "No log is open";

@@ -2392,7 +2392,7 @@ test('SPEC3 D: "Selected flights" lists the logs and the known flights, sends op
     // the default selection is every flight that the analysis can use, and the list is closed under its head (2026-10-06)
     assert.match(list, /^<details class="tuning-fsel-box"><summary class="tuning-fsel-head" title="Open or close the list of the flights"><strong>Flights in the analysis:<\/strong> <span class="tuning-fsel-count">2 of 2 flights, all flights of 1 of 1 other log \(1 log with no data\)<\/span><\/summary><div class="tuning-fsel-body">/);
     assert.match(list, /<div class="tuning-fsel-actions"><button type="button" class="btn btn-default btn-xs tuning-fsel-all">Select all flights<\/button><button type="button" class="btn btn-default btn-xs tuning-fsel-none">Remove the selection<\/button><\/div>/);
-    assert.match(list, /The app finds the flights in each log\. Before the list shows the flights of a log, you can select only the full log\./, 'the scan of the flights operates');
+    assert.match(list, /The app loads the flights of each log\. Before the list shows the flights of a log, you can select only the full log\./, 'the scan of the flights operates');
     assert.equal(app.scanWorker().sent[0].msg.cmd, 'scanFlights');
     // log 1: the date of its header, its length from the log index, its flights not known; log 2: no date, its two flights
     // with their times, closed under its row; log 3: no data, not selectable, its error in the title as quoted text
@@ -2464,9 +2464,10 @@ test('SPEC3 D: a bench run cannot be selected; before the scan or a result each 
     // before the scan and a result: each log as a full log, the help says so
     app.jq.fire('change', '.tuning-scope', {}, { value: 'flights' });
     let list = app.html('.tuning-fsel');
-    assert.match(list, /The app finds the flights in each log\. Before the list shows the flights of a log, you can select only the full log\./);
-    app.scanWorker().reply({ type: 'progress', stage: 'decode', fraction: 0.6, text: 'The app finds the flights in log 2 of 3 <b>.' });
-    assert.match(app.html('.tuning-fsel'), /The app finds the flights in each log\. The app finds the flights in log 2 of 3 &lt;b&gt;\. Before the list/, 'the progress, as text');
+    assert.match(list, /The app loads the flights of each log\. Before the list shows the flights of a log, you can select only the full log\./);
+    app.scanWorker().reply({ type: 'progress', stage: 'decode', fraction: 0.6, text: 'The app calculates the flight rpm from log 2 of 3 <b>.' });
+    assert.match(app.html('.tuning-fsel'), /The app loads the flights of each log\. Before the list/, 'the load of the flights: not the steps of the worker');
+    assert.doesNotMatch(app.html('.tuning-fsel'), /calculates/);
     assert.match(app.jq.node('.tuning-progress-text').text, /^The analysis starts\./, 'the progress of an analysis that operates comes first');
     assert.equal((list.match(/All flights of this log/g) || []).length, 3);
     // a result that finds no flight in log 1: "Bench run (no analysis)", not selectable
@@ -2578,15 +2579,15 @@ test('the default of "Logs" is "Selected flights" with every flight of the scan:
     const scan = app.scanWorker(), s = scan.sent[0].msg;
     assert.deepEqual([s.cmd, s.fileName, s.bytes.byteLength], ['scanFlights', '<i>flight</i>.bbl', 400], 'the whole file');
     assert.equal(app.runs.length, 0, 'no analysis before the pilot clicks "Start analysis"');
-    assert.equal(app.jq.node('.tuning-progress-text').text, 'The app finds the flights in each log.', 'the scan operates');
+    assert.equal(app.jq.node('.tuning-progress-text').text, 'The app loads the flights of each log.', 'the scan operates: a load, not the analysis');
     assert.match(app.html('.tuning-empty'), /Select the flights in the list\. Then click "Start analysis"\./);
     assert.equal(app.jq.node('.tuning-analyse').props.disabled, true, 'no start before the scan ends');
-    assert.equal(app.jq.node('.tuning-analyse').attrs.title, 'The app finds the flights in each log. When this is complete, click "Start analysis".');
+    assert.equal(app.jq.node('.tuning-analyse').attrs.title, 'The app loads the flights of each log. When this is complete, click "Start analysis".');
     assert.equal(app.dialog.scopePanel().scanning, true, 'the Analysis view waits too');
     app.open();
     assert.equal(app.workers.length, 1, 'one scan for each file');
-    scan.reply({ type: 'progress', stage: 'decode', fraction: 0.6, text: 'The app finds the flights in log 2 of 3.' });
-    assert.equal(app.jq.node('.tuning-progress-text').text, 'The app finds the flights in log 2 of 3. (60 %)', 'the progress of the scan, before a result');
+    scan.reply({ type: 'progress', stage: 'decode', fraction: 0.6, text: 'The app calculates the flight rpm from log 2 of 3.' });
+    assert.equal(app.jq.node('.tuning-progress-text').text, 'The app loads the flights of each log (60 %).', 'the progress of the load, before a result, without the steps of the worker');
     assert.equal(app.jq.node('.tuning-progress').attrs.class, 'tuning-progress is-running');
     // the flights of the scan: log 1 a bench run, logs 2 and 3 one flight each
     const flights = [{ log: 1, segment: 0, t0: 14.3, t1: 87, seconds: 72.7 }, { log: 2, segment: 0, t0: 2, t1: 6, seconds: 4 }];

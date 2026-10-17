@@ -637,7 +637,7 @@ test('the "Logs" control in the verdict: hooks.scopePanel in both states, the ac
     panel = Object.assign({}, panel, { scanning: true });
     settings[0]();
     assert.match(startButton(), /disabled/, 'no start while the scan operates');
-    assert.match(startButton(), /title="The app finds the flights in each log\. When this is complete, click &quot;Start analysis&quot;\."/);
+    assert.match(startButton(), /title="The app loads the flights of each log\. When this is complete, click &quot;Start analysis&quot;\."/);
     panel = Object.assign({}, panel, { scanning: false });
     settings[0]();
     assert.doesNotMatch(startButton(), /disabled|title="[^"]/, 'the scan ended');

@@ -2771,7 +2771,7 @@ var TuningWorker = (function () {
         const K = J.K, usePh = phasesOn(J, K), extra = rpmExtra(J, K);
         for (const li of J.logs) {
             await checkpoint(J.id);
-            J.progress(`The app finds the flights in log ${li + 1} of ${count}.`, 'decode', 0.5 + 0.5 * li / Math.max(1, count));
+            J.progress(`The app loads the flights of log ${li + 1} of ${count}.`, 'decode', 0.5 + 0.5 * li / Math.max(1, count));
             const d = timedDecode(J, K, slice(li), li, extra);
             if (d.error) { J.errorRecords.push({ log: li, segment: 0, skipped: d.error }); continue; }
             const live = d.segs.filter(w => !w.skipped), airborneEvents = live.some(w => w.airborneAt.some(v => !v));

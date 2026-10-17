@@ -71,7 +71,7 @@ var AnalysisView = (function () {
         about: "The analysis examines the log with the checks of the toolkit. It gives each result with its value, its limit and the part of the log that it comes from.",
         stale: "The results on display are for different logs, flights or CLI dump. To use the logs, the flights and the CLI dump that you selected, start the analysis again.",
         start: "Start analysis",
-        scanning: 'The app finds the flights in each log. When this is complete, click "Start analysis".',
+        scanning: 'The app loads the flights of each log. When this is complete, click "Start analysis".',
         running: "The analysis started. Wait for the results. The Tuning view shows when the analysis is complete.",
         startFailed: "The analysis did not start.",
         openTuning: "Open the Tuning view",
