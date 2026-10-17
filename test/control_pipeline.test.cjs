@@ -325,6 +325,39 @@ test('pooled recorded configurations qualify their own loops before a frozen cou
     assert.deepEqual(result.twin.eligibleSteps,['cyclic','cycomp','tail','tailcomp']);
     assert.ok(result.twin.predictions.every(p=>p.profile===1));
     assert.ok(result.controller.closedLoopParity.every(r=>r.trace&&r.trace.predictedGyro.length===3&&r.trace.measuredMixer.length===4));
+    // IMP-07: the flights that can show the selected change (validation_power.cjs). The plan does not change the selection or the CLI text.
+    const vp=result.validationPower,brief=JSON.stringify(vp&&{text:vp.text,error:vp.error,metrics:vp.metrics.map(m=>[m.id,m.delta,m.sd,m.flights,m.configurations,m.n])});
+    assert.ok(vp&&vp.available&&vp.text.length>=2,brief);
+    assert.ok(result.recommendations.every(r=>r.validationPower===vp));
+    assert.deepEqual(result.recommendations.map(r=>r.cli),result.recommendations.map(r=>['profile 0',`set ${r.parameter} = ${result.search.selected[r.parameter]}`]));
+    assert.deepEqual(result.rows.map(r=>[r.name,r.to]),Object.entries(result.search.selected));
+    const tracking=vp.metrics.find(m=>m.id==='tracking');
+    // the change of the tracking error: the 6 s windows of the flight-to-flight SD on the model gyro of the test flights
+    // (validation_power.pairedTracking), else the frozen test improvement
+    if(tracking.deltaSource==='windows')assert.ok(Number.isFinite(tracking.delta)&&tracking.deltaFlights>=1,brief);
+    else assert.equal(tracking.delta,-result.search.holdout.improvement.mean,brief);
+    assert.equal(vp.profile,1);assert.equal(vp.profileLabel,'PID profile 1');
+    assert.deepEqual(vp.selection,{periodsPerFlight:ID.RULES.maxWindowsPerFlight,periodS:ID.RULES.windowS});
+    assert.ok(tracking.flights>=pipeline.RULES.validation.minFlights&&tracking.configurations===2&&tracking.lowerBound===false,brief);
+    assert.deepEqual(vp.metrics.map(m=>m.id),['tracking','transfer','uncommanded'],brief);
+    assert.equal(vp.flightsPerArm,Math.min(...vp.metrics.filter(m=>!m.lowerBound).map(m=>m.n).filter(Number.isFinite)));
+    assert.equal(vp.confirmable,!vp.lowerBound&&vp.flightsPerArm<=pipeline.RULES.validation.maxFlights);
+    assert.match(vp.text[0],vp.confirmable?/^Flights can show this change/:/^Flights cannot show this change/);
+});
+test('IMP-07: the validation plan pools the configurations of a known PID profile only, and a failure gives its STE text',()=>{
+    const seg=(id,configuration)=>({id,configuration,flight:id});
+    const input={configuration:{id:'A',pidProfile:null},analysis:{datasets:{datasets:[{id:'A',pidProfile:null},{id:'B',pidProfile:null},{id:'C',pidProfile:2},{id:'D',pidProfile:2}]}}};
+    const segments=[seg('a','A'),seg('b','B'),seg('c','C'),seg('d','D')];
+    // an unknown PID profile is not a match of other unknown PID profiles: the target configuration only
+    assert.deepEqual(pipeline.profilePeriods(input,segments,input.configuration).map(s=>s.id),['a']);
+    const known={...input,configuration:{id:'C',pidProfile:2}};
+    assert.deepEqual(pipeline.profilePeriods(known,segments,known.configuration).map(s=>s.id),['c','d']);
+    // a period with no setpoint column: the plan says that the app cannot calculate the number of flights, with the error
+    const y=[0,1,2].map(()=>new Float64Array(4000));
+    const plan=pipeline.validationPlan([{flight:'f',group:'A',rate:250,n:4000,y}],[],[],'cyclic',{mean:0.5,se:0.1},{periodsPerFlight:4,periodS:16});
+    assert.equal(plan.available,false);assert.equal(plan.confirmable,false);assert.ok(typeof plan.error==='string'&&plan.error.length>0,JSON.stringify(plan));
+    assert.match(plan.text[0],/^The app cannot calculate the number of flights that can show this change\./);
+    assert.ok(typeof plan.rule==='string'&&Array.isArray(plan.metrics));
 });
 test('a log without gyroRAW tunes: the gyro filter check is not applicable and its reason stays visible',async()=>{
     const input=await pooled();
@@ -402,6 +435,23 @@ test('historical CLI fields remain unknown even when a materialized header conta
     const check=await pipeline.controllerReplay(f.input,[f.segment],f.config);
     assert.equal(check.pass,false,'perfect term parity alone does not turn optional CLI gains into recorded gains');
     assert.ok(check.rows[0].coverage.reasons.some(r=>r.includes('recorded PID gains')));
+});
+
+// review IMP-05: a configuration interval whose values come from the parameter snapshot of its log (datasets.cjs 'log snapshot') has
+// recorded PID gains for every PID profile; a value of a recorded journal change ('log journal') is recorded too. targetConfig keeps
+// them, not the classic header values of the PID profile at the start
+test('a snapshot interval: recorded gains of the snapshot, and targetConfig keeps the snapshot and the journal values',async()=>{
+    const f=await fixture(),item=f.input.items[0],rec=item.w.recordedConfiguration,d=f.input.configuration;
+    rec.interval.source.profile='log snapshot';rec.values={...rec.values,roll_p_gain:33};
+    const ev=pipeline.recordedGainEvidence(item,f.input);
+    assert.deepEqual([ev.known,ev.profileSource,ev.values.roll_p_gain,ev.sources.roll_p_gain],[true,'log snapshot',33,'log snapshot']);
+    const missing=pipeline.snapshotGainEvidence({values:{roll_p_gain:33}},rec.interval);
+    assert.equal(missing.known,false);assert.match(missing.reasons[0],/do not have all PID gains/);
+    // the target configuration: the snapshot value of roll_p_gain (33, not the header value 20) and a journal value of yaw_p_gain (150)
+    d.values={...d.values,roll_p_gain:33,yaw_p_gain:150};d.sources={...d.sources,roll_p_gain:'log snapshot',yaw_p_gain:'log journal'};
+    const cfg=pipeline.targetConfig(f.input);
+    assert.deepEqual([cfg.values.roll_p_gain,cfg.sources.roll_p_gain,cfg.values.yaw_p_gain,cfg.sources.yaw_p_gain],[33,'log snapshot',150,'log journal']);
+    assert.ok(!cfg.unknown.includes('roll_p_gain')&&!cfg.unknown.includes('yaw_p_gain'));
 });
 
 test('sensor replay uses the original scheduler phase rather than the later logged raw sample',async()=>{
@@ -627,6 +677,47 @@ test('confirmed profile continuity uses original header donors and never current
     assert.equal(pipeline.recordedGainEvidence(switched,f.input).known,false,'conflicting original headers cannot prove continuity');
     assert.ok(pipeline.recordedGainEvidence(switched,f.input).continuity.conflicts.includes('yaw_p_gain'));
 });
+test('a CLI dump that the pilot selects supplies the values that the log header does not record (user, 2026-10-15)',async()=>{
+    const f=await fixture(),item=f.input.items[0],record=item.w.recordedConfiguration,rate=item.w.rate||RATE;
+    // Rotorflight 4.6 writes neither pid_mode nor the swash ring in the header
+    item.w.originalHeader={...item.w.originalHeader};for(const name of ['pid_mode','swash_ring','battery_cell_count'])delete item.w.originalHeader[name];
+    assert.ok(pipeline.targetConfig(f.input).unknown.includes('pid_mode'),'without a CLI dump the value stays unknown');
+    const gains=p=>pipeline.GAIN_NAMES.map(n=>`set ${n} = ${n==='roll_p_gain'?p:f.config.values[n]}`);
+    const cliText=['# dump all','set swash_ring = 80','set battery_cell_count = 0','servo 1 1500 -700 700 500 500 333 0 0',
+        'profile 0','set pid_mode = 3',...gains(25),'profile 1','set pid_mode = 3',...gains(30)].join('\n');
+    f.input.options={cliText,cliName:'fireball.txt'};
+    // the header interval (PID profile 1 at the start of the log) keeps the header gains, the CLI dump gives the other values
+    let config=pipeline.targetConfig(f.input);
+    assert.equal(config.values.pid_mode,3);assert.equal(config.sources.pid_mode,pipeline.CLI_SOURCE);
+    assert.equal(config.values.swash_ring,80);assert.ok(!config.unknown.includes('swash_ring')&&!config.unknown.includes('pid_mode'));
+    assert.equal(config.values.roll_p_gain,20);assert.match(config.sources.roll_p_gain,/original log header/);
+    assert.equal(config.servos.verified,true);assert.equal(config.servos.count,1);
+    // battery_cell_count 0 is the firmware auto rule, not a cell count: it is not copied
+    assert.ok(config.unknown.includes('battery_cell_count'));assert.notEqual(config.values.battery_cell_count,0);
+    assert.equal(pipeline.recordedGainEvidence(item,f.input).values.roll_p_gain,20);
+    // PID profile 2: the header does not record it, thus the gains come from the CLI section "profile 1"
+    record.profile=2;record.interval.source.profile='cli';f.input.configuration={...f.input.configuration,pidProfile:2};
+    const evidence=pipeline.recordedGainEvidence(item,f.input);
+    assert.equal(evidence.known,true);assert.equal(evidence.profileSource,'user-cli');assert.equal(evidence.values.roll_p_gain,30);
+    assert.equal(evidence.sources.roll_p_gain,pipeline.CLI_SOURCE);
+    config=pipeline.targetConfig(f.input);
+    assert.equal(config.values.roll_p_gain,30);assert.equal(config.sources.roll_p_gain,pipeline.CLI_SOURCE);assert.ok(!config.unknown.includes('roll_p_gain'));
+    // a second arm, a PID profile change and a logging pause use the CLI values and get the flag; an in-flight adjustment stays excluded
+    item.epochs=[{t0:0,t1:3,reasons:['rearm'],source:{pid:'header'}},{t0:3,t1:6,reasons:['switched'],source:{pid:'cli'}},
+        {t0:6,t1:9,reasons:['resume'],source:{pid:'header'}},{t0:9,t1:12,reasons:['adjusted'],source:{pid:'header'}}];
+    item.stale=item.epochs;
+    assert.equal(pipeline.recordedGainMask(item,f.input).counts.known,9*rate);
+    config=pipeline.targetConfig(f.input);
+    assert.deepEqual(config.stale.map(s=>s.reasons),[['adjusted']]);
+    assert.deepEqual(config.userCovered.map(s=>[s.reasons[0],s.source]),[['rearm',pipeline.CLI_SOURCE],['switched',pipeline.CLI_SOURCE],['resume',pipeline.CLI_SOURCE]]);
+    const flag=pipeline.userFlag(config);
+    assert.deepEqual(flag.reasons,['rearm','switched','resume']);
+    assert.match(flag.text,/The log does not record the values of some flight periods/);assert.match(flag.text,/CLI dump "fireball\.txt"/);
+    assert.equal(pipeline.userFlag({userCovered:[]}),null);
+    // a PID profile that the app cannot find has no CLI section: the gains stay unknown
+    record.profile=0;f.input.configuration={...f.input.configuration,pidProfile:null};
+    assert.equal(pipeline.recordedGainEvidence(item,f.input).known,false);
+});
 
 test('a low-rate saved trace replays without a later sample: origins are on recorded samples and inputs are held',async()=>{
     const f=await fixture(),model={...f.model,fit:{rules:{fitRate:500,originEveryS:1}}};
@@ -750,6 +841,42 @@ test('the native governor drives the twin rotor speed when the log records its i
     const wrong=await pipeline.governorReplay(f.input,[f.segment],()=>f.config);
     assert.equal(wrong.pass,false);assert.match(wrong.reasons.join(' '),/does not agree with the recorded throttle/);
 });
+// review IMP-06: the governor state agreement of an audited build counts the recorded prefix only. The replay starts in THROTTLE_OFF
+// governorWarmupS before the period, so a period that starts in flight (the log says ACTIVE from the start) agrees after the warm-up
+test('the governor state agreement counts the recorded prefix: a period that starts in flight with ACTIVE logged agrees',async()=>{
+    const f=await governedFixture(),w=f.input.items[0].w,n=w.n,at=Math.round(4*f.segment.rate);
+    w.govStateAt=new Uint8Array(n).fill(4);   // GOVERNOR_STATE ACTIVE in the whole log
+    const mid={...f.segment,id:'mid',source:{item:0,start:at,end:n},n:n-at};
+    const [row]=(await pipeline.governorReplay(f.input,[mid],()=>f.config)).rows;
+    assert.equal(row.pass,true,JSON.stringify(row));assert.equal(row.stateAgreement,1,'the warm-up (OFF, IDLE, SPOOLUP in the replay) does not count');
+    // the period at the log start: its prefix has the spool-up of the replay, which the synthetic log does not show
+    const [first]=(await pipeline.governorReplay(f.input,[f.segment],()=>f.config)).rows;
+    assert.ok(first.stateAgreement<1,JSON.stringify(first.stateAgreement));
+    const eq={equivalence:{revision:'85d7049a9',parity:{governorStateAgreement:0.995,governorThrottleRms:0.002}}};
+    pipeline.equivalentGovernorParity(eq,row);assert.equal(row.equivalence.pass,true,JSON.stringify(row.equivalence));
+});
+// review IMP-06: each axis passes on its relative error or on its RMS floor; the window passes when every axis passes
+test('the parity of an audited build: each axis passes on its relative error or its floor, every axis must pass',()=>{
+    const eq={equivalence:{revision:'85d7049a9',parity:{controllerMixerRelative:0.05,controllerMixerFloor:0.001}}};
+    const rows=[{pass:true,metrics:[{relative:0.08,rmse:0.0005},{relative:0.02,rmse:0.004},{relative:0.01,rmse:0.002}]},
+        {pass:true,metrics:[{relative:0.08,rmse:0.002},{relative:0.02,rmse:0.004},{relative:0.01,rmse:0.002}]},{pass:true,metrics:[]}];
+    pipeline.equivalentParity(eq,rows);
+    assert.deepEqual(rows.map(r=>[r.pass,r.equivalence.pass]),[[true,true],[false,false],[false,false]]);
+    assert.deepEqual(rows[0].equivalence.axes.map(a=>a.pass),[true,true,true]);assert.equal(rows[1].equivalence.axes[0].pass,false);
+});
+// review IMP-05: a journal epoch (check 'journal') counts a reason with keys only for a value that the replay reads; 'changed' only
+// for an element (datasets.cjs applies the other recorded changes, source 'log journal')
+test('the journal reasons of an epoch count for the replay only with a key that the replay reads',()=>{
+    const E=(reasons,keys,pidProfile=1)=>({check:'journal',pidProfile,reasons,keys:Object.assign({mixed:[],uncertain:[],pending:[],unknown:[],changed:[]},keys)});
+    assert.deepEqual(pipeline.gainEpochReasons(E(['changed'],{changed:['debug_mode','blackbox_log_esc']})),[]);
+    assert.deepEqual(pipeline.gainEpochReasons(E(['changed'],{changed:['p0.yaw_p_gain']})),[],'datasets applies the change');
+    assert.deepEqual(pipeline.gainEpochReasons(E(['changed'],{changed:['el.mixin.3']})),['changed']);
+    assert.deepEqual(pipeline.gainEpochReasons(E(['pending'],{pending:['p0.yaw_p_gain']})),['pending']);
+    assert.deepEqual(pipeline.gainEpochReasons(E(['pending'],{pending:['p1.yaw_p_gain']})),[],'a value of PID profile 2 in PID profile 1');
+    assert.deepEqual(pipeline.gainEpochReasons(E(['pending'],{pending:['r0.roll_rc_rate']})),[],'a rate: the setpoint is a measured input');
+    assert.deepEqual(pipeline.gainEpochReasons(E(['unknown','lost'],{unknown:['debug_mode']})),['lost'],'a reason with no keys counts for every value');
+    assert.deepEqual(pipeline.gainEpochReasons({reasons:['changed'],keys:{changed:['debug_mode']}}),['changed'],'a stock epoch keeps every reason');
+});
 test('without the throttle stick the governor is not calculated and the closed loop uses the recorded headspeed',async()=>{
     const f=await governedFixture(),w=f.input.items[0].w;delete w.extra['rcCommand[4]'];
     const path=pipeline.governorInputs(f.input,f.segment,f.config);
@@ -759,12 +886,12 @@ test('without the throttle stick the governor is not calculated and the closed l
     assert.equal(row.governor,null);assert.equal(row.initialization.rotorSpeed,'recorded headspeed at each log sample');
     assert.deepEqual(Array.from(row.headspeed.subarray(f.start)),Array.from(w.hs.subarray(f.start)));
 });
-test('a governor step without the governor path is not supported and gives its reasons',async()=>{
-    const input=await pooled();input.step='governor';input.options.closedLoopFit={stages:[]};
+test('the governor step is refused before a model fit: the governor model tunes the governor (user, 2026-10-15)',async()=>{
+    const input=await pooled();input.step='governor';
     const result=await pipeline.tune(input);
-    assert.equal(result.status,'unsupported-loop',tuneReport(result));
-    assert.equal(result.controller.governor.active,false);assert.match(result.controller.governor.reasons.join(' '),/rcCommand\[4\]/);
-    assert.equal(result.twin.governor.active,false);assert.deepEqual(result.recommendations,[]);
+    assert.equal(result.status,'unsupported-step',tuneReport(result));
+    assert.match(result.reason,/The governor model of the Governor tab tunes the governor\./);
+    assert.equal(result.twin,null,'no helicopter model');assert.deepEqual(result.recommendations,[]);assert.deepEqual(result.rows,[]);
 });
 
 test('a partial twin tunes the cyclic step and refuses the tail step with the yaw reason',async()=>{

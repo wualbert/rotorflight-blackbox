@@ -364,7 +364,9 @@ function analyse(w, ctx) {
         const logged = v.length ? quantile(v, 0.5) : null, what = req ? 'govRequest median' : 'govTarget median', cliV = ctx.govHeadspeed && ctx.govHeadspeed[p];
         if (cliV && !(req && logged > RULE.cliCheck.request * cliV)) { full[p] = cliV; fullSource[p] = ctx.govHeadspeedSource || 'CLI gov_headspeed'; continue; }
         full[p] = logged;
-        fullSource[p] = !v.length ? null : cliV ? `${what} ${logged} (CLI gov_headspeed ${cliV} is below the logged request: CLI not from this setup)` : `${what} (fallback: no gov_headspeed from the CLI)`;
+        // ctx.paramSnapshot: the values come from the parameter snapshot of the log header (health.cjs snapshotContext), not from a CLI dump
+        fullSource[p] = !v.length ? null : cliV ? (ctx.paramSnapshot ? `${what} ${logged} (gov_headspeed ${cliV} of the log header is below the logged request: a later change)` : `${what} ${logged} (CLI gov_headspeed ${cliV} is below the logged request: CLI not from this setup)`)
+            : `${what} (fallback: no gov_headspeed from ${ctx.paramSnapshot ? 'the log header' : 'the CLI'})`;
     }
     const fullAny = Math.max(0, ...Object.values(full).filter(Boolean)) || null;
     out.fullHeadspeed = { value: full, source: fullSource };
@@ -490,15 +492,16 @@ function analyse(w, ctx) {
             n: v.length, blocks: blocks.length, seconds: r(v.length / rate, 1), reference: out.reference, fullHeadspeed: full[p] };
     }) };
 
-    // ceiling per profile: gov_max_throttle from the CLI (ctx.maxThrottle, %), unless motor[0] went above it in this log
-    // (the CLI dump is then not this log's setup); else the highest motor[0] if it plateaus there; else 1000, assumed
+    // ceiling per profile: gov_max_throttle from the CLI or from the parameter snapshot of the log header (ctx.maxThrottle, %,
+    // ctx.maxThrottleSource), unless motor[0] went above it in this log (the CLI dump is then not this log's setup, or the value
+    // changed after the log start); else the highest motor[0] if it plateaus there; else 1000, assumed
     const ceiling = {}, ceilingSource = {};
     for (const p of profiles) {
         let top = -Infinity; const count = new Map();
         if (mot) for (let i = 0; i < n; i++) if (flying[i] && prof[i] === p && (!gs || gs[i] === ACTIVE)) { count.set(mot[i], (count.get(mot[i]) || 0) + 1); if (mot[i] > top) top = mot[i]; }
         const cliV = ctx.maxThrottle && ctx.maxThrottle[p];
         if (cliV && !(mot && top > cliV * 10 + RULE.cliCheck.ceilingCounts)) { ceiling[p] = cliV * 10; ceilingSource[p] = ctx.maxThrottleSource || 'CLI gov_max_throttle'; continue; }
-        const why = cliV ? `; CLI gov_max_throttle ${cliV} % not used: motor[0] reached ${top}` : '; no gov_max_throttle from the CLI';
+        const why = cliV ? `; ${ctx.paramSnapshot ? 'gov_max_throttle of the log header' : 'CLI gov_max_throttle'} ${cliV} % not used: motor[0] reached ${top}` : `; no gov_max_throttle from ${ctx.paramSnapshot ? 'the log header' : 'the CLI'}`;
         if (!mot) continue;
         // a clamp piles samples up on one value: the highest value counts, if it holds several times more samples than the values just below
         const cnt = count.get(top) || 0, below = [1, 2, 3].reduce((a, k) => a + (count.get(top - k) || 0), 0) / 3;

@@ -79,6 +79,22 @@
     font-size: calc(13 * var(--rf-px));
 }
 
+/* No CLI dump: the request with its steps (cliBlockHtml) */
+.tuning-cli-missing {
+    flex: 1 1 100%;
+    margin: 0;
+    color: #303030;
+}
+
+.tuning-cli-missing p {
+    margin: 0 0 6px;
+}
+
+.tuning-cli-steps {
+    margin: 6px 0;
+    padding-left: 20px;
+}
+
 .tuning-cli-about code {
     color: inherit;
     background: none;
@@ -463,6 +479,32 @@
 
 .tuning-tab-count:empty {
     display: none;
+}
+
+/* The progress of an autotune on its tab (js/tuning_dialog.js autoBars), also while a different tab shows */
+.tuning-tab-bar {
+    display: none;
+    height: 3px;
+    margin-top: 4px;
+    border-radius: 2px;
+    background: #dfe3e6;
+    overflow: hidden;
+}
+
+.tuning-tab.is-autotune .tuning-tab-bar { display: block; }
+
+.tuning-tab-bar > span {
+    display: block;
+    width: 0;
+    height: 100%;
+    background: #4da8da;
+    transition: width 0.3s ease;
+}
+
+.tuning-tab.is-busy .tuning-tab-bar > span {
+    background: repeating-linear-gradient(45deg, #4da8da 0 6px, #80c5eb 6px 12px);
+    background-size: 17px 17px;
+    animation: tuning-busy 0.8s linear infinite;
 }
 
 .tuning-tabs::-webkit-scrollbar {
@@ -1790,7 +1832,11 @@
     animation: tuning-busy 0.8s linear infinite;
 }
 
-.tuning-ft-progress-text {
+/* the autotune bar of each tab (autotuneBarHtml): the button and the reason of a disabled button, or the progress and "Cancel" */
+.tuning-at { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: calc(280 * var(--rf-px)); }
+.tuning-at-why, .tuning-at-done { color: #505050; font-size: calc(13 * var(--rf-px)); max-width: calc(360 * var(--rf-px)); }
+
+.tuning-ft-progress-text, .tuning-at-text {
     color: #505050;
     font-size: calc(14 * var(--rf-px));
     font-variant-numeric: tabular-nums;

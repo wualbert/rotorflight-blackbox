@@ -24,6 +24,9 @@
  *                        CLI dump PID profile with that headspeed (only one); a sample with none: "PID profile unknown" (excluded)
  *     gear, voltageSource, cells (the CLI dump; else 1:1, none, 0 = the auto rule of govCreate), notes
  *   Value priority (for each log, and each PID profile of a profile name):
+ *     0. the parameter snapshot of that log (blackbox_params FULL, param_log.cjs snapshotOf of run.header): the values of every PID
+ *        profile at the start of the log, source "log header (the parameter values of log N)". A CLI dump is not compared with
+ *        them (it is of a different time when it does not agree, check D4). The gear, the voltage source and the cell count too
  *     1. the CLI dump, if it agrees with the recovered values of that log (gov_params.compareCli, also the products of the gains
  *        that contain the name, and the candidates), or if that log cannot show the value
  *     2. the recovered value of that log: its epoch (calculated from the log, then the log header; bench epochs only for their
@@ -235,15 +238,30 @@ function configOf(runs, recovered, opts = {}) {
     return out;
 }
 
+// the parameter snapshot of a run's log (param_log.cjs snapshotOf caches it for each header object), or null
+const optionalPL = () => { try { return require('./param_log.cjs'); } catch (e) { return null; } };
+function snapshotOfRun(run) { const PL = optionalPL(); return PL && typeof PL.snapshotOf === 'function' && run ? PL.snapshotOf(run.header) : null; }
+// 4.7: the battery values are lists of the 6 battery profiles; the value is the element of bat_profile
+const BATTERY_LISTS = /^(?:battery_cell_count|bat_capacity|vbat_(?:max|full|min|warning)_cell_voltage)$/;
+function snapValue(snap, name, p) {
+    if (!snap) return undefined;
+    const sec = p ? snap.profiles[String(p - 1)] : snap.global; let v = sec ? sec[name] : undefined;
+    if (v !== undefined && BATTERY_LISTS.test(name) && Array.isArray(v)) { const k = snap.global.bat_profile; v = Number.isInteger(k) ? v[k] : undefined; }
+    return v === null ? undefined : v;
+}
+
 function logConfig(run, R, cli, cmp) {
+    const snap = snapshotOfRun(run), snapSource = `log header (the parameter values of log ${run.log + 1})`;
     const log = run.log, cfg = { key: keyOf(run), log, segment: run.segment || 0, global: {}, profiles: {}, cli: { global: {}, profiles: {} }, sources: {}, profileSources: {},
         assumptions: [], unknown: [], flags: [], excluded: null, start: 0, changes: [], gear: null, voltageSource: null, cells: 0, notes: [TEXT.kmot] };
     const why = !run.hs ? TEXT.noHs : !run.u ? TEXT.noMotor : !run.thr ? TEXT.noThr : !run.coll || !run.roll || !run.pitch || !run.yaw ? TEXT.noMixer : null;
     if (why) { cfg.excluded = why; return cfg; }
     const lab = GP.labels(run, R.profileMap);
-    // the CLI dump gives the PID profile of a governor headspeed that only one of its PID profiles has (CLAUDE.md "PID profiles")
-    if (cli && run.request && lab.some(v => v === 0)) {
-        const by = {}; for (const [k, s] of Object.entries(cli.profiles || {})) if (typeof s.gov_headspeed === 'number') by[s.gov_headspeed] = by[s.gov_headspeed] === undefined ? +k + 1 : 0;
+    // the parameter snapshot of the log (else the CLI dump) gives the PID profile of a governor headspeed that only one of its PID
+    // profiles has (CLAUDE.md "PID profiles")
+    const hsSource = snap || cli;
+    if (hsSource && run.request && lab.some(v => v === 0)) {
+        const by = {}; for (const [k, s] of Object.entries(hsSource.profiles || {})) if (typeof s.gov_headspeed === 'number') by[s.gov_headspeed] = by[s.gov_headspeed] === undefined ? +k + 1 : 0;
         for (let i = 0; i < run.n; i++) if (!lab[i]) lab[i] = by[Math.round(run.request[i])] || 0;
     }
     const ev = profileEvents(run, lab);
@@ -279,8 +297,10 @@ function logConfig(run, R, cli, cmp) {
     const fits = (v, name, p) => { const b = boundOf(name, p), c = candOf(name, p);
         return typeof v !== 'number' ? !c || c.some(x => same(x, v)) : (b.lo == null || v >= b.lo - 1e-9) && (b.hi == null || v <= b.hi + 1e-9); };
     const valueOf = (e) => e.effective ? e.estimate : e.value;
-    // 1-2: the CLI dump, the epoch of this log, an epoch around this log -> { v, source, reason, flag } or null
+    // 0-2: the parameter snapshot of this log, the CLI dump, the epoch of this log, an epoch around this log -> { v, source, reason, flag } or null
     const lookup = (name, p) => {
+        const sv = snapValue(snap, name, p);
+        if (sv !== undefined) return { v: sv, source: snapSource };
         const s = sec(p), cv = s ? s[name] : undefined;
         if (cv !== undefined) {
             const prods = Object.keys(PRODUCTS).filter(e => PRODUCTS[e].includes(name));
@@ -362,15 +382,16 @@ function logConfig(run, R, cli, cmp) {
         if (same(v.gov_use_voltage_comp, 'inactive')) { v.gov_use_voltage_comp = 'OFF'; cfg.assumptions.push({ name: 'gov_use_voltage_comp', profile: p, value: 'OFF', reason: TEXT.vcompOff, states: null }); }
         else if (same(v.gov_use_voltage_comp, 'active')) {
             v.gov_use_voltage_comp = 'ON';
-            if (!(cli && cli.global.battery_meter) && cfg.voltageSource !== 'ADC') { cfg.voltageSource = 'ADC'; cfg.assumptions.push({ name: 'battery_meter', profile: 0, value: 'ADC', reason: TEXT.vcompAdc, states: null }); }
+            if (!((snap && snap.global.battery_meter !== undefined) || (cli && cli.global.battery_meter)) && cfg.voltageSource !== 'ADC') { cfg.voltageSource = 'ADC'; cfg.assumptions.push({ name: 'battery_meter', profile: 0, value: 'ADC', reason: TEXT.vcompAdc, states: null }); }
         }
     }
-    // the values outside the governor list: the CLI dump, else the rules
-    const g = cli ? cli.global : {}, extra = {};
+    // the values outside the governor list: the parameter snapshot of the log, else the CLI dump, else the rules
+    const g = snap ? snap.global : cli ? cli.global : {}, gs = snap ? snapSource : 'CLI dump', extra = {};
     cfg.gear = Array.isArray(g.main_rotor_gear_ratio) ? g.main_rotor_gear_ratio.map(Number) : null;
     if (g.battery_meter !== undefined) cfg.voltageSource = g.battery_meter;
-    cfg.cells = typeof g.battery_cell_count === 'number' ? g.battery_cell_count : 0;
-    for (const k of ['main_rotor_dir', 'tail_rotor_mode']) if (g[k] !== undefined) { extra[k] = g[k]; cfg.sources[k] = 'CLI dump'; }
+    const cells = snap ? snapValue(snap, 'battery_cell_count', 0) : g.battery_cell_count;
+    cfg.cells = typeof cells === 'number' ? cells : 0;
+    for (const k of ['main_rotor_dir', 'tail_rotor_mode']) if (g[k] !== undefined) { extra[k] = g[k]; cfg.sources[k] = gs; }
     // schema values; a profile without all four flags has no gov_flags
     cfg.global = toSchema(Object.assign({}, cfg.cli.global, extra));
     for (const p of profiles) {

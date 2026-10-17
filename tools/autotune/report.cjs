@@ -366,6 +366,10 @@ out.push('## 5. Yaw behaviour against the gains that were flown', '',
     const cP = centred('P'), cD = centred('D'), corr = (x, y) => { let a = 0, b = 0, c = 0; for (let i = 0; i < x.length; i++) { a += x[i] * y[i]; b += x[i] * x[i]; c += y[i] * y[i]; } return a / Math.sqrt(b * c); };
     const spanOf = (x) => Math.max(...x) - Math.min(...x), classes = [0, 1, 2].filter(k => obs.some(o => o.k === k));
     const tests = 6, dof = obs.length - (4 + classes.length), z = 2.638; // two-sided 5 % shared by 6 tests (Bonferroni)
+    // the regression needs more observations than regressors (P, D, collective, yaw stick and one for each class, IMP-04): else a note
+    if (dof < 1) { results.yawExperiment = { observations: obs.length, necessary: 4 + Math.max(1, classes.length) + 1, fits: {} };
+        out.push(`No result: ${obs.length} segments, ${4 + Math.max(1, classes.length) + 1} necessary. Each segment is 30 s or more, with the yaw P gain of each direction and the yaw D gain.`, ''); }
+    else {
     const tCrit = z + (z ** 3 + z) / (4 * dof) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * dof * dof);
     results.yawExperiment = { observations: obs.length, perClass: classes.map(k => ({ class: names[k], n: obs.filter(o => o.k === k).length })), withinClassSpanP: spanOf(cP), withinClassSpanD: spanOf(cD), withinClassCorrelationPD: corr(cP, cD), tCritical: tCrit, fits: {} };
     out.push(table(['Headspeed class', 'Observations', 'P × stop, min to max', 'D, min to max'], classes.map(k => { const o = obs.filter(x => x.k === k);
@@ -383,6 +387,7 @@ out.push('## 5. Yaw behaviour against the gains that were flown', '',
     out.push(table(['Metric (deg/s RMS)', 'Median', 'Per unit of P × stop', 'Per unit of D', 'Per 100 collective RMS', 'Per 10 deg/s yaw stick RMS', 'R²', 'Smallest detectable effect of the P / D changes flown'], rows), '',
         `Six gain coefficients are tested at once, so one counts as evidence only at |t| ≥ ${n1(tCrit, 2)} (5 % shared across the six tests, ${dof} degrees of freedom). ` +
         'The last column is two standard errors times the within-class span that was flown: a real effect smaller than that would go unseen in this data.', '');
+    }
 }
 
 // ---- 6. decisions ----------------------------------------------------------------------------

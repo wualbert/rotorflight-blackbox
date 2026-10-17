@@ -601,6 +601,8 @@
     "legend": "15",
     "level mode": "6",
     "liftoff": "8",
+    "ground contact": "8",
+    "motor cut": "8",
     "line": "7",
     "link": "19",
     "linkage": "1",

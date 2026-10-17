@@ -6,6 +6,7 @@
  *   EXTRA                          the logged fields to decode (lib.segments extra), besides headspeed and the event columns
  *   fromColumns(cols, meta, ph)    one run from named columns: the dev data (analysis/governor-20261014/data/<craft>/*.f32,
  *                                  'time' in s from the segment start) or the worker path (fromSegment converts to this)
+ *   partsOf(w)                     the parts of a whole-log segment out of the cut of each receiver signal loss (IMP-02), for runOf
  *   runOf(w, ctx)                  one run from a whole-log segment of lib.segments (the worker decode), ctx: { phases (the
  *                                  result of health_phase.phases, with its code), segment, name, events, armingProfile }. Without
  *                                  phases it calls health_phase.phases; when that fails, class is null with a reason. fromSegment
@@ -58,9 +59,12 @@ const RULES = {
     disarmBackS: 0.005,
     prerollFrames: 2000, // the samples of the IDLE ramp at the log start that give the loops before sample 0
     prerollMin: 10,      // fewer ramp samples give no estimate (preroll 0)
+    // partsOf: a part of a segment out of the cut of a receiver signal loss (lib.cjs rxLossAt, IMP-02) that is shorter than this is not a
+    // run (pipeline, unvalidated: less than 1 s has no governor response to fit, for example the time before a loss at the log start)
+    rxLossMinS: 1,
 };
 const DISARM = 15; // FlightLogEvent.DISARM (js/flightlog_fielddefs.js)
-const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];
+const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact']; // health_phase PHASES (fall, aftercontact: IMP-03)
 const MIX = ['mixer[0]', 'mixer[1]', 'mixer[2]', 'mixer[3]'];
 const GOV = { govP: 'govP', govI: 'govI', govD: 'govD', govF: 'govF', govSum: 'govSum', target: 'govTarget', request: 'govRequest' };
 const EXTRA = ['time', 'govP', 'govI', 'govD', 'govF', 'govSum', 'govTarget', 'govRequest', 'motor[0]', 'rcCommand[3]', 'rcCommand[4]', ...MIX, 'Vbat', 'Ibat', 'vario', 'flightModeFlags'];
@@ -74,10 +78,10 @@ const TEXT = {
     noIbat: 'The log does not record the battery output ("Ibat" is 0 in most samples with the motor on). Thus, the model uses the battery voltage only. The governor does not use "Ibat".',
     noGov: 'The log does not record the governor values ("govP", "govI", "govF", "govSum", "govTarget" or "govRequest"). Thus, the analysis cannot find the governor gains and the PID profile from the headspeed. The log records these values only with "blackbox_log_governor" ON.',
     noState: 'The log does not record the governor changes ("GOVERNOR_STATE"). Thus, the analysis cannot find the ramps, the time limits and the values of FALLBACK.',
-    noMotor: 'The log does not record the motor output ("motor[0]"). Thus, the governor analysis is not possible for this log.',
+    noMotor: 'The log does not record the motor output ("motor[0]"). Thus, the governor autotune is not possible for this log.',
     noThr: 'The log does not record the throttle input ("rcCommand[4]"). Thus, the analysis uses the governor changes in the log for the throttle input.',
     noMixer: 'The log does not record the mixer inputs ("mixer[0]" to "mixer[3]"). Thus, the analysis cannot find the feedforward values and the rotor load.',
-    noHs: 'The log does not record the headspeed. Thus, the governor analysis is not possible for this log.',
+    noHs: 'The log does not record the headspeed. Thus, the governor autotune is not possible for this log.',
     noPhase: 'The analysis cannot find the flight phases of this log. Thus, the governor model and the tuning do not use this log.',
 };
 
@@ -174,17 +178,45 @@ function preroll(run) {
     return Math.max(0, Math.round(s / e));
 }
 
-// w: a whole-log segment of lib.segments (w.hs, w.extra[name], w.profileAt, w.govStateAt, w.airborneAt, w.rescueAt, w.flight)
+// The parts of a whole-log segment w out of the cut of each receiver signal loss (lib.cjs rxLossAt, else the cut0..cut1 of w.rxLoss;
+// IMP-02): after the inferred last RC frame the throttle is the held or the rxfail value, not the pilot's, and the RC values come back
+// settleS after the RX return. -> { parts: [[i0, i1], ...] in samples, each RULES.rxLossMinS or longer, cutS: the seconds that the
+// parts leave out (the cut and the parts that are too short), 0 without a loss }
+function partsOf(w) {
+    const n = w.n, rate = (w.flight && w.flight.actualRate) || w.rate || 1;
+    let cut = w.rxLossAt && w.rxLossAt.length === n ? w.rxLossAt : null;
+    if (!cut && Array.isArray(w.rxLoss) && w.rxLoss.length) { cut = new Uint8Array(n); for (const q of w.rxLoss) if (q && isFinite(q.cut0) && isFinite(q.cut1)) cut.fill(1, Math.max(0, q.cut0), Math.min(n, q.cut1)); }
+    if (!cut || cut.indexOf(1) < 0) return { parts: [[0, n]], cutS: 0 };
+    const min = Math.max(2, Math.round(RULES.rxLossMinS * rate)), parts = []; let left = 0;
+    for (let i = 0; i < n;) { if (cut[i]) { left++; i++; continue; } let j = i; while (j < n && !cut[j]) j++; if (j - i >= min) parts.push([i, j]); else left += j - i; i = j; }
+    return { parts, cutS: +(left / rate).toFixed(2) };
+}
+// w: a whole-log segment of lib.segments (w.hs, w.extra[name], w.profileAt, w.govStateAt, w.airborneAt, w.rescueAt, w.flight). ctx.i0,
+// ctx.i1: the samples of the run (a part of partsOf: the time, the phases, the flights and the DISARM events of that part; class
+// 'bench' when the part has no flight of its own). Without them, the first part of partsOf: a receiver signal loss ends the run at its
+// cut (run.rxLossEnd: the samples that the run left out after it). run.part: [i0, i1] of a part that is not all of w
 function fromSegment(w, ctx = {}) {
-    const x = w.extra || {}, cols = { profileAt: w.profileAt, airborneAt: w.airborneAt, govStateAt: w.govStateAt, rescueAt: w.rescueAt, hs: w.hs };
-    for (const k of EXTRA) if (k !== 'time' && x[k]) cols[k] = x[k];
-    if (!cols['mixer[0]'] && w.u) w.u.forEach((a, j) => { if (a) cols[MIX[j]] = Float64Array.from(a, v => v * 1000); }); // lib w.u = mixer[0..2] / 1000
-    const t = x.time; if (t) { cols.time = new Float64Array(w.n); for (let i = 0; i < w.n; i++) cols.time[i] = (t[i] - t[0]) / 1e6; }
+    const n0 = w.n, ranged = Number.isInteger(ctx.i0) && Number.isInteger(ctx.i1), P = ranged ? null : partsOf(w);
+    const [a, b] = ranged ? [Math.max(0, ctx.i0), Math.min(n0, Math.max(ctx.i0 + 1, ctx.i1))] : P.parts.length ? P.parts[0] : [0, Math.min(n0, 1)];
+    const x = w.extra || {}, end = b - a, sub = a > 0 || b < n0;
+    const cut = (v) => v && sub ? v.subarray(a, b) : v, cols = { profileAt: cut(w.profileAt), airborneAt: cut(w.airborneAt), govStateAt: cut(w.govStateAt), rescueAt: cut(w.rescueAt), hs: cut(w.hs) };
+    for (const k of EXTRA) if (k !== 'time' && x[k]) cols[k] = cut(x[k]);
+    if (!cols['mixer[0]'] && w.u) w.u.forEach((q, j) => { if (q) cols[MIX[j]] = Float64Array.from(cut(q), v => v * 1000); }); // lib w.u = mixer[0..2] / 1000
+    const t = x.time && x.time.length === n0 ? x.time : null, fl = w.flight || {}, rate = fl.actualRate || w.rate, tAt = (i) => t ? w.fromS + (t[i] - t[0]) / 1e6 : w.fromS + i / rate;
+    if (t) { cols.time = new Float64Array(end); for (let i = 0; i < end; i++) cols.time[i] = (t[a + i] - t[a]) / 1e6; }
     let ph = ctx.phases || null;
     if (!ph) try { ph = require('./health_phase.cjs').phases(w, Object.assign({ rate: w.flight && w.flight.actualRate || w.rate }, ctx)); } catch (e) { ph = false; }
-    const fl = w.flight || {};
-    return fromColumns(cols, { log: fl.log, segment: ctx.segment || 0, name: ctx.name || null, file: fl.file, craft: fl.craft, n: w.n, rate: w.rate, actualRate: fl.actualRate,
-        fromS: w.fromS, timeStartUs: t ? t[0] : undefined, header: fl.header, events: ctx.events, armingProfile: ctx.armingProfile }, ph);
+    if (ph && sub) { const flights = (ph.flights || []).filter(f => f.i1 > a && f.i0 < b).map(f => Object.assign({}, f, { i0: Math.max(f.i0, a) - a, i1: Math.min(f.i1, b) - a,
+        t0: f.i0 >= a ? f.t0 : tAt(a), t1: f.i1 <= b ? f.t1 : tAt(b - 1) }));
+        ph = Object.assign({}, ph, { code: ph.code ? ph.code.subarray(a, b) : ph.code, flights, class: ph.class === 'flight' && !flights.length ? 'bench' : ph.class }); }
+    // the DISARM events of the part (arming puts an earlier one at sample 0); the other events of the whole log (adjustments: gov_params)
+    const fromS = tAt(a), tol = 0.5 / rate, t1 = tAt(b - 1), isDisarm = (e) => e && (e.event === DISARM || e.name === 'DISARM');
+    const events = sub && Array.isArray(ctx.events) ? ctx.events.filter(e => !isDisarm(e) || (e.t >= fromS - tol && e.t <= t1 + tol)) : ctx.events;
+    const run = fromColumns(cols, { log: fl.log, segment: ctx.segment || 0, name: ctx.name || null, file: fl.file, craft: fl.craft, n: end, rate: w.rate, actualRate: fl.actualRate,
+        fromS, timeStartUs: t ? t[a] : undefined, header: fl.header, events, armingProfile: ctx.armingProfile }, ph);
+    if (!ranged && b < n0) run.rxLossEnd = n0 - b;
+    if (sub) run.part = [a, b];
+    return run;
 }
 
 // the runs of a dev data directory (analysis/governor-20261014/extract.cjs and phase.cjs), in meta order; o.logs: the logs to read,
@@ -207,7 +239,7 @@ function load(dir, o = {}) {
     return runs;
 }
 
-module.exports = { RULES, PHASES, EXTRA, TEXT, fromColumns, runOf: fromSegment, fromSegment, load, arming };
+module.exports = { RULES, PHASES, EXTRA, TEXT, fromColumns, runOf: fromSegment, fromSegment, partsOf, load, arming };
 if (require.main !== module) return;
 
 // node tools/autotune/gov_data.cjs <data dir>: a summary of each run

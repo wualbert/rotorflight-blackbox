@@ -18,13 +18,20 @@
  *   const table = PS.forFirmware(sysConfig['Firmware revision'], header.fixes);
  *
  * Firmware evidence: rotorflight-firmware release/4.6.0 (118e912), paths relative to src/main/. The PG numbers are from
- * pg/pg_ids.h, the CLI names and their PGs from the valueTable of cli/settings.c (generated, see NAMES).
+ * pg/pg_ids.h, the CLI names and their PGs from the valueTable of cli/settings.c (generated, see NAMES). 4.7.0 (85d7049a9,
+ * RULES.firmware47) has the same loaders and keys, three more names and the battery arrays of CLASSIC_47.
  *
  * Worker-loadable (js/tuning_worker.js CommonJS shim): no Node API at module load.
  */
 
 const RULES = {
     firmware: /^Rotorflight\s+4\.6\./,  // the revision line ("Rotorflight 4.6.0 (118e912) STM32G47X") of this table
+    // the 4.7 table (KEYS_47, CLASSIC_47): rotorflight-firmware 85d7049a9 ("Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X"),
+    // cli/settings.c (error_decay_gain_cyclic, horizon_angle_limit, airborne_*; the battery values are arrays of 6 battery
+    // profiles, bat_profile is the index), sensors/battery.c:310-325, blackbox/blackbox.c:1693-1695
+    // only the audited build: another 4.7.0 build gets known false (its epochs are 'effect-unknown' and flagged), as
+    // firmware/equivalence.cjs REVISIONS accepts only the audited hashes (review IMP-05)
+    firmware47: /^Rotorflight\s+4\.7\.0\S*\s+\(85d7049a9[0-9a-f]*\)/,
 };
 
 // PG numbers of the tracked set (pg/pg_ids.h; spec 2.2)
@@ -56,7 +63,7 @@ const NAMES = {
     [PG.ESC_SENSOR_CONFIG]: 'esc_sensor_protocol esc_sensor_halfduplex esc_sensor_pinswap esc_sensor_update_hz esc_sensor_current_offset esc_sensor_filter_cutoff esc_sensor_voltage_correction esc_sensor_current_correction esc_sensor_consumption_correction',
     [PG.FREQ_SENSOR_CONFIG]: 'freq_input_pull freq_input_edge freq_input_minhz',
     [PG.GENERIC_MIXER_CONFIG]: 'main_rotor_dir tail_rotor_mode tail_motor_idle tail_center_trim swash_type swash_ring swash_phase swash_roll_trim swash_pitch_trim swash_collective_trim swash_pitch_limit swash_tta_precomp swash_geo_correction collective_tilt_correction_pos collective_tilt_correction_neg',
-    [PG.RC_CONTROLS_CONFIG]: 'rc_center rc_deflection rc_min_throttle rc_max_throttle rc_smoothness rc_threshold deadband yaw_deadband',
+    [PG.RC_CONTROLS_CONFIG]: 'rc_center rc_deflection rc_min_throttle rc_max_throttle rc_smoothness rc_threshold deadband yaw_deadband airborne_mode airborne_gyro_threshold airborne_acc_threshold', // airborne_*: 4.7
     [PG.RX_CONFIG]: 'rx_pulse_min rx_pulse_max rssi_channel rssi_src_frame_errors rssi_scale rssi_offset rssi_invert rssi_src_frame_lpf_period serialrx_provider serialrx_inverted serialrx_halfduplex serialrx_pinswap spektrum_sat_bind spektrum_sat_bind_autoreset srxl2_unit_id srxl2_baud_fast sbus_baud_fast crsf_use_rx_snr crsf_use_negotiated_baud',
     [PG.FAILSAFE_CONFIG]: 'failsafe_delay failsafe_off_delay failsafe_throttle failsafe_switch_mode failsafe_throttle_low_delay failsafe_procedure failsafe_recovery_delay failsafe_stick_threshold',
     [PG.ARMING_CONFIG]: 'auto_disarm_delay gyro_cal_on_first_arm pwr_on_arm_grace enable_stick_arming enable_stick_commands wiggle_strength wiggle_frequency wiggle_enable_ready wiggle_enable_armed wiggle_enable_error wiggle_enable_fatal',
@@ -109,7 +116,7 @@ const FINGERPRINT_LOADER = { pid: 'pid', gov: 'gov', sp: 'sp' };
 // Keys (spec 4.3 seed for 4.6.0), first match wins. use[0] is the default consumer. fields: a use for one field of an
 // element key (el.servo: field 5 is the rate). Ticks of the consumers come from param_phase (pid, sp, mix, mot, fupd, ...),
 // 'filter' is the gyro-filter task, 'rx' and 'acc' are tasks outside the PID loop (transition frames, spec 2.5).
-const PROFILE_PID = /^p[0-5]\.(?:pid_mode|(?:roll|pitch|yaw)_[pidfbo]_gain|(?:roll|pitch|yaw)_(?:gyro|d|b)_cutoff|offset_limit|offset_flood_relax_(?:level|cutoff)|iterm_relax_(?:type|level|cutoff)|error_limit|error_decay_(?:time_(?:ground|cyclic|yaw)|limit_(?:cyclic|yaw))|yaw_(?:cw|ccw)_stop_gain|yaw_precomp_cutoff|yaw_(?:cyclic|collective)_ff_gain|yaw_inertia_precomp_(?:gain|cutoff)|pitch_collective_ff_gain|cyclic_cross_coupling_(?:gain|ratio|cutoff))$/;
+const PROFILE_PID = /^p[0-5]\.(?:pid_mode|(?:roll|pitch|yaw)_[pidfbo]_gain|(?:roll|pitch|yaw)_(?:gyro|d|b)_cutoff|offset_limit|offset_flood_relax_(?:level|cutoff)|iterm_relax_(?:type|level|cutoff)|error_limit|error_decay_(?:time_(?:ground|cyclic|yaw)|limit_(?:cyclic|yaw)|gain_cyclic)|yaw_(?:cw|ccw)_stop_gain|yaw_precomp_cutoff|yaw_(?:cyclic|collective)_ff_gain|yaw_inertia_precomp_(?:gain|cutoff)|pitch_collective_ff_gain|cyclic_cross_coupling_(?:gain|ratio|cutoff))$/;
 const KEYS_46 = [
     { match: /^pid_profile$/, use: [{ by: 'live', consumer: 'pid' }],
         src: 'config/config.c:839-851 changePidProfile sets the index and the pointer, then loads the profile (A pid)' },
@@ -280,6 +287,12 @@ const CLASSIC_46 = [
     ['debug_axis', [{ boot: 'debug_axis' }]],
 ];
 
+// 4.7 (RULES.firmware47): the cell voltages are arrays of the 6 battery profiles, and the classic line has the values of the
+// battery profile bat_profile (blackbox.c:1693 getBatteryMinCellVoltage, battery.c:310-325). { m, at }: element [value of
+// the key at] of the list of m. The other classic lines are those of 4.6.0
+const CLASSIC_47 = CLASSIC_46.map(([name, sources]) => name !== 'vbatcellvoltage' ? [name, sources]
+    : [name, ['vbat_min_cell_voltage', 'vbat_warning_cell_voltage', 'vbat_max_cell_voltage'].map(m => ({ m, at: 'bat_profile' }))]);
+
 // The sysConfig names of the classic keys that js/flightlog_parser.js renames (translationValues) or splits
 const CLASSIC_SYSCONFIG = {
     gyro_hardware_lpf: 'gyro_lpf', gyro_lpf1_type: 'gyro_soft_type', gyro_lpf1_static_hz: 'gyro_lowpass_hz', gyro_lpf1_dyn_hz: 'gyro_lowpass_dyn_hz',
@@ -301,7 +314,7 @@ function matchRule(keys, key) {
  */
 function forFirmware(revision, fixes) {
     const fx = new Set((Array.isArray(fixes) ? fixes : String(fixes || '').split(',')).map(s => String(s).trim()).filter(s => s && s !== '-'));
-    const known = RULES.firmware.test(String(revision || ''));
+    const v47 = RULES.firmware47.test(String(revision || '')), known = v47 || RULES.firmware.test(String(revision || ''));
     const keys = known ? KEYS_46.slice() : [];
     const adjustments = known ? Object.assign({}, ADJUSTMENTS_46) : {};
     if (known && fx.has('c3')) // c3: the setpoint-boost setters also set sp.boostGain (spec 3.11)
@@ -309,8 +322,8 @@ function forFirmware(revision, fixes) {
     if (known && fx.has('c4')) // c4: the rate setters call setpointInitProfile, which writes its own A(sp) record
         for (let f = 5; f <= 13; f++) adjustments[f] = Object.assign({}, adjustments[f], { applies: 'sp', src: 'c4: setpointInitProfile after the write' });
     const table = {
-        known, firmware: known ? 'Rotorflight 4.6.*' : null, revision: revision || null, fixes: [...fx],
-        loaders: LOADERS, keys, adjustments, lookups: LOOKUPS, classic: known ? CLASSIC_46 : [], classicSysConfig: CLASSIC_SYSCONFIG,
+        known, firmware: v47 ? 'Rotorflight 4.7.0' : known ? 'Rotorflight 4.6.*' : null, revision: revision || null, fixes: [...fx],
+        loaders: LOADERS, keys, adjustments, lookups: LOOKUPS, classic: v47 ? CLASSIC_47 : known ? CLASSIC_46 : [], classicSysConfig: CLASSIC_SYSCONFIG,
         classify: (key) => matchRule(keys, String(key).replace(/\[\d+\]$/, '')),
         pgOf: pgOfKey,
         slotOf: slotOfKey,
@@ -344,7 +357,7 @@ function forFirmware(revision, fixes) {
     return table;
 }
 
-module.exports = { RULES, PG, NAMES, ELEMENT_PG, LOADERS, FINGERPRINT_LOADER, KEYS_46, ADJUSTMENTS_46, LOOKUPS, CLASSIC_46, CLASSIC_SYSCONFIG, pgOfKey, slotOfKey, forFirmware };
+module.exports = { RULES, PG, NAMES, ELEMENT_PG, LOADERS, FINGERPRINT_LOADER, KEYS_46, ADJUSTMENTS_46, LOOKUPS, CLASSIC_46, CLASSIC_47, CLASSIC_SYSCONFIG, pgOfKey, slotOfKey, forFirmware };
 if (require.main !== module) return;
 
 // node tools/autotune/param_semantics.cjs [key ...]: the rule of each key for 4.6

@@ -38,6 +38,21 @@
  *     collective + RULE.td.afterCollS, the bound end and, without AIRBORNE_STATE, the headspeed under the flight rpm +
  *     RULE.td.afterRpmS). Without it: the earliest of the collective decrease, the throttle cut - RULE.td.cutLateS, the
  *     flag drop - RULE.td.flagLateS.
+ *   - In-flight cut (IMP-03). The firmware clears AIRBORNE when the motor stops (airborne.c touchdown(): isSpooledUp() is false in
+ *     OFF, IDLE and HOLD, governor.c), also at 5 m. A flag drop RULE.td.cutTieS or less after a governor change to OFF, IDLE, HOLD
+ *     or AUTOROTATION, or in a receiver signal loss (lib.cjs RX_LOSS: from the inferred last RC frame to the RX return), or with
+ *     failsafePhase > 0, is a cut in flight when no touchdown movement comes before the end of the control and the helicopter
+ *     is in the air: for a loss or a failsafe the collective at the liftoff level or more, or the altitude RULE.baro.rise or more
+ *     above the level before the liftoff; for a cut by the pilot both (the sanity rule: no in-flight cut on the ground, and no
+ *     touchdown while the altitude stays high). Then the flight ends at the earlier of the inferred last RC frame and the cut
+ *     (touchdownBy 'in-flight cut'). The ground contact is the first 1-frame step of the roll or pitch gyroRAW (gyroADC without
+ *     it) of more than RULE.td.crashFactor x the largest step of the flight, from the end of the flight to RULE.td.cutSearchS
+ *     after the cut, back to the first frame of the steep rise (steps of RULE.td.onsetFrac x the largest step of the flight or
+ *     more); else the first touchdown movement (RULE.td.jolt; the band-pass is not causal, so it can come early). The phase
+ *     'fall' is from the end of the flight to the contact, the phase 'aftercontact' from the contact to the disarm (the governor
+ *     OFF, or armed 0): RECOVERY or ACTIVE after a contact is neither a spool-up nor a flight. Check D11 reports each cut.
+ *     Crash log 2026-10-15: the last RC frame 68.344 s, HOLD at 68.645 s, the flag drop 1 ms later at about 5 m, the contact
+ *     70.4435 s (the gyroRAW roll step 109 deg/s, then 537 deg/s against the largest step of the flight, 121 deg/s)
  *   - A flight is RULE.minFlightS or longer, has the flight rpm or more for half of its time, and has roll and pitch
  *     movement at 0.1-2 Hz of RULE.body.minRms deg/s rms or more; or, for a calm flight, of RULE.body.calmRms or more
  *     with a signal that the sticks and the governor do not set: the touchdown movement or the altitude increase.
@@ -70,7 +85,13 @@ const RULE = {
     body: { band: [0.1, 2], minRms: 3, calmRms: 1, groundRms: 1.5 },  // roll and pitch movement, deg/s rms; minRms: a flight from the movement alone; calmRms: a calm flight with the touchdown movement or the altitude (margins in the head of this file)
     minFlightS: 2,
     split: { minS: 3 },                                 // s of low collective with the body still between two flights
-    td: { band: [5, 20], jolt: 40, searchS: 4, afterCollS: 1, afterRpmS: 2, minAfterLiftS: 0.5, cutLateS: 0.7, flagLateS: 1.0 },
+    td: { band: [5, 20], jolt: 40, searchS: 4, afterCollS: 1, afterRpmS: 2, minAfterLiftS: 0.5, cutLateS: 0.7, flagLateS: 1.0,
+        // in-flight cut (IMP-03): cutTieS the flag drop after the governor change (crash log: 1 ms); cutSearchS the contact search after
+        // the cut; crashFactor, onsetFrac: the contact step against the largest gyroRAW step of the flight (crash log: 4.4 x, onset 0.9 x);
+        // controlS: the collective and the altitude before the end of the control; peakS: the peak rates after the contact; landingS: a cut by
+        // the pilot with the ground contact this time or less after it is a landing (health_more RULE.hold.landingS). 2026-10-05 dump, 6 normal
+        // landings: the touchdown gyroRAW step is 0.45-1.15 x the largest step of the flight; crash log 2026-10-15: 4.4 x (DEFAULT_RULES.D11)
+        cutTieS: 0.01, cutSearchS: 4, crashFactor: 2.0, onsetFrac: 0.5, controlS: 0.2, peakS: 0.2, landingS: 0.5 },
     baro: { rise: 50, withinS: 5, beforeS: 2 },         // altitude (cm) rise in withinS after liftoff that confirms it (peer hop_baro 0.5 m)
     noGov: { top: 0.95, q: 0.9 },                       // without GOVSTATE: the spool-up ends at top x the q quantile of the run's headspeed
     spool: { motor: [100, 450], minS: 0.3, slopeS: 0.05, preS: 1 }, // G15: the throttle ramp is the slope of motor[0] in this range (0.1 %, peer ramp_mot); slopeS: half width of the headspeed slope; preS: the IDLE time before SPOOLUP with the rotor turning that the spool-up includes, at most
@@ -83,9 +104,13 @@ const RULE = {
     maxEvents: 200,
 };
 
-const EXTRA = ['mixer[3]', 'motor[0]', 'govTarget', 'altitude', 'time']; // time: the durations on the frame clock
-const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];
-const [IDLE, SPOOL, GROUND, FLIGHT, DOWN] = [0, 1, 2, 3, 4];
+// time: the durations on the frame clock; gyroRAW, failsafePhase, armed: the in-flight cut and the ground contact (IMP-03)
+const EXTRA = ['mixer[3]', 'motor[0]', 'govTarget', 'altitude', 'time', 'gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'failsafePhase', 'armed'];
+const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact']; // fall, aftercontact: after an in-flight cut (IMP-03)
+const [IDLE, SPOOL, GROUND, FLIGHT, DOWN, FALL, AFTER] = [0, 1, 2, 3, 4, 5, 6];
+// OFF, IDLE and HOLD: isSpooledUp() is false (governor.c, the same in 4.6.0 118e912, 58a4bd5cc and 4.7.0 85d7049a9), so airborne.c touchdown()
+// clears AIRBORNE at once; AUTOROTATION keeps isSpooledUp() true, but its motor cut is a cut too (IMP-03)
+const CUT_STATES = new Set([0, 1, 5, 7]);
 const STATES = ['OFF', 'IDLE', 'SPOOLUP', 'RECOVERY', 'ACTIVE', 'HOLD', 'FALLBACK', 'AUTOROTATION', 'BAILOUT', 'BYPASS']; // health_setup GOV_STATES
 
 // The sources are shown to the pilot (quoted, review V3): no file name or path. The methods and the numbers of the Gaui X4 II
@@ -101,9 +126,14 @@ const DEFAULT_RULES = {
     G17: { flag: 1, source: `${P}; a step that the throttle does not command, or a headspeed decrease at a throttle that does not decrease, as the spool-up analysis of a different helicopter (Gaui X4 II) found them`, note: 'flag: number of kicks' },
     G18: { flag: 0.05, minWindows: 3, source: P, note: 'flag: rms headspeed change / mean headspeed at IDLE with a constant motor output, by 2 SE' },
     C15: { peak: 5, minS: 1, source: `${P}; ${GAUI}: 8.46 +- 0.11 Hz, increase 3.34 +- 0.74 /s in 3 of 4 flights`, note: 'flag: an episode of RULE.osc that reaches peak deg/s rms and increases (growth - 2 SE > 0); minS: s of ground running before liftoff' },
+    D11: { crashFactor: 2.0, source: `${P}; the firmware clears AIRBORNE_STATE when the motor stops (airborne.c), also in the air. Crash log 2026-10-15: the receiver signal stops, HOLD at 5 m, the ground contact 1.80 s later, with a rate step of 4.4 times the largest step of the flight. The 6 normal landings of the 2026-10-05 dump: 0.45 to 1.15 times`,
+        note: 'flag: a ground contact after a motor cut in flight from a receiver signal loss or a failsafe, or a ground contact step (the largest 1-frame roll or pitch step in RULE.td.peakS from the contact) of crashFactor x the largest step of the flight or more; note: a cut by the pilot with a contact that is not that strong, or no contact found' },
 };
-const UNITS = { D7: 's', G15: 'deg/s', G16: 'fraction', G17: 'count', G18: 'fraction', C15: 'deg/s' };
-const PHASE_OF = { D7: null, G15: 'spoolup', G16: 'spoolup', G17: null, G18: 'idle', C15: 'ground' }; // G17: the phase of its first kick
+const UNITS = { D7: 's', G15: 'deg/s', G16: 'fraction', G17: 'count', G18: 'fraction', C15: 'deg/s', D11: 'count' };
+const PHASE_OF = { D7: null, G15: 'spoolup', G16: 'spoolup', G17: null, G18: 'idle', C15: 'ground', D11: 'fall' }; // G17: the phase of its first kick
+// the phases that a check examines, when it is more than one (catalog.cjs CHECKS[id].phases; js/tuning_worker.js f.phases): D11, the end of
+// the flight, the fall and the time after the ground contact
+const PHASES_OF = { D11: ['flight', 'fall', 'aftercontact'] };
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -177,6 +207,14 @@ function compute(w, ctx, hsMin, gov) {
     const cumBody = new Float64Array(n + 1); for (let i = 0; i < n; i++) cumBody[i + 1] = cumBody[i] + bp[0][i] ** 2 + bp[1][i] ** 2;
     const bodyRms = (s, e) => e > s ? Math.sqrt((cumBody[e] - cumBody[s]) / (e - s)) : 0;
     let joltSig = null; const jolt = () => { if (!joltSig) { const [a, b] = [0, 1].map(k => lib.bandpass(w.gyro[k], RULE.td.band[0], RULE.td.band[1], rate)); joltSig = Float64Array.from(a, (v, i) => Math.max(Math.abs(v), Math.abs(b[i]))); } return joltSig; };
+    // the in-flight cut (IMP-03): the receiver signal losses of the segment (lib.segments w.rxLoss) with the sample of the inferred last
+    // RC frame, failsafePhase, the gyro for the contact (gyroRAW, else gyroADC), the altitude and the armed field
+    const lowerBound = (us) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (T[m] < us) lo = m + 1; else hi = m; } return lo; }, RX = lib.RX_LOSS || {};
+    const rxSpans = (Array.isArray(w.rxLoss) ? w.rxLoss : []).filter(s => s && s.i1 > 0).map(s => Object.assign({}, s, { last: T && typeof s.lastFrameUs === 'number' ? Math.min(s.i0, lowerBound(s.lastFrameUs))
+        : Math.max(0, s.i0 - S(s.cause === 'signal' ? RX.lastFrameLeadS || 0.1 : s.cause === 'channel' ? RX.holdS || 0.3 : 0)) }));
+    const rawOk = [0, 1, 2].every(k => X[`gyroRAW[${k}]`] && X[`gyroRAW[${k}]`].length === n);
+    const env = { T, rx: rxSpans, fsp: X.failsafePhase || null, raw: rawOk ? [0, 1, 2].map(k => X[`gyroRAW[${k}]`]) : w.gyro, rawField: rawOk ? 'gyroRAW' : 'gyroADC', armed: X.armed || null,
+        alt: X.altitude && !X.altitude.every(v => v === X.altitude[0]) ? X.altitude : null };
 
     // bounds of the search
     const bounds = [];
@@ -197,11 +235,11 @@ function compute(w, ctx, hsMin, gov) {
         const m = median(alt.subarray(Math.max(0, fl.i0 - S(RULE.baro.beforeS)), fl.i0 + 1)); return hi - m; })();
     const flights = [], rejected = [];
     for (const bd of bounds) for (const c of candidates(w, bd, coll, hsMin, rate, bodyRms, S)) {
-        const fl = touchdown(w, ctx, c, bd, coll, gov, hsMin, rate, S, jolt, hasAir);
+        const fl = touchdown(w, ctx, c, bd, coll, gov, hsMin, rate, S, jolt, hasAir, env);
         const secs = dur(fl.i0, fl.i1), rms = bodyRms(fl.i0, fl.i1);
         let atRpm = 0, airN = 0; for (let i = fl.i0; i < fl.i1; i += 4) { atRpm += w.hs[i] >= hsMin ? 1 : 0; airN += hasAir && air[i] ? 1 : 0; }
         const k4 = Math.max(1, Math.ceil((fl.i1 - fl.i0) / 4)), rpmShare = atRpm / k4, baro = baroOf(fl);
-        const byJolt = fl.touchdownBy === 'jolt', byBaro = baro !== null && baro >= RULE.baro.rise, agree = [byJolt ? 'touchdown movement' : null, byBaro ? 'altitude' : null].filter(Boolean);
+        const byJolt = fl.touchdownBy === 'jolt' || fl.touchdownBy === 'ground contact', byBaro = baro !== null && baro >= RULE.baro.rise, agree = [byJolt ? 'touchdown movement' : null, byBaro ? 'altitude' : null].filter(Boolean);
         const moves = rms >= B.minRms || (rms >= B.calmRms && agree.length > 0);
         const reason = secs < RULE.minFlightS ? 'short' : !moves ? 'movement' : rpmShare < 0.5 ? 'headspeed' : null;
         const base = { i0: fl.i0, i1: fl.i1, t0: t(fl.i0), t1: t(fl.i1), seconds: r(secs, 2), bodyRms: r(rms, 2), calm: rms < B.minRms, agree,
@@ -210,9 +248,22 @@ function compute(w, ctx, hsMin, gov) {
         const signals = [hasAir ? 'airborne' : null, c.by, byJolt ? 'touchdown movement' : null, byBaro ? 'altitude' : null].filter(Boolean);
         const score = (hasAir ? 1 : 0) + (byJolt ? 1 : 0) + (byBaro ? 1 : 0);
         flights.push(Object.assign(base, { liftoffBy: c.by, method: signals.join('+'), confidence: score >= 2 ? 'high' : score === 1 ? 'medium' : 'low',
-            hover: r(c.hover, 0), threshold: r(c.thr, 0), atStart: fl.atStart, atEnd: fl.atEnd }));
+            hover: r(c.hover, 0), threshold: r(c.thr, 0), atStart: fl.atStart, atEnd: fl.atEnd }, fl.cut ? { cut: fl.cut } : {}));
     }
     flights.sort((a, b) => a.i0 - b.i0);
+    // after an in-flight cut: the ground contact, and the end of the phase after it (the disarm: the governor OFF or armed 0; without
+    // GOVSTATE the rotor under RULE.spinRpm), never into the next flight. After a cut by the pilot with a ground contact that is not a contact
+    // step (an autorotation landing: D11 a note), also the motor start (a change from OFF, IDLE, HOLD or AUTOROTATION to SPOOLUP or RECOVERY)
+    // or the rotor under RULE.spinRpm: the spool-up and the ground run after it are not 'aftercontact'. After a receiver signal loss or a
+    // failsafe, RECOVERY on the ground stays in the phase after the contact
+    for (const [k, f] of flights.entries()) if (f.cut) {
+        const q = f.cut, next = k + 1 < flights.length ? flights[k + 1].i0 : n, ct = contactOf(w, f.i0, f.i1, q.i, next, rate, S, env, jolt);
+        // the disarm: armed 0 when the log records it; else the governor that changes to OFF (or stays OFF after a cut to OFF: the rotor stops)
+        const soft = q.by === 'pilot' && !!ct && ct.by !== 'step', restart = (i) => !!gov && i > 0 && (gov[i] === 2 || gov[i] === 3) && CUT_STATES.has(gov[i - 1]);
+        const off = (i) => (soft && (restart(i) || w.hs[i] < RULE.spinRpm)) || (env.armed ? !env.armed[i] : gov && gov[q.i] !== 0 ? gov[i] === 0 : w.hs[i] < RULE.spinRpm);
+        let end = next; for (let i = ct ? ct.i : q.i; i < next; i++) if (off(i)) { end = i; break; }
+        Object.assign(q, { contact: ct, fallEnd: ct ? ct.i : Math.min(end, q.i + S(RULE.td.cutSearchS)), afterEnd: ct ? Math.max(ct.i, end) : null });
+    }
 
     // the phase of every sample
     const code = new Uint8Array(n), spin = (i) => w.hs[i] >= RULE.spinRpm;
@@ -223,6 +274,8 @@ function compute(w, ctx, hsMin, gov) {
         code.fill(SPOOL, s, up); code.fill(GROUND, up, dn + 1); code.fill(DOWN, dn + 1, e);
     }
     for (const f of flights) code.fill(FLIGHT, f.i0, f.i1);
+    for (const f of flights) if (f.cut) { const q = f.cut; for (let i = f.i1; i < q.fallEnd; i++) if (code[i] !== FLIGHT) code[i] = FALL;
+        if (q.contact) for (let i = q.contact.i; i < q.afterEnd; i++) if (code[i] !== FLIGHT) code[i] = AFTER; }
     for (let i = 0, last = IDLE; i < n; i++) { // OFF or IDLE with the rotor still turning after ground, flight or spool-down
         if (code[i] === IDLE) { if (spin(i) && last !== IDLE) code[i] = DOWN; else if (!spin(i)) last = IDLE; }
         else last = code[i];
@@ -266,14 +319,19 @@ function candidates(w, bd, coll, hsMin, rate, bodyRms, S) {
 
 // the touchdown of a candidate: the first sudden roll or pitch movement before the landing bound, else the earliest sign
 // of the landing; { i0, i1, touchdownBy, jolt, atStart, atEnd }
-function touchdown(w, ctx, c, bd, coll, gov, hsMin, rate, S, jolt, hasAir) {
+function touchdown(w, ctx, c, bd, coll, gov, hsMin, rate, S, jolt, hasAir, env = {}) {
     const T = RULE.td, n = w.n, L = c.L, end = c.next !== null ? c.next : bd.b1;
     let hsEnd = L; for (let i = L; i < end; i++) if (w.hs[i] >= hsMin) hsEnd = i + 1;
     const U = Math.min(end, c.E + S(T.afterCollS), hasAir ? end : hsEnd + S(T.afterRpmS)), atStart = L === 0, j0 = Math.max(L + S(T.minAfterLiftS), U - S(T.searchS));
-    const J = jolt(); let at = -1;
-    for (let i = j0; i < U; i++) if (J[i] >= T.jolt) { at = i; break; }
+    // an in-flight cut (IMP-03): the touchdown movement is searched only up to the end of the control; a movement after it is the
+    // ground contact (contactOf), not a landing
+    // a cut by the pilot with the ground contact RULE.td.landingS or less after it is a landing: the touchdown at the contact
+    const found = hasAir ? inFlightCut(w, c, bd, coll, gov, rate, S, env, jolt) : null, cut = found && !found.landing ? found : null, J = jolt(); let at = -1;
+    for (let i = j0; i < (cut ? Math.min(U, cut.end) : U); i++) if (J[i] >= T.jolt) { at = i; break; }
     if (at >= 0) { let pk = 0; for (let i = at; i < Math.min(U, at + S(0.2)); i++) pk = Math.max(pk, J[i]);
         return { i0: L, i1: at, touchdownBy: 'jolt', jolt: { i: at, t: r(w.fromS + at / rate, 3), value: r(pk, 1) }, atStart, atEnd: false }; }
+    if (found && found.landing) return { i0: L, i1: found.landing.i, touchdownBy: 'ground contact', jolt: null, atStart, atEnd: false };
+    if (cut) return { i0: L, i1: cut.end, touchdownBy: 'in-flight cut', jolt: null, atStart, atEnd: false, cut };
     const cands = [];
     if (c.E < U && c.E < bd.b1 - S(RULE.bound.padS)) cands.push(['collective', c.E]);
     if (gov) { let cut = -1; for (let i = Math.max(L + 1, 1); i < Math.min(n, U + S(1)); i++) if (gov[i - 1] === 4 && gov[i] !== 4 && gov[i] !== 6 && gov[i] !== 3) cut = i;
@@ -282,6 +340,72 @@ function touchdown(w, ctx, c, bd, coll, gov, hsMin, rate, S, jolt, hasAir) {
     const best = cands.filter(([, i]) => i > L).sort((a, b) => a[1] - b[1])[0];
     if (best) return { i0: L, i1: Math.min(best[1], U), touchdownBy: best[0], jolt: null, atStart, atEnd: false };
     return { i0: L, i1: U, touchdownBy: U >= n ? 'log end' : 'bound end', jolt: null, atStart, atEnd: U >= n };
+}
+
+// The cut in flight of candidate c in bound bd (head of this file), or null: { i (the motor cut: the governor change; with no motor cut
+// in a receiver signal loss, the inferred last RC frame), motorCut (false: the governor stays out of CUT_STATES in the loss, no RC
+// control only), end (the end of the flight: the earlier of the inferred last RC frame and the cut), by ('receiver loss' | 'failsafe' |
+// 'pilot'), state (the governor state of the cut, null with no motor cut), lastFrame, rxReturn (samples, null when the loss does not end
+// in the segment), collective (the mean before the end of the control), baroRise (cm over the level before the liftoff, null without the
+// altitude), baroDrop (cm from the end of the flight to the ground contact, null without the altitude), contact (a cut by the pilot only) }.
+// { landing: contact } for a cut by the pilot with the ground contact RULE.td.landingS or less after it: a landing (touchdown at the contact).
+//   - A receiver signal loss (env.rx) that starts after the liftoff, before the end of the candidate, and not after the flag drop (a loss
+//     after the flag drop is on the ground): the helicopter in the air at the inferred last RC frame (the collective at the liftoff level,
+//     or the altitude RULE.baro.rise over the level before the liftoff), and the flag drop in the loss or up to RX_LOSS.settleS after the
+//     RX return, or a contact step in the loss. With the pilot's option B (rxfail 1500, the AUTOROTATION band) isSpooledUp() stays true:
+//     the flag drops only when the sticks come back, after the RX return or never. The cut is the first governor change into CUT_STATES
+//     after the last RC frame in the loss (the stage-1 change of the rxfail values), not the flag drop
+//   - Else the flag drop: RULE.td.cutTieS or less after a governor change into CUT_STATES (by the pilot), or with failsafePhase > 0
+function inFlightCut(w, c, bd, coll, gov, rate, S, env, jolt) {
+    const T = RULE.td, L = c.L, n = w.n, stop = c.next !== null ? c.next : bd.b1, RX = lib.RX_LOSS || {}, settle = S(typeof RX.settleS === 'number' ? RX.settleS : 1);
+    const f = bd.flagOff !== null && bd.flagOff > L + 1 && (c.next === null || bd.flagOff < c.next) ? bd.flagOff : null; // the flag drop of this candidate (not of the next flight of the bound)
+    const control = (end) => { const k = Math.max(L, end - S(T.controlS)), cm = coll ? mean(coll, k, end) : null; let rise = null, at = null;
+        if (env.alt) { at = median(env.alt.subarray(k, end)); if (L > 0) { const base = median(env.alt.subarray(Math.max(0, L - S(RULE.baro.beforeS)), L + 1)); if (base !== null && at !== null) rise = at - base; } }
+        return { k, cm, high: cm !== null && c.thr !== null && cm >= c.thr, rise, at, up: rise !== null && rise >= RULE.baro.rise }; };
+    const stateOf = (i) => gov ? STATES[gov[i]] || String(gov[i]) : null;
+    // 1. a receiver signal loss in the flight
+    for (const rx of env.rx || []) {
+        const end = rx.last; if (!(end > L + 1 && end < stop) || (f !== null && f < end)) continue;
+        const a = control(end); if (!(a.high || a.up)) continue;
+        // the motor cut before the loss (an autorotation of the pilot that the loss interrupts): the cut of the pilot, with the last RC frame
+        let ci = null, before = false; if (gov) { if (CUT_STATES.has(gov[end])) { ci = end; while (ci > L + 1 && gov[ci - 1] === gov[end]) ci--; before = true; }
+            else for (let i = end + 1; i < Math.min(n, rx.i1); i++) if (gov[i] !== gov[i - 1] && CUT_STATES.has(gov[i])) { ci = i; break; } }
+        const flagIn = f !== null && f <= Math.min(n, rx.i1 + settle), hit = flagIn ? null : contactOf(w, L, end, end, Math.min(n, rx.i1), rate, S, env, jolt, true);
+        if (!flagIn && !hit) continue;
+        return { i: ci !== null ? ci : end, motorCut: ci !== null, end: Math.max(L + 1, ci !== null ? Math.min(ci, end) : end), by: before ? 'pilot' : 'receiver loss', state: ci !== null ? stateOf(ci) : null, lastFrame: end,
+            rxReturn: rx.i1 < n ? rx.i1 : null, collective: r(a.cm, 0), threshold: r(c.thr, 0), baroRise: r(a.rise, 0), baroDrop: null };
+    }
+    // 2. the flag drop after a governor change (the pilot) or in failsafe
+    if (f === null) return null;
+    let g = -1; if (gov) for (let i = f; i >= Math.max(L + 1, f - S(T.cutTieS)); i--) if (gov[i] !== gov[i - 1] && CUT_STATES.has(gov[i]) && !CUT_STATES.has(gov[i - 1])) { g = i; break; }
+    const fs = !!(env.fsp && env.fsp[f] > 0);
+    if (g < 0 && !fs) return null;
+    const ci = g >= 0 ? g : f, end = Math.max(L + 1, ci), a = control(end);
+    const out = { i: ci, motorCut: true, end, by: fs ? 'failsafe' : 'pilot', state: g >= 0 ? stateOf(ci) : null, lastFrame: null, rxReturn: null, collective: r(a.cm, 0), threshold: r(c.thr, 0), baroRise: r(a.rise, 0), baroDrop: null };
+    if (fs) return a.high || a.up ? out : null;
+    // a cut by the pilot: the collective at the liftoff level, and an altitude decrease of RULE.baro.rise or more from the end of the flight to
+    // the ground contact (the median over 1 s from the contact; with no contact, the minimum in RULE.td.cutSearchS). The level before the
+    // liftoff is not used: at the end of a flight the baro drifts (2026-09-26 and 2026-09-29 dumps, 28 HOLDs at the landing: -2.49 to +0.49 m)
+    if (!a.high || !env.alt || a.at === null) return null;
+    const ct = contactOf(w, L, end, ci, Math.min(n, c.next !== null ? c.next : n), rate, S, env, jolt);
+    if (ct && ct.i - ci <= S(T.landingS)) return { landing: ct };
+    let after = null; if (ct) after = median(env.alt.subarray(ct.i, Math.min(n, ct.i + S(1)))); else { after = Infinity; for (let i = ci; i < Math.min(n, ci + S(T.cutSearchS)); i++) after = Math.min(after, env.alt[i]); }
+    const drop = after !== null && isFinite(after) ? a.at - after : null;
+    if (!(drop !== null && drop >= RULE.baro.rise)) return null;
+    return Object.assign(out, { baroDrop: r(drop, 0), contact: ct });
+}
+// The ground contact after the cut q.i of the flight [L, end) (head of this file): { i, by ('step' | 'jolt'), step, flightStep, ratio, field }
+// or null. The search ends RULE.td.cutSearchS after the cut, at the next flight (stop) or at the segment end. stepOnly: no jolt
+function contactOf(w, L, end, ci, stop, rate, S, env, jolt, stepOnly) {
+    const T = RULE.td, x = env.raw || w.gyro, hi = Math.min(stop, w.n, ci + S(T.cutSearchS));
+    const step = (i) => Math.max(Math.abs(x[0][i] - x[0][i - 1]), Math.abs(x[1][i] - x[1][i - 1]));
+    let big = 0; for (let i = L + 1; i < end; i++) { const d = step(i); if (d > big) big = d; } // the steps in the flight
+    if (big > 0) for (let i = Math.max(1, end); i < hi; i++) if (step(i) > T.crashFactor * big) {
+        let j = i; while (j - 1 > end && step(j - 1) >= T.onsetFrac * big) j--;
+        return { i: j, by: 'step', step: r(step(i), 1), flightStep: r(big, 1), ratio: r(step(i) / big, 2), field: env.rawField || 'gyroADC' }; }
+    if (stepOnly) return null;
+    const J = jolt(); for (let i = end; i < hi; i++) if (J[i] >= T.jolt) return { i, by: 'jolt', step: null, flightStep: r(big, 1), ratio: null, field: 'gyroADC' };
+    return null;
 }
 
 // flight phase: 1, else 0
@@ -308,7 +432,36 @@ function analyse(w, ctx) {
     out.G17 = kicks(w, ctx, code, gov, mot, prof, hsMin, rate, t, S);
     out.G18 = idleStability(w, code, gov, mot, rate, t, S);
     out.C15 = groundResonance(w, ph, code, gov, prof, hsMin, rate, t, S);
+    out.D11 = inFlightCuts(w, ph, gov, prof, rate, t, S);
     return out;
+}
+
+// D11 (IMP-03): each cut in flight (head of this file), in frame seconds (the time column; index time without it): cutS (the motor cut;
+// with no motor cut, the last RC frame), motorCut, endS (the end of the flight), lastFrameS, returnS (the RX return), contactS, fallS
+// (contact - cut), afterReturnS (contact - RX return; < 0: the contact comes before the return), ratio (the largest 1-frame roll or pitch
+// step in RULE.td.peakS from the contact / the largest step of the flight: judge DEFAULT_RULES.D11.crashFactor), the peak rates in
+// RULE.td.peakS after the contact (gyroRAW when logged), the headspeed at the cut and at the contact, the collective and the altitude before
+// the end of the control. { skipped } when the log cannot show a cut: no AIRBORNE_STATE, or no GOVSTATE, receiver fields and failsafePhase
+function inFlightCuts(w, ph, gov, prof, rate, t, S) {
+    const n = w.n, X = w.extra || {}, T = X.time && X.time.length === n ? X.time : null, F = (i) => i === null || i === undefined ? null : r(T ? w.fromS + (T[Math.min(n - 1, i)] - T[0]) / 1e6 : w.fromS + i / rate, 4);
+    if (!ph.hasAirborne) return { skipped: 'The log does not record AIRBORNE_STATE. Thus, check D11 did not operate.', events: [] };
+    if (!gov && !Array.isArray(w.rxLoss) && !X.failsafePhase) return { skipped: 'The log does not record GOVSTATE, the receiver signal or failsafePhase. Thus, check D11 did not operate.', events: [] };
+    const raw = [0, 1, 2].every(k => X[`gyroRAW[${k}]`] && X[`gyroRAW[${k}]`].length === n) ? [0, 1, 2].map(k => X[`gyroRAW[${k}]`]) : w.gyro, field = raw === w.gyro ? 'gyroADC' : 'gyroRAW';
+    const stepAt = (i) => i > 0 ? Math.max(Math.abs(raw[0][i] - raw[0][i - 1]), Math.abs(raw[1][i] - raw[1][i - 1])) : 0;
+    // the altitude decrease from the end of the flight to the ground contact (median over RULE.td.controlS before the end, over 1 s from the contact)
+    const alt = X.altitude && X.altitude.length === n && !X.altitude.every(v => v === X.altitude[0]) ? X.altitude : null;
+    const dropOf = (end, ci) => alt && ci < n ? median(alt.subarray(Math.max(0, end - S(RULE.td.controlS)), Math.max(1, end))) - median(alt.subarray(ci, Math.min(n, ci + S(1)))) : null;
+    const events = ph.flights.filter(f => f.cut).map(f => { const q = f.cut, ct = q.contact, peak = {}; let big = 0;
+        if (ct) { for (const [a, name] of [[0, 'roll'], [1, 'pitch'], [2, 'yaw']]) { let pk = 0; for (let i = ct.i; i < Math.min(n, ct.i + S(RULE.td.peakS)); i++) pk = Math.max(pk, Math.abs(raw[a][i])); peak[name] = r(pk, 0); }
+            for (let i = ct.i; i < Math.min(n, ct.i + S(RULE.td.peakS)); i++) big = Math.max(big, stepAt(i)); }
+        const cutS = F(q.i), contactS = ct ? F(ct.i) : null, returnS = F(q.rxReturn);
+        return { t: t(q.i), cutS, motorCut: q.motorCut !== false, endS: F(f.i1), lastFrameS: F(q.lastFrame), returnS, by: q.by, state: q.state, contactS, contactBy: ct ? ct.by : null, step: ct ? ct.step : null, flightStep: ct ? ct.flightStep : null,
+            ratio: ct && ct.flightStep > 0 ? r(Math.max(big, ct.step || 0) / ct.flightStep, 2) : null, fallS: ct ? r(contactS - cutS, 4) : null, afterReturnS: ct && returnS !== null ? r(contactS - returnS, 4) : null, peak: ct ? peak : null, field,
+            headspeedAtCut: r(w.hs[q.i], 0), headspeedAtContact: ct ? r(w.hs[ct.i], 0) : null, collective: q.collective, threshold: q.threshold, baroRise: q.baroRise === null ? null : r(q.baroRise / 100, 2),
+            baroDrop: typeof q.baroDrop === 'number' ? r(q.baroDrop / 100, 2) : ct && dropOf(f.i1, ct.i) !== null ? r(dropOf(f.i1, ct.i) / 100, 2) : null,
+            afterContactS: ct && q.afterEnd !== null ? r((T ? (T[Math.min(n - 1, q.afterEnd)] - T[ct.i]) / 1e6 : (q.afterEnd - ct.i) / rate), 3) : null, profile: prof ? prof[q.i] : null }; });
+    const landed = ph.flights.every(f => !f.cut && f.touchdownBy !== 'log end' && f.touchdownBy !== 'bound end');
+    return { events, landed, definition: `a receiver signal loss after the liftoff with the collective at the liftoff level or the altitude ${RULE.baro.rise} cm over the level before the liftoff at the last RC frame, and the flag drop of AIRBORNE_STATE in the loss or ${(lib.RX_LOSS || {}).settleS || 1} s or less after the RX return, or a contact step in the loss (the cut: the first governor change to OFF, IDLE, HOLD or AUTOROTATION after the last RC frame); else a flag drop ${RULE.td.cutTieS} s or less after a governor change to one of these states (the pilot: the collective at the liftoff level and an altitude decrease of ${RULE.baro.rise} cm or more to the ground contact, the contact more than ${RULE.td.landingS} s after the cut), or with failsafePhase > 0; contact: the first 1-frame step of the ${field} roll or pitch rate of more than ${RULE.td.crashFactor} x the largest step of the flight, back to the first frame of steps of ${RULE.td.onsetFrac} x that step or more, in ${RULE.td.cutSearchS} s after the cut, else the first ${RULE.td.band.join('-')} Hz movement of ${RULE.td.jolt} deg/s or more; times are frame seconds` };
 }
 
 // G15: each spool-up (SPOOLUP state, or the spoolup phase without GOVSTATE), with the IDLE time before it where the rotor
@@ -468,7 +621,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
     const fmt = (v, d = 2) => typeof v === 'number' && isFinite(v) ? (Math.abs(v) < 0.5 * 10 ** -d ? 0 : v).toFixed(d) : 'unknown'; // no "-0.0"
     const pm = (v, se, d) => typeof se === 'number' && isFinite(se) ? `${fmt(v, d)} ± ${fmt(se, d)}` : fmt(v, d), pct = (v) => typeof v === 'number' ? 100 * v : null;
     const add = (id, severity, f, profile, o) => F.push(Object.assign({ id, severity, log: f.log, profile: profile === undefined || profile === null ? null : +profile, value: null, se: null, n: null,
-        threshold: null, source: rule(id).source || null, unit: UNITS[id], phase: PHASE_OF[id], thin: false }, o));
+        threshold: null, source: rule(id).source || null, unit: UNITS[id], phase: PHASE_OF[id], thin: false }, PHASES_OF[id] ? { phases: PHASES_OF[id].slice() } : {}, o));
     const para = (...p) => p.map(q => q && q.trim()).filter(Boolean).join('\n'), NONE = 'The data is not sufficient for a result.';
     const at = (s) => `at ${fmt(s, 1)} s`;
 
@@ -484,7 +637,8 @@ function judge(flights, RULES = DEFAULT_RULES) {
             return `Flight ${k + 1} is from ${fmt(q.t0, 1)} s to ${fmt(q.t1, 1)} s (${fmt(q.seconds, 1)} s). ` + (sg.length > 1 ? `For this flight, ${sg.length} signals agree: ${series(sg)}.` : `Only ${sg[0] || 'the collective'} shows this flight.`)
                 + (q.calm && ag.length ? ` In this flight, the roll and pitch rates are only ${fmt(q.bodyRms, 2)} deg/s rms. ${cap(series(ag))} ${ag.length > 1 ? 'show' : 'shows'} that the helicopter was airborne.` : ''); });
         const how = fl.length ? `The analysis finds the start of each flight from the collective. It finds the end of each flight from ${series([...new Set(fl.map(q => TD[q.touchdownBy] || q.touchdownBy))])}.` : '';
-        const parts = series(PHASES.filter(p => sec[p] > 0).map(p => `${fmt(sec[p], 1)} s ${PHASE_WORD[p]}`));
+        const parts = series(PHASES.filter(p => sec[p] > 0 && !CUT_PHASES.includes(p)).map(p => `${fmt(sec[p], 1)} s ${PHASE_WORD[p]}`)),
+            cutParts = series(CUT_PHASES.filter(p => sec[p] > 0).map(p => `${fmt(sec[p], 1)} s ${PHASE_WORD[p]}`)); // IMP-03: a sentence of their own (STE length)
         // the periods that are not a flight, for each reason, with the values against the rule (RULE.body, minFlightS, the flight rpm)
         const B = RULE.body, hsMin = ms.length ? ms[0].phases.flightRpm : null, these = (k) => k === 1 ? 'this period is' : 'these periods are';
         const range = (v) => { const x = v.filter(q => typeof q === 'number'); if (!x.length) return 'unknown'; const lo = Math.min(...x), hi = Math.max(...x); return lo === hi ? fmt(lo, 2) : `${fmt(lo, 2)} to ${fmt(hi, 2)}`; };
@@ -499,7 +653,40 @@ function judge(flights, RULES = DEFAULT_RULES) {
             rejectedBy: { movement: rj.filter(q => q.reason === 'movement').length, short: rj.filter(q => q.reason === 'short').length, headspeed: rj.filter(q => q.reason === 'headspeed').length },
             rejectedRms: rj.length ? [Math.min(...rj.map(q => q.bodyRms)), Math.max(...rj.map(q => q.bodyRms))] : null, threshold: { minRms: RULE.body.minRms, calmRms: RULE.body.calmRms },
             text: bench ? para('This log is a bench run. It has no flight. Thus, the analysis does not use this log.', why, parts ? `The log has ${parts}.` : '', air)
-                : para(`This log is a flight log. It has ${many(fl.length, 'flight')}, with a total of ${fmt(flightS, 1)} s in the air.`, ...each, how, parts ? `The log has ${parts}.` : '', why, air) });
+                : para(`This log is a flight log. It has ${many(fl.length, 'flight')}, with a total of ${fmt(flightS, 1)} s in the air.`, ...each, how, parts ? `The log has ${parts}.` + (cutParts ? ` It also has ${cutParts}.` : '') : '', why, air) });
+        // D11 (IMP-03): the cuts in flight of a flight log, its segments together
+        if (!bench) d11(f0, ms);
+    }
+    function d11(f0, ms) {
+        const ran = ms.filter(m => m.D11 && !m.D11.skipped), sk = ms.find(m => m.D11 && m.D11.skipped);
+        if (!ran.length) { if (sk) add('D11', 'skipped', f0, null, { text: sk.D11.skipped }); return; }
+        const ev = ran.flatMap(m => m.D11.events || []), landed = ran.every(m => m.D11.landed !== false);
+        const R = rule('D11'), D = RULE.td, cf = typeof R.crashFactor === 'number' ? R.crashFactor : DEFAULT_RULES.D11.crashFactor, contacts = ev.filter(e => e.contactS !== null);
+        const strong = (e) => typeof e.ratio === 'number' && e.ratio >= cf, bad = contacts.filter(e => e.by !== 'pilot' || strong(e)), rx = ev.some(e => e.by !== 'pilot');
+        const base = { n: ev.length, value: contacts.length, threshold: { crashFactor: cf, cutTieS: D.cutTieS, cutSearchS: D.cutSearchS, limit: 0 },
+            events: ev.map(e => Object.assign({ tS: e.endS, t1S: e.contactS !== null ? e.contactS : e.cutS, value: e.fallS }, e)) };
+        if (!ev.length) return add('D11', 'ok', f0, null, Object.assign(base, { text: 'The analysis finds no motor cut while the helicopter is in the air.' + (landed ? ' Each flight ends with a landing.' : '') }));
+        const CUT = { 'receiver loss': 'after the receiver signal stops', failsafe: 'in failsafe', pilot: 'from the throttle switch or the throttle stick' };
+        const one = (e, k) => { const lead = ev.length > 1 ? `${e.motorCut ? 'Motor cut' : 'Flight end'} ${k + 1}: at` : 'At', from = e.motorCut ? 'the motor cut' : 'the last RC frame';
+            return para((e.motorCut ? `${lead} ${fmt(e.cutS, 2)} s, the governor changes to ${e.state || 'a state with no motor output'} ${CUT[e.by]}, while the helicopter is in the air.`
+                    + (e.lastFrameS !== null ? ` The last RC frame comes at approximately ${fmt(e.lastFrameS, 2)} s (check D10).` : '')
+                    : `${lead} approximately ${fmt(e.lastFrameS, 2)} s, the last RC frame comes while the helicopter is in the air (check D10). After it, the pilot has no RC control. The governor does not stop the motor.`)
+                    + ` Thus, the flight ends at ${fmt(e.endS, 2)} s.`
+                    + (e.baroDrop !== null && e.baroDrop !== undefined ? ` From the end of the flight to the ground contact, the altitude decreases by ${fmt(e.baroDrop, 1)} m.`
+                        : e.baroRise !== null ? ` Before the end of the flight, the altitude is ${fmt(e.baroRise, 1)} m more than before the liftoff.` : ''),
+                e.contactS === null ? `The analysis does not find a ground contact in the ${D.cutSearchS} s after ${from}.`
+                    : (e.motorCut ? `The helicopter falls for ${fmt(e.fallS, 2)} s, and it touches the ground at ${fmt(e.contactS, 2)} s.` : `After ${fmt(e.fallS, 2)} s, the helicopter touches the ground at ${fmt(e.contactS, 2)} s.`)
+                    + (e.afterReturnS !== null ? ` This is ${fmt(Math.abs(e.afterReturnS), 2)} s ${e.afterReturnS < 0 ? 'before' : 'after'} the receiver signal comes back at ${fmt(e.returnS, 2)} s.` : '')
+                    + (e.contactBy === 'step' ? ` At the ground contact, the ${e.field} rate changes by ${fmt(e.step, 0)} deg/s in one frame, ${fmt(e.step / e.flightStep, 1)} times the largest change in the flight.` : ` The ground contact is the first sudden roll or pitch movement after ${from}.`)
+                    + ` After the ground contact, the rates get to ${fmt(e.peak.roll, 0)} deg/s roll, ${fmt(e.peak.pitch, 0)} deg/s pitch and ${fmt(e.peak.yaw, 0)} deg/s yaw.`
+                    + ` The headspeed ${e.headspeedAtContact < e.headspeedAtCut ? 'decreases' : 'changes'} from ${fmt(e.headspeedAtCut, 0)} rpm at ${from} to ${fmt(e.headspeedAtContact, 0)} rpm at the ground contact.`); };
+        const RXDO = 'Examine the receiver, its power supply, its connectors and its antennas. Check D12 gives the response of the firmware when the receiver signal stops.';
+        const verdict = bad.length ? `This is a problem. ${bad.some(e => e.by === 'receiver loss') ? `${RXDO} ` : ''}Before the next flight, examine the helicopter for damage.`
+            : rx ? RXDO : 'Make sure that the motor cut in flight was a command of the pilot, for example an autorotation.';
+        const top = bad[0] || contacts[0] || ev[0], allCut = ev.every(e => e.motorCut);
+        add('D11', bad.length ? 'flag' : 'note', f0, top.profile, Object.assign(base, { contactS: top.contactS, cutS: top.cutS, fallS: top.fallS, by: top.by, state: top.state, motorCut: top.motorCut, afterReturnS: top.afterReturnS, peak: top.peak, contactBy: top.contactBy, ratio: top.ratio,
+            text: [ev.length > 1 ? (allCut ? `The analysis finds ${many(ev.length, 'motor cut')} while the helicopter is in the air.` : `The analysis finds ${many(ev.length, 'flight')} that end in the air, with a motor cut or with no RC control.`) : '',
+                ...ev.slice(0, 3).map(one), verdict].filter(Boolean).join('\n') }));
     }
 
     for (const f of flights) {
@@ -578,8 +765,10 @@ function judge(flights, RULES = DEFAULT_RULES) {
 }
 // the words of the texts: the signals of a flight (its method), how its end was found, the phases (catalog.cjs PHASE_AT)
 const SIGNAL = { airborne: 'AIRBORNE_STATE', collective: 'the collective', 'touchdown movement': 'the sudden movement at the landing', altitude: 'the altitude', movement: 'the movement of the helicopter' };
-const TD = { jolt: 'the sudden roll or pitch movement at the landing', collective: 'the decrease of the collective', 'throttle cut': 'the throttle cut', 'airborne flag': 'AIRBORNE_STATE', 'bound end': 'the end of the high collective', 'log end': 'the end of the log' };
-const PHASE_WORD = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
+const TD = { jolt: 'the sudden roll or pitch movement at the landing', collective: 'the decrease of the collective', 'throttle cut': 'the throttle cut', 'airborne flag': 'AIRBORNE_STATE', 'bound end': 'the end of the high collective', 'log end': 'the end of the log',
+    'in-flight cut': 'the motor cut in flight or the last RC frame before it', 'ground contact': 'the ground contact at the landing' };
+const CUT_PHASES = ['fall', 'aftercontact'];
+const PHASE_WORD = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down', fall: 'from the end of the flight to the ground contact', aftercontact: 'after the ground contact' };
 
 // ---------------------------------------------------------------------------------------------
 // curves
@@ -595,7 +784,7 @@ function curves(w, ctx, metrics) {
     return { t, phase, names: PHASES, flights: ph.flights.map(f => ({ t0: f.t0, t1: f.t1 })), class: ph.class };
 }
 
-module.exports = { EXTRA, RULE, DEFAULT_RULES, PHASES, phases, flightMask, analyse, judge, curves };
+module.exports = { EXTRA, RULE, DEFAULT_RULES, PHASES, PHASES_OF, phases, flightMask, analyse, judge, curves };
 if (require.main !== module) return;
 
 // node tools/autotune/health_phase.cjs <log files...>: the class, phases and flights of every log

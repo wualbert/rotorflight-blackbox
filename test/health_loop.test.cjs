@@ -354,6 +354,18 @@ test('raw C11 gives a possible source of high-frequency D power and a signal che
     assert.doesNotMatch(f.text,/D is driven by noise/);
 });
 
+// user, 2026-10-16: "Not measured" only when the data is missing. A D gain of 0 (Gaui X4 II 2026-10-04: rollPID 50,100,0, axisD[0] always 0)
+// leaves nothing to measure: information, not "Not measured"; no axisD field: not measured
+test('C11: an axisD that is always 0 is information; a log without axisD is not measured', () => {
+    const zero = rawFinding('C11', { C11: { roll: { zero: true }, pitch: { skipped: 'The log does not record axisD[1].' } } }, 'roll');
+    assert.deepEqual([zero.severity, zero.dZero, zero.value], ['ok', true, 0]);
+    assert.match(zero.text, /The roll axisD is 0 in this log: the D gain is 0\. Thus, the D-term noise is 0\./);
+    const C = require('../tools/autotune/catalog.cjs');
+    assert.equal(C.status(zero), 'information'); assert.equal(C.display(zero).value, 'D-term 0 (D gain 0)');
+    const none = rawFinding('C11', { C11: { roll: { zero: true }, pitch: { skipped: 'The log does not record axisD[1].' } } }, 'pitch');
+    assert.equal(none.severity, 'skipped'); assert.equal(C.status(none), 'notMeasured');
+});
+
 test('raw T6 differentiates possible low or high precompensation from an unknown direction', () => {
     for (const [mean,se,word] of [[40,5,'low'],[-40,5,'high'],[10,15,null]]) {
         const s={absPeak:{mean:50,se:5,n:5},towardTorque:{mean,se},withTorqueShare:0.8};

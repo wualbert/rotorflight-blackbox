@@ -69,8 +69,9 @@ var AnalysisView = (function () {
         title: "Results of the analysis",
         noResult: "No analysis result is available.",
         about: "The analysis examines the log with the checks of the toolkit. It gives each result with its value, its limit and the part of the log that it comes from.",
-        stale: "The results on display are for different logs or flights. To use the logs and the flights that you selected, start the analysis again.",
-        start: "Start the analysis",
+        stale: "The results on display are for different logs, flights or CLI dump. To use the logs, the flights and the CLI dump that you selected, start the analysis again.",
+        start: "Start analysis",
+        scanning: 'The app finds the flights in each log. When this is complete, click "Start analysis".',
         running: "The analysis started. Wait for the results. The Tuning view shows when the analysis is complete.",
         startFailed: "The analysis did not start.",
         openTuning: "Open the Tuning view",
@@ -235,7 +236,7 @@ var AnalysisView = (function () {
         if (/^G(1|12|20|21)$/.test(id)) return "rpm";   // G21: the RPM signal at the throttle maximum (catalog.cjs AREA_OF)
         if (/^G\d+$/.test(id)) return "governor";
         if (/^(F\d+|C11|C15|T4)$/.test(id)) return "vibration";
-        if (/^(D6|D8|D9|R1)$/.test(id)) return "radio";
+        if (/^(D6|D8|D9|D10|D11|D12|R1)$/.test(id)) return "radio";
         if (/^T\d+$/.test(id) || (id === "C7" && axisOf(f) === "yaw")) return "tail";
         if (/^C\d+$/.test(id)) return "cyclic";
         return "logging";
@@ -758,7 +759,7 @@ var AnalysisView = (function () {
     function emptyHtml(state) {
         return '<div class="analysis-verdict-box is-empty"><div class="analysis-head"><h3 class="analysis-title">' + esc(TEXT.title) + "</h3></div>" +
             '<div class="analysis-scope" data-analysis-scope="1"></div>' +
-            '<p class="analysis-verdict">' + esc(TEXT.noResult) + ' <button type="button" class="btn btn-primary btn-sm" data-analysis-act="start"' + (state.running ? " disabled" : "") + ">" +
+            '<p class="analysis-verdict">' + esc(TEXT.noResult) + ' <button type="button" class="btn btn-primary btn-sm" data-analysis-act="start"' + (state.running ? " disabled" : state.scanning ? ' disabled title="' + esc(TEXT.scanning) + '"' : "") + ">" +
                 esc(TEXT.start) + "</button></p>" +
             (state.running ? '<p class="analysis-muted">' + esc(TEXT.running) + "</p>" : "") +
             (state.error ? '<p class="analysis-warn">' + (I() ? I().runErrorHtml(state.error) : esc(TEXT.startFailed)) + "</p>" : "") +
@@ -788,7 +789,7 @@ var AnalysisView = (function () {
         }
 
         function render() {
-            var scopeState = getScopeState();
+            var scopeState = getScopeState(), panel = scopePanel();
             destroyPlots();
             if (!I()) {
                 root.innerHTML = '<div class="analysis-verdict-box"><p class="analysis-warn">' + esc(TEXT.noLens) + "</p></div>";
@@ -798,8 +799,8 @@ var AnalysisView = (function () {
             issues = result ? issuesOf(result, rows) : [];
             if (open && !rows.some(function (o) { return o.id === open.id && o.f === open.f; })) open = null;
             root.innerHTML = result ? verdictHtml(result, { li: li, open: open && open.id, at: open && open.at, kind: open && open.kind, moreOpen: moreOpen, issuesOpen: issuesOpen, issues: issues }) :
-                emptyHtml({ running: running, error: startError });
-            renderScope(scopeState);
+                emptyHtml({ running: running, error: startError, scanning: !!(panel && panel.scanning) });
+            renderScope(scopeState, panel);
             if (open) (open.kind === "log" ? drawLog : drawCompare)(open);
         }
 
@@ -813,14 +814,17 @@ var AnalysisView = (function () {
             return TD && TD.fselState ? TD.fselState(el) : null;
         }
 
-        function renderScope(state) {
+        function scopePanel() {
+            try { return typeof hooks.scopePanel === "function" ? hooks.scopePanel() : null; } catch (e) { console.warn(e); return null; }
+        }
+
+        function renderScope(state, panel) {
             var el = root.querySelector ? root.querySelector("[data-analysis-scope]") : null;
             if (!el) return;
-            var p = null;
-            try { p = typeof hooks.scopePanel === "function" ? hooks.scopePanel() : null; } catch (e) { console.warn(e); }
+            var p = panel !== undefined ? panel : scopePanel();
             var TD = typeof TuningDialog !== "undefined" && TuningDialog.internals ? TuningDialog.internals : null, again = state || getScopeState();
             el.innerHTML = !p || typeof p.html !== "string" ? "" : p.html + (p.stale && result && !p.running ? '<p class="analysis-muted analysis-stale">' + esc(TEXT.stale) +
-                ' <button type="button" class="btn btn-primary btn-xs" data-analysis-act="start">' + esc(TEXT.start) + "</button></p>" : "");
+                ' <button type="button" class="btn btn-primary btn-xs" data-analysis-act="start"' + (p.scanning ? ' disabled title="' + esc(TEXT.scanning) + '"' : "") + ">" + esc(TEXT.start) + "</button></p>" : "");
             if (el.querySelectorAll) Array.prototype.forEach.call(el.querySelectorAll('[data-partly="1"]'), function (x) { x.indeterminate = true; });
             if (TD && TD.fselRestore) TD.fselRestore(el, again);
         }
@@ -975,6 +979,9 @@ var AnalysisView = (function () {
         root.addEventListener("click", function (e) {
             var inScope = e.target && e.target.closest ? e.target.closest("[data-analysis-scope]") : null;
             if (inScope) {
+                // the CLI dump block (TuningDialog cliBlockHtml): the file input and the dump are in the Tuning view
+                var c = e.target.closest(".tuning-cli-load, .tuning-cli-clear");
+                if (c) { e.preventDefault(); scopeAct({ kind: c.classList.contains("tuning-cli-clear") ? "cliClear" : "cli" }); return; }
                 var b = e.target.closest(".tuning-fsel-all, .tuning-fsel-none, .tuning-fsel-head, .tuning-fsel-sub > summary");
                 if (b && b.classList.contains("tuning-fsel-all")) { e.preventDefault(); scopeAct({ kind: "all" }); return; }
                 if (b && b.classList.contains("tuning-fsel-none")) { e.preventDefault(); scopeAct({ kind: "none" }); return; }
@@ -1043,7 +1050,7 @@ var AnalysisView = (function () {
         this.internals = { getResult: function () { return result; }, rows: function () { return rows.slice(); }, issues: function () { return issues.slice(); } };
 
         if (typeof hooks.onResult === "function") hooks.onResult(function (r) { self.setResult(r); });
-        if (typeof hooks.onSettings === "function") hooks.onSettings(function () { renderScope(); });
+        if (typeof hooks.onSettings === "function") hooks.onSettings(function () { if (result) renderScope(); else render(); }); // no result: the start button follows the scan
     }
 
     // ---------------------------------------------------------------------------------------------

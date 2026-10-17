@@ -200,6 +200,102 @@ test('durations on the frame clock: with the time field, the flight and phase se
     within(Object.values(ph.seconds).reduce((a, b) => a + b, 0), frame(w.n - 1), 0.01, 'all phases: the frame length of the segment');
 });
 
+// IMP-03: a motor cut in flight. The governor changes to HOLD at cutS while the helicopter is in the air (the collective at the hover
+// value, the altitude baroM over the level before the liftoff), the firmware clears AIRBORNE 1 ms later (airborne.c), the rotor slows, and
+// the helicopter touches the ground at contactS: a gyroRAW roll step of 10 x the largest step of the flight. The disarm (OFF) at offS.
+// rx: a receiver signal loss from rx[0] to rx[1] (lib.segments w.rxLoss, cause signal: the last RC frame 0.1 s before rx[0])
+// state: the governor state of the cut (5 HOLD; 7 AUTOROTATION, the pilot's option B: rxfail 1500; 4 ACTIVE: no motor cut); flagS: the flag
+// drop (default 1 ms after the cut); stepX: the contact step against the largest step of the flight; jolt: the touchdown ring of sim at the
+// contact (deg/s); spikeS: a 1-frame step of 50 deg/s in the flight at this time; restartS: SPOOLUP from this time, ACTIVE 2 s later
+function cutSim(o = {}) {
+    const c = Object.assign({ seed: 40, cutS: 50, contactS: 51.8, offS: 55, baroM: 4, rx: null, state: 5, flagS: null, stepX: 10, jolt: 0, spikeS: null, restartS: null }, o);
+    const flagS = c.flagS === null ? c.cutS + 0.001 : c.flagS;
+    const { w } = sim({ seed: c.seed, land: c.contactS, cutAfter: c.cutS - c.contactS, flagLate: flagS - c.contactS, jolt: c.jolt }), n = w.n;
+    for (let i = at(c.cutS); i < n; i++) w.govStateAt[i] = c.restartS !== null && i >= at(c.restartS) ? (i < at(c.restartS + 2) ? 2 : 4) : i < at(c.offS) ? c.state : 0;
+    if (c.spikeS !== null) for (let i = at(c.spikeS); i < at(c.spikeS) + 1; i++) w.gyro[0][i] += 50;
+    const raw = [0, 1, 2].map(a => Float64Array.from(w.gyro[a])); let big = 0;
+    for (let i = at(25) + 1; i < at(c.cutS); i++) big = Math.max(big, Math.abs(raw[0][i] - raw[0][i - 1]), Math.abs(raw[1][i] - raw[1][i - 1]));
+    for (let i = at(c.contactS); i < n; i++) raw[0][i] += c.stepX * big;
+    [0, 1, 2].forEach(a => { w.extra[`gyroRAW[${a}]`] = raw[a]; });
+    w.extra.altitude = c.baroM === null ? null : Float64Array.from({ length: n }, (_, i) => i >= at(26) && i < at(c.contactS) ? 100 * c.baroM : 0);
+    if (c.rx) w.rxLoss = [{ i0: at(c.rx[0]), i1: at(c.rx[1]), signal: true, cause: 'signal', returned: true, lastFrameUs: null, cut0: at(c.rx[0] - 0.11), cut1: at(c.rx[1] + 1) }];
+    return { w, c, big };
+}
+
+test('IMP-03: a HOLD in flight is not a landing: the flight ends at the cut, the fall to the ground contact, the time after it, check D11', () => {
+    // the cut of the pilot (HOLD with the collective at the hover value and the altitude 4 m up): flight [25, 50.0], contact 51.8 s
+    const a = cutSim(), { ph, findings } = run(a.w), f = ph.flights[0];
+    assert.equal(ph.flights.length, 1); within(f.i0 / RATE, 25, 0.02, 'liftoff'); within(f.i1 / RATE, 50.0, 0.01, 'the end of the flight at the cut');
+    assert.deepEqual([f.touchdownBy, f.cut.by, f.cut.state], ['in-flight cut', 'pilot', 'HOLD']);
+    within(f.cut.contact.i / RATE, 51.8, 0.01, 'the ground contact'); assert.equal(f.cut.contact.by, 'step'); assert.ok(f.cut.contact.ratio >= 8, `the contact step: ${f.cut.contact.ratio} x the largest step of the flight (10 x and the noise)`);
+    const span = (p) => ph.spans.filter(s => s.phase === p).map(s => [s.i0 / RATE, s.i1 / RATE]);
+    assert.equal(span('fall').length, 1); within(span('fall')[0][0], 50.0, 0.01, 'fall start'); within(span('fall')[0][1], 51.8, 0.01, 'fall end');
+    assert.equal(span('aftercontact').length, 1); within(span('aftercontact')[0][1], 55, 0.01, 'after the contact: to the disarm (OFF)');
+    assert.ok(!ph.spans.some(s => (s.phase === 'spoolup' || s.phase === 'ground') && s.i0 >= at(50) && s.i0 < at(55)), 'no spool-up and no ground phase between the cut and the disarm');
+    const d11 = find(findings, 'D11')[0];
+    assert.equal(d11.severity, 'flag'); assert.equal(d11.value, 1); within(d11.contactS, 51.8, 0.01, 'D11 contact'); within(d11.fallS, 1.8, 0.01, 'D11 seconds from the cut');
+    assert.match(d11.text, /the governor changes to HOLD from the throttle switch or the throttle stick, while the helicopter is in the air/);
+    // without the altitude, a cut by the pilot is not shown as a cut in flight (the sanity rule needs both): the old rule, the flag drop less 1 s
+    const b = run(cutSim({ baroM: null }).w).ph.flights[0];
+    assert.equal(b.touchdownBy, 'airborne flag'); within(b.i1 / RATE, 50.001 - P.RULE.td.flagLateS, 0.002, 'the touchdown before the fix: 49.0 s');
+    // a receiver signal loss from 49.7 s (the last RC frame at 49.6 s), HOLD from the rxfail values at 49.9 s: the flight ends at the last RC frame
+    const c = cutSim({ cutS: 49.9, rx: [49.7, 52.5], baroM: null }), r = run(c.w), g = r.ph.flights[0], e = find(r.findings, 'D11')[0];
+    assert.deepEqual([g.touchdownBy, g.cut.by], ['in-flight cut', 'receiver loss']); within(g.i1 / RATE, 49.6, 0.002, 'the end of the flight at the last RC frame');
+    within(g.cut.contact.i / RATE, 51.8, 0.01, 'contact'); assert.equal(e.severity, 'flag'); within(e.events[0].afterReturnS, 51.8 - 52.5, 0.01, 'the contact before the RX return');
+    assert.match(e.text, /The last RC frame comes at approximately 49\.60 s \(check D10\)\. Thus, the flight ends at 49\.60 s\./);
+    // a normal flight: D11 has no cut
+    const ok = find(run(sim({ seed: 41 }).w).findings, 'D11')[0]; assert.deepEqual([ok.severity, ok.value, ok.n], ['ok', 0, 0]);
+});
+
+// review IMP-03: the pilot's option B (rxfail 1500, the AUTOROTATION band: isSpooledUp() stays true, so AIRBORNE drops late or not at all),
+// and an rxfail throttle that keeps the governor ACTIVE (no motor cut). The cut is the stage-1 change after the last RC frame, not the flag drop
+test('IMP-03 review: a receiver signal loss with AUTOROTATION or ACTIVE: the cut at the stage-1 change, the flag drop late, no motor cut', () => {
+    // AUTOROTATION at 49.9 s (the last RC frame 49.6 s), AIRBORNE drops 1.5 s later in the loss, the ground contact 2 s after the cut
+    const a = cutSim({ cutS: 49.9, contactS: 51.9, rx: [49.7, 52.5], baroM: null, state: 7, flagS: 51.4 }), A = run(a.w), fa = A.ph.flights[0], ea = find(A.findings, 'D11')[0];
+    assert.deepEqual([fa.touchdownBy, fa.cut.by, fa.cut.state, fa.cut.motorCut], ['in-flight cut', 'receiver loss', 'AUTOROTATION', true]);
+    within(fa.i1 / RATE, 49.6, 0.002, 'the end of the flight: the last RC frame'); within(fa.cut.i / RATE, 49.9, 0.002, 'the cut: the stage-1 change, not the flag drop at 51.4 s');
+    within(ea.events[0].cutS, 49.9, 0.002, 'D11 cut'); within(ea.fallS, 2.0, 0.01, 'D11 fall'); assert.equal(ea.severity, 'flag');
+    assert.match(ea.text, /At 49\.90 s, the governor changes to AUTOROTATION after the receiver signal stops, while the helicopter is in the air\./);
+    within(ea.events[0].headspeedAtCut, a.w.hs[at(49.9)], 1, 'the headspeed at the stage-1 change');
+    // the flag drops after the RX return (51.0 s), RX_LOSS.settleS or less after it: the same cut
+    const b = run(cutSim({ cutS: 49.9, contactS: 51.9, rx: [49.7, 51.0], baroM: null, state: 7, flagS: 51.5 }).w), fb = b.ph.flights[0];
+    assert.deepEqual([fb.touchdownBy, fb.cut.state], ['in-flight cut', 'AUTOROTATION']); within(fb.i1 / RATE, 49.6, 0.002, 'flight end'); within(fb.cut.contact.i / RATE, 51.9, 0.01, 'contact');
+    // the flag never drops in the bound, but a contact step comes in the loss: a cut
+    const c = run(cutSim({ cutS: 49.9, contactS: 51.9, rx: [49.7, 52.5], baroM: null, state: 7, flagS: 60 }).w), fc = c.ph.flights[0];
+    assert.deepEqual([fc.touchdownBy, fc.cut.state], ['in-flight cut', 'AUTOROTATION']); within(fc.cut.contact.i / RATE, 51.9, 0.01, 'contact');
+    // the governor stays ACTIVE: no motor cut. The flight ends at the last RC frame, the event has no state, and the text has no motor cut
+    const d = run(cutSim({ cutS: 49.9, contactS: 51.9, rx: [49.7, 52.5], baroM: null, state: 4, flagS: 51.95 }).w), fd = d.ph.flights[0], ed = find(d.findings, 'D11')[0];
+    assert.deepEqual([fd.touchdownBy, fd.cut.motorCut, fd.cut.state], ['in-flight cut', false, null]); within(fd.i1 / RATE, 49.6, 0.002, 'flight end');
+    assert.deepEqual([ed.severity, ed.motorCut, ed.events[0].state], ['flag', false, null]); within(ed.events[0].cutS, 49.6, 0.002, 'no motor cut: the last RC frame');
+    assert.match(ed.text, /At approximately 49\.60 s, the last RC frame comes while the helicopter is in the air \(check D10\)\. After it, the pilot has no RC control\. The governor does not stop the motor\./);
+    assert.doesNotMatch(ed.text, /changes to ACTIVE|the motor stops/i);
+    // a short loss in flight with no flag drop and no contact (the pilot keeps the control): no cut
+    const e = run(cutSim({ cutS: 49.9, contactS: 65, offS: 70, rx: [40, 40.5], baroM: null, state: 7, stepX: 0 }).w).ph.flights[0];
+    assert.notEqual(e.touchdownBy, 'in-flight cut', 'the loss at 40 s with the flag set and no contact is not the end of the flight');
+});
+
+// review IMP-03: a cut by the pilot needs an altitude decrease to the ground contact (not the level before the liftoff, which drifts), and a
+// contact RULE.td.landingS or less after the cut is a landing; after an autorotation landing (no contact step), the motor start ends the phase
+// after the ground contact; D11 does not operate without AIRBORNE_STATE
+test('IMP-03 review: a HOLD 0.2 s before the ground contact is a landing; an autorotation landing and a motor start; D11 skipped without AIRBORNE_STATE', () => {
+    const a = run(cutSim({ cutS: 51.6, contactS: 51.8, baroM: 0.6 }).w), fa = a.ph.flights[0];
+    assert.ok(['ground contact', 'jolt'].includes(fa.touchdownBy), fa.touchdownBy); within(fa.i1 / RATE, 51.8, 0.05, 'the touchdown at the ground contact');
+    assert.ok(!fa.cut && !a.ph.spans.some(q => q.phase === 'fall' || q.phase === 'aftercontact'), 'no in-flight cut');
+    const d = find(a.findings, 'D11')[0]; assert.deepEqual([d.severity, d.n], ['ok', 0]); assert.match(d.text, /^The analysis finds no motor cut while the helicopter is in the air\./);
+    // the altitude does not decrease to the ground contact (0.3 m): not a cut in flight
+    assert.notEqual(run(cutSim({ baroM: 0.3 }).w).ph.flights[0].touchdownBy, 'in-flight cut');
+    // an autorotation landing: HOLD at 50 s, the touchdown ring at 51.8 s (no contact step: a spike of 50 deg/s in the flight), SPOOLUP at 53 s
+    const b = cutSim({ stepX: 0, jolt: 150, spikeS: 30, restartS: 53, offS: 70 }), B = run(b.w), fb = B.ph.flights[0];
+    assert.deepEqual([fb.touchdownBy, fb.cut.by, fb.cut.contact.by], ['in-flight cut', 'pilot', 'jolt']);
+    const after = B.ph.spans.filter(q => q.phase === 'aftercontact'); assert.equal(after.length, 1); within(after[0].i1 / RATE, 53, 0.01, 'the phase after the ground contact ends at the motor start');
+    assert.ok(B.ph.spans.some(q => q.phase === 'spoolup' && Math.abs(q.i0 / RATE - 53) < 0.01), 'the spool-up after the landing');
+    assert.equal(find(B.findings, 'D11')[0].severity, 'note', 'a cut by the pilot with no strong ground contact');
+    // no AIRBORNE_STATE: check D11 does not operate (not "Satisfactory")
+    const c = find(run(sim({ seed: 41, air: false }).w).findings, 'D11')[0]; assert.equal(c.severity, 'skipped'); assert.match(c.text, /does not record AIRBORNE_STATE\. Thus, check D11 did not operate\./);
+    // the phases of D11 are the phases of the catalog
+    assert.deepEqual(d.phases, require('../tools/autotune/catalog.cjs').CHECKS.D11.phases);
+});
+
 // ---------------------------------------------------------------------------------------------
 // G15 spool-up, G16 change to ACTIVE
 // ---------------------------------------------------------------------------------------------
@@ -372,4 +468,56 @@ test('the second Gaui X4 II dump: exactly its 14 flight logs; the movement margi
     assert.deepEqual([...out].filter(([, p]) => p.class === 'flight').map(([k]) => k), [23, 24, 25, 32, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49]);
     for (const [log, p] of out) if (p.class === 'flight') { assert.equal(p.flights.length, 1, `log ${log}`); assert.equal(p.flights[0].confidence, 'high'); }
     margins([...out.values()]);
+});
+
+// IMP-03, the Fireball crash log 2026-10-15 (analysis/fireball-crash-20261015/crash.bbl, 4.7.0-bbp-pr 85d7049a9): the receiver signal stops at
+// 68.4444 s (the last RC frame 68.3444 s), the rxfail values give HOLD at 68.6453 s, AIRBORNE drops 1 ms later at about 5 m, the ground
+// contact 70.4435 s, the RX return 70.5409 s, the disarm 72.8414 s. Before IMP-03 the flight ended at 67.6468 s ("airborne flag")
+const CRASH = require('node:path').join(__dirname, '../analysis/fireball-crash-20261015/crash.bbl');
+test('real: the crash log 2026-10-15: the flight ends at the last RC frame, the fall to the ground contact, check D11', { skip: !require('node:fs').existsSync(CRASH) ? 'analysis/fireball-crash-20261015/crash.bbl is not here' : false }, () => {
+    const app = lib.loadApp(), [w] = [...lib.segments(app, CRASH, { whole: true, extra: P.EXTRA })].filter(q => !q.skipped), fl = w.flight;
+    const ctx = { rate: fl.actualRate, govState: w.govStateAt || null, header: fl.header, flightRule: { headspeed: 2900 }, airborneEvents: true, profile: w.profileAt };
+    const ph = P.phases(w, ctx), m = P.analyse(w, Object.assign({}, ctx, { phases: ph })), F = P.judge([{ log: 0, metrics: JSON.parse(JSON.stringify(m)) }]);
+    const T = w.extra.time, frame = (i) => w.fromS + (T[Math.min(w.n - 1, i)] - T[0]) / 1e6, f = ph.flights[0];
+    assert.equal(ph.flights.length, 1); within(frame(f.i0), 22.489, 0.003, 'liftoff'); within(frame(f.i1), 68.344, 0.003, 'the end of the flight: the last RC frame');
+    assert.deepEqual([f.touchdownBy, f.cut.by, f.cut.state], ['in-flight cut', 'receiver loss', 'HOLD']);
+    const span = (p) => ph.spans.filter(s => s.phase === p).map(s => [frame(s.i0), frame(s.i1)]);
+    assert.equal(span('fall').length, 1); within(span('fall')[0][0], 68.344, 0.003, 'fall start (the end of the flight)'); within(span('fall')[0][1], 70.4435, 0.003, 'fall end (the ground contact)');
+    assert.equal(span('aftercontact').length, 1); within(span('aftercontact')[0][1], 72.8414, 0.003, 'after the contact: to the disarm');
+    assert.ok(!ph.spans.some(s => ['spoolup', 'ground'].includes(s.phase) && frame(s.i0) > 60), 'no spool-up (RECOVERY) and no ground (ACTIVE) after the cut');
+    const d = F.find(q => q.id === 'D11'), e = d.events[0];
+    assert.equal(d.severity, 'flag'); assert.equal(d.profile, 2); assert.equal(d.n, 1);
+    within(e.cutS, 68.645, 0.002, 'the cut'); within(e.contactS, 70.4435, 0.002, 'the ground contact'); within(e.fallS, 1.798, 0.003, 'seconds from the cut');
+    within(e.afterReturnS, 70.4435 - 70.5409, 0.003, 'the contact comes before the RX return'); assert.equal(e.contactBy, 'step'); assert.equal(e.field, 'gyroRAW');
+    assert.ok(e.peak.roll > 1500 && e.baroRise > 3.5 && e.baroDrop > 3.5, JSON.stringify(e)); assert.ok(e.ratio >= 4.3, `the contact step ratio ${e.ratio}`);
+    // review IMP-03: the same log with the pilot's option B (rxfail 1500: AUTOROTATION at the stage-1 change, AIRBORNE set until flagS) and with an
+    // rxfail throttle in the ACTIVE band (no motor cut). The flight ends at the last RC frame, and the cut is the stage-1 change at 68.645 s
+    const idx = (sec) => { let i = 0; while (i < w.n && frame(i) < sec) i++; return i; };
+    for (const [state, flagS] of [[7, 70.6], [7, 69.8], [4, 69.8]]) {
+        const g = Uint8Array.from(w.govStateAt), air = Uint8Array.from(w.airborneAt); for (let i = idx(68.645); i < w.n && g[i] === 5; i++) g[i] = state; air.fill(1, idx(68.646), idx(flagS));
+        const v = Object.assign({}, w, { govStateAt: g, airborneAt: air }), c2 = Object.assign({}, ctx, { govState: g }), p2 = P.phases(v, c2), f2 = p2.flights[0];
+        const F2 = P.judge([{ log: 0, metrics: JSON.parse(JSON.stringify(P.analyse(v, Object.assign({}, c2, { phases: p2 })))) }]), d2 = F2.find(q => q.id === 'D11'), e2 = d2.events[0], what = `state ${state}, flag drop ${flagS} s`;
+        assert.equal(p2.flights.length, 1, what); within(frame(f2.i1), 68.344, 0.003, `${what}: the end of the flight`); assert.deepEqual([f2.touchdownBy, f2.cut.by], ['in-flight cut', 'receiver loss'], what);
+        const sp = (ph) => p2.spans.filter(q => q.phase === ph).map(q => [frame(q.i0), frame(q.i1)]);
+        within(sp('fall')[0][1], 70.4435, 0.003, `${what}: the ground contact`); assert.ok(!p2.spans.some(q => ['spoolup', 'ground'].includes(q.phase) && frame(q.i0) > 60), what);
+        assert.equal(d2.severity, 'flag', what); within(e2.contactS, 70.4435, 0.002, what);
+        if (state === 7) { assert.equal(e2.state, 'AUTOROTATION', what); within(e2.cutS, 68.645, 0.002, `${what}: the cut`); within(e2.fallS, 1.798, 0.003, what); assert.ok(e2.headspeedAtCut > 4400, `${what}: ${e2.headspeedAtCut} rpm at the cut`); }
+        else { assert.deepEqual([e2.motorCut, e2.state], [false, null], what); assert.match(d2.text, /the pilot has no RC control\. The governor does not stop the motor\./); assert.doesNotMatch(d2.text, /changes to ACTIVE/); }
+    }
+});
+
+// IMP-03: the normal landings of the Fireball dump 2026-10-05 (AUTOTUNE_RESCUE_LOG, 4.6.0) keep their flight ends within 0.05 s (frame
+// seconds before IMP-03, flight rpm 2900 as the worker): no landing there is an in-flight cut (the flag drops before the AUTOROTATION)
+const LANDINGS = { 5: [10.197, 252.4335], 10: [25.9455, 196.2541], 11: [21.9612, 309.7812], 13: [7.4215, 299.0465], 14: [9.6615, 221.4822], 15: [6.9121, 246.5578] };
+test('real: the Fireball dump 2026-10-05: every normal landing keeps its flight end within 0.05 s (IMP-03)', { skip: !process.env.AUTOTUNE_RESCUE_LOG && 'AUTOTUNE_RESCUE_LOG is not set' }, () => {
+    const app = lib.loadApp(), got = {};
+    for (const w of lib.segments(app, process.env.AUTOTUNE_RESCUE_LOG, { whole: true, extra: P.EXTRA })) {
+        if (w.skipped) continue;
+        const fl = w.flight, T = w.extra.time, frame = (i) => w.fromS + (T[Math.min(w.n - 1, i)] - T[0]) / 1e6;
+        const ph = P.phases(w, { rate: fl.actualRate, govState: w.govStateAt || null, header: fl.header, flightRule: { headspeed: 2900 }, airborneEvents: true, profile: w.profileAt });
+        if (ph.flights.length) got[fl.log] = ph.flights.map(f => [frame(f.i0), frame(f.i1), f.touchdownBy]);
+        assert.ok(!ph.spans.some(s => s.phase === 'fall' || s.phase === 'aftercontact'), `log ${fl.log + 1}: no in-flight cut`);
+    }
+    assert.deepEqual(Object.keys(got).map(Number), Object.keys(LANDINGS).map(Number));
+    for (const [log, [L, T]] of Object.entries(LANDINGS)) { assert.equal(got[log].length, 1); within(got[log][0][0], L, 0.05, `log ${+log + 1} liftoff`); within(got[log][0][1], T, 0.05, `log ${+log + 1} touchdown`); }
 });

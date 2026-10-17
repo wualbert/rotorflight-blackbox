@@ -102,9 +102,10 @@ test('1a every setting of 4.6.0 settings.c has one group and the scope of settin
     const unknown = all.filter(s => !DS.classify(s.name).known).map(s => s.name);
     assert.deepEqual(unknown, [], 'every setting is in the table');
     for (const s of all) assert.equal(DS.scopeOf(s.name), s.mode === 'PROFILE' ? 'profile' : s.mode === 'RATE' ? 'rate' : 'global', `scope of ${s.name}`);
-    // the table holds no name that 4.6.0 does not have, except the header-only names, the feature bits and the 4.4 names
+    // the table holds no name that 4.6.0 does not have, except the header-only names, the feature bits, the 4.4 names and the names of
+    // the builds with a parameter snapshot: blackbox_params (4.6.0-bbp), the 4.7.0 names (85d7049a9 settings.c)
     const names = new Set(all.map(s => s.name)), extra = DS.GROUPS.flatMap(g => g.names).filter(n => !names.has(n));
-    const allowed = /^(feature |Firmware |Board |Craft |Product|Data version|Log start|firmware|gyroScale|acc_1G|vbatref|looptime|gyro_sync_denom|fields_mask|frameInterval|map$|yaw_precomp_impulse|piro_compensation|gyro_rpm_filter_bank_)/;
+    const allowed = /^(feature |Firmware |Board |Craft |Product|Data version|Log start|firmware|gyroScale|acc_1G|vbatref|looptime|gyro_sync_denom|fields_mask|frameInterval|map$|yaw_precomp_impulse|piro_compensation|gyro_rpm_filter_bank_|blackbox_params$|error_decay_gain_cyclic$|horizon_angle_limit$|airborne_(mode|gyro_threshold|acc_threshold)$)/;
     assert.deepEqual(extra.filter(n => !allowed.test(n)), [], 'names out of settings.c');
 });
 
@@ -362,6 +363,46 @@ test('3h options.useEstimates: the arming profile that the governor target shows
 
 // ---- 4. Comparisons ----------------------------------------------------------------------------------------------------
 
+// a parameter snapshot (param_log.cjs snapshotCli) of the fixture header: PID profile 1 as the header, PID profile 2 with other gains
+function snapshot(over = {}) {
+    const p0 = { pid_mode: 3, roll_p_gain: 50, roll_i_gain: 100, roll_d_gain: 15, roll_f_gain: 100, roll_b_gain: 25, pitch_p_gain: 90, pitch_i_gain: 100, pitch_d_gain: 38,
+        pitch_f_gain: 100, pitch_b_gain: 70, yaw_p_gain: 65, yaw_i_gain: 120, yaw_d_gain: 12, yaw_f_gain: 10, yaw_b_gain: 10, gov_headspeed: 3500, error_limit: [45, 45, 50] };
+    const p1 = Object.assign({}, p0, { pitch_p_gain: 99, pitch_i_gain: 110, roll_i_gain: 110, yaw_p_gain: 50, yaw_i_gain: 116, yaw_d_gain: 10, gov_headspeed: 4500 });
+    const profiles = { 0: p0, 1: p1 }; for (let k = 2; k < 6; k++) profiles[k] = Object.assign({}, p0);
+    const rates = {}; for (let k = 0; k < 6; k++) rates[k] = { rates_type: 'ACTUAL', roll_rc_rate: 22 + k };
+    return Object.assign({ kind: 'snapshot', source: 'log snapshot', version: '4.7.0', craft: 'SAB Fireball', global: { gov_mode: 'ELECTRIC', tail_rotor_gear_ratio: [19, 76] },
+        profiles, rateprofiles: rates, features: { GOVERNOR: true }, mixerInputs: { SC: [-1250, 1250, 1070] }, mixerRules: {}, servos: { 1: [1500, -700, 700, 500, 500, 333, 0, 2] },
+        selectedProfile: 0, selectedRateProfile: 0 }, over);
+}
+
+test('3i a parameter snapshot: the values of every PID profile (source log snapshot), the PID profile at the start, journal changes; without it as before', () => {
+    const runs = [[0, 40, 0], [40, 100, 2]], base = log(0, header(), { runs });
+    const ds = DS.datasets([Object.assign({}, base, { snapshot: snapshot() })], null);
+    assert.equal(ds.logs[0].armingProfile, 1, 'param_pid_profile 0 is PID profile 1'); assert.equal(ds.logs[0].snapshot, true);
+    const B = ds.datasets.find(d => d.pidProfile === 2), A = ds.datasets.find(d => d.pidProfile === 1);
+    assert.deepEqual(['pitch_p_gain', 'roll_i_gain', 'pitch_i_gain', 'yaw_p_gain', 'yaw_i_gain'].map(n => [B.values[n], B.sources[n]]), [[99, 'log snapshot'], [110, 'log snapshot'], [110, 'log snapshot'], [50, 'log snapshot'], [116, 'log snapshot']]);
+    assert.equal(B.assumed, false); assert.equal(A.assumed, false); assert.equal(A.values.yaw_p_gain, 65);
+    assert.equal(B.values['mixer input SC rate'], 1070, 'the global values that the header does not record');
+    assert.ok(!ds.notes.some(t => /does not record the values of the mixer/.test(t)));
+    assert.deepEqual(ds.labels.map(q => q.source.profile), ['log snapshot', 'log snapshot']);
+    // a journal change of PID profile 2 after the log start: a new configuration from that time
+    const J = DS.datasets([Object.assign({}, base, { snapshot: snapshot(), journal: [{ t: 70, key: 'p1.yaw_p_gain', value: '55' }] })], null);
+    assert.deepEqual(J.labels.map(q => [q.t0, q.t1, q.pidProfile]), [[0, 40, 1], [40, 70, 2], [70, 100, 2]]);
+    assert.equal(J.datasets.find(d => d.pidProfile === 2 && d.values.yaw_p_gain === 55).sources.yaw_p_gain, 'log journal', 'a recorded change: the source of the journal');
+    assert.ok(J.notes.some(t => /`yaw_p_gain` changed at 70 s\. The log records this change\./.test(t)));
+    // a rate profile switch that only the journal records (MSP, the Lua script, the Configurator): the values of rate profile 2 from that time
+    const RJ = DS.datasets([Object.assign({}, base, { snapshot: snapshot(), journal: [{ t: 20, key: 'rate_profile', value: '1' }] })], null);
+    assert.deepEqual(RJ.labels.map(q => [q.t0, q.t1]), [[0, 20], [20, 40], [40, 100]]);
+    assert.deepEqual(RJ.datasets.filter(d => d.pidProfile === 1).map(d => d.values.roll_rc_rate), [22, 23], 'rate profile 1 (22), then rate profile 2 (23)');
+    // the snapshot ranks above a CLI dump that does not agree
+    const C = DS.datasets([Object.assign({}, base, { snapshot: snapshot() })], cliText({ yaw: [45, 105, 10] }));
+    assert.equal(C.datasets.find(d => d.pidProfile === 2).values.yaw_p_gain, 50);
+    // the same log without a snapshot: PID profile 2 unknown, the arming profile unknown (the present results)
+    const old = DS.datasets([Object.assign({}, base, { snapshot: null })], null), stock = DS.datasets([base], null);
+    assert.deepEqual(JSON.stringify(old.datasets), JSON.stringify(stock.datasets.map(d => d)), 'snapshot null is a stock log');
+    assert.equal(stock.logs[0].armingProfile, null); assert.equal(stock.datasets.find(d => d.pidProfile === 2).assumed, true);
+});
+
 test('4a A/B: the difference of the means with its SE and the 2-SE test', () => {
     const logs = [log(0, header(), { arming: 1 }), log(1, header({ yaw_stop_gain: [140, 100] }), { arming: 1 }), log(2, header({ yaw_stop_gain: [140, 100], rollPID: [60, 100, 15, 100, 25], pitchPID: [100, 100, 38, 100, 70], yawPID: [70, 120, 12, 10, 10], rollBW: [90, 35, 35] }), { arming: 1 })];
     const ds = DS.datasets(logs, null);
@@ -545,4 +586,23 @@ test('configuration header replays logged LUA gains and cutoffs without inheriti
     assert.equal(cfg.pid.header.roll.P,75);assert.equal(cfg.pid.header.roll.gyro_cutoff,120);assert.equal(cfg.pid.header.pitch.P,null);assert.equal(cfg.pid.header.pitch.gyro_cutoff,null);
     assert.equal(cfg.s.gyro_lpf1_type,7);assert.equal(cfg.s.DYN_NOTCH,true);
     assert.deepEqual(h.rollPID,[60,90,20,10]);assert.equal(h.features,0,'original header stays unchanged');
+});
+
+// IMP-02 (review 2026-10-16): the flights without the cut of a receiver signal loss (cutFlights, the CLI path and the worker), and a flight
+// fully in a cut stays an item, so that flight k stays flight k
+test('cutFlights and inputsOfFile: a loss of 2 s in flight splits the flight; flight k stays flight k', () => {
+    assert.deepEqual(DS.cutFlights([{ i0: 100, i1: 1000 }, { i0: 1200, i1: 1300 }, { i0: 1500, i1: 2000 }], [{ cut0: 400, cut1: 600 }, { cut0: 1100, cut1: 1400 }]),
+        [{ i0: 100, i1: 400, flight: 0, rxLossCut: true }, { i0: 600, i1: 1000, flight: 0, rxLossCut: true }, { i0: 1200, i1: 1200, flight: 1, rxLossCut: true }, { i0: 1500, i1: 2000, flight: 2, rxLossCut: false }]);
+    assert.deepEqual(DS.cutFlights([{ i0: 5, i1: 50 }], null), [{ i0: 5, i1: 50, flight: 0, rxLossCut: false }]);
+    const os = require('node:os'), bbl = require('./helpers/bbl_encode.cjs'), log = bbl.simulateFlight({ seconds: 80, seed: 7, airborne: [6, 76] });
+    log.slow.rxSignalReceived = Float64Array.from(log.slow.rxSignalReceived, (v, i) => i >= 40000 && i < 42000 ? 0 : v); log.slow.rxFlightChannelsValid = Float64Array.from(log.slow.rxSignalReceived);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsloss-')), file = path.join(dir, 'loss.bbl');
+    try {
+        fs.writeFileSync(file, bbl.encode([log]).bytes);
+        const [L] = DS.inputsOfFile(file, { flightRpm: 2000 }), R = require('../tools/autotune/lib.cjs').RX_LOSS;
+        assert.equal(L.flights.length, 2, JSON.stringify(L.flights)); assert.deepEqual(L.flights.map(f => [f.flight, f.rxLossCut]), [[0, true], [0, true]]);
+        assert.ok(Math.abs(L.flights[0].t1 - (40 - R.lastFrameLeadS - R.guardS)) < 0.002, `the flight stops at the cut: ${L.flights[0].t1} s`);
+        assert.ok(Math.abs(L.flights[1].t0 - (42 + R.settleS)) < 0.002, `and starts again after it: ${L.flights[1].t0} s`);
+        const ds = DS.datasets([L], null, { logBase: 1 }); assert.deepEqual(ds.datasets[0].flights.map(f => f.flight), [0], 'one flight in the configuration');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

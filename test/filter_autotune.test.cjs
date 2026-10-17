@@ -31,8 +31,18 @@ test('missing raw samples, unknown RPM sources and unrecorded dynamic LPF inputs
     const dyn=fixture(); dyn.w.flight.header.gyro_lowpass_dyn_hz=[60,200];
     assert.match(A.prepare([dyn],{gear}).excluded[0].reason,/headspeed ratio/);
     const rpm=fixture(); rpm.w.flight.header.features=1<<30;
-    assert.match(A.prepare([rpm],{logGear:false}).excluded[0].reason,/RPM notch/);
-    const fw=fixture(); fw.w.flight.firmware='Rotorflight 4.7.0';
+    const ex=A.prepare([rpm],{logGear:false}).excluded[0];
+    assert.match(ex.reason,/RPM notch/);
+    // no CLI dump: the result names the values that a CLI dump gives and asks for it (user 2026-10-15); with a CLI dump, no call
+    assert.deepEqual(ex.cliValues,['tail_rotor_gear_ratio']);
+    const needs=A.tune([rpm],{logGear:false}).cliNeeded;
+    assert.equal(needs.text,'The log does not record `tail_rotor_gear_ratio`. To calculate the filter values, load a CLI dump of this helicopter.');
+    assert.equal(A.tune([rpm],{logGear:false}).recommended.reasons[0],'The log does not record all the values that are necessary for the filter replay.');
+    assert.equal(A.prepare([rpm],{logGear:false,cli:'# diff all\nset tail_rotor_gear_ratio = 1,4\n'}).excluded.length,0,'the CLI dump gives the tail notch frequency');
+    // 4.7.0 has the gyro filter code of 4.6.0; a later version is not known
+    const fw=fixture(); fw.w.flight.firmware='Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X';
+    assert.equal(A.prepare([fw],{gear}).segments[0].unsupported,false);
+    fw.w.flight.firmware='Rotorflight 4.8.0';
     assert.equal(A.prepare([fw],{gear}).segments[0].unsupported,true);
 });
 test('the same complete target is replayed across logs with different original LPF and PID cutoffs',()=>{

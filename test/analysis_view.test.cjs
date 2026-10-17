@@ -1,7 +1,7 @@
 // The Analysis view (js/analysis_view.js): the verdict of the analysis, with the pieces of js/log_lens.js that it shares,
 // in node:vm with stand-ins for the DOM, the timers, TuningPlot, TuningSnippet.Reader and the hooks of js/main.js. From
 // synthetic TuningResults with known findings: the summary, the area cards with status, value, limit and PID profile, the
-// flights and bench runs, "Show in the log" and "Show the measurement", the no-result state with "Start the analysis",
+// flights and bench runs, "Show in the log" and "Show the measurement", the no-result state with "Start analysis",
 // escaping; the words and units agree with tools/autotune/catalog.cjs; the upstream Flight analysis files are the files of
 // HEAD and are not used; the script is registered in index.html (and gulpfile.js).
 // test/ste_text.test.cjs runs these tests again to read every text that the view writes: the containers come from the
@@ -632,12 +632,21 @@ test('the "Logs" control in the verdict: hooks.scopePanel in both states, the ac
     panel = Object.assign({}, panel, { scope: 'flights', html: '<div class="tuning-scope-bar">selected</div><div class="tuning-fsel">list</div>' });
     settings[0]();
     assert.equal(scope.innerHTML, '<div class="tuning-scope-bar">selected</div><div class="tuning-fsel">list</div>', 'drawn again after a change of the settings');
+    // the scan of the flights operates: no start before it ends, then the button again
+    const startButton = () => app.verdict().match(/<button[^>]*data-analysis-act="start"[^>]*>/)[0];
+    panel = Object.assign({}, panel, { scanning: true });
+    settings[0]();
+    assert.match(startButton(), /disabled/, 'no start while the scan operates');
+    assert.match(startButton(), /title="The app finds the flights in each log\. When this is complete, click &quot;Start analysis&quot;\."/);
+    panel = Object.assign({}, panel, { scanning: false });
+    settings[0]();
+    assert.doesNotMatch(startButton(), /disabled|title="[^"]/, 'the scan ended');
     // with a result: the same control, and for a result of other settings the note and the start button
     app.give(synthResult());
     assert.match(app.verdict(), /<span class="analysis-meta">[\s\S]*?<\/span><\/div><div class="analysis-scope" data-analysis-scope="1"><\/div>/);
     panel = Object.assign({}, panel, { stale: true });
     settings[0]();
-    assert.match(scope.innerHTML, /<p class="analysis-muted analysis-stale">The results on display are for different logs or flights\. To use the logs and the flights that you selected, start the analysis again\. <button type="button" class="btn btn-primary btn-xs" data-analysis-act="start">Start the analysis<\/button><\/p>$/);
+    assert.match(scope.innerHTML, /<p class="analysis-muted analysis-stale">The results on display are for different logs, flights or CLI dump\. To use the logs, the flights and the CLI dump that you selected, start the analysis again\. <button type="button" class="btn btn-primary btn-xs" data-analysis-act="start">Start analysis<\/button><\/p>$/);
     panel = Object.assign({}, panel, { running: true });
     settings[0]();
     assert.doesNotMatch(scope.innerHTML, /analysis-stale/, 'no button while a run operates');
@@ -656,8 +665,12 @@ test('the "Logs" control in the verdict: hooks.scopePanel in both states, the ac
     fire('click', button('tuning-fsel-none'));
     fire('click', button('tuning-fsel-head', { open: false }));
     fire('click', button('summary', { open: true, getAttribute: () => '3' }));
+    // the CLI dump block (TuningDialog cliBlockHtml): "Load CLI dump" and the remove link go to the Tuning view
+    const cliButton = (cls) => ({ closest: (sel) => (sel === '[data-analysis-scope]' ? scope : /tuning-cli-load/.test(sel) ? { classList: { contains: (c) => c === cls } } : null) });
+    assert.equal(fire('click', cliButton('tuning-cli-load')).prevented, true);
+    fire('click', cliButton('tuning-cli-clear'));
     eq(acts, [{ kind: 'scope', value: 'log' }, { kind: 'log', log: 2, on: true }, { kind: 'flight', log: 3, flight: 1, count: 4, on: false }, { kind: 'all' }, { kind: 'none' },
-        { kind: 'open', on: true }, { kind: 'sub', log: 3, on: false }]);
+        { kind: 'open', on: true }, { kind: 'sub', log: 3, on: false }, { kind: 'cli' }, { kind: 'cliClear' }]);
     assert.ok(inScope);
     // a host without the hooks: no control
     const plainApp = await shown({ result: null });
@@ -715,9 +728,9 @@ test('flight selection keeps its scroll position and focus through settings upda
     assert.equal(focused.preventScroll, true);
 });
 
-test('no result: "Start the analysis", then the result; a run that does not start; results of another file or log', async () => {
+test('no result: "Start analysis", then the result; a run that does not start; results of another file or log', async () => {
     const app = await shown({ result: null });
-    assert.match(app.verdict(), /No analysis result is available\. <button type="button" class="btn btn-primary btn-sm" data-analysis-act="start">Start the analysis<\/button>/);
+    assert.match(app.verdict(), /No analysis result is available\. <button type="button" class="btn btn-primary btn-sm" data-analysis-act="start">Start analysis<\/button>/);
     app.click('start');
     assert.equal(app.calls.runAnalysis, 1);
     assert.ok(app.verdict().includes('data-analysis-act="start" disabled'));
@@ -747,7 +760,7 @@ test('no result: "Start the analysis", then the result; a run that does not star
     assert.ok(p.verdict().includes('The analysis found 7 problems and 1 item to monitor in 21 results.'), 'a promise of the result');
 });
 
-test('"Start the analysis" ends: a run that stops, is canceled or is replaced, and a result for another log, give the button again (B1)', async () => {
+test('"Start analysis" ends: a run that stops, is canceled or is replaced, and a result for another log, give the button again (B1)', async () => {
     const error = (reason, message, detail) => Object.assign(new Error(message), { reason, detail });
     // js/tuning_dialog.js runAnalysis rejects when the run stops: the worker, Cancel, other settings
     const failed = await shown({ result: null, runAnalysis: () => Promise.reject(error('failed', '', 'The log cannot be <b>decoded</b>.')) });

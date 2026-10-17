@@ -411,6 +411,7 @@ function dist() {
         './tools/autotune/optimizer/manifest.json',
         './tools/autotune/control_tune.cjs',
         './tools/autotune/control_pipeline.cjs',
+        './tools/autotune/validation_power.cjs',
         './tools/autotune/helicopter_model.cjs',
         './tools/autotune/heli_twin.cjs',
         './tools/autotune/twin_fit.cjs',
@@ -418,8 +419,13 @@ function dist() {
         './tools/autotune/firmware_controller.cjs',
         './tools/autotune/firmware_sensor.cjs',
         './tools/autotune/firmware/schema.cjs',
+        './tools/autotune/firmware/equivalence.cjs',
         './tools/autotune/firmware/**/*',
         './tools/autotune/param_epochs.cjs',
+        // the parameter snapshot and journal of firmware with blackbox_params (IMP-05): param_log.cjs, its semantics, the CLI defaults (D4)
+        './tools/autotune/param_log.cjs',
+        './tools/autotune/param_semantics.cjs',
+        './tools/autotune/cli_defaults.cjs',
         // the governor model and autotune (worker command governorTune, docs/GOVERNOR_AUTOTUNE.md)
         './tools/autotune/gov_twin.cjs',
         './tools/autotune/gov_data.cjs',

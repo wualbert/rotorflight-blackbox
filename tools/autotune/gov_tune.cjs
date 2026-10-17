@@ -239,6 +239,31 @@ function cliOf(cli, name, p) {
     return null;
 }
 
+// The parameter snapshot of the logs (blackbox_params FULL, param_log.cjs snapshotOf): the snapshot of the newest flight log, when
+// that log has one. Its values rank above every other source (IMP-05): they are the values of all PID profiles at the start of
+// that log. When a newer flight log has no snapshot (stock firmware again), the older snapshot is not used: the header epochs of
+// the newer logs give the values (review IMP-05)
+function snapshotOfRuns(runs) {
+    const PL = optional(() => require('./param_log.cjs')); if (!PL || typeof PL.snapshotOf !== 'function') return null;
+    const flights = (runs || []).filter(isFlight), newest = flights.length ? Math.max(...flights.map(q => q.log)) : null;
+    let best = null;
+    for (const q of runs || []) { if (q.segment) continue; const s = PL.snapshotOf(q.header); if (s && (!best || q.log >= best.log)) best = { log: q.log, snap: s }; }
+    return best && (newest === null || best.log >= newest) ? best : null;
+}
+// a log with a parameter snapshot also has the parameter journal: it records each change, also between two arms and in a pause
+const journalLog = (run) => { const PL = optional(() => require('./param_log.cjs')); return !!(PL && typeof PL.snapshotOf === 'function' && run && PL.snapshotOf(run.header)); };
+// 4.7: the battery values are lists of the 6 battery profiles; the value is the element of bat_profile
+const BATTERY_LISTS = /^(?:battery_cell_count|bat_capacity|vbat_(?:max|full|min|warning)_cell_voltage)$/;
+// the value of name in the snapshot (global: p ignored): { value, where, logs } or null
+function snapOf(S, name, p) {
+    if (!S) return null;
+    const R = REG[name] || REL[name], global = !R || R.scope !== 'profile', sec = global ? S.snap.global : p > 0 ? S.snap.profiles[String(p - 1)] : null;
+    if (!sec || sec[name] === undefined || sec[name] === null) return null;
+    let v = sec[name];
+    if (BATTERY_LISTS.test(name) && Array.isArray(v)) { const k = S.snap.global.bat_profile; v = Number.isInteger(k) && v[k] !== undefined ? v[k] : null; if (v === null) return null; }
+    return { value: v, where: global ? `log header (the parameter values of log ${S.log + 1})` : `log header (the parameter values of ${prof(p)} in log ${S.log + 1})`, logs: [S.log] };
+}
+
 // ---------------------------------------------------------------------------------------------
 // PID profiles and the logs
 // ---------------------------------------------------------------------------------------------
@@ -264,9 +289,10 @@ function allLabelsOf(flights, labels) { const out = new Set(); for (const run of
 function logInfo(runs, labels) {
     const by = new Map();
     for (const run of runs) {
-        const lab = labels.get(run), x = by.get(run.log) || { log: run.log, flight: false, startProfile: null, rearm: false, pause: false, profiles: new Set() };
+        const lab = labels.get(run), x = by.get(run.log) || { log: run.log, flight: false, startProfile: null, rearm: false, pause: false, journal: false, profiles: new Set() };
         if (isFlight(run)) x.flight = true;
         if (!run.segment && lab) x.startProfile = lab[0];
+        if (!run.segment && journalLog(run)) x.journal = true;
         if (run.segment) x.pause = true;
         let armed = false; for (let i = 0; i < run.n; i++) { const a = run.armed ? run.armed[i] === 1 : true; if (a && !armed && i > 0 && x.armedOnce) x.rearm = true; if (a) x.armedOnce = true; armed = a; }
         for (let i = 1; i < run.n; i++) if (run.time[i] - run.time[i - 1] > RULES.pauseS) { x.pause = true; break; }
@@ -335,8 +361,10 @@ function staleOf(R, p, cur, rec, info) {
     // start of the log for a profile name, a second arm and a pause (CLAUDE.md "Values that are possibly not current";
     // js/tuning_worker.js reasonsFor)
     const used = cur.from === 'log' ? info.filter(l => l.flight && (cur.logs || []).includes(l.log)) : info.filter(l => l.flight && (global || l.profiles.has(p)));
-    if (cur.from !== 'log' && !global) { const sw = used.filter(l => l.startProfile !== p).map(l => l.log); if (sw.length) flags.push({ reason: 'switched', logs: sw, text: STALE_TEXT.switched(p, sw) }); }
-    const re = used.filter(l => l.rearm).map(l => l.log), pa = used.filter(l => l.pause).map(l => l.log);
+    // a value of the parameter snapshot (cur.snapshot) is the recorded value of that PID profile: a switch to it is no cause. A log with a
+    // parameter journal records each change, also between two arms and in a pause: the journal epochs of the worker give its causes
+    if (cur.from !== 'log' && !global && !cur.snapshot) { const sw = used.filter(l => l.startProfile !== p).map(l => l.log); if (sw.length) flags.push({ reason: 'switched', logs: sw, text: STALE_TEXT.switched(p, sw) }); }
+    const re = used.filter(l => l.rearm && !l.journal).map(l => l.log), pa = used.filter(l => l.pause && !l.journal).map(l => l.log);
     if (re.length) flags.push({ reason: 'rearm', logs: re, text: STALE_TEXT.rearm(re) });
     if (pa.length) flags.push({ reason: 'resume', logs: pa, text: STALE_TEXT.resume(pa) });
     if (cur.conflict) flags.push({ reason: 'cli', logs: [], text: STALE_TEXT.cli(R.name, cur.conflict) });
@@ -377,7 +405,8 @@ function simStale(ctx, names, p, logs) {
         text.push(...said);
         if (!sources.includes(src)) sources.push(src);
     }
-    const info = (ctx && ctx.info || []).filter(l => l.flight && set.has(l.log)), re = info.filter(l => l.rearm).map(l => l.log), pa = info.filter(l => l.pause).map(l => l.log);
+    // a log with a parameter journal records each change between the arms and in a pause (logInfo journal): the worker's journal epochs give them
+    const info = (ctx && ctx.info || []).filter(l => l.flight && set.has(l.log)), re = info.filter(l => l.rearm && !l.journal).map(l => l.log), pa = info.filter(l => l.pause && !l.journal).map(l => l.log);
     if (re.length) { flags.push({ reason: 'rearm', logs: re, text: SIM_TEXT.rearm(re) }); text.push(SIM_TEXT.rearm(re)); }
     if (pa.length) { flags.push({ reason: 'resume', logs: pa, text: SIM_TEXT.resume(pa) }); text.push(SIM_TEXT.resume(pa)); }
     if (!flags.length) return null;
@@ -412,15 +441,17 @@ function sameValue(R, cur, v) {
     if (typeof cur.value === 'number' && isNum(Number(v))) return Math.abs((isNum(cur.estimate) ? cur.estimate : cur.value) - Number(v)) <= Math.max(0.5, 3 * (cur.se || 0));
     return norm(cur.value) === norm(R.type === 'flag' ? cliValue(R.name, v) || v : v);
 }
-function valueAt(R, p, rec, cli, info) {
+function valueAt(R, p, rec, cli, info, snap) {
     const global = R.scope !== 'profile', eps = rec.epochs.filter(e => e.name === R.name && (global || e.profile === p));
     const hdr = eps.filter(e => e.source === 'log header'), calc = eps.filter(e => e.source !== 'log header' && !e.effective && !(R.name === 'gov_use_voltage_comp'));
     const eff = R.name === 'gov_use_voltage_comp' ? eps.filter(e => e.value === 'inactive' || e.value === 'active') : [];
-    const c = cliOf(cli, R.name, p);
+    const c = cliOf(cli, R.name, p), sv = snapOf(snap, R.name, p);
     let out = null;
-    if (hdr.length) { const e = hdr[hdr.length - 1]; out = { value: e.value, source: `log header, ${prof(p)} at the start of the log`, se: null, logs: e.logs, from: 'header' }; }
+    // the parameter snapshot: the value of the log; a CLI dump that does not agree is of a different time (no conflict)
+    if (sv) { out = { value: sv.value, source: sv.where, se: null, logs: sv.logs, from: 'header', snapshot: true }; if (c) out.cli = sameValue(R, out, c.value) ? 'same' : 'different'; }
+    else if (hdr.length) { const e = hdr[hdr.length - 1]; out = { value: e.value, source: `log header, ${prof(p)} at the start of the log`, se: null, logs: e.logs, from: 'header' }; }
     else if (calc.length) { const e = calc[calc.length - 1]; out = { value: e.value, estimate: e.estimate, source: e.source, se: e.se, logs: e.logs, from: 'log' }; }
-    if (out && c) { if (sameValue(R, out, c.value)) { out.cli = 'same'; if (out.from === 'header') out.source = `${c.where}, the same as the log header`; } else out.conflict = { log: out.value, cli: c.value }; }
+    if (out && c && !out.snapshot) { if (sameValue(R, out, c.value)) { out.cli = 'same'; if (out.from === 'header') out.source = `${c.where}, the same as the log header`; } else out.conflict = { log: out.value, cli: c.value }; }
     if (!out && c) out = { value: c.value, source: c.where, se: null, logs: [], from: 'cli' };
     if (!out) {
         const items = rec.items.filter(i => i.name === R.name && (global || i.profile === p));
@@ -436,7 +467,7 @@ function valueAt(R, p, rec, cli, info) {
     return out;
 }
 // the related values: the CLI global section, the log header (features), the recorded fields; else unknown
-function relatedValues(runs, cli) {
+function relatedValues(runs, cli, snap) {
     const h = (runs.find(r => !r.segment) || runs[0] || {}).header || {}, out = {};
     for (const R of RELATED) {
         if (R.name === 'feature GOVERNOR') {
@@ -444,10 +475,10 @@ function relatedValues(runs, cli) {
             out[R.name] = f !== null ? { value: f ? 'ON' : 'OFF', source: 'log header', from: 'header' } : c !== undefined ? { value: c ? 'ON' : 'OFF', source: 'CLI dump', from: 'cli' } : { value: null, source: 'unknown', from: null };
             continue;
         }
-        const c = cliOf(cli, R.name, 0);
-        out[R.name] = c ? { value: c.value, source: c.where, from: 'cli' } : { value: null, source: 'unknown', from: null };
+        const c = cliOf(cli, R.name, 0), sv = snapOf(snap, R.name, 0);
+        out[R.name] = sv ? { value: sv.value, source: sv.where, from: 'header' } : c ? { value: c.value, source: c.where, from: 'cli' } : { value: null, source: 'unknown', from: null };
     }
-    out.tail_rotor_mode = (() => { const c = cliOf(cli, 'tail_rotor_mode', 0); return c ? { value: c.value, source: c.where, from: 'cli' } : { value: null, source: 'unknown', from: null }; })();
+    out.tail_rotor_mode = (() => { const c = cliOf(cli, 'tail_rotor_mode', 0), sv = snapOf(snap, 'tail_rotor_mode', 0); return sv ? { value: sv.value, source: sv.where, from: 'header' } : c ? { value: c.value, source: c.where, from: 'cli' } : { value: null, source: 'unknown', from: null }; })();
     return out;
 }
 // profiles: the PID profiles with rows; extraProfiles: the other labels of the flight samples (a short PID profile, PID profile unknown),
@@ -455,8 +486,9 @@ function relatedValues(runs, cli) {
 function currentValues(runs, recovered, o = {}) {
     const rec = recovered || GP.recover(runs, { cli: o.cli || null }), cli = parseCli(o.cli), labels = o.labels || labelsOf(runs, rec), flights = runs.filter(isFlight);
     const profiles = o.profiles || profilesOf(flights, labels), extra = allLabelsOf(flights, labels).filter(p => !profiles.includes(p)), info = logInfo(runs, labels), byName = {};
-    for (const R of REGISTRY) { byName[R.name] = {}; for (const p of R.scope === 'global' ? [0] : profiles.concat(extra)) byName[R.name][p] = valueAt(R, p, rec, cli, info); }
-    return { profiles, extraProfiles: extra, byName, related: relatedValues(runs, cli), cli: cli ? { kind: cli.kind || null, version: cli.version || null } : null };
+    const snap = snapshotOfRuns(runs);
+    for (const R of REGISTRY) { byName[R.name] = {}; for (const p of R.scope === 'global' ? [0] : profiles.concat(extra)) byName[R.name][p] = valueAt(R, p, rec, cli, info, snap); }
+    return { profiles, extraProfiles: extra, byName, related: relatedValues(runs, cli, snap), cli: cli ? { kind: cli.kind || null, version: cli.version || null } : null, snapshot: snap ? { log: snap.log } : null };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -910,7 +942,7 @@ const TEXT = {
     record: {
         esc: 'The log does not record "EscThr" and "EscPwm". They show the start ramp of the ESC and the throttle that the ESC uses.',
         escRecord: 'To record them, set "blackbox_log_esc" to ON for one flight.',
-        escOn: 'The value is ON. The governor analysis does not use the ESC fields at this time.',
+        escOn: 'The value is ON. The governor autotune does not use the ESC fields at this time.',
         ibat: 'The log does not record the battery output ("Ibat" is 0). The governor does not use "Ibat". The model uses it to find the motor resistance and the rotor inertia.',
         ibatRecord: 'If the ESC or the flight controller has a sensor for "Ibat", set "current_meter" to that source.',
         vbat: 'The log does not record the battery voltage.',
@@ -1524,7 +1556,7 @@ const AUTO = {
             vcomp: 'The governor model calculates the effect of the battery voltage.', bailout: 'The governor model flies a BAILOUT from a slow rotor.', done: 'The governor model flies the test conditions.' },
         rows: 'The app makes the recommendations.',
     },
-    cancelled: 'The governor analysis stopped before the end.',
+    cancelled: 'The governor autotune stopped before the end.',
     failed: 'The app cannot make the governor model from these logs.',
     limits: {
         noise: 'The RPM signal of the governor model has no vibration. Thus, a larger gain or a filter with a higher cutoff can give more fast throttle changes in flight than in the model.',

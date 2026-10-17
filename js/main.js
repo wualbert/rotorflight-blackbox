@@ -1965,6 +1965,11 @@ function BlackboxLogViewer() {
 
         var tuningDialog = new TuningDialog($("#viewTuning"), $.extend({
             viewInLog: function(req) { return viewInLog($.extend({}, req, {from: "tuning"})); },
+            // the progress of an autotune on the view tab, also while a different view shows: { fraction (null: not known) }, or null
+            autotuneProgress: function(p) {
+                var tab = $("#tabTuning").toggleClass("is-autotune", !!p).toggleClass("is-busy", !!p && p.fraction === null);
+                if (tab[0]) tab[0].style.setProperty("--autotune", p && p.fraction !== null ? String(p.fraction) : "1");
+            },
             seek: function(us) {
                 setCurrentBlackboxTime(clampToLog(us));
                 setGraphState(GRAPH_STATE_PAUSED);

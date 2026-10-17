@@ -585,7 +585,16 @@ function controlPlanTexts(plan, add) {
         for (const line of item.instructions || []) add(line,'instruction','flight maneuver instruction');
     }
 }
+// IMP-07: the plan of the flights that can show a change (tools/autotune/validation_power.cjs): its paragraphs, its rule, the
+// names of its measurements
+function powerTexts(plan, add) {
+    if (!plan || typeof plan !== 'object') return;
+    for (const t of [].concat(plan.text || [])) add(t, 'message', 'validation power');
+    add(plan.rule, 'message', 'validation power rule');
+    for (const m of [].concat(plan.metrics || [])) if (m && typeof m.label === 'string') add(m.label.charAt(0).toUpperCase() + m.label.slice(1), 'label', 'validation power measurement');
+}
 const READERS = {
+    'tools/autotune/validation_power.cjs': { plan: powerTexts, forModel: powerTexts, forDecision: powerTexts },
     'tools/autotune/control_tune.cjs': {
         flightPlan: controlPlanTexts,
         tune: (out,add) => {
@@ -806,7 +815,9 @@ function afterScript(ctx, name, add) {
         // worker tests come from simulated logs, some with stand-in modules that the tests inject, and our modules give their texts
         // in their own harvests
         // (AUTOTUNE_GOV_LOG: the dump of the governorTune test of the real logs, with its result texts: governorTuned)
-        const reals = [process.env.AUTOTUNE_REAL_LOG, process.env.AUTOTUNE_RESCUE_LOG, process.env.AUTOTUNE_GOV_LOG].filter(Boolean).map((f) => path.basename(f));
+        // (STE_HARVEST_REALS: the file names of a harvest of its own, for example the crash log test of the default run)
+        const reals = [process.env.AUTOTUNE_REAL_LOG, process.env.AUTOTUNE_RESCUE_LOG, process.env.AUTOTUNE_GOV_LOG].filter(Boolean).map((f) => path.basename(f))
+            .concat(process.env.STE_HARVEST_REALS ? process.env.STE_HARVEST_REALS.split(',') : []);
         const isReal = (r) => !reals.length || reals.includes(r.fileName);
         const wrapped = function (m) {
             try { if (m && m.type === 'result' && m.result && isReal(m.result)) resultTexts(m.result, (t, k, w) => add('TuningResult', t, k, w));
@@ -854,7 +865,9 @@ function withoutData(item, found) {
     for (const d of [...item.data].sort((a, b) => b.length - a.length)) for (const f of escapes(d)) if (t.includes(f)) { t = t.split(f).join(' X '); found.add(d); }
     return Object.assign({}, item, { text: t, data: undefined });
 }
-async function harvestFile(file) {
+// o.only: run only the tests whose name has this text; o.reals: the file names of the worker results to read (STE_HARVEST_REALS)
+async function harvestFile(file, o = {}) {
+    if (o.reals && o.reals.length) process.env.STE_HARVEST_REALS = o.reals.join(',');
     const items = new Map(), add = (source, text, kind, where, data) => {
         if (typeof text !== 'string' || !/[A-Za-z]/.test(text)) return;
         const k = `${source}\u0000${kind}\u0000${text}`;
@@ -876,7 +889,7 @@ async function harvestFile(file) {
     const stats = { passed: 0, failed: 0, skipped: 0 }, errors = [];
     try { require(path.join(ROOT, file)); } catch (e) { errors.push(`load: ${String(e && e.message || e).split('\n')[0]}`); }
     for (const h of hooks.before) { try { await h(); } catch (e) { errors.push(`before: ${e.message}`); } }
-    for (const t of registered) await runBody(t, stats, errors, hooks);
+    for (const t of registered) { if (o.only && !t.name.includes(o.only)) { stats.skipped++; continue; } await runBody(t, stats, errors, hooks); }
     for (const h of hooks.after) { try { await h(); } catch (e) { /* cleanup */ } }
     const out = [], found = new Map();
     for (const it of items.values()) {
@@ -888,9 +901,9 @@ async function harvestFile(file) {
     return { items: out, stats, errors };
 }
 // Run one harvest in a worker thread: { items, stats, errors }
-function harvest(file, { timeoutS = 300, heapMb = 4096 } = {}) {
+function harvest(file, { timeoutS = 300, heapMb = 4096, only = null, reals = null } = {}) {
     return new Promise((resolve) => {
-        const w = new WT.Worker(__filename, { workerData: { steHarvest: file }, execArgv: [], resourceLimits: { maxOldGenerationSizeMb: heapMb }, stdout: true, stderr: true });
+        const w = new WT.Worker(__filename, { workerData: { steHarvest: file, only, reals }, execArgv: [], resourceLimits: { maxOldGenerationSizeMb: heapMb }, stdout: true, stderr: true });
         const timer = setTimeout(() => { w.terminate(); resolve({ items: [], stats: null, errors: [`timeout after ${timeoutS} s`] }); }, timeoutS * 1000);
         w.stdout.resume(); w.stderr.resume();
         w.once('message', (m) => { clearTimeout(timer); resolve(m); w.terminate(); });
@@ -1045,7 +1058,7 @@ function snippetSource() {
 }
 function digitalTwinSource() {
     const items=[];
-    for (const rel of ['tools/autotune/control_pipeline.cjs','tools/autotune/system_id.cjs','tools/autotune/firmware_controller.cjs','tools/autotune/firmware_sensor.cjs']) {
+    for (const rel of ['tools/autotune/control_pipeline.cjs','tools/autotune/system_id.cjs','tools/autotune/firmware_controller.cjs','tools/autotune/firmware_sensor.cjs','tools/autotune/firmware/equivalence.cjs']) {
         const src=fs.readFileSync(path.join(ROOT,rel),'utf8');
         for (const x of sentenceLiterals(src)) items.push({text:x.text,kind:x.kind,where:`${rel}:${lineOf(src,x.at)}`});
     }
@@ -1142,6 +1155,7 @@ function countsOf(hits) { const c = {}; for (const h of hits) c[h.check] = (c[h.
 // tree is reported as not found, and every js/*_view.js with its test is read as a DOM script
 const HARVEST = [
     { file: 'test/control_tune.test.cjs', expect: ['tools/autotune/control_tune.cjs'] },
+    { file: 'test/validation_power.test.cjs', expect: ['tools/autotune/validation_power.cjs'] },   // IMP-07
     { file: 'test/tuning_dialog.test.cjs', expect: ['js/tuning_dialog.js', 'plots of js/tuning_dialog.js'] },
     { file: 'test/log_lens.test.cjs', expect: ['js/log_lens.js'] },
     ...[...DOM_SCRIPTS].filter((f) => /_view\.js$/.test(f)).map((f) => ({ file: `test/${path.basename(f, '.js')}.test.cjs`, expect: [f] })),
@@ -1164,6 +1178,8 @@ const HARVEST = [
     { file: 'test/filter_tune.test.cjs', expect: ['tools/autotune/filter_tune.cjs'] },    // round 3 M2
     { file: 'test/filter_autotune.test.cjs', expect: ['tools/autotune/filter_autotune.cjs'] },
     { file: 'test/tuning_worker.test.cjs', expect: ['TuningResult'], env: ['AUTOTUNE_REAL_LOG', 'AUTOTUNE_GOV_LOG'], timeoutS: 3600, heapMb: 12000 },
+    // the result of the crash log 2026-10-15 in the default run (the texts of D10, D11, G14 and the limits with a cause, review IMP-03 and IMP-12)
+    { file: 'test/tuning_worker.test.cjs', expect: ['TuningResult'], only: 'the crash log 2026-10-15', reals: ['crash.bbl'], need: 'analysis/fireball-crash-20261015/crash.bbl', timeoutS: 900, heapMb: 8000 },
 ];
 // The names that advice.cjs exports (read from the source: the module is not loaded in the main thread for this)
 function adviceExports() {
@@ -1303,6 +1319,30 @@ function mainThread() {
             'advice.cjs is not available', 'advice failed: "error"']);
     });
 
+    // The flags of the values that are possibly not current (CLAUDE.md): the worker makes the cause sentences (causeText) and the texts
+    // of the parts of a log with a parameter journal (journalText) at run time, so the source literals do not show them. Every
+    // combination of 1 to 4 causes, the full list, and the texts of each journal reason with and without its keys (review IMP-05)
+    test('the worker flags: every combination of causes and every journal reason text passes the STE lint', () => {
+        const vm = require('node:vm'), JS = path.join(ROOT, 'js'), ctx = vm.createContext({}), run = (code, filename) => vm.runInContext(code, ctx, { filename });
+        Object.assign(ctx, { console: { log() {}, info() {}, warn() {}, debug() {}, error() {} }, setTimeout,
+            importScripts: (...urls) => { for (const u of urls) { const f = path.resolve(JS, u); run(fs.readFileSync(f, 'utf8'), f); } } });
+        run('var self = globalThis;', 'worker-global.js');
+        run(fs.readFileSync(path.join(JS, 'tuning_worker.js'), 'utf8'), path.join(JS, 'tuning_worker.js'));
+        const F = run('TuningWorker.fresh'), all = Array.from(F.ALL_REASONS), bad = [];
+        const check = (text, what) => { const f = failing(text); if (f.length) bad.push(`${what}: ${why(text)} ${text}`); };
+        const combos = (k, from = 0, pre = []) => { if (!k) { check(F.causeText(pre), pre.join('+')); return; } for (let i = from; i < all.length; i++) combos(k - 1, i + 1, pre.concat([all[i]])); };
+        for (let k = 1; k <= 4; k++) combos(k);
+        check(F.causeText(all), 'all causes');
+        // the texts of a journal part (spanInfo, check 'journal'): each journal reason, then two reasons, with 0, 1, 2 and 3 keys
+        const journal = all.filter(k => F.FRESH.journalReasons[k]).concat(['resume']), keys = ['p0.yaw_p_gain', 'r1.roll_rc_rate', 'debug_mode'];
+        const c = { li: 0, resumes: [15.25], changes: keys.map((key, i) => ({ t: 12.5 + i, key, value: '1' })) };
+        for (const n of [0, 1, 2, 3]) for (const a of journal) for (const b of [null].concat(journal)) {
+            const reasons = b && b !== a ? [a, b] : [a], ks = keys.slice(0, n), span = { t0: 20, t1: 30, pidProfile: 1, rateProfile: 2, reasons, keys: { changed: ks, unknown: ks, mixed: ks, pending: ks, uncertain: ks } };
+            check(F.journalText(span, c, reasons, null).join(' '), `journal ${reasons.join('+')} with ${n} keys`);
+        }
+        assert.deepEqual(bad.slice(0, 10), []);
+    });
+
     test('the vocabulary holds only headwords and our classes, the alternatives are STE, and docs/STE_GLOSSARY.md agrees with it', () => {
         const V = L.V, deny = new Set(Object.keys(V.deny));
         for (const [w, s] of Object.entries(V.approved)) assert.match(s, /^(?:n|v|adj|adv|prep|conj|pron|art)(?:\/(?:n|v|adj|adv|prep|conj|pron|art))*(?: [a-z'\-]+)*$/, `approved ${w}: ${s}`);
@@ -1345,6 +1385,7 @@ function mainThread() {
         }
         const todo = HARVEST.map((h) => {
             if (!fs.existsSync(path.join(ROOT, h.file))) return Promise.resolve({ h, skip: `${h.file} not found` });
+            if (h.need && !fs.existsSync(path.join(ROOT, h.need))) return Promise.resolve({ h, skip: `${h.need} not found` });
             if (h.env && ![].concat(h.env).some((e) => process.env[e])) return Promise.resolve({ h, skip: `${[].concat(h.env).join(' or ')} is not set` });
             return harvest(h.file, h).then((r) => ({ h, r }));
         });
@@ -1377,5 +1418,5 @@ function mainThread() {
 }
 
 if (!WT.isMainThread && WT.workerData && WT.workerData.steHarvest) {
-    harvestFile(WT.workerData.steHarvest).then((r) => WT.parentPort.postMessage(r), (e) => WT.parentPort.postMessage({ items: [], stats: null, errors: [String(e && e.stack || e)] }));
+    harvestFile(WT.workerData.steHarvest, WT.workerData).then((r) => WT.parentPort.postMessage(r), (e) => WT.parentPort.postMessage({ items: [], stats: null, errors: [String(e && e.stack || e)] }));
 } else mainThread();

@@ -40,7 +40,7 @@ function run(w, ctx = ctxOf(w)) {
     // every finding: a unit, thin data as a field (the text is for the reader), no semicolon, "+-" or ">=" in the text
     for (const f of findings) { assert.ok(f.unit && typeof f.text === 'string', JSON.stringify(f)); assert.equal(!!f.thin, /^The data is not sufficient for a result\./.test(f.text), f.text);
         if (f.thin) assert.equal(f.severity, 'note'); assert.doesNotMatch(f.text, /;|\+-|>=|<=|no finding/, `${f.id}: ${f.text}`);
-        assert.equal(f.axis, { T13: 'yaw', C14: 'pitch', T14: 'yaw', D6: undefined, G14: undefined }[f.id] ?? f.axis, `${f.id} axis`); assert.ok(f.id === 'D6' || f.id === 'G14' || typeof f.axis === 'string' || f.severity === 'skipped' && f.id !== 'T13' && f.id !== 'C14' && f.id !== 'T14' || f.id === 'F10' || f.id === 'F11', `${f.id}: an axis`); }
+        assert.equal(f.axis, { T13: 'yaw', C14: 'pitch', T14: 'yaw', D6: undefined, D10: undefined, G14: undefined }[f.id] ?? f.axis, `${f.id} axis`); assert.ok(f.id === 'D6' || f.id === 'D10' || f.id === 'G14' || typeof f.axis === 'string' || f.severity === 'skipped' && f.id !== 'T13' && f.id !== 'C14' && f.id !== 'T14' || f.id === 'F10' || f.id === 'F11', `${f.id}: an axis`); }
     return { metrics, findings };
 }
 const within = (got, want, tol, what) => assert.ok(Math.abs(got - want) <= tol, `${what}: got ${got}, want ${want} +- ${tol}`);
@@ -112,7 +112,7 @@ test('normalMask takes rescue from RESCUE_STATE events: an exit blend of any len
     assert.equal(nm.mask[at(47.9)], 0); assert.equal(nm.mask[at(48.1)], 1);
     assert.equal(nm.rescueSource, 'The analysis finds rescue from the RESCUE_STATE log events and the RESCUE switch.');
     const d = find(run(w).findings, 'D6')[0];
-    assert.match(d.text, /Of this time, 7\.00 s is rescue, 3\.00 s is a level mode, 1\.50 s is failsafe and 4\.47 s is ground contact\. .* Rescue operated 1 time, and the rescue time includes the exit time\.\nThe analysis finds rescue from the RESCUE_STATE log events and the RESCUE switch\.$/);
+    assert.match(d.text, /Of this time, 7\.00 s is rescue, 3\.00 s is a level mode, 1\.50 s is failsafe and 4\.47 s is ground contact\. .* Rescue operated 1 time, and the rescue time includes the exit time\.\nThe analysis finds rescue from the RESCUE_STATE log events and the RESCUE switch\.(\nOn Rotorflight 4\.6\.0, `failsafePhase` is always 0, .*)?$/); // IMP-01: the note of the firmware that does not operate failsafe stage 2
     // no flightModeFlags: rescue still comes from the events, level modes and the failsafe switch are not applied
     w.extra.flightModeFlags = null;
     const nf = M.normalMask(w, ctxOf(w)); within(nf.excluded.rescueS, 7, 0.006, 'rescue from the events alone');
@@ -524,8 +524,11 @@ test('G14: state census, spool-up ramp, landing autorotation not flagged', () =>
     assert.equal(m.states.AUTOROTATION.entries, 1); assert.equal(m.states.OFF.entries, 1);
     within(m.spoolup.throttlePctPerS.mean, 4, 0.01, 'spool-up throttle ramp, %/s'); assert.equal(m.spoolup.impliedSpoolupTime, 250);
     within(m.spoolup.rpmPerS.mean, 230, 0.5, 'spool-up headspeed ramp');
-    assert.equal(m.entries.length, 1); assert.equal(m.entries[0].landing, true);
+    // the phases of health_phase.cjs decide "in flight" (IMP-12 review): the AUTOROTATION at 104 s comes after the touchdown, so it is not an
+    // entry in flight. With the airborne flag only (phases false), it is an entry at the landing (the flag drops at 105 s)
+    assert.equal(m.entries.length, 0, JSON.stringify(m.entries)); assert.equal(m.airborneFrom, 'the flight and fall phases (health_phase)');
     const f = find(findings, 'G14')[0]; assert.equal(f.severity, 'note', f.text);
+    const w = govW(), flag = run(w, ctxOf(w, { phases: false })).metrics.G14; assert.equal(flag.entries.length, 1); assert.equal(flag.entries[0].landing, true);
 });
 
 test('G14 flags a bailout in flight and an autorotation at hover collective; not one with the collective down', () => {
@@ -534,6 +537,20 @@ test('G14 flags a bailout in flight and an autorotation at hover collective; not
     assert.deepEqual(b.events.map(e => e.t).sort((x, y) => x - y), [50, 50.8]);
     const w = govW([[60, 62, 7]]); for (let i = at(59); i < at(62); i++) w.coll[i] = -100; // practice autorotation, collective lowered first
     const a = find(run(w).findings, 'G14')[0]; assert.equal(a.severity, 'note', a.text);
+});
+
+// IMP-12: a change from ACTIVE to HOLD in flight is a throttle hold in flight (the firmware clears AIRBORNE 1 ms after it, so the phase
+// RULE.hold.beforeS before it decides), with the headspeed RULE.hold.afterS after it; a HOLD after the landing is not counted
+test('G14 flags a throttle hold in flight (HOLD from ACTIVE), with the headspeed after 1 s; a HOLD after the landing does not count (IMP-12)', () => {
+    const w = govW([[60, 62, 5]]); for (let i = at(60); i < at(62); i++) w.hs[i] = 2500 - 800 * (i / RATE - 60);
+    for (const ctx of [ctxOf(w), ctxOf(w, { phases: false })]) {   // the phases of health_phase.cjs, and the airborne flag (the CLI view)
+        const { metrics, findings } = run(w, ctx), f = find(findings, 'G14')[0], e = metrics.G14.entries.find(q => q.state === 'HOLD');
+        assert.equal(f.severity, 'flag', f.text); assert.equal(f.holds, 1); assert.equal(e.kind, 'throttle hold in flight'); assert.equal(e.landing, false);
+        within(e.headspeed, 2500, 1, 'the headspeed at HOLD'); within(e.headspeedAfter, 1700, 2, 'the headspeed 1 s after HOLD');
+        assert.match(f.text, /At 60\.000 s, the governor changes from ACTIVE to HOLD while the helicopter is in the air\. The headspeed decreases from 2500 rpm to 1700 rpm in 1\.0 s\./);
+        assert.equal(f.cause, undefined, 'no receiver signal loss: the governor block keeps it');
+    }
+    const g = govW([[106, 108, 5]]), m = run(g).metrics.G14; assert.ok(!m.entries.some(q => q.state === 'HOLD'), 'a HOLD after the landing is not an entry in flight');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -592,4 +609,155 @@ test('analyse and curves leave w and ctx unchanged and stay within the time budg
     const t0 = Date.now(), m = M.analyse(w, ctx); M.curves(w, ctx, m); const ms = Date.now() - t0;
     assert.deepEqual([sum(w.gyro[0]), sum(w.extra['gyroRAW[0]']), sum(w.u[2]), sum(ctx.flying), sum(ctx.profile), Object.keys(ctx).join(), Object.keys(w).join()], before);
     assert.ok(ms < 1000, `analyse + curves of 100 s at 1 kHz: ${ms} ms`);
+});
+
+// ---------------------------------------------------------------------------------------------
+// D10: no receiver signal (IMP-01), and its cut in the masks (IMP-02)
+// ---------------------------------------------------------------------------------------------
+
+const fsx = require('node:fs'), osx = require('node:os'), pathx = require('node:path'), bbl = require('./helpers/bbl_encode.cjs');
+// a simulated 4.6 flight (test/helpers/bbl_encode.cjs) with rxSignalReceived and rxFlightChannelsValid at 0 for `seconds` s from `from`
+// s, and failsafePhase 0 in all frames (firmware 4.3 to 4.7), written as a .bbl and read back with lib.segments
+function lossSegment(from, seconds, o = {}) {
+    const log = bbl.simulateFlight(Object.assign({ seconds: 60, seed: 5, airborne: [6, 54] }, o)), a = at(from), b = at(from + seconds);
+    log.slow.rxSignalReceived = Float64Array.from(log.slow.rxSignalReceived, (v, i) => i >= a && i < b ? 0 : v);
+    log.slow.rxFlightChannelsValid = Float64Array.from(log.slow.rxSignalReceived);
+    const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'rxloss-')), file = pathx.join(dir, 'loss.bbl');
+    try { fsx.writeFileSync(file, bbl.encode([log]).bytes); return [...lib.segments(app, file, { whole: true, extra: [...new Set(M.EXTRA.concat(['govTarget']))] })].find(s => !s.skipped); }
+    finally { fsx.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('D10: both flags at 0 for 200 ms with failsafePhase 0 is one period of 0.200 s; the normal mask leaves out its cut', () => {
+    const w = lossSegment(30, 0.2), R = M.RULE.rxLoss;
+    assert.ok(w.extra.failsafePhase.every(v => v === 0), 'failsafePhase is 0 in every frame');
+    const ctx = ctxOf(w), { metrics, findings } = run(w, ctx), d = metrics.D10;
+    assert.equal(d.spans.length, 1, JSON.stringify(d.spans)); const s = d.spans[0];
+    within(s.seconds, 0.2, 0.001, 'period'); within(s.startS, 30, 0.001, 'rxSignalReceived to 0'); within(s.lastFrameS, 30 - R.lastFrameLeadS, 0.001, 'the inferred last RC frame');
+    assert.equal(s.stage1S, null, 'the signal comes back at the time of the rxfail values (0.3 s after the last frame)'); assert.equal(s.cause, 'signal'); assert.equal(s.rotor, true);
+    assert.equal(metrics.D6.failsafeAirborneS, 0, 'failsafePhase and the failsafe switch show nothing');
+    const f = find(findings, 'D10'); assert.equal(f.length, 1); assert.equal(f[0].severity, 'flag'); assert.equal(f[0].n, 1); within(f[0].value, 0.2, 0.001, 'value'); assert.equal(f[0].phase, 'all');
+    assert.equal(f[0].profile, 0, 'the raw label of the start of the log'); assert.equal(f[0].events[0].tS, s.lastFrameS); assert.equal(f[0].events[0].t1S, s.returnS);
+    assert.match(f[0].text, /^The flight controller gets no RC frames from the receiver for 0\.20 s, from 30\.00 s to 30\.20 s\. The last RC frame comes at approximately 29\.90 s/);
+    assert.match(f[0].text, /The signal comes back before the firmware sets the `rxfail` values\./); assert.match(f[0].text, /Before the next flight, examine the receiver, its power supply, its connectors and its antennas\./);
+    assert.match(f[0].text, /The log does not record `rssi`\. To record `rssi`, set `blackbox_log_rssi = ON`\./, 'the setting that records rssi');
+    assert.match(f[0].text, /The results of the attitude, the filters, the gains and the headspeed error of the governor do not use the data from 29\.89 s to 31\.20 s\./);
+    assert.deepEqual(f[0].stage1Delay, [0.3, 0.4]);
+    // the cut, [last frame - guardS, return + settleS): no sample of it in the normal mask, and the samples before and after it stay
+    const nm = M.normalMask(w, ctx), c0 = at(30 - R.lastFrameLeadS - R.guardS), c1 = at(30.2 + R.settleS);
+    for (let i = c0; i < c1; i++) assert.equal(nm.mask[i], 0, `normal mask at ${i / RATE} s`);
+    assert.equal(nm.mask[c0 - 5], 1); assert.equal(nm.mask[c1 + 5], 1); within(nm.excluded.rxLossS, (c1 - c0) / RATE, 0.002, 'D6: the seconds of the receiver signal loss');
+    // a clean log: D10 is satisfactory; a log without the flags: skipped with the reason
+    const c = run(lossSegment(30, 0)); assert.equal(find(c.findings, 'D10')[0].severity, 'ok');
+    const x = makeW(60); x.extra.rxSignalReceived = null; x.extra.rxFlightChannelsValid = null;
+    const none = find(run(x).findings, 'D10')[0]; assert.equal(none.severity, 'skipped'); assert.match(none.text, /does not record `rxSignalReceived` and `rxFlightChannelsValid`/);
+});
+
+test('D10 with the rotor less than the flight rpm (on the ground) is a value to monitor; the failsafe switch alone is cause "switch"', () => {
+    const w = makeW(60), n = w.n; w.hs.fill(1000); w.extra.rxSignalReceived = new Float64Array(n).fill(1); w.extra.rxFlightChannelsValid = new Float64Array(n).fill(1);
+    w.extra.rxSignalReceived.fill(0, at(20), at(21)); w.extra.rxFlightChannelsValid.fill(0, at(20), at(21)); w.extra.rxFlightChannelsValid.fill(0, at(40), at(40.5));
+    w.extra.flightModeFlags = new Float64Array(n).fill(1).fill(1 | 1 << 7, at(40), at(40.5)); // ARM, and the FAILSAFE switch (bit 7) at 40-40.5 s
+    w.hs[at(20.2)] = 4000; // one false RPM reading (check G21) does not change the median: the loss stays on the ground
+    const m = M.analyse(w, ctxOf(w)), f = M.judge([{ log: 0, metrics: m }]).find(q => q.id === 'D10');
+    assert.equal(m.D10.spans.length, 2); assert.deepEqual(m.D10.spans.map(s => s.cause), ['signal', 'switch']); assert.deepEqual(m.D10.spans.map(s => s.rotor), [false, false]);
+    assert.equal(m.D10.spans[0].headspeedMax, 4000); assert.equal(m.D10.spans[0].headspeedMedian, 1000);
+    within(m.D10.spans[1].lastFrameS, 40, 0.001, 'the failsafe switch: no 100 ms lead'); within(m.D10.spans[1].stage1S, 40.3, 0.001, 'the rxfail values 300 ms after the switch');
+    assert.equal(f.severity, 'note'); assert.equal(f.n, 2); assert.match(f.text, /^The receiver signal stops 2 times, for 1\.50 s in total\. Each time, the headspeed stays less than the flight rpm\./);
+    assert.match(f.text, /The failsafe switch is on: `rxFlightChannelsValid` is 0, and `rxSignalReceived` stays at 1\./);
+    assert.doesNotMatch(f.text, /xamine the receiver/, 'an instruction only for a problem');
+});
+
+test('D10: rxFlightChannelsValid at 0 with rxSignalReceived at 1 and the failsafe switch off is a control channel out of its range (cause "channel")', () => {
+    const w = makeW(60), n = w.n; w.extra.rxSignalReceived = new Float64Array(n).fill(1); w.extra.rxFlightChannelsValid = new Float64Array(n).fill(1).fill(0, at(30), at(31));
+    w.extra.flightModeFlags = new Float64Array(n).fill(1);
+    const m = M.analyse(w, ctxOf(w)), s = m.D10.spans[0], f = M.judge([{ log: 0, metrics: m }]).find(q => q.id === 'D10'), R = M.RULE.rxLoss;
+    assert.equal(m.D10.spans.length, 1); assert.equal(s.cause, 'channel'); assert.equal(s.rotor, true);
+    within(s.lastFrameS, 30 - R.holdS, 0.001, 'the last correct value: holdS before the flag'); within(s.stage1S, 30, 0.001, 'the rxfail values at the flag');
+    assert.match(f.text, /^The flight controller does not use the RC values of the receiver for 1\.00 s, from 30\.00 s to 31\.00 s\. `rxSignalReceived` stays at 1, and `rxFlightChannelsValid` is 0\. The failsafe switch is off\. Thus, a control channel has a value out of the range from `rx_pulse_min` to `rx_pulse_max`\. The last correct value comes at approximately 29\.70 s/);
+    assert.doesNotMatch(f.text, /The failsafe switch is on/);
+    // the cut of lib.rxLossSpans starts holdS + guardS before the flag
+    const L = lib.rxLossSpans(n, (i) => i * 1000, (i) => w.extra.rxFlightChannelsValid[i] === 0, () => false, () => true, lib.RX_LOSS, () => 0);
+    assert.equal(L.spans[0].cause, 'channel'); assert.equal(L.spans[0].cut0, at(30 - R.holdS - R.guardS));
+});
+
+// a simulated 4.6 log of 60 s with both flags at 0 from `from` for `seconds` s and the options of bbl_encode (gapAt, slow), read back
+function lossLog(from, seconds, o = {}, edit = null) {
+    const log = bbl.simulateFlight(Object.assign({ seconds: 60, seed: 5, airborne: [6, 54] }, o)), a = at(from), b = at(from + seconds);
+    log.slow.rxSignalReceived = Float64Array.from(log.slow.rxSignalReceived, (v, i) => i >= a && i < b ? 0 : v);
+    log.slow.rxFlightChannelsValid = Float64Array.from(log.slow.rxSignalReceived);
+    if (edit) edit(log);
+    const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'rxloss-')), file = pathx.join(dir, 'loss.bbl');
+    try { fsx.writeFileSync(file, bbl.encode([log]).bytes); return [...lib.segments(app, file, { whole: true, extra: [...new Set(M.EXTRA.concat(['govTarget']))] })].filter(s => !s.skipped); }
+    finally { fsx.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('D10: a logging gap 0.4 s after a loss (in its settle time) gives no span in the second segment, and one D10 result for the log', () => {
+    const segs = lossLog(30, 0.2, { gapAt: 30.6, gapFrames: 300 });
+    assert.equal(segs.length, 2, 'two segments');
+    assert.equal(segs[0].rxLoss.length, 1); assert.deepEqual(segs[1].rxLoss, [], 'the second segment has only the settle time of the loss: no span');
+    assert.ok(segs[1].rxLossAt && segs[1].rxLossAt[0] === 1, 'the cut (settle time) continues in the second segment');
+    const recs = segs.map((w, k) => ({ log: 0, segment: k, header: w.flight.header, metrics: M.analyse(w, ctxOf(w)) }));
+    assert.equal(recs[1].metrics.D10.spans.length, 0);
+    const F = M.judge(recs).filter(q => q.id === 'D10'); assert.equal(F.length, 1, 'one D10 result for each log'); assert.equal(F[0].n, 1); assert.equal(F[0].severity, 'flag');
+    // the guard of rxLossOf: a span of another segment is not a span of this one
+    const w1 = Object.assign({}, segs[1], { rxLoss: [{ i0: 0, i1: -392, signal: true, cause: 'signal', returned: true, lastFrameUs: 0, cut0: 0, cut1: 400 }] });
+    assert.equal(M.analyse(w1, ctxOf(w1)).D10.spans.length, 0);
+});
+
+test('D10: a 4.6 log without the field armed and with the ARM switch off for 3 s: both flags at 0 at 1-2 s give no span', () => {
+    const segs = lossLog(1, 1, {}, (log) => { log.slow.flightModeFlags = Float64Array.from(log.slow.flightModeFlags, (v, i) => i < at(3) ? v & ~1 : v); });
+    assert.equal(segs.length, 1); assert.deepEqual(segs[0].rxLoss, []); assert.equal(segs[0].rxLossAt, null);
+    const armed = lib.armedOf(5, undefined, 0, (i) => [1, 0, 1, 1, 0][i], []); assert.deepEqual([...armed], [1, 0, 1, 1, 0], 'the ARM switch is a necessary condition');
+});
+
+const CRASH = pathx.join(__dirname, '../analysis/fireball-crash-20261015/crash.bbl');
+test('real: the receiver signal loss of the Fireball crash log 2026-10-15 (D10) and its cut in the masks and the segments', { skip: !fsx.existsSync(CRASH) ? 'analysis/fireball-crash-20261015/crash.bbl is not here' : false }, () => {
+    const P = require('../tools/autotune/health_phase.cjs'), HC = require('../tools/autotune/health.cjs');
+    const w = [...lib.segments(app, CRASH, { whole: true, extra: [...new Set(M.EXTRA.concat(P.EXTRA, ['govTarget']))] })].find(s => !s.skipped), rate = w.flight.actualRate;
+    const rule = Object.assign({}, HC.RULE.flight, { headspeed: 2900 }), fm = HC.flightMask(w, rate, rule);
+    const ctx = { flying: fm.flying, profile: w.profileAt, govState: w.govStateAt, rate, header: w.flight.header, app, flightRule: rule };
+    ctx.phases = P.phases(w, Object.assign({}, ctx));
+    const m = M.analyse(w, ctx), F = M.judge([{ log: 0, header: w.flight.header, metrics: m }]), d = m.D10;
+    assert.equal(d.spans.length, 1); const s = d.spans[0];
+    within(s.startS, 68.444, 0.001, 'start'); within(s.seconds * 1000, 2096.5, 1.1, 'duration in ms'); within(s.lastFrameS, 68.344, 0.002, 'the inferred last RC frame');
+    within(s.stage1S, 68.645, 0.002, 'the rxfail values'); within(s.rssiZero.seconds * 1000, 2016.2, 1.1, 'rssi 0 in ms'); assert.equal(s.govAtStage1, 5, 'the governor in HOLD at the rxfail values');
+    assert.equal(s.rssiBefore, 540); within(s.rssiBeforeDbm, -61.4, 0.05, 'rssi in dBm');
+    const f = F.find(q => q.id === 'D10'); assert.equal(f.severity, 'flag'); assert.equal(f.profile, 2);
+    assert.match(F.find(q => q.id === 'D6').text, /On Rotorflight 4\.7\.0, `failsafePhase` is always 0, because the firmware does not operate failsafe "stage 2"\./);
+    // D6: the cut of the loss in the flight phase is flight that the analysis does not use (the health.cjs mask already leaves it out)
+    // (IMP-03: health_phase ends the flight phase at the inferred last RC frame 68.345 s, and the cut starts guardS 0.01 s before it; the
+    // fall after it is not flight), and the text gives the cut of D10
+    within(m.D6.excluded.rxLossS, 0.01, 0.005, `D6 rxLossS ${m.D6.excluded.rxLossS}`); assert.equal(m.D6.stage2Off, true);
+    assert.match(F.find(q => q.id === 'D6').text, /The analysis does not use the data near the period with no receiver signal \(check D10\), from 68\.33 s to 71\.54 s\./);
+    assert.equal(s.cause, 'signal'); assert.equal(s.rotor, true);
+    // IMP-02: no flight-mask or normal-mask sample in [68.343, 71.541] s, and the extract.cjs segments (lib.segments) end at or before 68.344 s
+    const T = w.extra.time, at1 = (i) => w.fromS + (T[i] - T[0]) / 1e6, nm = M.normalMask(w, ctx);
+    for (let i = 0; i < w.n; i++) { const t = at1(i); if (t >= 68.343 && t <= 71.541) { assert.equal(fm.flying[i], 0, `flight mask at ${t} s`); assert.equal(nm.mask[i], 0, `normal mask at ${t} s`); } }
+    const segs = [...lib.segments(app, CRASH, { extra: ['time'] })].filter(g => !g.skipped);
+    assert.equal(segs.length, 1); const g = segs[0], end = g.fromS + (g.extra.time[g.n - 1] - g.extra.time[0]) / 1e6;
+    assert.equal(g.profile, 2); assert.ok(end <= 68.344, `the PID profile 2 segment ends at ${end} s`);
+    // G14 (IMP-12): the HOLD from the rxfail values at 68.645 s is a throttle hold in flight (the phase 0.1 s before it: the fall after the end
+    // of the flight at the last RC frame), with no receiver signal: its cause is the receiver signal loss
+    const g14 = F.find(q => q.id === 'G14'), h = g14.events.find(q => q.kind === 'throttle hold in flight');
+    assert.equal(g14.severity, 'flag'); assert.equal(g14.holds, 1); assert.equal(g14.cause, 'receiver loss');
+    within(h.tS, 68.645, 0.002, 'HOLD in flight'); assert.deepEqual([h.headspeed, h.rx, h.rxLoss, h.phase], [4494, 'lost', true, 'fall']);
+    within(h.tAfterS, 69.645, 0.002, '1 s after HOLD'); within(h.headspeedAfter, 1598, 30, 'the headspeed 1 s after HOLD');
+});
+
+// review IMP-12: the Fireball dumps of 2026-09-26 and 2026-09-29 (AUTOTUNE_LANDING_LOGS, the paths separated by the path delimiter): HOLD
+// follows the touchdown of each landing within about 1 ms of the flag drop. With the phases of health_phase.cjs, no landing is an in-flight
+// cut, and G14 has no "throttle hold in flight" that is not at a landing (measured 2026-10-16: 32 flights, 0 cuts, 1 HOLD at a landing)
+const LANDINGS = (process.env.AUTOTUNE_LANDING_LOGS || '').split(pathx.delimiter).filter(Boolean);
+test('real: the landings of the Fireball dumps 2026-09-26 and 2026-09-29: no in-flight cut, no throttle hold in flight (AUTOTUNE_LANDING_LOGS)', { skip: !LANDINGS.length && 'AUTOTUNE_LANDING_LOGS is not set' }, () => {
+    const lib = require('../tools/autotune/lib.cjs'), P = require('../tools/autotune/health_phase.cjs'), app = lib.loadApp(); let flights = 0;
+    for (const file of LANDINGS) for (const w of lib.segments(app, file, { whole: true, extra: [...new Set(M.EXTRA.concat(P.EXTRA, ['rxSignalReceived']))] })) {
+        if (w.skipped) continue; const fl = w.flight;
+        const ctx = { rate: fl.actualRate, govState: w.govStateAt || null, header: fl.header, flightRule: { headspeed: 2900 }, airborneEvents: true, profile: w.profileAt, app };
+        ctx.phases = P.phases(w, ctx); if (!ctx.phases.flights.length) continue; flights += ctx.phases.flights.length;
+        ctx.flying = Uint8Array.from(ctx.phases.code, (c) => c === 3 ? 1 : 0);
+        assert.ok(!ctx.phases.flights.some(f => f.cut), `${pathx.basename(file)} log ${fl.log + 1}: an in-flight cut`);
+        const m = M.analyse(w, ctx), g = M.judge([{ log: fl.log, header: fl.header, metrics: JSON.parse(JSON.stringify(m)) }], M.DEFAULT_RULES).find(q => q.id === 'G14');
+        assert.ok(!m.G14.entries.some(e => e.kind === 'throttle hold in flight' && !e.landing), `${pathx.basename(file)} log ${fl.log + 1}: ${JSON.stringify(m.G14.entries)}`);
+        assert.notEqual(g.severity, 'flag', `${pathx.basename(file)} log ${fl.log + 1}: ${g.text}`);
+    }
+    assert.ok(flights >= 10, `${flights} flights`);
 });

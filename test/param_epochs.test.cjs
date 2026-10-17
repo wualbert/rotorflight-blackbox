@@ -6,6 +6,9 @@
 //   node --test test/param_epochs.test.cjs
 //   PARAM_EPOCHS_LOG=<Fireball dump RTFL_BLACKBOX_LOG_SAB_Fireball_20261005_204823.BBL> node --max-old-space-size=8000 --test test/param_epochs.test.cjs
 //     also the real log (read only): its re-arms
+//   PARAM_EPOCHS_LOG=analysis/fireball-crash-20261015/crash.bbl node --test test/param_epochs.test.cjs
+//     a log of firmware with blackbox_params (a FULL parameter snapshot): the snapshot values of every PID profile, the PID profile at
+//     the start, the journal epochs of the 4.7 table, the I-term limits of L6 (IMP-05)
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
@@ -81,9 +84,17 @@ test('adjustments and logging resume', () => {
     assert.deepEqual(spans[1].adjust, [{ t: 7, func: 5, name: 'Roll Rate', value: 120 }]);
 });
 
-test('real log: the re-arms of the Fireball dump of 2026-10-05', { skip: !process.env.PARAM_EPOCHS_LOG }, () => {
-    const lib = require(path.resolve(__dirname, '../tools/autotune/lib.cjs'));
-    const app = lib.loadApp(), log = new app.FlightLog(require('node:fs').readFileSync(process.env.PARAM_EPOCHS_LOG));
+// the real log: a param log (blackbox_params) or a stock dump; each real-log test skips the other kind
+const PL = require(path.resolve(__dirname, '../tools/autotune/param_log.cjs'));
+function realLog() {
+    if (!process.env.PARAM_EPOCHS_LOG) return null;
+    const lib = require(path.resolve(__dirname, '../tools/autotune/lib.cjs')), app = lib.loadApp(), log = new app.FlightLog(require('node:fs').readFileSync(process.env.PARAM_EPOCHS_LOG));
+    return { lib, app, log, param: log.openLog(0) && PL.isParamLog(log.getSysConfig()) };
+}
+const REAL = realLog();
+
+test('real log: the re-arms of the Fireball dump of 2026-10-05', { skip: !REAL ? 'PARAM_EPOCHS_LOG not set' : REAL.param && 'PARAM_EPOCHS_LOG is a param log' }, () => {
+    const log = REAL.log;
     const armsOf = (i) => {
         assert.ok(log.openLog(i));
         const tMin = log.getMinTime(), chunks = log.getChunksInTimeRange(tMin, Infinity), t = [], events = [];
@@ -93,4 +104,39 @@ test('real log: the re-arms of the Fireball dump of 2026-10-05', { skip: !proces
     };
     // logs 2, 3, 5 and 12 (1-based) hold 2, 3, 2 and 3 arms (DISARM events and the arm switch, 2026-10-06)
     assert.deepEqual([1, 2, 4, 11, 0, 5].map(armsOf), [2, 3, 2, 3, 1, 1]);
+});
+
+test('real param log (crash.bbl): snapshot values of PID profile 2, the start profile, journal epochs, L6 limits', { skip: !REAL ? 'PARAM_EPOCHS_LOG not set' : !REAL.param && 'PARAM_EPOCHS_LOG is not a param log' }, () => {
+    const file = process.env.PARAM_EPOCHS_LOG, log = REAL.log; assert.ok(log.openLog(0));
+    const sc = log.getSysConfig(), got = PL.collect(log), rec = PL.assemble(got.strings), snap = PL.snapshotCli(sc, rec);
+    assert.ok(snap, 'a complete FULL snapshot');
+    assert.equal(snap.selectedProfile, 0, 'param_pid_profile 0: PID profile 1 at the start');
+    const want = { pitch_p_gain: 99, roll_i_gain: 110, pitch_i_gain: 110, yaw_p_gain: 50, yaw_i_gain: 116 };
+    for (const [n, v] of Object.entries(want)) assert.equal(snap.profiles[1][n], v, n);
+    // datasets.cjs: PID profile 2 has the snapshot values (source 'log snapshot'), PID profile 1 is the start profile
+    const DS = require(path.resolve(__dirname, '../tools/autotune/datasets.cjs'));
+    const inputs = DS.inputsOfFile(file, { app: REAL.lib.loadApp() }), ds = DS.datasets(inputs, null);
+    assert.equal(ds.logs[0].armingProfile, 1);
+    const B = ds.datasets.find(d => d.pidProfile === 2);
+    assert.ok(B && !B.assumed, 'PID profile 2 is known');
+    for (const [n, v] of Object.entries(want)) assert.deepEqual([B.values[n], B.sources[n]], [v, 'log snapshot'], n);
+    assert.ok(!ds.notes.some(t => /No log header shows the values of PID profile 2/.test(t)));
+    // the journal epochs with the 4.7 table: no effect-unknown, and the classic lines agree with the snapshot (self-test)
+    const tl = PL.buildTimeline({ sysConfig: sc, records: rec, frames: got.frames, resumes: got.resumes });
+    assert.equal(tl.semantics.known, true);
+    const frameS = Float64Array.from(got.frames.time, t => (t - log.getMinTime()) / 1e6), ep = PE.paramEpochs({ timeline: tl, frameS });
+    assert.ok(ep.length > 1);
+    assert.ok(ep.every(s => !s.reasons.includes('effect-unknown')), JSON.stringify(ep.map(s => s.reasons)));
+    const st = PL.selfTest(tl, sc);
+    assert.ok(st.compared > 0); assert.equal(st.mismatches.length, 0, JSON.stringify(st.mismatches));
+    // L6 (health_limits.cjs): the I-term limits of PID profile 2 from the snapshot, without a CLI dump
+    const HL = require(path.resolve(__dirname, '../tools/autotune/health_limits.cjs')), RS = require(path.resolve(__dirname, '../tools/autotune/health_rescue.cjs'));
+    const app = REAL.lib.loadApp();
+    for (const w of REAL.lib.segments(app, file, { whole: true, extra: [...new Set(HL.EXTRA.concat(RS.EXTRA))] })) {
+        if (w.skipped) continue;
+        const m = HL.analyse(w, { rate: w.flight.actualRate, header: w.flight.header });
+        const lim = (axis) => m.channels.find(c => c.id === 'L6' && c.axis === axis).limits;
+        assert.deepEqual(['roll', 'pitch', 'yaw'].map(a => lim(a).byProfile[2]), [990, 990, 2900]);
+        assert.ok(['roll', 'pitch', 'yaw'].every(a => lim(a).unknownProfiles.length === 0 && /snapshot/.test(lim(a).source)));
+    }
 });

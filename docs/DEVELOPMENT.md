@@ -602,6 +602,21 @@ windows 1.1 times it). Set it below the lowest governor target for a helicopter 
 `AUTOTUNE_FLIGHT_RPM=2000` for a 2300-2700 rpm rotor (`analysis/gaui-x4/`), and use the same value for every script of one
 analysis.
 
+**Receiver signal loss, in-flight cuts and the parameter snapshot (crash flight 2026-10-15, IMP-01 to IMP-12).** Section 13 has
+the details; in short:
+- `lib.segments` gives `rxLoss`/`rxLossAt` from `rxSignalReceived` and `rxFlightChannelsValid` (`failsafePhase` is always 0 since
+  d864d6496). Every analysis mask, segment and dataset leaves out the cut; the governor, power and limit checks keep it.
+- New checks: D10 (no receiver signal, `health_more`), D11 (in-flight cut and ground contact, `health_phase`) and D12 (the
+  failsafe throttle, information, `health_config`). `health_phase` adds the phases `fall` and `aftercontact` after an in-flight cut.
+- A log of a `blackbox_params` build (4.6.0-bbp 58a4bd5cc, 4.7.0-bbp-pr 85d7049a9) with a complete FULL snapshot is the source
+  of the values of every PID and rate profile (`param_log.cjs`), ranked above a CLI dump.
+- The replay accepts the release 118e912 and the audited builds of `firmware/equivalence.cjs` (IMP-06). `validation_power.cjs`
+  gives the number of flights that can show a calculated change (IMP-07).
+- Tests that use the crash log: `PARAM_EPOCHS_LOG=analysis/fireball-crash-20261015/crash.bbl node --test test/param_epochs.test.cjs
+  test/health_limits.test.cjs test/filter_tune.test.cjs test/health_setup.test.cjs`. `health_config`, `health_more`,
+  `health_phase`, `gov_data`, `validation_power`, `tuning_worker` and `ste_text` tests read it from the repository (they skip
+  without it).
+
 ### Method
 
 1. **Segments.** Airborne, spooled up, one PID profile, no logging gaps, 20 s or more. Grouped by headspeed
@@ -660,7 +675,7 @@ moment. Only the airframe response comes from the steady stretches of 20 s or mo
 
 | Step | What is computed |
 |---|---|
-| Groups of flights | From the pilot: `<out dir>/groups.json`, `{ "starts": [log numbers], "why": "what changed", "note": "status text" }` (`analysis/fireball-wag/groups.json` is an example). Without it, all flights form one group. What was changed on the helicopter is not in a log |
+| Groups of flights | From the pilot: `<out dir>/groups.json`, `{ "starts": [log numbers], "why": "what changed", "note": "status text" }` (`analysis/fireball-wag/groups.json` is an example). Without it, all flights form one group. What was changed on the helicopter is not in a log. A group with flights of more than `RULES.baseline` dates or files (1 and 1) is a mixed period: the report flags it in section 1, before the before/after quarters and in the decisions, because a pool of other dates is no baseline (PID profile 1 roll 1.37-1.42 × a pool that was 95 % one day, 1.10 × the same period: `analysis/fireball-crash-20261015/verify/tuning-content-F6-0/by_date.txt`). `results.json` has `groups[].days`, `files`, `mixedPeriod` |
 | Amplitude by profile | Half-second windows of gyro minus setpoint in the band of each axis, per group and profile; windows where the stick moves in the band are not counted as oscillation |
 | Spectrum by profile | Amplitude per 1 Hz band, to tell a hump (oscillation) from a slope (tracking error) |
 | Sticks | Amplitude at equal stick movement (collective, yaw stick, overall activity), and the share of the motion that the four sticks together explain, band by band (multiple coherence). A pilot who flies harder in later flights changes every other comparison |
@@ -714,6 +729,26 @@ quiet and the second to oscillate at the predicted frequency.
   the result, so the text stays on screen ("Open in the log viewer" in the panel goes to the viewer). "Show the measurement"
   opens the plot of one result against its limit, with its caption. The Analysis view has no log lens (removed 2026-10-06:
   it repeated the log viewer).
+- Two stages, each on demand. "Start analysis" (the Tuning view and the Analysis view: one run, one result for both views) measures
+  the selected flights with the checks and gives the changes of the check rules. "Autotune" then makes a model from the flights of
+  that result and tests other values in it: the filter model on the Filters tab (`filterTune`), the governor model on the Governor
+  tab (`governorTune`, all governor parameters) and the six-degree-of-freedom helicopter model on Cyclic gains, Tail gains and the two
+  compensation tabs (`controlTune`). They need the analysis: the gates, configurations and flight rpm come from the result.
+- "Autotune all" (after "Start analysis") starts the autotune of each step at once (`AUTO_STEPS`: Filters, Governor, Cyclic gains, Tail
+  gains, the two compensation tabs), each in its own worker, for the configuration on display. A step with a current result or no
+  data is skipped. One at a time (the first version) hid the queued steps for minutes: the pilot saw only the filter autotune. Each autotune runs in its own worker, so it continues when the pilot opens a
+  different tab or view: a bar on its tab (`autoBars`) and on the "Tuning" view tab (`hooks.autotuneProgress`) shows its progress.
+- The autotune of each tab has one bar (`autotuneBarHtml`, user 2026-10-17), at the right of the tab heading on Filters, Governor and
+  the four control tabs: "Autotune" (the reason of a disabled button next to it), the progress with "Cancel", or "Autotune completed".
+  The classes `tuning-ft-*`, `tuning-gm-*` and `tuning-ct-*` of the button, the bar and "Cancel" stay for the handlers. The control
+  panes get their progress from `autoBars`; "Autotune all" has the reason of a disabled button in its title.
+- A result of "Selected flights" has the key of its flights without the logs that it finds as bench runs or logs with no data
+  (`unusedLogs`): `selection()` leaves them out after the result. Without this, a run that started before the flight scan ended, or a
+  log that the scan gave as a flight log, made the result not current for its own selection: "Start analysis" was available again, and
+  the control "Autotune" and "Autotune all" were disabled (user, 2026-10-17).
+- The governor is always tuned with the governor model (user, 2026-10-15). The Governor tab has no helicopter-model autotune
+  (`isModelStep`), and `control_pipeline.tune` refuses the step `governor` before a model fit (`status: 'unsupported-step'`). The
+  helicopter model still calculates the governor in its closed loop when it can (`governorInputs`), for the other steps.
 - Every claim links to the part of the log it comes from ("Show in the log") and to a plot of the measured behaviour
   against its limit ("Show the measurement", with a caption of one STE sentence).
 - Nothing is sent to the flight controller. All text that the views show is ASD-STE100 (`docs/STE_GLOSSARY.md`).
@@ -734,12 +769,14 @@ markup, PR #84) stays byte-identical to upstream and is not used. Only its toolb
 | `js/tuning_plot.js` | Canvas plots: linear and log axes, two y axes, NaN gaps, uncertainty bands, hover readout, click to seek |
 | `tools/autotune/catalog.cjs` | One entry for each check id: STE noun, unit, scale, home item, subsystem (`areaOf`), Tuning tab, evidence spec, the lead texts (symptom, why, good, info) and the summary template; `summary(f)`, `lead(f, status)`, `status(f)`, `display(f)`, `tunerOf(f)` |
 | `tools/autotune/hierarchy.cjs` | The prerequisites (`PREREQ`: 6) and the tuning blocks (`BLOCKS`: 6, parameters only), 22 edges (`EDGES`: gate with an optional `scope`, order, cause with an optional `viaRules`, validity), K rules K1-K27 (`RULES`), `graph()` (the K1 shape), `status`, `causesOf`, `gateUpstream`, `homeOf`, `isPrereq`, `isBlock`, `LEGACY` (the round 1 ids) |
-| `tools/autotune/health_config.cjs` | Check D9: `rescue_mode` of each PID profile, from the CLI dump, a rescue state in the log or a header value |
+| `tools/autotune/health_config.cjs` | Check D9: `rescue_mode` of each PID profile, from the CLI dump, a rescue state in the log or a header value. Check D12: the failsafe throttle (see "Receiver signal loss") |
 | `tools/autotune/health_power.cjs` | Checks P1 (the battery voltage at the load steps, for each flight log) and P2 (the voltage decrease for each 1 A, for each battery) |
 | `tools/autotune/evidence.cjs` | The spans in frame seconds, the viewer request and the plot spec of each finding (`timeMap`, `toFrame`, `locate`, `forFinding`, `forDecision`) |
 | `tools/autotune/health_track.cjs` | Checks C12/T11 tracking error, C13/T12 time delay, R1 stick-to-setpoint time delay, C5/T1 fast oscillation; `curves()` |
-| `tools/autotune/health_more.cjs` | `normalMask` and D6 (rescue, level modes, failsafe), F10, F11, T13, C14, T14, G14; `curves()` |
-| `tools/autotune/health_phase.cjs` | Flights and flight phases (`phases`, `flightMask`), D7 log class, G15-G18 and C15 |
+| `tools/autotune/health_more.cjs` | `normalMask` and D6 (receiver signal loss, rescue, level modes, failsafe), D10 (no receiver signal), F10, F11, T13, C14, T14, G14; `curves()` |
+| `tools/autotune/health_phase.cjs` | Flights and flight phases (`phases`, `flightMask`; after an in-flight cut also `fall` and `aftercontact`), D7 log class, D11 in-flight cut, G15-G18 and C15 |
+| `tools/autotune/param_log.cjs`, `param_semantics.cjs`, `cli_defaults.cjs` | The parameter snapshot and the journal of a `blackbox_params` log (IMP-05), the loader and keys of each journal item for each firmware, and the CLI defaults of the audited builds (D4 with a `diff`) |
+| `tools/autotune/firmware/equivalence.cjs` | The audited builds other than 118e912 (IMP-06): the changed replayed files with their sha256, the conditions of each hunk, the per-log parity limits (`RULES`) |
 | `tools/autotune/health_rescue.cjs` | The checks at each rescue start: G19 headspeed, T15 tail, D8 PID profile change (all phases, rescue included) |
 | `tools/autotune/health_limits.cjs` | Control outputs at their limits (CLAUDE.md "Control limits"): L1 throttle, L2 collective, L3 cyclic, L4 tail, L5 servos, L6 I-term, L7 collective stick at its end, in all phases with no guard time |
 | `tools/autotune/advice.cjs` | Findings and `report.cjs` decisions to recommendations: tuning sequence, guards, causes, CLI text, `exportScript`; the coverage matrix; the configurations of a recommendation (`dataset`, `supportedBy`, `ab`, `slope`), `comparisons`, `filterRecommendations` |
@@ -750,6 +787,7 @@ markup, PR #84) stays byte-identical to upstream and is not used. Only its toolb
 | `tools/autotune/control_pipeline.cjs`, `firmware_controller.cjs`, `firmware/` | Native Rotorflight replay and artifact verification, digital-twin lifecycle, controller parity, closed-loop candidate search and refusal gates |
 | `tools/autotune/heli_twin.cjs`, `twin_fit.cjs` | Six-degree-of-freedom helicopter twin (state, equations, observer, linearization) and its identification, instrumented frequency responses, reserved-flight checks |
 | `tools/autotune/control_validate.cjs`, `twin_replay.cjs` | Production-worker real-log validation with resource hashes, and frozen saved-model replay |
+| `tools/autotune/validation_power.cjs` | IMP-07: the flights that can show a calculated change (per-flight SD, input-matched null, flights for each set of values, STE plan); `control_pipeline.tune` and advice C7 |
 | `docs/STE_GLOSSARY.md`, `test/ste/vocabulary.json`, `test/ste_text.test.cjs` | The STE rules, words and lint |
 
 Tests: one file for each part (`test/catalog.test.cjs`, `hierarchy`, `evidence`, `health_track`, `health_more`,
@@ -891,7 +929,7 @@ Our modules mark a result with too little data with `thin: true` (not a text tha
 
 ### Catalog
 
-`catalog.cjs` has one entry for each check id: D1-D9, H, SETUP, F1-F11, G0-G21, C1-C15, T1-T15, R1, C7, L1-L7, P1 and P2. Each
+`catalog.cjs` has one entry for each check id: D1-D12, H, SETUP, F1-F11, G0-G21, C1-C15, T1-T15, R1, C7, L1-L7, P1 and P2. Each
 entry gives an STE noun of three words or fewer, the display unit and scale, its home item, its subsystem, its Tuning tab, the
 evidence spec (source, pads, fields, analyser field, plot kind and reference lines, expected behaviour), the lead texts and a
 summary template. Limits come from the finding's `threshold` and the modules' `DEFAULT_RULES`; a threshold that is only a string
@@ -1031,7 +1069,8 @@ controller"), log fields are necessary, more flights are necessary, or a log can
 - D4 marks a CLI value as old only when `cliSection.usable` is true: the compared section is the one of the confirmed arming
   profile, not one that a guessed label chose.
 - A "from" value of PID profile p comes only from the CLI section `profile p-1`, from the gains that `report.cjs` recovered
-  for p (an estimate, no CLI), or from the log header when p is the confirmed PID profile at arming.
+  for p (an estimate, no CLI), or from the log header when p is the confirmed PID profile at arming. A complete parameter
+  snapshot in the log header (blackbox_params FULL) is the log header of every PID profile (IMP-05, datasets source `log snapshot`).
 - The diagram has a PID profile menu: one PID profile, or "All PID profiles" with one status for each PID profile.
   `hierarchy.status` gives `byProfile` (the status of each PID profile), `profiles` (their keys, `'0'` for unknown) and,
   for each node, `profiles: { [key]: status }`. The findings of a bench run do not count.
@@ -1079,6 +1118,121 @@ the reasons `grace`, `rearm`, `switched`, `unlogged` (a `govRequest` step with n
   `govRequest` step with no event) and "a CLI dump that disagrees with the log". `test/helpers/bbl_encode.cjs` writes DISARM,
   FLIGHT_MODE and SYNC_BEEP events (`log.events`).
 
+### The parameter snapshot and the journal (firmware with `blackbox_params`, IMP-05)
+
+A log of a build with the blackbox parameter journal (4.6.0-bbp 58a4bd5cc, 4.7.0-bbp-pr 85d7049a9; `param_mode FULL`) has in its
+header a snapshot of every tracked setting: the global values, the values of all 6 PID profiles and all 6 rate profiles, the
+servos, mixer inputs, mixer rules and features (`set.*`, `set@p.*`, `set@r.*`, `el.*`), the PID profile and the rate profile at
+the start (`param_pid_profile`, `param_rate_profile`), and `param_end` (line count and FNV-1 hash). The C records of the journal
+give each change after that. When `param_log.isParamLog(sysConfig)` and the snapshot is complete (the count and the hash agree),
+the snapshot is the source of the values of the log, ranked above a CLI dump. Without a complete snapshot nothing changes.
+
+- `param_log.snapshotCli(sysConfig, records)` gives the snapshot in the shape of a parsed CLI dump (with the records before T0);
+  `snapshotOf(header)` once for each header object. Source name `'log snapshot'` (`SNAPSHOT_SOURCE`). Mixer rules have the
+  names of the CLI line (`set SC S1 1000 0`: oper, input, output, weight, offset), `rxfail` the CLI shape (`{ 4: ['s', 1500] }`,
+  pulse = 875 + 5 x step; `health_setup.parseCli` reads `rxfail` lines in the same shape). The worker (`decode`) and
+  `datasets.inputsOfFile` give the snapshot with the records before T0 to every module through `rememberSnapshot(header, snap)`;
+  `datasets.configurationHeader` copies it to its header copies.
+- `param_log.journalChanges(timeline, frameS)`: the C items after the log start for every stamp kind (an interval stamp at its end
+  n1, `uncertain`), at the frame at or before the stamp (`timeline.frameOf`; a stamp after the last frame at the last frame). The
+  worker (`d.param.journal`) and `datasets.inputsOfFile` use it, so the two paths give the same times.
+- `health.cjs buildCtx`: with a snapshot, `govHeadspeed`, `maxThrottle` (each PID profile) and `cells` (the element of
+  `bat_profile` in 4.7) come from the snapshot (`snapshotContext`, `ctx.paramSnapshot`, source "parameter values in the log
+  header"), not from a CLI dump; the worker does not filter them with the CLI checks (`cliMaxThrottle`). G6, G21, L1 (source
+  `snapshot`), D5/G13 and P1 use them.
+- `gov_sim.configOf`: priority 0 is the snapshot of the log of the run (every governor value, the gear, the voltage source and the
+  cell count), source "log header (the parameter values of log N)". `gov_tune`: the snapshot of the newest flight log only (an
+  older snapshot does not hide newer header epochs); a value of the snapshot has no `switched` flag, and a log with a snapshot
+  (and thus a journal) has no `rearm` or `resume` flag of `logInfo` (the journal epochs of the worker give its causes).
+- D9 (`health_config.cjs`): the rescue values of every PID profile from the snapshot of the newest flight log (basis `snapshot`,
+  above a CLI dump; the worker gives `extra.snapshots`).
+- `datasets.cjs`: every PID profile and rate profile has the snapshot values (source `log snapshot`, not assumed); the PID profile
+  at the start is `param_pid_profile` + 1 when the caller does not confirm one; `logs[].journal` (`{ t, key, value }` after the
+  log start) changes a value from its time (source `log journal`, a recorded value), and then the value adjustment events are
+  not used. A journal `rate_profile` item is a rate profile switch. The worker gives both (`decode` collects the S-frame columns
+  and the event-101 strings of a param log: `d.param`).
+- The worker: the start profile has the basis `snapshot` (confirmed; `advice.cjs`, `hierarchy.cjs` CONFIRMED); the epochs of a
+  log with a complete FULL snapshot are `paramEpochs({ timeline, frameS })` (`check: 'journal'`, source `journal`, the journal
+  reasons with their texts in `FRESH.journalReasons`, and `changed` after a recorded change of a value in force (the PID profile
+  and the rate profile of the part, or a global value), with `keys.changed`: some checks use the values at the start of the log,
+  the configurations use the new value). `mixed` with no key (an A record that loads the values that the journal has) is dropped.
+  The text of a part names the changed and the unknown values and the source of the other values (`journalText`); `causeText`
+  fills each sentence to 25 words and 3 causes at most, and gives 2 sentences at most. No gear fit for a log whose snapshot gives
+  the gear ratios; `cliStatus.conflicts` has `what: 'snapshot'` when D4 finds differences; `result.paramSnapshot { logs, all }`
+  (the "No CLI dump" block of the views then names the values that the log does not record).
+- `control_pipeline.gainEpochReasons`: a journal reason with keys counts only for a key that the replay reads (the schema names, the
+  gains of the PID profile of the epoch, `el.mixin`/`el.mixrule`/`el.servo`); `changed` only for an element (datasets applies the
+  other changes).
+- D4 (`health_setup.compareSnapshot`): every snapshot value against the CLI dump. For a `diff`, a name that the dump leaves out
+  has the default of the build of the dump (`cli_defaults.cjs`: tables of 85d7049a9 and 58a4bd5cc, also 874f369d5 and 118e912,
+  from `dump all` and `diff all` pairs of the same session, board MATEKG474HELI: `forRevision(dump text)` also matches the
+  `board_name` line, and a dump of another board or with no board line gets no table). Each difference names its PID profile.
+  The log wins: the text says that the dump is not of the time of the log. `advice.cjs` makes a snapshot row of PID profile p
+  stale only for PID profile p (`staleCliProfile`).
+- `health_limits.cjs` (L2-L6), `health_setup`/`health_more` gear ratios (F5, F6, F9), `filter_tune.config` (source `header`),
+  `filter_autotune.prepare` (governor ratio, no `cliNeeded`), `gov_tune.currentValues` (source "log header (the parameter values
+  of ...)", a dump that does not agree is not a conflict), `control_pipeline.recordedGainEvidence` and `targetConfig` (an interval
+  with label source `log snapshot` has recorded gains for every PID profile) use the snapshot.
+- `param_semantics.forFirmware`: the 4.7.0 table (`RULES.firmware47`, only the audited build 85d7049a9; another 4.7.0 build has no
+  table and its epochs are `effect-unknown`): the same loaders and keys, `error_decay_gain_cyclic` (loader pid), and `CLASSIC_47`,
+  whose `vbatcellvoltage` is the element of `bat_profile` of the battery lists. `firmware_controller.fromHeader` takes that element
+  of the battery lists too.
+- Crash log of 2026-10-15 (`PARAM_EPOCHS_LOG=analysis/fireball-crash-20261015/crash.bbl`): PID profile 2 from the snapshot
+  (pitch P 99, roll and pitch I 110, yaw P 50, yaw I 116), start PID profile 1, 19 journal epochs (18 fresh, 1 mixed), self-test
+  72 keys with 0 mismatches, L6 limits of PID profile 2 990/990/2900, D4 with the 16:53 dump 12 differences of 1073 values. With
+  no CLI dump, L1 and G6 have the throttle maximum 1000 of PID profiles 1 and 2 from the snapshot
+  (`PARAM_EPOCHS_LOG=... node --test test/health_limits.test.cjs`).
+
+### Receiver signal loss (IMP-01, IMP-02, IMP-11)
+
+`failsafePhase` is always 0 on Rotorflight 4.3 to 4.7 (`failsafeStartMonitoring()` has its only statement commented out, commit
+d864d6496; 4.3.0, 4.5.0, 4.6.0 118e912, the bbp builds 58a4bd5cc and 874f369d5, and 4.7.0 85d7049a9), and the FAILSAFE bit of
+`flightModeFlags` is the failsafe switch. A loss of the receiver signal shows only in `rxSignalReceived`, `rxFlightChannelsValid`
+and `rssi`.
+
+- `lib.cjs` (`RX_LOSS`, `rxLossSpans`): a loss is a run of either flag at 0 with an armed frame (the field `armed` of a
+  blackbox_params log, else armed to each DISARM event and again from the next rise of the ARM switch, and only with the ARM switch
+  on: a 4.6 log can start with it off). Its cause (rx.c `detectAndApplySignalLossBehaviour`): `signal` (rxSignalReceived 0: the last
+  RC frame is 100 ms before the flag drop, `DELAY_100_MS`, and the rxfail values come `holdS` 0.3 s after it at the 100 ms
+  rechecks), `switch` (the FAILSAFE bit 7 of `flightModeFlags` at the drop: the pilot's values stop at the drop, the rxfail values
+  come 0.3 s later) or `channel` (rxSignalReceived 1, no switch: a control channel out of `rx_pulse_min`..`rx_pulse_max`; the flag
+  drops only with the rxfail values, 0.3 s after the last good value; also the cause without `flightModeFlags`). rssi goes to 0
+  250 ms after the last link-statistics frame. The cut of a loss is [last RC frame - `guardS` 0.01 s, RX return + `settleS` 1 s).
+  `lib.segments` gives `rxLoss` (the spans with a frame of the loss in the segment, in samples; null without the flags) and
+  `rxLossAt` (the cut in the segment, also the guard or settle time of a loss of the segment before a logging gap) for a whole log,
+  and the analysis segments (extract.cjs) end before a cut and start again only after it, with the airborne and headspeed rules.
+  The worker's `sliceSegment` keeps the same rule.
+- The cut is out of the health.cjs and wag.cjs flight masks, `steadySegments`, spectra.cjs, line.cjs, the filter_tune default mask
+  (and the worker's fallback when `normalMask` stops), `health_more.normalMask` (reason `rxLoss`, not widened by `spanGuardS`), the
+  governor tracking mask of the worker, the flights of `datasets.cutFlights` (inputsOfFile and the worker's `dsInput`: a flight
+  gives a part before and after the cut, with its index `flight`; a flight fully in a cut stays an empty item) and the gov_data runs
+  (`partsOf`: one run for each part out of the cut that is `rxLossMinS` 1 s or longer; the worker note gives the seconds left out).
+  The governor, power and control-limit checks keep these frames in the masks of all phases and of the rotor.
+- Difference that stays: without flight phases (the app with no health_phase.cjs, and health.cjs on the command line), one mask
+  carries the governor tracking checks and the checks of all phases, and it leaves out the cut (the health.cjs flight mask). Thus
+  there D5, G12, G13, G21 and the state census do not get the frames of a loss. The cut is not put back, because the same mask
+  gives the tracking checks, which must not see the held or rxfail throttle.
+- D10 (health_more): each loss with its cause, start, duration, the inferred last RC frame, the time of the rxfail values, the
+  rssi 0 run, the rssi before it (dBm for CRSF with `crsf_use_rx_snr` OFF), the governor state there, and the flight phase and PID
+  profile of each part. A problem when the median headspeed from the last RC frame to the RX return (at most `rotorAfterS` 0.1 s
+  after the rxfail values) is at the flight rpm or more, else a value to monitor (one false RPM reading, check G21, does not
+  change it). One result for each log (the records of its segments joined). The worker runs health_more also on a flight log that
+  health.cjs does not call flown (a short flight, a calm hover), with the all-phase context: only D10 (`d10Only`), the other checks
+  skipped. D6 counts the cut in the flight phase as flight that is not used (`rxLossS`), and its text gives the cut of D10. Crash log 2026-10-15: one loss,
+  68.4444 s, 2096.5 ms, last frame 68.3444 s, rxfail values 68.6444 s (logged 68.6453 s), rssi 0 for 2016.2 ms, HOLD.
+- D12 (health_config, information): the failsafe throttle of the snapshot of the newest flight log (else the CLI dump), its band of
+  the FUNCTION throttle (off below rc_min_throttle - 5 µs, IDLE, AUTO, MAX), the governor state from ACTIVE, the motor stop time
+  (the spool-down rate 10 / `gov_spooldown_time` for each second) and the recovery time limit, the other rxfail values with their
+  risks, and the note that failsafe stage 2 does not operate. No recommendation and no export line. Crash log: `rxfail 4 a` =
+  1031 µs, off, HOLD, the motor stops 0.3 s to 0.4 s after the last frame; `rxfail 4 s 1500` (option B): AUTO, AUTOROTATION, the
+  motor stops after 6.1 s from the throttle 0.766 at the loss. The throttle at the loss is used only for a loss with the motor on
+  and the governor ACTIVE or the headspeed at the flight rpm, else the median in flight. A CLI value that is not a step
+  (`rxfail 4 s 1037` in a restore script) is calculated as the stored step (1035 µs) and the text gives both. A CLI dump with other
+  values than the snapshot (`cliAlt`, `cliDiffers`) is in the summary and in the second paragraph. The recovery texts give the
+  conditions of governor.c (the throttle more than the handover value with a good RPM signal; HOLD changes to OFF after its time
+  limit only with the input off, else to IDLE). `gov_mode` LIMIT and DIRECT are not modelled: a thin note with the stored throttle.
+- The Fireball dumps of 2026-09-19 to 2026-10-15 and the bench logs of 2026-10-13 to 2026-10-15 have no other loss.
+
 ### Flights, phases and bench runs
 
 `health_phase.cjs` (the health module contract: `EXTRA`, `RULE`, `DEFAULT_RULES`, `analyse`, `judge`, `curves`):
@@ -1099,7 +1253,38 @@ the reasons `grace`, `rearm`, `switched`, `unlogged` (a `govRequest` step with n
   (`result.headerLog`, with a note).
 - `report.cjs` gets a segment only if 90 % of it is in the attitude mask (flight phase without rescue, level modes and
   failsafe) and it lies between the liftoff and the touchdown + 0.1 s (`SEGMENT` in the worker). On the Gaui dump this keeps
-  4 of 10 segments, too few for a gain decision (3 flights for each headspeed bin).
+  4 of 10 segments, too few for a gain decision (3 flights for each headspeed bin). Since IMP-04 the worker passes the flights
+  of the flight logs to `extract.cjs --clip=<json>` (`clipSpans`): a segment is cut to the flight that it overlaps most (and
+  kept if it is still 20 s or longer) instead of dropped. `lib.solve` gives null with no row, and section 5 of `report.cjs`
+  writes "No result: n segments, k necessary" when it has no more observations than regressors (crash log: 0 yaw
+  observations, the gain table of PID profile 2 with pitch P 98.9 and roll I 109.5). `extract.cjs --clip` takes one log file only.
+- In-flight cut (IMP-03, `health_phase.cjs` head and `RULE.td`): the firmware clears AIRBORNE when the motor stops
+  (airborne.c `touchdown()`: `isSpooledUp()` is false in OFF, IDLE and HOLD; the same in 4.6.0 118e912, 58a4bd5cc and 4.7.0
+  85d7049a9), also at 5 m. Three cases (review 2026-10-16), each with no touchdown jolt before the end of the control:
+  (1) a receiver signal loss (`w.rxLoss`) that starts after the liftoff and not after the flag drop, with the collective at the
+  liftoff level or the altitude 0.5 m over the level before the liftoff at the inferred last RC frame, and the flag drop in the loss
+  or up to `RX_LOSS.settleS` after the RX return, or a contact step in the loss. The cut is the first governor change into OFF,
+  IDLE, HOLD or AUTOROTATION after the last RC frame (the stage-1 change), not the flag drop: with the pilot's option B (rxfail 1500,
+  the AUTOROTATION band) `isSpooledUp()` stays true and the flag drops late or never. With no such change (an rxfail throttle in
+  the ACTIVE band) the event has `motorCut` false and state null, and D11 writes "no RC control", not a motor cut. (2) A flag drop
+  `cutTieS` 0.01 s or less after such a governor change by the pilot, with the collective at the liftoff level and an altitude
+  decrease of 0.5 m or more to the ground contact (drift free: the level before the liftoff drifts up to 2.5 m at the end of a
+  flight); a contact `RULE.td.landingS` 0.5 s or less after the cut is a landing (`touchdownBy` 'ground contact'). (3) A flag
+  drop with `failsafePhase` > 0. Each ends the flight at the earlier of the inferred last RC frame and the cut (`touchdownBy`
+  'in-flight cut'). Two phases follow: `fall` (from the end of
+  the flight to the ground contact: the first gyroRAW roll or pitch step of more than `crashFactor` 2 x the largest step of the
+  flight, back to the start of the steep rise; else the touchdown jolt) and `aftercontact` (to the disarm; after a cut by the pilot
+  with no contact step, also to the motor start or the rotor stop). RECOVERY or ACTIVE after a contact is neither a spool-up nor
+  ground. D11 is "not measured" with no AIRBORNE_STATE, or with no GOVSTATE, receiver fields and failsafePhase. Its problem threshold
+  is `DEFAULT_RULES.D11.crashFactor` 2 (the 6 landings of the 2026-10-05 dump: 0.45-1.15 x, the crash 4.4 x), and its phases
+  (`PHASES_OF.D11`: flight, fall, aftercontact) are the phases of the catalog. `health_more.normalMask` does not count the fall as ground contact, so the
+  flight before the cut is not widened away. Check D11 (health_phase, home Rescue, area radio) reports each cut: a problem after
+  a receiver signal loss or a failsafe, or with a strong contact; a cut by the pilot is a value to monitor. Crash log 2026-10-15:
+  flight 22.489-68.344 s, fall to the contact at 70.4435 s (1.798 s after HOLD at 68.645 s), after contact to the disarm at
+  72.841 s; normalS 44.9 s (43.2 s before), C8 PID profile 2 roll 10 windows. On the Fireball dumps of 2026-09-19 to 2026-10-05
+  no flight end changes. The governor and power checks of all phases (D5, G12, G13, G21, the state census, P1, P2: `PHASE_USE.load`
+  in the worker, `LOAD_PHASES` in the catalog) leave out the fall and the time after the contact (no flight load); the control
+  limits, the rescue checks, D10 and G14 keep every phase.
 - The governor runs three times in a flight log (`metrics.gov.phaseMasks`): all phases for D5, G12, G13 and the states;
   ground and flight phases for the G1 glitch test; ground and flight at the flight rpm or more, without rescue, level modes and
   failsafe, for G0 and G2-G11 (health_gov adds its own ACTIVE gate). The findings carry `phase` ('all' or 'ground+flight')
@@ -1232,7 +1417,7 @@ validated in flight. Flags that have a standard error must pass a 2-SE test.
 | P2 | with `Ibat`: the voltage decrease for each 1 A at the steps with 10 A or more, for each battery (a new battery when the start voltage is 0.15 V for each cell or more over the end of the previous flight log) | information; monitor when 1.3 x the median of the other batteries by 2 SE |
 | G20 | at each change to FALLBACK (LOST_HEADSPEED before 4.6), with or without a rescue: signal (the glitch rule of governor.c with the throttle under 95 % before the change; else a sudden change of check G21, the same detector `health_gov.spikeScan`, 30 ms or less before the change at any throttle: critique C12, the Fireball FALLBACK entries come at 100 % throttle 1-22 ms after one), overload (the G19 overload test: the throttle at 95 % or more, a headspeed fall of 2 % or more, 0.3 s or less before the change) or none; `causes` lists signal and overload when both apply. `value` counts the entries with an overload sign, also with a signal error (`overloadOnly`: the overload alone), and the summary names both causes; `signal.startS`/`endS` give the first and last fast sample of the sudden change against the change (negative: after it), the words of G21 "during a sudden change or 30 ms or less after its end" (review 2026-10-15) | information. `G1:overload` describes coincident output limits (not for a FALLBACK that G20 gives to the signal, also when G19 finds an overload); G1 remains an unresolved RPM prerequisite because timing does not establish a correct RPM signal |
 | G21 | `health_gov.cjs` (analyse: `spikeScan`, `ceilingsOf`, `vcompBlocks`; judge: `g21Pool`, `g21Test`): the sudden changes of the headspeed signal in each throttle band against the governed time at the throttle maximum, and each FALLBACK entry with its throttle and the change before it (docs/TUNING_KNOWLEDGE.md 10.2). With GOVSTATE the governor states select the samples, not the mask: the worker takes it from the mask of all phases (`GOV_ALL`), and the result is the same in every mask | problem: k ≥ 3 changes at the maximum, binomial p < 0.001 and the rate under the maximum 1/10 or less of the rate at the maximum, for a PID profile, or for all PID profiles together when a PID profile has 1-2 changes at its maximum and its own rates keep the 1/10 rule (`basis: 'pooled'`); note: changes with no such relation; skipped ("not measured"): no time at the maximum, no change in less than `minOkS` (12 s) at the maximum, or no sample with the governor in RECOVERY, ACTIVE or FALLBACK. A PID profile with 3 or more changes at its maximum always takes its own test. One change is one episode (review 2026-10-15: the binomial test needs independent trials): the samples faster than 40 rpm/ms with gaps of 300 ms or less (the 200 ms FALLBACK detect delay and 100 ms), 1 s long or less, with one sample or more over the limits; its throttle is the maximum of `motor[0]` in the 20 ms before its start, its sign the sign at its start, and `pulses` its runs over the limits. On the four governed Fireball dumps (38 unique flight logs): 17 of 19 changes at the maximum in 59.3 s of 5619 s (p = 4e-32), all upward, 0 in 47 s at 95-99.5 %. `DEFAULT_RULES.G21` (and `health_report.cjs` RULES) |
-| L1-L7 | each sample at 0.5 % of its limit or nearer, gaps of less than 50 ms joined; for each period the frame times, the phase, the PID profile, the rescue state, the other outputs at their limits (a servo that follows its mixer input, correlation 0.9 or more, is the same output), the headspeed error, the rate error and the tracking ratio at the best time delay (C12) | Monitor for a period; flag for a period of 100 ms or more, an error more than G3, T6 or C12, or two outputs at their limits at the same time. Limits: L1 gov_max_throttle (CLI) or the firmware 100 %; L2 collectiveRange of the header (else `mixer input SC`); L3 the clamp in the flight data (the C2 rule, else `mixer input SR, SP`); L4 the T8 limits (else the clamp in the flight data, else `mixer input SY`); L5 the `servo` lines of the CLI dump only (the extreme of a servo in the data is the servo at the stick end, Gaui X4 #50); L6 SCALE.I x I gain x error_limit (CLI section, else the header for the PID profile at the start); L7 rcCommand[3] at ±500 (rc.c), in flight and in a rescue. Else "limit unknown" (skipped). The firmware has no PID sum limit: the mixer input limits are the output limits of the axes |
+| L1-L7 | each sample at 0.5 % of its limit or nearer, gaps of less than 50 ms joined; for each period the frame times, the phase, the PID profile, the rescue state, the other outputs at their limits (a servo that follows its mixer input, correlation 0.9 or more, is the same output), the headspeed error, the rate error and the tracking ratio at the best time delay (C12) | Monitor for a period; flag only for a period of 100 ms or more, in flight or in a rescue, in which the output does not move the gyro rate to the setpoint (`stuckOf`: the gyro from the first to the last quarter, in the direction of the setpoint, less than `DEFAULT_RULES.stuck.progress` = 20 % of the largest error in a quarter window; L1, L2, L7: the headspeed decrease at the start less the decrease at the end) and the error at the end is more than its limit (30 deg/s, `stuck.rate`; the G3 headspeed decrease for L1, L2, L7). Not the error alone: a stick that moves to its end raises the setpoint while the gyro accelerates (Gaui X4 II 2026-10-04 log 41, 24.69 s), and a torque change can raise the error and let it fall with the output still at its limit (Fireball 2026-10-05 log 15, 9.93 s). A short period, or one in which the gyro moves to the setpoint, is the response at its maximum rate (user, 2026-10-16). A stuck rate period with the gyro under the setpoint (`stuck.unreached`) gives the rate that the helicopter gets to; the advice tells the pilot to set the full-stick rate of the rate profile to it or less. Limits: L1 gov_max_throttle (CLI) or the firmware 100 %; L2 collectiveRange of the header (else `mixer input SC`); L3 the clamp in the flight data (the C2 rule, else `mixer input SR, SP`); L4 the T8 limits (else the clamp in the flight data, else `mixer input SY`); L5 the `servo` lines of the CLI dump only (the extreme of a servo in the data is the servo at the stick end, Gaui X4 #50); L6 SCALE.I x I gain x error_limit (CLI section, else the header for the PID profile at the start); L7 rcCommand[3] at ±500 (rc.c), in flight and in a rescue. Else "limit unknown" (skipped). The firmware has no PID sum limit: the mixer input limits are the output limits of the axes |
 
 ### The rescue checks and the control limits
 
@@ -1261,6 +1446,26 @@ validated in flight. Flags that have a standard error must pass a 2-SE test.
   model (`gov_tune.cjs` GT13, `gov_scenarios.cjs` GC6) uses the same detector and test: with a G21 problem, the GC6 row of
   `gov_max_throttle` gives the model cost of that value as a check with no CLI text of its own (no second set line in the export).
 - The verdict has a card "Control limits" for L1-L7; the lens shows their periods (up to 10 spans each, `evidence.maxSpans`).
+- IMP-12 (`health_limits.cjs`): the mixer-input and servo limits come from the parameter snapshot of the log header (el.mixin,
+  el.servo) or the CLI dump before the data; a limit from the data (cyclic, swash ring, tail) needs plateau evidence
+  (`RULE.clamp.minFrames` samples at it with the PID sum, axisSum, more than it). Crash log: roll +-1250 from the snapshot (the
+  data extreme +415/-435 follows axisSum: no in-flight period), the tail -1517/+1021 (in flight 32.639-32.677 s). L7 counts the
+  high end of the collective stick in every phase while armed with the rotor turning (`RULE.turningRpm` = health_phase
+  `RULE.spinRpm`) or in flight, the low end in flight and in a rescue only. A CLI limit that a T8 or plateau limit of this log
+  contradicts by more than `RULE.pile.tol` gives way to the limit of this log (`conflict`, with a note: the dump is possibly not of
+  that time). A period is split where a cause starts or ends, and each part gets its `cause`: 'receiver loss' (the cut of a loss,
+  lib.cjs rxLossAt), 'fall', 'after contact'. Only the periods in flight or in a rescue decide a problem; a period on the ground
+  is a value to monitor (`groundN`), and the periods out of flight (at IDLE, in the spool-up or the spool-down, or the rotor under
+  `RULE.turningRpm`: the pre-flight stick check) are a finding of their own (`outOfFlight`, a value to monitor in its home block,
+  no limit recommendation). judge puts the periods with a cause in a finding of their own (severity note, never "Satisfactory", no limit
+  sentence, the text names checks D10 and D11), which `hierarchy.nodeOfFinding` puts under the Rescue item (the area radio in
+  the catalog; `catalog.issues` keys it `<id>|<axis>|cause`): it is not a problem of a tuning block, and advice gives it no limit
+  recommendation. G14 decides "in flight" from the phases (the flight and the fall, never after the ground contact), and advice
+  gives a G14 with a cause no governor recommendation. G14 (`health_more`
+  `RULE.hold`) records each HOLD from ACTIVE in flight (the phase 0.1 s before it is the flight or the fall), with the
+  headspeed 1 s after it and the receiver signal, and flags it as a throttle hold in flight; a HOLD 0.5 s or less before the
+  touchdown is a landing. When every flagged change is a HOLD with no receiver signal, G14 has `cause` 'receiver loss' and
+  goes under Rescue too. Crash log: HOLD at 68.645 s, 4494 rpm, 1598 rpm 1 s later.
 
 ### Flight selection
 
@@ -1272,12 +1477,25 @@ in frame seconds (`all`: the logs with every flight); `result.flights` has the a
 analysis: log 1 (all flights), log 2 flight 2 (50.0 s to 83.0 s).") is a note, the first line of `reportMarkdown` and a line of the
 verdict. `result.scope` stays "file". extract.cjs and report.cjs get only the segments of the selected time.
 
-The "Logs" control (2026-10-06) has "All flights in the file" (the default: the worker leaves out the bench runs and the logs with no
-data), "Selected flights" and "This log". The value stays for the session, and the Analysis view has the same control
-(`TuningDialog.scopePanel()`, `scopeAction(act)`, `onSettings(cb)`; the hooks `scopePanel`, `scopeAction`, `onSettings` of `js/main.js`), so
-the two views use one setting. Both views start their runs with it, also the automatic run of the Tuning view (`show()`, for "All
-flights in the file" and "This log"; for "Selected flights" the pilot starts the run). With "Selected flights" of every flight and a
-result of all flights on display, the result is not for other settings (`sameFlights`):
+The "Logs" control (2026-10-06) has "All flights in the file" (the worker leaves out the bench runs and the logs with no data),
+"Selected flights" (the default since 2026-10-15, with every flight of the scan selected) and "This log". The value stays for the
+session, and the Analysis view has the same control (`TuningDialog.scopePanel()`, `scopeAction(act)`, `onSettings(cb)`; the hooks
+`scopePanel`, `scopeAction`, `onSettings` of `js/main.js`), so the two views use one setting. Both views start their runs with it.
+
+The analysis runs on demand only (user, 2026-10-15: some flights are possibly not usable). Opening a view starts no analysis; the pilot
+selects the flights and clicks "Start analysis". "Start analysis" is disabled while the result on display is of the selected values and
+of the log on display (`isCurrent`). For the flight list before an analysis, `ensureScan` (called by `renderChrome` and `scopePanel`,
+not for "This log") posts the worker command `scanFlights` once for each open file:
+- `scanFlights` runs the first pass of `analyseFile` (the flight rpm of every log), then decodes each log again with the same columns
+  and finds its phases at that rpm as `selectFlights` does (`cli: null`). Thus flight k of a log in the list is flight k of a selection.
+  Its result has `records` (log, segment, logClass, phases, flights, phaseSeconds, noData), `flights`, `benchRuns` and `noData` in the
+  shapes of the TuningResult, so `flightsOf` reads it. `knownFlights` uses it for each log that no result of the file knows.
+- No checks run. On the Fireball dump of 2026-10-05 (16 logs) the scan takes 17 s against 103 s for the analysis, on the Gaui X4 dump of
+  2026-10-04 (59 logs) 23 s against 59 s (two decodes of each log; most Gaui logs are bench runs, which the analysis does not examine).
+  On both dumps the flights (to 0.01 s), the bench runs and the logs with no data are the same as those of the analysis of the file.
+- While the scan operates, the list help gives its progress, and the logs are full logs only. A scan that fails gives its error.
+
+With "Selected flights" of every flight and a result of all flights on display, the result is not for other settings (`sameFlights`):
 - The key of a file or flights run has `*` for the log (`keyFor`): the result is of the file, and another log in the viewer shows the
   same result, with the notice that its curves and header are of the log that was on display when it ran. "Start analysis" runs
   again with the log on display. A "This log" key keeps the log.
@@ -1381,10 +1599,20 @@ The control workspace's **Parameters in selected logs** panel accepts an explici
 parameters did not change. The confirmation applies separately to each PID profile and requires an original-header
 donor for that profile. It does not supply missing gains or certify unchanged mechanics. The browser persists this
 evidence under the full file SHA-256, and the worker independently verifies the hash and zero-based local log indexes.
-Changing the range removes confirmation and invalidates all control results and exports for that file. Current CLI
-values remain hypotheses; they cannot overwrite historical header gains. API callers can supply canonical
-`options.parameterContinuity` assertions or an explicit `parameterContinuityRequest`; results return the verified
-assertions and source files even when model validation fails.
+Changing the range removes confirmation and invalidates all control results and exports for that file. API callers can
+supply canonical `options.parameterContinuity` assertions or an explicit `parameterContinuityRequest`; results return the
+verified assertions and source files even when model validation fails.
+
+A CLI dump that the pilot selects (`options.cliText`, user decision 2026-10-15) supplies the values that the log header
+does not record. The Rotorflight 4.6 header has no `pid_mode`, swash, mixer or servo settings, and only the gains of the PID
+profile at the start of the log. `control_pipeline.userCli` maps the global section and the section of each PID profile;
+`targetConfig` fills every unknown value from it (source `CLI dump that the pilot selected`), and `recordedGainEvidence`
+takes the gains of a later PID profile from its CLI section. The header still wins for the PID profile at the start of the
+log. With a CLI dump, a second arm, a PID profile change and a logging pause no longer remove flight periods; an in-flight
+adjustment still does. These periods stay in `config.userCovered`, and each control recommendation carries the flag
+`stale` (`userFlag`) with the CLI dump as the source. The native controller parity check then tests the CLI values
+against the recorded PID terms: a dump that does not apply to the log fails there. Without a CLI dump, values that the
+header does not record stay unknown.
 
 `system_id.cjs` selects the data and calls `twin_fit.identify`: staged Levenberg-Marquardt fits of rotor speed, the
 vertical channel, the fast dynamics against the 3 x 3 setpoint-instrumented frequency responses (no feedback bias),
@@ -1410,6 +1638,19 @@ collective, cyclic, total-pitch and tail limits. The digital twin stores their a
 Blackbox's `collectiveRange` records collective limits; the CLI dump supplies additional mixer bounds and geometry.
 These are configured angles conditional on correct calibration, not independent blade-angle measurements. Tail command
 excursion is reported relative to trim. Unknown limits remain unknown rather than being replaced by observed extrema.
+
+Builds other than the release 118e912 (IMP-06): `firmware/equivalence.cjs` lists the audited builds 58a4bd5cc and 874f369d5
+(4.6.0-bbp: only journal hooks in the replayed files, no condition), a88bec8f8 and 85d7049a9 (4.7: the error decay gain, the
+leveling timer and the first servo input, each with the condition that makes it inactive: `error_decay_gain_cyclic` 0, no level
+mode or rescue, servo speed 0), with the sha256 of each changed manifest file (test/firmware_controller.test.cjs checks them
+against the firmware repository when it is present). `compatibility()` accepts such a build only when its version is the build
+version and each condition holds, and gives `equivalence` (the build, the conditions, `EQUIVALENCE.RULES`); `control_pipeline`
+then also requires the per-window parity of the build (each axis: mixer relative RMS 5 % or the logging step, every axis must
+pass; governor state agreement 0.995 in the recorded prefix, not in the warm-up where the replay starts in THROTTLE_OFF, and
+throttle RMS 0.002). `filter_autotune.prepare` accepts a 4.6.0 log as before and a listed build whose sensor hunks have no
+effect; its parity (`EQUIVALENCE.RULES.filterBandDb` 1 dB and `filterDelayMs` 0.3 ms for a listed build) decides for each log.
+Every other build stays refused. `sensors/battery.c` (6 battery profiles in 4.7) is not replayed: the governor takes the logged
+voltage and the cell count of the element of `bat_profile`, and the governor parity tests it.
 
 `control_pipeline.cjs` requires plant validation, native firmware replay, sensor-chain replay and unchanged closed-loop
 agreement before candidate search. The pinned Rotorflight 4.6 source implements PID, mixer and governor in WebAssembly;
@@ -1509,6 +1750,50 @@ The diagnostic proposals above are bounded flight-test hypotheses. Their earlier
 for the aircraft digital twin and is not reused as a changed-loop simulation. The production result reports a gain
 change only after the simulated actuator and plant respond to those exact values. A new flight must measure the result
 before any recorded problem can close.
+
+Flights to compare the values (IMP-07, `validation_power.cjs`, `RULES.validation` of `control_pipeline.cjs`). A twin result
+of a few percent is often smaller than the flight-to-flight spread of every measurement of it. The 2026-10-15 field trip
+predicted -0.57 ± 0.10 deg/s of cyclic tracking error against a flight-to-flight SD of about 1 deg/s, and the |1 - T| changes
+needed 150 to 14,000 flights for each set of values (`analysis/fireball-crash-20261015/verify/twin-validation-F6-0`,
+`tuning-content-F4-0`). After the frozen test passes, `tune` adds `validationPower` to the result and to each of its
+recommendations (the same object, with `profile` and `profileLabel`). The selection, the rows and the CLI text do not change.
+`validation_power.forModel` takes the recorded periods of the target configuration and of the other configurations of its
+PID profile (`profilePeriods`: with an unknown PID profile, the target configuration only), the test rows of the frozen test
+(model gyro with the recorded and the selected values) and the period selection of `system_id.prepareSegments` (`selection`:
+the 4 periods of 16 s with the most stick input in each flight, none below 5 deg/s of setpoint movement on all axes). It
+calculates three measurements, with the flight (and configuration) as the unit:
+
+- the tracking error rms of 6 s windows after a 20 Hz zero-phase low-pass, minus a line of the window setpoint rms (regression
+  over all windows). Its change is the same window measurement on the model gyro of the test flights, paired before and after,
+  mean over the test flights with its SE over flights (`deltaSource: 'windows'`); without windows, the frozen test improvement.
+- |1 - T| (in % of the setpoint) over the band of a centre frequency ± 1 Hz (from 0.5 Hz), weighted with the recorded setpoint
+  spectrum (`bandOneMinusT`, the statistic of `matched.py`). The centre is the frequency of 1-10 Hz with the largest change of
+  this band value between the two model runs, on a band with a recorded coherence of 0.5 or more. The change, the flight
+  values, the pooled value and the null use the same statistic.
+- the gyro rms at 0.5-8 Hz that the setpoint does not explain. Its change is the relative change of the model times the
+  recorded value. The setpoint power subtracts the commanded part, so it also needs stick input.
+
+For each one: the SD of the flight values, pooled inside each configuration, with df = flights - configurations. With df below
+2, the tracking error gets the window SD / sqrt(windows of a flight), a lower bound (`lowerBound`: no flight-to-flight variance),
+and the two spectral measurements get no SD. Also the input-matched null (`matchedNull`: sets of the planned window count, a
+constructive draw without replacement: the targets in a random order, each from its 20 nearest unused windows in log input
+power, seeded; at least 2 pool windows for each target, windows of 3 flights or more, 200 sets or more, else none) and
+n = 2 (2.8 SD / change)^2 flights for each set of values (a minimum of 3), with its range (`flightRange`: the SE of the change,
+and the 95 % chi-square interval of the SD with df). The plan takes the measurement with the smallest n among those with a
+measured SD, a lower bound only when no SD is measured. A lower bound never gives "Flights can show this change": the text
+says that the app cannot calculate the flight-to-flight standard deviation and gives the minimum n. A measured n of
+`maxFlights` (10) or less gives the flights to fly in the same period, the periods that the app uses and the stick activity of
+each axis (the median setpoint rms of the flights with a coherence of 0.5 or more). If the range goes above 10, the text says
+that more flights can be necessary. Above 10 it says that flights cannot show the change, and the smallest change that 10
+flights can show. Advice C7 gets a plan from `report.cjs` (`forDecision`: `dTrack` ± `seTrack`, and `measured.trackRmsSE` ×
+sqrt(flights) as the SD with flights - 1 degrees of freedom). That measurement is the tracking error in the band of the gain
+model (id `decision`), not the 6 s window measurement. The CLI file gives the plan once under "Flights to compare the values",
+and a later change with the same plan refers to it ("Change N has the same text about the flights"). The Tuning view shows it
+under "Effect of this change" and on recommendation cards, with the PID profile, "(minimum)" on a lower bound and the range of
+n. If the plan fails, the result has the plan with no measurement and `error`. On the 2026-10-05 flights, the null of PID
+profile 2 roll |1 - T| for the 16 windows of the crash flight is 0.368 ± 0.088 (pooled 0.184, 4000 of 4000 sets), as
+`matched.txt`. Run `node --test test/validation_power.test.cjs`; with `AUTOTUNE_RESCUE_LOG` it also runs that real-log case
+(about 15 s).
 
 `control_tune.flightPlan` maps accepted control changes to stick maneuvers. Governor gains and collective compensation
 use collective steps, including full positive collective only after a smaller step gives stable headspeed and tail control.
@@ -1634,7 +1919,7 @@ in closed loop with the twin), `gov_fit.cjs` (identification and validation), `g
   need it). The CLI dump is optional and goes to `autotune` as text; without it, `cli` is null.
 - Decode: each log with `gov_data.EXTRA`, the columns of `health_phase.cjs` and `govRequest`. `hsCollect`, `epochCollect` and
   `armWhole` read the whole log (the PID profile at the start of the log and the stale). `health_phase.cjs` classifies each log
-  (`classOf`): a bench run is left out (`benchRuns`, one note with their count: "The governor analysis does not use bench runs (36
+  (`classOf`): a bench run is left out (`benchRuns`, one note with their count: "The governor autotune does not use bench runs (36
   logs)."; the panel lists each one), a log that does not parse or has no flight phases goes to `skipped` with its reason. A log that `lib.segments` cannot read for a
   missing field (`govLacks`, from the field list of the log header) gives the field and the setting that records it:
   `gov_data.TEXT.noHs` and `blackbox_log_rpm` for the headspeed, else `blackbox_log_setpoint`, `_gyro`, `_mixer` or `_pid`
@@ -1652,7 +1937,7 @@ in closed loop with the twin), `gov_fit.cjs` (identification and validation), `g
   headspeed, `motor[0]` or the governor fields is left out, and the reasons of `gov_data.TEXT` go to the notes with the log numbers
   (information only: they name the setting that records the value, they are not instructions, STE Rule 5.5).
   A part whose flight phases stop is left out with the note "The app cannot find the flight phases of a part of this log. Thus,
-  the governor analysis does not use that part." (the error note of `phasesOf` loses its sentence about the airborne time).
+  the governor autotune does not use that part." (the error note of `phasesOf` loses its sentence about the airborne time).
 - No run left: `status: 'unavailable'` with the reasons: the missing values (for example `gov_data.TEXT.noGov`, which says that the
   log records them only with `blackbox_log_governor` ON), else "The selected logs have no flight." when bench runs are the cause or no log
   is left, else the reasons of the logs in `skipped`. `autotune` does not run.
@@ -1876,3 +2161,17 @@ hit. A source that is missing is a line in the table, not a stop.
   expo of the rate profile changes between logs 14 and 15, so PID profile 2 is B and G), Fireball 2026-09-29 #3 16 s. With
   configurations the Fireball #3 findings are those of the PID profiles (210 of 210 keys the same); on the Fireball 2026-10-05 dump
   only G3, G4 and G5 change (pooled over the logs of B and of G, not of PID profile 2). `filterTune`: 7.5 s, 13 s and 27 s.
+- 2026-10-17, release of the crash-flight round (IMP-01 to IMP-07, IMP-11, IMP-12), built from an rsync snapshot of the shared
+  tree and installed with `make apps`:
+  - Without real logs, every `test/*.test.cjs`: 1407 tests, 0 failures (35 skipped for missing real logs; the snapshot also skips
+    the git test). `test/ste_text.test.cjs`: 49 of 49, also with `AUTOTUNE_GOV_LOG` set to the crash log.
+  - With `AUTOTUNE_REAL_LOG` (Gaui X4 II 2026-10-04 11:37) and `AUTOTUNE_RESCUE_LOG` (Fireball 2026-10-05): `tuning_worker` 96 tests,
+    1 failure from before this round ("round 2: Fireball 2026-10-05 in file scope" expects the governor item `blocked`, the
+    hierarchy gives `possible` since commit 4af7fc9, G21 does not gate). `PARAM_EPOCHS_LOG` with the crash log and with the
+    Fireball dump, `health_rescue`/`health_limits` with the Fireball dump, and `governorTune real` on the Fireball dump with its
+    CLI dump of 2026-10-13 (partial), on the crash log (partial) and on the Gaui dump (Vbat 0): no failure.
+  - Firmware: `git diff 118e912 58a4bd5cc` and `118e912 874f369d5` of the 25 manifest files changes only `flight/pid.[ch]`,
+    `flight/mixer.c`, `flight/governor.[ch]` and `flight/rpm_filter.c`, with additions only (the journal hooks and the read-only
+    fingerprints), and their sha256 agree with `firmware/equivalence.cjs`. 58a4bd5cc and 874f369d5 have the same manifest files.
+  - Installed app (app.nw on the 0.62.2 SDK runtime over CDP): the Analysis view on `crash.bbl` completes in 35 s, with D10 "No
+    receiver signal" 2.1 s (problem) and D11 "In-flight motor cut" under "Transmitter and rescue", and no page error.

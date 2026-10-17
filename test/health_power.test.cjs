@@ -89,6 +89,15 @@ test('P1 and P2 recover the battery model: decrease for each cell, lowest cell v
     const c = P.curves(w, { rate: RATE, header: HEADER }); assert.equal(c.steps.length, 4); within(c.steps[0].sag, 0.45, 0.04, 'curve sag');
 });
 
+// IMP-03: a load step after a motor cut in flight (the phases 'fall' and 'aftercontact' of health_phase.cjs) is not a load step of a flight:
+// P1 does not use it, and a note gives the count
+test('IMP-03: a load step in the fall after a motor cut in flight is not used, with a note', () => {
+    const w = segment(), code = new Uint8Array(w.n).fill(3); code.fill(5, at(21.5), at(25)); // flight, and the fall over the third step (22 s)
+    const m = metrics(w, { phases: { code } }); assert.equal(m.noLoadSteps, 1); assert.equal(m.steps.length, 3); assert.ok(!m.steps.some(q => Math.abs(q.tS - 22) < 0.1), JSON.stringify(m.steps.map(q => q.tS)));
+    assert.ok(m.notes.includes('The analysis does not use 1 load step after a motor cut in flight (check D11).'), JSON.stringify(m.notes));
+    assert.equal(only(judgeOne(w, { phases: { code } }), 'P1', 0).n, 3);
+});
+
 test('a weak battery: a load step takes the voltage from the warning level or more to less than the minimum (flag)', () => {
     // R = 80 mOhm, 25.3 V at rest: 52 A before the step gives 21.14 V (3.52 V for each cell), 82 A in the step 18.74 V (3.12 V)
     const F = judgeOne(segment({ v0: 25.3, R: 0.08, drift: 0 })), p1 = only(F, 'P1', 0);

@@ -12,7 +12,8 @@
  *   D1  logging rate, nominal and as the log clock has it
  *   D2  time and loop-iteration jumps inside the segment, gaps of the log
  *   D3  which fields the log has, which are all zero, and which checks that rules out
- *   D4  header against a CLI dump (ctx.cli): gains, cutoffs, limits, notch banks, features; CLI-only settings
+ *   D4  header against a CLI dump (ctx.cli): gains, cutoffs, limits, notch banks, features; CLI-only settings. A log with a
+ *       parameter snapshot (blackbox_params FULL): every value of the snapshot, all PID and rate profiles (compareSnapshot)
  *   F1-F4, F8   filter setup from the header
  *   F5  rotor-locked lines of gyroRAW (against rotor revolutions) and the notch nearest each
  *   F6  gyroADC / gyroRAW power at every configured RPM notch, window by window
@@ -85,17 +86,20 @@ function parseCli(text) {
     // that shows none of these is taken as a diff.
     const head = text.split(/^\s*profile\s+\d/m)[0], masterSets = (head.match(/^\s*set\s/gm) || []).length;
     const kind = /^\s*(#\s*)?diff\b/m.test(text) ? 'diff' : /^\s*(#\s*)?dump\b/m.test(text) || /^\s*#\s*master\b/m.test(text) || masterSets > RULE.cli.dumpMasterSets ? 'dump' : 'diff';
-    const out = { kind, version: null, features: {}, global: {}, profiles: {}, rateprofiles: {}, mixerInputs: {}, selectedProfile: null };
+    const out = { kind, version: null, versionLine: null, board: null, features: {}, global: {}, profiles: {}, rateprofiles: {}, mixerInputs: {}, rxfail: {}, selectedProfile: null };
     let cur = out.global;
     const value = (s) => { const parts = s.split(',').map(p => p.trim()); const conv = parts.map(p => (p !== '' && isFinite(+p)) ? +p : p); return conv.length === 1 ? conv[0] : conv; };
     for (const raw of text.split(/\r?\n/)) {
         const line = raw.trim(); let m;
-        if ((m = /^# Rotorflight .*? (\d+\.\d+\.\d+)/.exec(line))) out.version = m[1];
+        if ((m = /^# Rotorflight .*? (\d+\.\d+\.\d+)/.exec(line))) { out.version = m[1]; if (!out.versionLine) out.versionLine = line; }
         if (!line || line.startsWith('#')) continue;
         if ((m = /^profile (\d+)/.exec(line))) { cur = out.profiles[m[1]] = out.profiles[m[1]] || {}; out.selectedProfile = +m[1]; continue; }
         if ((m = /^rateprofile (\d+)/.exec(line))) { cur = out.rateprofiles[m[1]] = out.rateprofiles[m[1]] || {}; continue; }
         if ((m = /^feature (-?)(\w+)/.exec(line))) { out.features[m[2]] = m[1] !== '-'; continue; }
         if ((m = /^mixer input (\w+) (-?\d+) (-?\d+) (-?\d+)/.exec(line))) { out.mixerInputs[m[1]] = [+m[2], +m[3], +m[4]]; continue; }
+        // "rxfail 4 s 1500", "rxfail 0 a" (cli.c printRxFailsafe): the shape of param_log.cjs snapshotCli rxfail
+        if ((m = /^rxfail (\d+) ([ahs])(?:\s+(-?\d+))?$/.exec(line))) { out.rxfail[m[1]] = m[3] !== undefined ? [m[2], +m[3]] : [m[2]]; continue; }
+        if ((m = /^board_name (\S+)/.exec(line))) { out.board = m[1]; continue; }
         if ((m = /^set (\w+)\s*=\s*(.*)$/.exec(line))) cur[m[1]] = value(m[2]);
     }
     return out;
@@ -160,19 +164,53 @@ function compareCli(header, cli, profileIndex) {
     return rows;
 }
 
+// A module that the app can be without (the worker loads the toolkit files as text): null when it is absent
+const optional = (name) => { try { return require(name); } catch (e) { return null; } };
+// The parameter snapshot of a log header (param_log.cjs snapshotCli, a complete FULL snapshot of a blackbox_params log), or null
+function snapshotOfHeader(header) { const PL = optional('./param_log.cjs'); return PL && typeof PL.snapshotOf === 'function' ? PL.snapshotOf(header) : null; }
+
+// D4 with a parameter snapshot: every name of the snapshot against the CLI dump. A diff leaves out a value at its default:
+// the default of the same build and board (cli_defaults.cjs, from the "# Rotorflight" and "board_name" lines of the dump), else the
+// name is not compared.
+// A PID profile or rate profile that the dump has no section for is not compared. Mixer inputs: the lines of the dump only.
+// -> [{ where ('global' | 'profile k' | 'rateprofile k'), name, pidProfile (1-6 | null), rateProfile, logValue, cliValue, from
+//      ('cli' | 'default'), match }]
+const valueText = (v) => (Array.isArray(v) ? v : [v]).map(x => { const t = String(x).trim(); return t !== '' && isFinite(+t) ? String(+t) : t.toUpperCase(); }).join(',');
+function compareSnapshot(snap, cli, defaults) {
+    const rows = [], diff = cli.kind === 'diff';
+    const cmp = (where, name, logValue, cliValue, def, extra) => {
+        let cv = cliValue, from = 'cli';
+        if (cv === undefined && diff && def !== undefined && def !== null) { cv = def; from = 'default'; }
+        if (cv === undefined || logValue === undefined || logValue === null) return;
+        rows.push(Object.assign({ where, name, pidProfile: null, rateProfile: null, logValue, cliValue: cv, from, match: valueText(logValue) === valueText(cv) }, extra || {}));
+    };
+    const def = (kind, n) => defaults ? defaults[kind][n] : undefined;
+    for (const [n, v] of Object.entries(snap.global)) cmp('global', n, v, cli.global[n], def('global', n));
+    for (const kind of ['profiles', 'rateprofiles']) for (const [k, sec] of Object.entries(snap[kind])) {
+        const c = cli[kind] && cli[kind][k]; if (!c) continue;
+        const where = `${kind === 'profiles' ? 'profile' : 'rateprofile'} ${k}`, extra = kind === 'profiles' ? { pidProfile: +k + 1 } : { rateProfile: +k + 1 };
+        for (const [n, v] of Object.entries(sec)) cmp(where, n, v, c[n], def(kind === 'profiles' ? 'profile' : 'rateprofile', n), extra);
+    }
+    for (const [n, on] of Object.entries(snap.features)) cmp('global', `feature ${n}`, on ? 'ON' : 'OFF', cli.features[n] === undefined ? undefined : cli.features[n] ? 'ON' : 'OFF',
+        def('features', n) !== undefined ? (def('features', n) ? 'ON' : 'OFF') : undefined);
+    for (const [n, v] of Object.entries(cli.mixerInputs || {})) if (snap.mixerInputs[n]) cmp('global', `mixer input ${n}`, snap.mixerInputs[n], v, undefined);
+    return rows;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Header facts
 // ---------------------------------------------------------------------------------------------
 
-function gearOf(ctx) {
+// header: the log header; its parameter snapshot (blackbox_params FULL) gives the gear ratios of the time of the log, before a CLI dump
+function gearOf(ctx, header) {
     if (ctx && ctx.gear) return Object.assign({ source: 'ctx.gear' }, ctx.gear);
-    const cli = ctx && ctx.cliParsed;
+    const snap = header ? snapshotOfHeader(header) : null, cli = snap || (ctx && ctx.cliParsed);
     if (!cli) return null;
     const g = cli.global, main = arr(g.main_rotor_gear_ratio) || (cli.kind === 'diff' ? [1, 1] : null), tail = arr(g.tail_rotor_gear_ratio) || (cli.kind === 'diff' ? [1, 1] : null);
     // every mode but VARIABLE drives the tail with its own motor (mixer.h:142-145: tail_rotor_mode != TAIL_MODE_VARIABLE);
     // lookup VARIABLE, MOTORIZED, BIDIRECTIONAL = 0, 1, 2
     const mode = g.tail_rotor_mode === undefined || g.tail_rotor_mode === null ? 'VARIABLE' : String(g.tail_rotor_mode).trim().toUpperCase();
-    return { main, tail, motorisedTail: mode !== 'VARIABLE' && mode !== '0', source: 'cli' + (cli.kind === 'diff' ? ' (absent keys taken as default 1,1)' : '') };
+    return { main, tail, motorisedTail: mode !== 'VARIABLE' && mode !== '0', source: snap ? 'log snapshot' : 'cli' + (cli.kind === 'diff' ? ' (absent keys taken as default 1,1)' : '') };
 }
 
 // what an RPM notch source code filters, as a multiple of the logged headspeed (rpm_filter.c:186-236, motors.c:251-258)
@@ -298,9 +336,9 @@ function analyse(w, ctx = {}) {
     out.startProfile = profile[0];
 
     // CLI
-    let cli = null;
-    if (ctx.cli) { const text = typeof ctx.cli === 'string' ? ctx.cli : ctx.cli.text; cli = parseCli(text); ctx.cliParsed = cli; }
-    const gear = gearOf(ctx);
+    let cli = null, cliText = '';
+    if (ctx.cli) { cliText = typeof ctx.cli === 'string' ? ctx.cli : ctx.cli.text; cli = parseCli(cliText); ctx.cliParsed = cli; }
+    const gear = gearOf(ctx, h);
     out.setup = setupFacts(w, gear);
 
     // D1 logging rate
@@ -359,6 +397,13 @@ function analyse(w, ctx = {}) {
                 main_rotor_gear_ratio: g.main_rotor_gear_ratio === undefined ? null : g.main_rotor_gear_ratio, tail_rotor_gear_ratio: g.tail_rotor_gear_ratio === undefined ? null : g.tail_rotor_gear_ratio,
                 tail_rotor_mode: g.tail_rotor_mode === undefined ? null : g.tail_rotor_mode, motor_poles: g.motor_poles === undefined ? null : g.motor_poles, mixerInputs: cli.mixerInputs,
                 swash_ring: g.swash_ring === undefined ? null : g.swash_ring, swash_pitch_limit: g.swash_pitch_limit === undefined ? null : g.swash_pitch_limit } };
+        // a log with a parameter snapshot (blackbox_params FULL): every value of every PID profile and rate profile against the
+        // dump, with the defaults of the build of the dump for the names that a diff leaves out (IMP-05). The log wins
+        const snap = snapshotOfHeader(h);
+        if (snap) {
+            const CD = optional('./cli_defaults.cjs'), defaults = CD && typeof CD.forRevision === 'function' ? CD.forRevision(cliText) : null, srows = compareSnapshot(snap, cli, defaults);
+            Object.assign(out.D4, { basis: 'snapshot', defaults: defaults ? defaults.revision : null, compared: srows.length, mismatches: srows.filter(v => !v.match), matches: srows.filter(v => v.match).length, headerRows: rows.length });
+        }
     }
 
     // F1-F4, F8: header facts
@@ -482,7 +527,15 @@ function judge(flights, RULES = DEFAULT_RULES) {
         if (!m.D4) { /* no CLI dump: no D4 result */ }
         else if (m.D4.skipped) add({ id: 'D4', severity: 'skipped', log, source: R.D4.source, text: m.D4.skipped });
         else { const d = m.D4, mm = d.mismatches, gm = d.cliOnly.gov_mode, gd = d.cliOnly.govModeFromData, govClash = gm && gd && ((/DIRECT|LIMIT|OFF/.test(gm) && /^PID/.test(gd)) || (/ELECTRIC|NITRO/.test(gm) && /^no PID/.test(gd)));
-            add({ id: 'D4', severity: mm.length || govClash ? 'flag' : 'ok', log, profile: d.profileCompared, value: mm.length, n: d.compared, threshold: 'any disagreement', source: R.D4.source, mismatches: mm,
+            // a parameter snapshot: each difference with its PID profile, and the log wins (the dump is of a different time)
+            const where = (v) => v.pidProfile ? ` of PID profile ${v.pidProfile}` : v.rateProfile ? ` of rate profile ${v.rateProfile}` : '';
+            if (d.basis === 'snapshot') add({ id: 'D4', severity: mm.length || govClash ? 'flag' : 'ok', log, profile: null, value: mm.length, n: d.compared, threshold: 'any disagreement', source: R.D4.source, mismatches: mm, basis: 'snapshot',
+                text: para(`The log header has the values of all PID profiles and rate profiles. These values and the CLI dump have ${mm.length} different values out of ${d.compared}.`,
+                    d.cliKind === 'diff' ? (d.defaults ? `For a value that the CLI dump does not show, the check uses the default value of the firmware ${quote(d.defaults)}.` : 'The check does not know the default values of the firmware of the CLI dump. Thus, it compares only the values that the CLI dump shows.') : '',
+                    mm.length ? mm.slice(0, 12).map(v => `${quote(v.name)}${where(v)} is ${quote(Array.isArray(v.logValue) ? v.logValue.join(',') : v.logValue)} in the log header. It is ${quote(Array.isArray(v.cliValue) ? v.cliValue.join(',') : v.cliValue)} in the CLI dump${v.from === 'default' ? ' (default value)' : ''}.`).join('\n') + (mm.length > 12 ? `\nThere are ${mm.length - 12} more differences.` : '')
+                        + '\nThus, the CLI dump is not of the time of this log. The analysis uses the values of the log header.' : '',
+                    govClash ? `The CLI gov_mode is ${quote(gm)}, but the data shows ${quote(gd)}. Use the data for the governor mode.` : '') });
+            else add({ id: 'D4', severity: mm.length || govClash ? 'flag' : 'ok', log, profile: d.profileCompared, value: mm.length, n: d.compared, threshold: 'any disagreement', source: R.D4.source, mismatches: mm,
                 text: para(`The log header and CLI dump have ${mm.length} different values out of ${d.compared}. The check uses CLI ${quote(`profile ${d.profileCompared}`)} (${quote(d.cliKind)}, ${quote(d.profileChosenBy)}).`,
                     mm.length ? mm.slice(0, 12).map(v => `${quote(v.header)} is ${quote(v.headerValue)} in the log header. ${quote(v.cli)} is ${quote(v.cliValue)} in the CLI dump${v.from === 'default' ? ' (default value)' : ''}.`).join('\n') + (mm.length > 12 ? `\nThere are ${mm.length - 12} more differences.` : '') + '\nUse the log header for these values.' : '',
                     govClash ? `The CLI gov_mode is ${quote(gm)}, but the data shows ${quote(gd)}. Use the data for the governor mode.` : '') }); }
@@ -495,7 +548,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
                         `The PID bandwidth filter also changes the gyro signal before P. Its gyro_cutoff values are ${quote([x.pidBandwidthHz.roll, x.pidBandwidthHz.pitch, x.pidBandwidthHz.yaw].map(val).join('/'))} Hz.`)
                         : 'The gyro low-pass filters are ' + x.active.map(v => `${quote(v.stage)} (${quote(v.type || 'dynamic low-pass filter')}, ${val(v.hz)} Hz)`).join(', ') + '.' }); } }
         { const t = R.F2, v = m.F2.lowestHz;
-            if (v === null) add({ id: 'F2', severity: 'skipped', log, source: t.source, text: 'No gyro low-pass filter is on. Thus, there is no cutoff to compare (check F1).' });
+            if (v === null) add({ id: 'F2', severity: 'ok', log, value: null, threshold: `< ${t.flagHz} Hz flag, < ${t.noteHz} Hz note`, source: t.source, text: 'No gyro low-pass filter is on. Thus, no low-pass cutoff adds a time delay (check F1).' }); // nothing to measure is not "not measured"
             else add({ id: 'F2', severity: v < t.flagHz ? 'flag' : v < t.noteHz ? 'note' : 'ok', log, value: v, threshold: `< ${t.flagHz} Hz flag, < ${t.noteHz} Hz note`, source: t.source, text: `The lowest gyro low-pass filter cutoff is ${v} Hz.` }); }
         { const t = R.F3, x = m.F3, low = x.rpm.filter(v => v.q < t.minQ), dynLow = x.dynNotchEnabled && x.dynNotchQ !== null && x.dynNotchQ < t.minQ;
             add({ id: 'F3', severity: low.length || dynLow ? 'flag' : x.rpm.length ? 'ok' : 'note', log, value: x.rpmMinQ, n: x.rpm.length, threshold: `Q >= ${t.minQ}`, source: t.source,
@@ -562,4 +615,4 @@ function filterGuidance(f) {
     return null;
 }
 
-module.exports = { EXTRA, RULE, DEFAULT_RULES, analyse, judge, parseCli, compareCli, decodeNotchSource, rpmBanks, headerChanges, GOV_STATES, LPF_TYPES, FEATURE_BITS, filterGuidance };
+module.exports = { EXTRA, RULE, DEFAULT_RULES, analyse, judge, parseCli, compareCli, compareSnapshot, snapshotOfHeader, gearOf, decodeNotchSource, rpmBanks, headerChanges, GOV_STATES, LPF_TYPES, FEATURE_BITS, filterGuidance };

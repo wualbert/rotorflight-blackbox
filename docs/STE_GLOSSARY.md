@@ -108,7 +108,9 @@ Labels of the views:
 | Open in the Tuning view | A link of the Analysis view: a result whose home is a tuning block (a parameter to tune) |
 | Do first | The prerequisites and the blocks that come before a block in the tuning order |
 | Possible result of | The upstream problems and the K rule of a possible result |
-| Start the analysis | The button of the Analysis view (in the verdict, or in the log lens) when there is no result |
+| Start analysis | The button of the Tuning view and of the Analysis view. The analysis starts only when the pilot clicks it. The log lens, which the app does not build, keeps "Start the analysis" |
+| Autotune | The button of the step tabs: a model tests other values. Filters: the filter model. Governor: the governor model (all governor parameters), never the helicopter model. Cyclic gains, Tail gains and the compensation steps: the helicopter model. Not "governor analysis" |
+| Autotune all | The button after "Start analysis": the "Autotune" of all step tabs. They start at the same time. "Cancel autotune all" stops it |
 | In this time window | The panel of the log lens with the results and the values of the time window |
 | PID profile 2 | A PID profile, with the number that the Configurator shows (1 to 6). The CLI text uses `profile 1` for it |
 | PID profile unknown | The PID profile at arming is not known (profile 0 before the first switch). There is no CLI text and no export for it |
@@ -120,6 +122,8 @@ Labels of the views:
 | On the ground | The flight phase "ground": the governor ACTIVE before the liftoff or after the touchdown |
 | Flight | The flight phase from the liftoff to the touchdown |
 | Spool-down | The flight phase after the touchdown: the throttle cut, AUTOROTATION and OFF |
+| Before the ground contact | The flight phase "fall" after a motor cut in flight or a receiver signal loss in flight (check D11): from the end of the flight to the ground contact |
+| After the ground contact | The flight phase "aftercontact": from the ground contact after a motor cut in flight or a receiver signal loss in flight to the disarm. Not "after the contact" |
 | Governor, ESC and power, Battery, Vibration and filters, Cyclic tracking error, Tail, Log and configuration | The areas of the Analysis verdict. Not "PID tracking", "Cyclic tracking" or "setup": *tracking* alone is an *-ing* word, and *setup* is not approved |
 | CLI file | The tab of the export panel |
 | Copy commands | The button that copies the CLI script to the clipboard |
@@ -132,6 +136,8 @@ One term for each item (Rule 1.11).
 | Write | For | Do not write |
 |---|---|---|
 | time delay | the time between the setpoint and the gyro, or the time that a filter adds | `lag`, `delay` alone |
+| motor cut | the governor stops the motor (OFF, IDLE, HOLD or AUTOROTATION) while the helicopter is in the air (check D11) | `cut` alone as a noun |
+| ground contact | the first sudden roll or pitch movement when the helicopter touches the ground after a motor cut in flight (check D11) | `contact` alone, `fall` as a noun |
 | tracking error | the difference between the setpoint and the gyro, as a percentage of the setpoint | error alone, when you mean the tracking error |
 | gyro noise | the vibration in the gyro signal | `noise` alone (STE *noise* is a sound) |
 | notch filter, RPM notch filter, dynamic notch filter, static notch filter | a notch filter of the gyro | `notch` alone (STE *notch* is a V-shaped cut) |
@@ -171,7 +177,7 @@ One term for each item (Rule 1.11).
 | rescue, pull-up | the rescue mode of the flight controller, and its first part (the firmware state PULLUP) | `bailout` for a rescue |
 | large load | a load that the motor cannot hold at full throttle: the headspeed decreases with the throttle at its limit (checks G19, L1) | `overload`, `bog` |
 | transmitter | the radio of the pilot, which sends the stick and switch commands | `radio`, `TX` |
-| CLI dump | the text of `diff all` that the pilot saved before. An optional input: the log is the only necessary input (user rule 2026-10-06). No text tells the pilot to load a CLI dump, or to connect to the flight controller, for the analysis. A text about a CLI dump shows only when the pilot loaded one. The "CLI file" export, with its `diff all` step before the commands, is a different item | `diff` alone, configuration file |
+| CLI dump | the text of `diff all` that the pilot saved before. An optional input: the analysis runs with only the log. When no CLI dump is loaded, the Tuning view and the Analysis view show "No CLI dump", the settings that the log does not record, the steps to get a CLI dump and the "Load CLI dump" button (user rule 2026-10-15). A result that cannot be calculated without a value of the CLI dump names the value and asks for the CLI dump. The "CLI file" export, with its `diff all` step before the commands, is a different item | `diff` alone, configuration file |
 | not recorded in the log | a value that the log header and the data do not record (the coverage status `not-in-log`): "The log does not record these values. Thus, the analysis cannot examine them." If a flight can record the value, the text says how: "The log header records the values of PID profile 2 only when the pilot arms the helicopter in PID profile 2." | "CLI dump necessary" |
 
 ## Gear ratios
@@ -262,7 +268,7 @@ dictionary), Project a term of this project (section "Terms"). The lint makes su
 | `caveat`, `custom`, `relative`, `recovery` | note, that you set, a percentage of, increase to the target again | Inf |
 
 UI element names are technical nouns of category 10 (quoted text) and category 19. Write each name as the screen shows it, in
-quotation marks: click "Start the analysis". Use one name for each element, and a technical verb of category 2 for the action.
+quotation marks: click "Start analysis". Use one name for each element, and a technical verb of category 2 for the action.
 
 ## Technical nouns
 
@@ -277,7 +283,7 @@ term that Rotorflight uses (Rule 1.8).
 | 3 | Tools and support equipment | `bench`, `charger` |
 | 6 | Systems, functions and configurations | `angle mode`, `autorotation`, `bailout`, `band-pass`, `band-pass filter`, `bank`, `board alignment`, `center trim`, `channel`, `collective`, `compensation`, `cross-coupling`, `cyclic`, `dynamic notch filter`, `failsafe`, `feedforward`, `filter`, `flight mode`, `governor`, `governor mode`, `gyro alignment`, `gyro filter`, `handover`, `high speed integral`, `high-pass`, `high-pass filter`, `horizon mode`, `I-term relax`, `inertia precompensation`, `level mode`, `loop stall`, `low-pass`, `low-pass filter`, `mixer`, `motor timing`, `motorized tail`, `notch filter`, `PID controller`, `PID loop`, `PID mode`, `pitch compensation`, `precompensation`, `rescue`, `rescue mode`, `RPM filter`, `RPM notch filter`, `setpoint`, `setpoint boost`, `static notch filter`, `stop gain`, `swash phase`, `swash ring`, `swash trim`, `tail center trim`, `tail output limit`, `tail precompensation`, `tail torque assist`, `telemetry`, `throttle`, `throttle hold`, `trainer mode`, `trim`, `voltage compensation` |
 | 7 | Mathematics, science and engineering | `angular rate`, `model confidence`, `confidence interval`, `battery current`, `ESC temperature`, `acceleration`, `alias`, `authority`, `aliasing`, `amplitude`, `angle`, `average`, `band`, `bandwidth`, `bin`, `blade tracking`, `center`, `center of gravity`, `coherence`, `configuration`, `correlation`, `cutoff`, `cutoff frequency`, `D-term`, `D-term noise`, `damping`, `deadband`, `decimation`, `deviation`, `disturbance`, `expo`, `F-term`, `feedback`, `formula`, `frequency`, `frequency response`, `gain`, `gear ratio`, `geometry`, `ground resonance`, `gyro noise`, `harmonic`, `headroom`, `headspeed`, `I-term`, `inertia`, `kick`, `line`, `load`, `margin`, `mean`, `measurement`, `median`, `model`, `moment`, `motor kick`, `motor speed`, `negative`, `Nyquist frequency`, `offset`, `oscillation`, `overshoot`, `P-term`, `peak`, `percentage`, `phase`, `pole count`, `positive`, `power`, `prominence`, `ramp`, `ratio`, `raw`, `raw gyro`, `reaction torque`, `regression`, `reserve`, `resistance`, `resonance`, `response`, `response time`, `rms`, `rotor order`, `rotor speed`, `saturation`, `scale`, `segment`, `sensitivity`, `settling time`, `signal`, `sine wave`, `spectrum`, `standard error`, `step response`, `target`, `term`, `thrust`, `time delay`, `torque`, `tracking error`, `transfer function`, `transmission`, `uncertainty`, `undershoot`, `voltage`, `window`, `yaw kick` |
-| 8 | Navigation and flight | `air`, `altitude`, `attitude`, `axis`, `climb`, `flip`, `heading`, `hover`, `landing`, `liftoff`, `maneuver`, `pirouette`, `pitch`, `roll`, `stop`, `touchdown`, `yaw` |
+| 8 | Navigation and flight | `air`, `altitude`, `attitude`, `axis`, `climb`, `flip`, `ground contact`, `heading`, `hover`, `landing`, `liftoff`, `maneuver`, `motor cut`, `pirouette`, `pitch`, `roll`, `stop`, `touchdown`, `yaw` |
 | 9 | Numbers, units and time | `eight`, `five`, `four`, `half`, `hour`, `minute`, `nine`, `percent`, `rpm`, `second`, `seven`, `six`, `ten`, `three`, `two`, `zero` |
 | 11 | Persons, organizations and products | `author`, `Configurator`, `FlyRotor`, `Gaui`, `pilot`, `Rotorflight` |
 | 15 | Documents and parts of documents | `caution`, `chart`, `colon`, `column`, `comma`, `description`, `diagram`, `documentation`, `font`, `glossary`, `graph`, `hyphen`, `imperative`, `introduction`, `label`, `legend`, `list`, `marker`, `note`, `overview`, `page`, `parenthesis`, `plot`, `quotation mark`, `recommendation`, `reference`, `rule`, `section`, `semicolon`, `sentence`, `strip chart`, `summary`, `table`, `technical noun`, `technical verb`, `text`, `title`, `tooltip`, `warning`, `word` |

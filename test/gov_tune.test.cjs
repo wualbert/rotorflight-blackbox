@@ -604,6 +604,41 @@ test('stale flags for a value from the CLI dump or unknown: a PID profile that i
     const cliVal = vals.find(([, v]) => v.from === 'cli'); if (cliVal) assert.match(cliVal[1].stale.text, /The source of the value is "CLI dump/);
 });
 
+// review IMP-05: a log with a parameter snapshot (blackbox_params FULL) records the values of every PID profile at its start, and its
+// journal records each change. A switch to PID profile 2 in that log is no cause, and a re-arm or a pause is not either
+test('a log with a parameter snapshot: the values of PID profile 2 come from the snapshot with no stale flag', () => {
+    const PL = require(path.join(ROOT, 'tools/autotune/param_log.cjs')), text = (v) => Array.isArray(v) ? v.join(',') : String(v);
+    const body = [['Param log', '1'], ['param_mode', 'FULL'], ['param_loop', '2,1,1,128'], ['param_phase', 'pos=0,sp=0,pid=0,mix=0,mot=0,fupd=0,bb=0,flush=0'],
+        ['param_pgs', '14.0/936'], ['param_fixes', '-'], ['param_rt', 'gov_mode=3,features=0,pid_denom=2,filter_denom=1,looptime=500,debug_mode=0,motors=1,servos=4'],
+        ['param_pid_profile', '0'], ['param_rate_profile', '0'], ['set.gov_mode', 'ELECTRIC'], ['set.bat_profile', '1'], ['set.battery_cell_count', '6,12,6,6,6,6']];
+    for (const n of GP.GLOBAL) if (n !== 'gov_mode') body.push([`set.${n}`, text(GT.REG[n].default)]);
+    for (const n of GP.PROFILE) body.push([`set@p.${n}`, [0, 1, 2, 3, 4, 5].map(k => n === 'gov_headspeed' ? [2000, 2200, 2400, 1000, 1000, 1000][k] : text(GT.REG[n].default)).join('|')]);
+    let hash = 2166136261; for (const [k, v] of body) hash = PL.fnv1(`H ${k}:${v}\n`, hash);
+    body.push(['param_end', `${body.length},${(hash >>> 0).toString(16)}`]);
+    // log 3 starts in PID profile 1 and changes to PID profile 2 at 20 s, with a second arm at 37 s
+    const d = synthRun(3, 40, (t) => t < 20 ? 2000 : 2200, 1, 'flight', (t) => {
+        if (t < 2) return { state: 0, stick: 0, phase: 0, u: 0, hs: 0 };
+        if (t < 4) return { state: 2, stick: 1, phase: 1, u: 0.3 + 0.1 * (t - 2), hs: 1000 + 500 * (t - 2) };
+        if (t < 36) return { state: 4, stick: 1, phase: 3, u: 0.6, hs: t < 20 ? 2000 : 2200, coll: 0.2 };
+        return { state: 0, stick: 0, phase: 4, u: 0, hs: 0 };
+    }, { profileAt: (t) => t < 20 ? 1 : 2 });
+    d.header = Object.assign({}, HEADER, { paramHeader: body });
+    assert.ok(PL.snapshotOf(d.header), 'a complete snapshot');
+    const res = GT.tune(syn().concat([d]), { cli: CLI_ESC }), byName = res.current.byName;
+    const rows = Object.entries(byName).filter(([n]) => GT.REG[n].scope === 'profile').map(([n, by]) => [n, by[2]]).filter(([, v]) => v && v.snapshot);
+    assert.ok(rows.length > 20, `${rows.length} rows of PID profile 2 from the snapshot`);
+    for (const [n, v] of rows) { assert.equal(v.stale, null, `${n}: ${JSON.stringify(v.stale)}`); assert.match(v.source, /^log header \(the parameter values of PID profile 2 in log 4\)$/, n); }
+    assert.equal(byName.gov_headspeed[2].value, 2200);
+    // 4.7: battery_cell_count is the element of bat_profile
+    assert.deepEqual([res.current.related.battery_cell_count.value, res.current.related.battery_cell_count.from], [12, 'header']);
+    // a newer flight log with no snapshot (stock firmware again): the older snapshot does not hide the newer header values
+    const e = synthRun(4, 40, 2000, 1, 'flight', (t) => t < 2 ? { state: 0, stick: 0, phase: 0, u: 0, hs: 0 } : t < 4 ? { state: 2, stick: 1, phase: 1, u: 0.3, hs: 1500 }
+        : t < 36 ? { state: 4, stick: 1, phase: 3, u: 0.6, hs: 2000, coll: 0.2 } : { state: 0, stick: 0, phase: 4, u: 0, hs: 0 });
+    const newer = GT.tune(syn().concat([d, e]), { cli: CLI_ESC });
+    assert.equal(newer.current.snapshot, null);
+    assert.ok(!Object.values(newer.current.byName).some(by => Object.values(by).some(v => v && v.snapshot)), 'no value of the older snapshot');
+});
+
 test('texts follow RULES: a change of a threshold changes the text', () => {
     const HG = require('../tools/autotune/health_gov.cjs');
     const keep = JSON.parse(JSON.stringify({ q: GT.RULES.headroom.q, sag: GT.RULES.fallback.sag, within: GT.RULES.fallback.within, minRate: HG.RULE.g21.minRate, low: GT.RULES.saturation.lowShare, reserve: GT.RULES.headroom.reserve, over: GT.RULES.spool.overshoot }));

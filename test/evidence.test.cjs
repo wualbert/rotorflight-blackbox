@@ -36,7 +36,7 @@ function moduleCounts(m) {
     if (l && !l.skipped) {
         out.C8 = Object.fromEntries(Object.entries(l.C8.byProfile).map(([p, q]) => [p, q.windows]));
         if (!l.C10.skipped) out.C10 = Object.fromEntries(['roll', 'pitch'].map(ax => [ax, Object.fromEntries(Object.entries(l.C10[ax].byProfile).map(([p, q]) => [p, q.bins.map(b => b.spans)]))]));
-        out.C11 = Object.fromEntries(['roll', 'pitch', 'yaw'].filter(ax => l.C11[ax] && !l.C11[ax].skipped).map(ax => [ax, Object.fromEntries(Object.entries(l.C11[ax].byProfile).map(([p, q]) => [p, q.windows]))]));
+        out.C11 = Object.fromEntries(['roll', 'pitch', 'yaw'].filter(ax => l.C11[ax] && !l.C11[ax].skipped && !l.C11[ax].zero).map(ax => [ax, Object.fromEntries(Object.entries(l.C11[ax].byProfile).map(([p, q]) => [p, q.windows]))]));
     }
     if (s && s.F5 && !s.F5.skipped) out.F5 = Object.fromEntries(s.F5.profiles.map(p => [p.profile, p.windows]));
     return out;
@@ -351,7 +351,7 @@ test('health_phase.cjs (when it loads): its findings on the simulated flight get
     let PH = null; try { PH = require('../tools/autotune/health_phase.cjs'); } catch (e) { t.skip(`health_phase.cjs does not load: ${e.message}`); return; }
     const { w, ctx, rec } = simulated(), m = PH.analyse(w, Object.assign({}, ctx)), r = Object.assign({}, rec, { metrics: Object.assign({}, rec.metrics, { phase: m }) });
     const F = PH.judge([{ log: r.log, start: r.start, header: r.header, metrics: m }], PH.DEFAULT_RULES).map((f, i) => Object.assign({ module: 'phase', fid: `phase|${f.id}|${i}` }, f));
-    assert.deepEqual([...new Set(F.map(f => f.id))].sort(), ['C15', 'D7', 'G15', 'G16', 'G17', 'G18']);
+    assert.deepEqual([...new Set(F.map(f => f.id))].sort(), ['C15', 'D11', 'D7', 'G15', 'G16', 'G17', 'G18']); // D11: no motor cut in flight (IMP-03)
     const lo = E.toFrame(r.timeMap, w.fromS), hi = E.toFrame(r.timeMap, w.fromS + w.n / w.flight.actualRate);
     for (const f of F) {
         const ev = E.forFinding(f, { record: r, findings: F });

@@ -154,7 +154,7 @@ X('F1', { noun: 'gyro low-pass filter', unit: '', scale: 1, tab: 'filters', modu
     value: (f, v) => v.val === null ? null : many(f.value, 'gyro low-pass filter'),
     evidence: ev('header', [], { kind: 'table', keys: ['gyro_soft_type', 'gyro_lowpass_hz', 'gyro_soft2_type', 'gyro_lowpass2_hz', 'gyro_lowpass_dyn_hz'] }, { expected: () => 'One gyro low-pass filter is on at approximately 100 Hz.' }) });
 X('F2', { noun: 'low-pass cutoff', unit: 'Hz', scale: 1, tab: 'filters', module: 'setup',
-    say: (f, v) => `The lowest gyro low-pass filter cutoff is ${v.value}.`,
+    say: (f, v) => num(f.value) === null ? 'No gyro low-pass filter is on. Thus, no low-pass cutoff adds a time delay.' : `The lowest gyro low-pass filter cutoff is ${v.value}.`,
     limit: (f, v, R) => num(R.flagHz) === null ? null : `The reference minimum is ${R.flagHz} Hz.`,
     evidence: ev('header', [], { kind: 'table', keys: ['gyro_soft_type', 'gyro_lowpass_hz', 'gyro_soft2_type', 'gyro_lowpass2_hz', 'gyro_lowpass_dyn_hz'] }, { expected: () => 'The lowest gyro cutoff is 80 Hz or more.' }) });
 X('F3', { noun: 'notch filter Q', unit: '', scale: 1, tab: 'filters', module: 'setup',
@@ -364,8 +364,9 @@ X('C10', { noun: 'I-term decrease', unit: 's', scale: 1, tab: 'checks', module: 
     limit: (f, v, R) => !f.axis ? null : Array.isArray(R.tau) ? `A time constant of ${R.tau[0]} to ${R.tau[1]} s in flight shows that the firmware possibly does not know that the helicopter is airborne.` : null,
     evidence: ev('runs', [[G.I], [G.sp], ['mixer[3]'], ['headspeed']], { kind: 'time', snippet: { fields: [G.I, 'mixer[3]'] } }, { expected: () => 'In flight, the I-term decreases slowly, with the airborne time constant.' }) });
 X('C11', { noun: 'D-term noise', unit: '%', scale: 100, tab: 'filters', module: 'loop', nOf: 'periods of 1 s', min: (R) => R.minWindows,
-    say: (f, v) => `${v.In}${v.value} of the ${ax(v)} D-term power is at more than 30 Hz.`,
-    limit: (f, v, R) => `The reference power percentage is ${pc(R.share)} %. It is not a limit on D-term RMS.`,
+    say: (f, v) => f.dZero ? `${v.In}the ${ax(v)} D-term is 0: the D gain is 0. Thus, the D-term noise is 0.` : `${v.In}${v.value} of the ${ax(v)} D-term power is at more than 30 Hz.`,
+    value: (f, v) => f.dZero ? 'D-term 0 (D gain 0)' : v.value, // the D gain is 0 (health_loop dNoise zero): nothing to measure, not "Not measured"
+    limit: (f, v, R) => f.dZero ? null : `The reference power percentage is ${pc(R.share)} %. It is not a limit on D-term RMS.`,
     evidence: ev('windows', [[G.D], [G.gy, G.raw]], { kind: 'spectrum', curve: 'more.dterm.{axis}' }, { analyser: 'axisD[{a}]', expected: () => 'Compare the D-term power percentage with its RMS value and the replay change.' }) });
 X('T2', { noun: 'slow tail oscillation', unit: 'x', scale: 1, tab: 'curves', module: 'loop', nOf: 'stable periods of 4 s', min: (R) => R.minWindows,
     say: (f, v) => `${v.In}when the sticks do not move, the yaw rate has a peak${num(f.hz) !== null ? ` at ${fmt(f.hz)} Hz` : ''}. The peak is ${v.value} the median level of the band.`,
@@ -422,9 +423,33 @@ for (const [id, yaw] of [['C5', false], ['T1', true]]) X(id, { noun: yaw ? 'fast
 
 // --- health_more.cjs ---
 X('D6', { noun: 'time not used', unit: 's', scale: 1, tab: 'checks', module: 'more', note: 'information',
-    say: (f, v) => f.severity === 'flag' ? `Failsafe is on for ${v.value} while the helicopter is airborne.` : `The analysis does not use ${v.value} of flight with rescue, a level mode, failsafe or ground contact.`,
+    say: (f, v) => f.severity === 'flag' ? `Failsafe is on for ${v.value} while the helicopter is airborne.` : `The analysis does not use ${v.value} of flight with no receiver signal, rescue, a level mode, failsafe or ground contact.`,
     limit: (f) => f.severity === 'flag' ? 'The limit is 0 s.' : null,
     evidence: ev('events', [['flightModeFlags', 'failsafePhase'], ['headspeed'], ['mixer[3]']], { kind: 'events' }, { pads: [1, 1], expected: () => 'Failsafe does not occur in flight.' }) });
+// D10 no receiver signal (health_more.cjs, IMP-01): value the seconds with no RC frame (rxSignalReceived or rxFlightChannelsValid at 0
+// while armed), n the periods, events the periods (tS the inferred last RC frame, t1S the RX return, rotor: the headspeed at the flight
+// rpm or more, stage1S, govAtStage1Name, rssiZero). A problem with the rotor at the flight rpm or more, else a value to monitor
+X('D10', { noun: 'no receiver signal', unit: 's', scale: 1, tab: 'checks', module: 'more', nOf: 'periods with no receiver signal',
+    say: (f, v) => num(f.n) > 0 ? `The receiver signal stops ${f.n === 1 ? '1 time' : `${fmt(f.n)} times`}, for ${v.value || 'an unknown time'} in total`
+        + (f.severity === 'flag' ? ', while the rotor turns at the flight rpm or more.' : ', while the headspeed is less than the flight rpm.') : 'The flight controller gets RC frames from the receiver during all of the log.',
+    limit: () => 'A period with no receiver signal while the rotor turns at the flight rpm or more is a problem.', bound: () => '0 s at the flight rpm or more',
+    value: (f) => num(f.value) === null ? null : `${pair(f.value, null, 's')} with no receiver signal`,
+    skipped: () => 'The log does not record `rxSignalReceived` and `rxFlightChannelsValid`. Thus, this check did not operate.',
+    evidence: ev('events', [['rxSignalReceived', 'rxFlightChannelsValid'], ['rssi'], ['rcCommand[3]', 'rcCommand[4]'], ['headspeed', 'motor[0]']], { kind: 'events' },
+        { pads: [0.5, 1], expected: () => 'The flight controller gets RC frames from the receiver at all times.' }) });
+// D11 in-flight motor cut (health_phase.cjs, IMP-03): value the ground contacts after a cut in flight, n the cuts, events [{ tS: the end of the
+// flight, t1S: the contact (else the cut), cutS, contactS, fallS, by: 'receiver loss' | 'failsafe' | 'pilot', state, peak }]. A problem for a
+// contact after a receiver signal loss or a failsafe, or a contact step of RULE.td.crashFactor x the largest step of the flight or more
+X('D11', { noun: 'in-flight motor cut', unit: '', scale: 1, tab: 'checks', module: 'phase', nOf: 'motor cuts in flight',
+    say: (f, v) => num(f.n) > 0 ? (f.motorCut === false ? `The flight ends in the air ${f.n === 1 ? '1 time' : `${fmt(f.n)} times`}, with no RC control.` : `The motor stops ${f.n === 1 ? '1 time' : `${fmt(f.n)} times`} while the helicopter is in the air.`)
+        + (num(f.fallS) !== null ? ` After ${pair(f.fallS, null, 's')}, the helicopter touches the ground.` : ' The analysis does not find the ground contact.')
+        : 'The analysis finds no motor cut while the helicopter is in the air.',
+    // the problem threshold: health_phase DEFAULT_RULES.D11.crashFactor (f.threshold.crashFactor)
+    limit: (f, v, R) => `A ground contact in failsafe or with no receiver signal is a problem. At the ground contact, a rate step of ${fmt(num(R.crashFactor) ?? 2)} times the largest step of the flight or more is also a problem.`,
+    bound: () => '0 ground contacts',
+    value: (f) => num(f.value) === null ? null : many(f.value, 'ground contact'),
+    evidence: ev('events', [['gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]'], ['headspeed', 'motor[0]'], ['altitude'], ['rxSignalReceived', 'rcCommand[3]']], { kind: 'events' },
+        { pads: [1, 1], expected: () => 'The motor operates until the helicopter lands.' }) });
 X('F10', { noun: 'D-term noise', unit: '%', scale: 100, tab: 'filters', module: 'more', nOf: 'periods of 1 s', min: (R) => R.minWindows,
     noteStatus: (f) => f.axis === 'yaw' && !isThin(f) && num(f.se) !== null ? 'monitor' : 'information',
     say: (f, v) => f.axis !== 'yaw' && f.unit === 'permille' ? `${v.In}at more than 30 Hz, the ${ax(v)} mixer output has an RMS value of ${pair(f.value, f.se, '‰')}.`
@@ -454,7 +479,8 @@ X('T14', { noun: 'inertia precompensation', unit: '', scale: 1, tab: 'tail', mod
     value: (f, v) => v.value === null ? null : `gain change ${v.value}`,
     evidence: ev('events', [['headspeed', 'govTarget'], ['gyroADC[2]', 'setpoint[2]'], ['mixer[2]', 'axisF[2]']], { kind: 'time', snippet: { fields: ['mixer[2]', 'axisF[2]', 'headspeed'], derive: { kind: 'lowpass' } } }, { pads: [1, 1.3], expected: () => 'The yaw rate stays stable when the headspeed changes.' }) });
 X('G14', { noun: 'governor changes', unit: '', scale: 1, tab: 'governor', module: 'more', note: 'information',
-    say: (f, v) => num(f.value) > 0 ? `In flight, the governor changes ${v.val} times to AUTOROTATION or BAILOUT, not at a landing.` : `The governor does not change to AUTOROTATION or BAILOUT in flight, other than at a landing.`,
+    say: (f, v) => num(f.value) > 0 ? `In flight, the governor changes ${f.value === 1 ? '1 time' : `${v.val} times`} to HOLD, AUTOROTATION or BAILOUT, not at a landing.` : `The governor does not change to HOLD, AUTOROTATION or BAILOUT in flight, other than at a landing.`,
+    after: (f) => f.cause === 'receiver loss' ? 'The receiver signal stopped before each of these changes (check D10). Thus, they do not show a problem of the governor adjustments.' : null,
     limit: (f) => f.severity === 'flag' ? 'Each change of this type is a problem.' : null, bound: (f) => f.severity === 'flag' ? '0 changes' : null,
     value: (f, v) => v.val === null ? null : many(f.value, 'change'),
     evidence: ev('events', [['headspeed', 'govTarget'], ['motor[0]'], ['mixer[3]']], { kind: 'governor', curve: 'more.gov' }, { pads: [1, 1], expected: () => 'The governor stays in ACTIVE in flight.' }) });
@@ -465,7 +491,7 @@ X('G14', { noun: 'governor changes', unit: '', scale: 1, tab: 'governor', module
 const UNIT_OF = { fraction: ['%', 100], percent: ['%', 1], '%': ['%', 1], permille: ['‰', 1], 'deg/s': ['deg/s', 1], s: ['s', 1], ms: ['ms', 1], rpm: ['rpm', 1], Hz: ['Hz', 1],
     '%/s': ['%/s', 1], '/s': ['/s', 1], 'per s': ['/s', 1], count: ['', 1], events: ['', 1], '': ['', 1] };
 const unitKey = (f) => typeof f.unit === 'string' && UNIT_OF[f.unit] ? UNIT_OF[f.unit][0] : null;
-const PHASE_AT = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
+const PHASE_AT = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down', fall: 'before the ground contact', aftercontact: 'after the ground contact' };
 const firstNum = (R, keys) => { for (const k of keys) if (num(R[k]) !== null) return R[k]; return null; };
 const benchOf = (f) => f.bench === true || f.logClass === 'bench' || f.class === 'bench' || f.flight === false || (f.flights !== undefined && flightsOf(f) === 0);
 const flightsOf = (f) => Array.isArray(f.flights) ? f.flights.length : num(f.flights);
@@ -600,6 +626,36 @@ X('D9', { noun: 'rescue mode', unit: '', scale: 1, tab: 'checks', module: 'confi
     skipped: () => 'The analysis has no flight log. Thus, this check did not operate.',
     evidence: ev('header', [], { kind: 'table', keys: [] }, { expected: () => 'The rescue is on in each PID profile that you fly.' }) });
 
+// D12 failsafe throttle (health_config.cjs, IMP-11): value the throttle of failsafe stage 1 in µs (rxfail of the throttle channel; null
+// for rxfail h), band, stateLog (the governor state from ACTIVE, the name of the log), cut (the motor stops at once), motorOffS, unbounded,
+// recovery { to, limitS }, stage2Off, missing (the values that the log and the dump do not give: thin). Information only, no CLI text
+const d12Cmd = (f) => Array.isArray(f.rxfail) ? (f.rxfail[0] === 's' ? `\`rxfail 4 s ${f.rxfail[1]}\`` : `\`rxfail 4 ${f.rxfail[0]}\``) : 'the `rxfail` value';
+// the delay of the rxfail values after the last RC frame (f.cutDelayS, health_config RULE.rxfail.cutDelayS)
+const d12Delay = (f) => Array.isArray(f.cutDelayS) && f.cutDelayS.length === 2 ? `${fmt(f.cutDelayS[0])} s to ${fmt(f.cutDelayS[1])} s` : 'a short time';
+// the response of the governor and the motor for the values q (the finding, or its cliAlt) after a lead (q.cut: the motor stops at once)
+const d12Response = (q, f, lead) => q.cut ? `${lead}the motor stops ${d12Delay(f)} after the last RC frame.`
+    : q.stateLog === 'ACTIVE' ? `${lead}the governor stays in ACTIVE, and the motor does not stop.`
+    : q.stateLog ? `${lead}the governor changes to ${q.stateLog}` + (num(q.motorOffS) > 0 ? `, and the motor stops after approximately ${fmt(q.motorOffS, 1)} s.` : q.unbounded ? ', and the motor does not stop.' : '.')
+    : '';
+X('D12', { noun: 'failsafe throttle', unit: 'µs', scale: 1, tab: 'checks', module: 'config', note: 'information',
+    info: 'This check calculates the response of the firmware when the receiver signal stops.',
+    why: 'The `rxfail` value of the throttle sets if the motor stops or if the governor holds the headspeed.',
+    // the values of the log header (or of the CLI dump without a parameter snapshot), then a CLI dump with other values (cliAlt: possibly
+    // the current values of the pilot, for example `rxfail 4 s 1500` after the flight)
+    say: (f) => (f.mode === 'h' ? `With ${d12Cmd(f)}, the firmware keeps the last throttle position` + (f.stateLog === 'ACTIVE' ? ', and the governor stays in ACTIVE.' : '.')
+        : num(f.value) === null ? 'The analysis cannot calculate the throttle when the receiver signal stops.'
+        : `With ${d12Cmd(f)}, the throttle is ${fmt(f.value)} µs` + (f.band === 'off' ? ', which is off.' : f.band ? ` in the ${f.band} band.` : '.') + d12Response(f, f, ' ').replace(/^ the/, ' The'))
+        + (f.cliAlt && Array.isArray(f.cliAlt.rxfail) ? (f.cliAlt.rxfail[0] === 'h' ? ` With ${d12Cmd(f.cliAlt)} of the CLI dump, the firmware keeps the last throttle position.`
+            : (d12Response(f.cliAlt, f, ` With ${d12Cmd(f.cliAlt)} of the CLI dump, `) || (num(f.cliAlt.pulse) !== null ? ` With ${d12Cmd(f.cliAlt)} of the CLI dump, the throttle is ${fmt(f.cliAlt.pulse)} µs.` : ''))) : '')
+        + (f.stage2Off ? ' Failsafe "stage 2" does not operate on this firmware.' : ''),
+    thinSay: (f) => f.modelled === false && num(f.value) !== null ? `With ${d12Cmd(f)}, the throttle is ${fmt(f.value)} µs` + (f.cut ? ', which is off, and the motor stops.' : '.')
+            + (f.govMode ? ` The app does not calculate the governor response for \`gov_mode = ${f.govMode}\`.` : ' The analysis cannot calculate the governor response.')
+        : Array.isArray(f.missing) && f.missing.length ? 'The log header does not record the `rxfail` values or the governor values. Thus, the analysis cannot calculate the response of the firmware when the receiver signal stops.'
+        : 'The analysis cannot calculate the response of this firmware when the receiver signal stops.',
+    limit: () => T.report(), value: (f) => num(f.value) === null ? (f.mode === 'h' ? 'the last throttle position' : null) : `${fmt(f.value)} µs (${f.band === 'off' ? 'off' : `${f.band || 'unknown'} band`})`,
+    skipped: () => 'The analysis has no flight log. Thus, this check did not operate.',
+    evidence: ev('header', [], { kind: 'table', keys: [] }, { expected: () => 'The pilot knows the response of the motor and the governor when the receiver signal stops.' }) });
+
 // --- battery at load steps (health_power.cjs, SPEC3 I): P1 for each flight log, value the mean voltage decrease for each cell at
 // the load steps (V), minCell / beforeCell the lowest voltage at a step and the voltage before it, severe the steps from the
 // warning level or more to less than the minimum, limits { min, warning, source } (V for each cell); P2 for each battery, value
@@ -641,16 +697,28 @@ const errSay = (x) => !x || num(x.value) === null ? '' : x.kind === 'headspeed' 
     : x.kind === 'yaw' ? ` During a period, the largest yaw error is ${fmt(x.value, 0)} deg/s.` : ` During a period, the tracking error is ${fmt(x.value * 100, 0)} % of the setpoint.`;
 const RELATED = { L1: 'G3', L2: 'G3', L7: 'G3', L3: 'C12', L4: 'T6', L5: 'C12', L6: 'C12' }, relatedOf = (f, id) => f.axis === 'yaw' ? (id === 'L5' ? 'T6' : id === 'L6' ? 'T11' : RELATED[id]) : RELATED[id]; // the tail servo and the yaw I-term: the tail checks
 const LIMIT_PLOT = (fields) => ({ kind: 'time', snippet: { fields } });
+// the stuck period of a problem (health_limits stuckOf, user 2026-10-16): the error at the start and the end of the longest period in which it does not decrease
+const stuckLimit = (f, R) => ['L1', 'L2', 'L7'].includes(f.id) ? `a headspeed decrease of ${fmt(100 * (num(R.error) ?? num(R.limit) ?? 0.05))} %` : `${fmt(num(R.stuck && R.stuck.rate) ?? 30)} deg/s`;
+const stuckMove = (f) => ['L1', 'L2', 'L7'].includes(f.id) ? 'the headspeed does not move to the target' : 'the gyro rate does not move to the setpoint';
+const stuckSay = (f) => { const s = f.stuck; if (!s || num(s.peak) === null || num(s.end) === null) return '';
+    return s.kind === 'headspeed' ? ` In a period of ${pair(s.seconds, null, 's')}, the headspeed does not move to the target: the decrease is ${fmt(100 * s.peak, 1)} % at most and ${fmt(100 * s.end, 1)} % at the end.`
+        : ` In a period of ${pair(s.seconds, null, 's')}, the gyro rate does not move to the setpoint: the ${s.axis} error is ${fmt(s.peak, 0)} deg/s at most and ${fmt(s.end, 0)} deg/s at the end.`; };
+// periods with a cause (health_limits IMP-12: f.causes 'receiver loss', 'fall', 'after contact'): the checks of the cause, not the tuning
+const CAUSE_AT = { 'receiver loss': 'after the receiver signal stops (check D10)', fall: 'before the ground contact (check D11)', 'after contact': 'after the ground contact (check D11)' };
+const causeSay = (f) => { const c = Array.isArray(f.causes) ? f.causes : f.cause ? String(f.cause).split(' / ') : []; if (!c.length) return null;
+    return `These periods come ${andList(c.map(x => CAUSE_AT[x] || x))}. Thus, they do not show a problem of the tuning.`; };
 for (const [id, noun, tab, graphs] of [['L1', 'throttle limit', 'governor', [['{field}'], ['headspeed', 'govTarget'], ['mixer[3]']]], ['L2', 'collective limit', 'checks', [['{field}'], ['headspeed', 'govTarget'], ['motor[0]']]],
     ['L3', 'cyclic limit', 'checks', [['{field}'], ['mixer[0]', 'mixer[1]'], [G.sp, G.gy]]], ['L4', 'tail limit', 'tail', [['{field}'], ['gyroADC[2]', 'setpoint[2]'], ['servo[3]']]],
     ['L5', 'servo limit', 'checks', [['{field}'], ['mixer[0]', 'mixer[1]', 'mixer[2]']]], ['L6', 'I-term limit', 'checks', [[G.I], [G.sp, G.gy]]], ['L7', 'collective stick end', 'governor', [['{field}'], ['mixer[3]'], ['headspeed', 'govTarget'], ['motor[0]']]]])
     X(id, { noun, unit: 's', scale: 1, tab, module: 'limits', note: 'monitor', nOf: 'periods at the limit',
         say: (f, v) => num(f.n) > 0 ? `${v.In}${chanOf(f)} is at its limit in ${many(f.n, 'period')}, for a total of ${v.value}. The longest period is ${pair(f.longestS, null, 's')}.`
-            + (f.combined ? ' Other outputs are at their limits at the same time.' : '') + errSay(f.worstError) : `${cap(chanOf(f))} does not get to its limit.`,
-        limit: (f, v, R) => num(R.longS) === null ? null : `Each period at the limit is a value to monitor. A problem is a period of ${fmt(R.longS)} s or more, an error more than the limit of check ${relatedOf(f, id)}, or two outputs at their limits.`,
-        bound: (f, v, R) => num(R.longS) === null ? null : `less than ${fmt(R.longS)} s for each period`,
+            + (f.combined ? ' Other outputs are at their limits at the same time.' : '') + errSay(f.worstError) + stuckSay(f) : `${cap(chanOf(f))} does not get to its limit.`,
+        limit: (f, v, R) => num(R.longS) === null || f.cause || f.outOfFlight ? null : `Each period at the limit is a value to monitor. A problem is a period of ${fmt(R.longS)} s or more in which ${stuckMove(f)}. `
+            + `At the end of that period, the error is more than ${stuckLimit(f, R)}.`,
+        bound: (f, v, R) => num(R.longS) === null || f.cause || f.outOfFlight ? null : `less than ${fmt(R.longS)} s, or ${stuckMove(f).replace(' does not move', ' moves')}, for each period`, // a cause (IMP-12) or out of flight: a value to monitor, the rule of the cause
         value: (f, v) => num(f.value) === null ? null : num(f.n) > 0 ? `${v.value} at the limit in ${many(f.n, 'period')} (longest ${pair(f.longestS, null, 's')})` : '0 s at the limit',
         skipped: (f) => f.limitUnknown ? `The limit of ${chanOf(f)} is unknown. Thus, this check did not operate. The toolkit text gives the cause.` : 'This check did not operate on this log. The toolkit text gives the cause.',
+        after: (f) => causeSay(f) || (f.outOfFlight ? 'These periods come at IDLE, during the spool-up or the spool-down, or with the rotor stopped. Thus, they do not show a problem of the control.' : null),
         evidence: ev('events', graphs, LIMIT_PLOT([graphs[0][0]]), { pads: [0.5, 0.5], maxSpans: 10, expected: () => 'The output does not get to its limits.' }) });
 
 // --- gain decisions (report.cjs) and the checks that no module of the app does ---
@@ -707,14 +775,29 @@ const LEAD = {
     C13: { info: (f, v) => `This check measures the time delay from the setpoint to the ${axIs(v)} rate.`, sym: (f, v) => `The ${axIs(v)} axis has a slow response to the stick.`, why: 'A long time delay makes the response slow. The filters, the servos and the B gain change it.' },
     T12: { info: 'This check measures the time delay from the setpoint to the yaw rate.', sym: 'The tail has a slow response to the stick.', why: 'A long time delay makes the response slow. The filters, the servo and the B gain change it.' },
     R1: { info: (f, v) => `This check measures the time delay from the stick to the ${axIs(v)} setpoint.`, sym: (f, v) => `The ${axIs(v)} setpoint follows the stick with a long time delay.`, why: 'The response time and the acceleration limit of the rates set this time delay.' },
-    D6: { sym: (f) => f.severity === 'flag' ? 'Failsafe is on while the helicopter is airborne.' : null, why: (f) => f.severity === 'flag' ? 'Failsafe in flight shows that the receiver did not get the signal of the transmitter.' : null },
+    // D6 (IMP-01): on 4.3 to 4.7 failsafePhase is always 0, so a flag comes from the failsafe switch (flightModeFlags bit 7); a receiver
+    // signal loss is check D10
+    // (f.stage2Off, f.failsafePhaseOff); on other firmware failsafePhase also shows a loss of the signal
+    D6: { sym: (f) => f.severity === 'flag' ? 'Failsafe is on while the helicopter is airborne.' : null, why: (f) => f.severity !== 'flag' ? null
+        : f.stage2Off || f.failsafePhaseOff ? 'Failsafe in flight shows that the failsafe switch is on. Check D10 finds the periods with no receiver signal.'
+        : 'Failsafe in flight shows that the failsafe switch is on, or that the receiver did not get the signal. Check D10 finds the periods with no receiver signal.' },
+    D10: { sym: (f) => f.severity === 'flag' ? 'While the rotor turns at the flight rpm, the flight controller gets no RC frames from the receiver.' : 'The flight controller gets no RC frames from the receiver while the headspeed is low.',
+        // f.stage1Delay: the rxfail values after the last RC frame (health_more RULE.rxLoss holdS to holdS + recheckS)
+        why: (f) => `Then the firmware holds the last stick positions, and ${Array.isArray(f.stage1Delay) && f.stage1Delay.length === 2 ? `${fmt(f.stage1Delay[0])} s to ${fmt(f.stage1Delay[1])} s` : 'a short time'} after the last RC frame, it sets the \`rxfail\` values. Check D12 gives the response of the governor.`,
+        good: 'The flight controller gets RC frames from the receiver at all times.' },
+    D11: { sym: (f) => f.motorCut === false ? (num(f.fallS) !== null ? 'The receiver signal stops while the helicopter is in the air, and the helicopter touches the ground.' : 'The receiver signal stops while the helicopter is in the air.')
+            : num(f.fallS) !== null ? 'The motor stops while the helicopter is in the air, and the helicopter falls to the ground.' : 'The motor stops while the helicopter is in the air.',
+        why: (f) => f.by === 'receiver loss' ? (f.motorCut === false ? 'The receiver signal stopped, and the pilot had no RC control. Check D10 gives the period with no receiver signal.'
+                : 'The receiver signal stopped, and the `rxfail` values stopped the motor. Check D10 gives the period with no receiver signal.')
+            : f.by === 'failsafe' ? 'Failsafe stopped the motor. Check D10 gives the periods with no receiver signal.' : 'With no motor power, the helicopter cannot hold its altitude. The analysis does not use the data after the motor cut.',
+        good: 'The motor operates until the helicopter lands.' },
     F10: { sym: (f, v) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'The yaw D-term power percentage is a reference value.', why: (f) => f.axis !== 'yaw' && f.unit === 'permille' ? null : 'Compare the power percentage with the RMS value and replay change.' },
     F11: { sym: 'The gyro filters cause a long time delay in the gyro signal.', why: 'A long filter time delay makes the loop less stable. Then the gains must be lower.' },
     T13: { sym: 'In hover, the yaw I-term must hold a large tail offset.', why: 'Then the I-term has less range to correct other errors. The tail center trim can supply this offset.' },
     C14: { sym: 'When the collective changes, the helicopter pitches, and the pitch I-term must correct it.', why: 'The I-term corrects slowly. Thus, the helicopter pitches for a short time after each collective change.',
         info: 'This check measures the pitch movement when the collective changes.' },
     T14: { info: 'This check measures the tail movement when the headspeed changes.', why: 'A headspeed change changes the torque of the main rotor. The inertia precompensation supplies the tail thrust for this change.' },
-    G14: { sym: 'In flight, the governor changes to AUTOROTATION or BAILOUT.', why: 'A change of this type removes or decreases the headspeed in flight.', good: 'The governor stays in ACTIVE in flight.' },
+    G14: { sym: 'In flight, the governor changes to HOLD, AUTOROTATION or BAILOUT.', why: 'A change of this type removes or decreases the headspeed in flight.', good: 'The governor stays in ACTIVE in flight.' },
     G15: { sym: (f) => phaseUnit(f) === 'deg/s' ? 'During the spool-up, the helicopter turns on the ground.' : 'The throttle increases fast during the spool-up.', why: 'A fast spool-up gives a large torque, and the tail cannot hold the helicopter at a low headspeed.' },
     G16: { sym: 'At the change from SPOOLUP to ACTIVE, the headspeed goes more than the target or less than it.', why: 'A step of the headspeed at this time changes the torque, and it can turn the helicopter.' },
     G17: { sym: 'The motor or the headspeed changes suddenly while the throttle does not change.', why: 'A sudden step can show a motor sync loss or a problem of the ESC.' },
@@ -794,8 +877,11 @@ const limitLines = (f) => { if (f.channel === 'ring') return []; // the swash ri
 for (const id of ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7']) REF[id] = (f) => limitLines(f);
 // the flight phases of each check (SPEC2 D13 correction): attitude-loop, filter and vibration checks use the flight only;
 // governor, motor, ESC and power checks use all phases of a flight log; header checks no phase (null)
-const ALL_PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];
-const PHASES = { G20: ALL_PHASES, P1: ALL_PHASES, P2: ALL_PHASES, D9: null, D5: ALL_PHASES, D7: ALL_PHASES, G14: ALL_PHASES, G19: ALL_PHASES, T15: ALL_PHASES, D8: ALL_PHASES, L1: ALL_PHASES, L2: ALL_PHASES, L3: ALL_PHASES, L4: ALL_PHASES, L5: ALL_PHASES, L6: ALL_PHASES, L7: ALL_PHASES, G15: ['spoolup'], G16: ['spoolup', 'ground', 'flight'], G17: ['idle', 'spoolup', 'ground'], G18: ['idle'], C15: ['ground'] }; // G16: a change after the liftoff is in flight
+// LOAD_PHASES: the governor and power checks of all phases leave out the fall and the time after the ground contact of an in-flight cut
+// (health_phase IMP-03: the motor is cut, then the rotor touches the ground; js/tuning_worker.js PHASE_USE.load); the control limits,
+// the rescue checks, the receiver and the state census keep them
+const ALL_PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'], LOAD_PHASES = ALL_PHASES.slice(0, 5);
+const PHASES = { G20: ALL_PHASES, P1: LOAD_PHASES, P2: LOAD_PHASES, D9: null, D10: ALL_PHASES, D11: ['flight', 'fall', 'aftercontact'], D12: null, D5: LOAD_PHASES, D7: ALL_PHASES, G14: ALL_PHASES, G19: ALL_PHASES, T15: ALL_PHASES, D8: ALL_PHASES, L1: ALL_PHASES, L2: ALL_PHASES, L3: ALL_PHASES, L4: ALL_PHASES, L5: ALL_PHASES, L6: ALL_PHASES, L7: ALL_PHASES, G15: ['spoolup'], G16: ['spoolup', 'ground', 'flight'], G17: ['idle', 'spoolup', 'ground'], G18: ['idle'], C15: ['ground'] }; // G16: a change after the liftoff is in flight
 const homeOf = (id, axis) => H ? H.homeOf(id, axis) : null;
 // The subsystem of each check for the Analysis overview (SPEC3 I, K3): power, motor, governor, rpm, vibration, limits, tail,
 // cyclic, radio, logging. C7 by its axis
@@ -803,12 +889,12 @@ const AREAS = ['power', 'motor', 'governor', 'rpm', 'vibration', 'limits', 'tail
 const AREA_OF = {};
 for (const [area, ids] of Object.entries({ logging: 'D1 D2 D3 D4 H SETUP D7', rpm: 'G1 G12 G20 G21', power: 'D5 G13 G11 P1 P2', motor: 'G17 G18',
     governor: 'G0 G2 G3 G4 G5 G6 G7 G8 G9 G10 G14 G15 G16 G19', vibration: 'F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 C11 C15 T4', limits: 'L1 L2 L3 L4 L5 L6 L7 C2 T8',
-    tail: 'T1 T2 T3 T5 T6 T7 T9 T10 T11 T12 T13 T14 T15', cyclic: 'C1 C3 C4 C5 C6 C8 C9 C10 C12 C13 C14', radio: 'R1 D6 D8 D9' })) for (const id of ids.split(' ')) AREA_OF[id] = area;
+    tail: 'T1 T2 T3 T5 T6 T7 T9 T10 T11 T12 T13 T14 T15', cyclic: 'C1 C3 C4 C5 C6 C8 C9 C10 C12 C13 C14', radio: 'R1 D6 D8 D9 D10 D11 D12' })) for (const id of ids.split(' ')) AREA_OF[id] = area;
 for (const [id, c] of Object.entries(CHECKS)) {
     c.id = id; if (REF[id]) c.evidence.plot.reference = REF[id]; c.template = c.say;
     c.node = id === 'C7' || id === 'L5' || id === 'L6' ? (axis) => homeOf(id, axis) : id === 'SETUP' ? (axis, f) => homeOf(f && f.rule ? `SETUP:${f.rule}` : 'SETUP', axis) : homeOf(id);
-    c.area = id === 'C7' ? (axis) => axis === 'yaw' ? 'tail' : 'cyclic' : AREA_OF[id] || null;
-    c.phases = PHASES[id] || (c.evidence.source === 'header' ? null : /^G\d/.test(id) ? ALL_PHASES : ['flight']);
+    c.area = id === 'C7' ? (axis) => axis === 'yaw' ? 'tail' : 'cyclic' : /^(L[1-7]|G14)$/.test(id) ? ((own) => (axis, f) => f && f.cause ? 'radio' : own)(AREA_OF[id]) : AREA_OF[id] || null; // IMP-12: a cause (a receiver signal loss, a fall) under D10
+    c.phases = PHASES[id] || (c.evidence.source === 'header' ? null : /^G\d/.test(id) ? LOAD_PHASES : ['flight']);
     for (const k of ['sym', 'why', 'good', 'info']) if (LEAD[id] && LEAD[id][k] !== undefined && c[k] === undefined) c[k] = LEAD[id][k];
 }
 // The hierarchy also reads statusOf when deciding whether a flag can block
@@ -837,7 +923,7 @@ function headerChange(f) {
 
 const unitOf = (f) => { const c = f && CHECKS[f.id]; return c ? (c.unitOf ? c.unitOf(f) : c.unit) : (f && f.unit) || ''; };
 const scaleOf = (f) => { const c = f && CHECKS[f.id]; return c ? (c.scaleOf ? c.scaleOf(f) : c.scale) : 1; };
-const nodeOf = (f) => { const c = f && CHECKS[f.id]; if (!c) return f ? homeOf(f.id, f.axis) : null; return typeof c.node === 'function' ? c.node(axisOf(f), f) : c.node; };
+const nodeOf = (f) => { const c = f && CHECKS[f.id]; if (!c) return f ? homeOf(f.id, f.axis) : null; if (f.cause && H && typeof H.nodeOfFinding === 'function') return H.nodeOfFinding(f); return typeof c.node === 'function' ? c.node(axisOf(f), f) : c.node; };
 // K2, K3: the subsystem of a finding, and if its home is a tuning block (a "poorly tuned parameters" item that the Analysis view
 // links to the Tuning view) or a prerequisite (hardware or setup: no tuner link)
 const areaOf = (f) => { const c = f && CHECKS[f.id]; if (!c) return null; return typeof c.area === 'function' ? c.area(axisOf(f), f) : c.area || null; };
@@ -955,7 +1041,9 @@ const numIn = (t) => { const m = /[−-]?\d+(?:\.\d+)?/.exec(String(t || '').rep
 // its limit; P1 by the lowest cell voltage against the minimum; the others from the value and the limit that the views show (display:
 // the same unit), with the direction of the limit
 const SIZE = {
-    L: (f) => { const R = f.threshold && typeof f.threshold === 'object' ? f.threshold : {}, a = num(f.longestS) !== null && num(R.longS) > 0 ? f.longestS / R.longS : null;
+    L: (f) => { const R = f.threshold && typeof f.threshold === 'object' ? f.threshold : {}, a = num(f.longestS) !== null && num(R.longS) > 0 ? f.longestS / R.longS : null, s = f.stuck;
+        // a problem: the size of its stuck period (its time against longS, its error at the end against the limit)
+        if (s && num(s.seconds) !== null && num(R.longS) > 0 && num(s.end) !== null && num(s.limit) > 0) return Math.max(s.seconds / R.longS, s.end / s.limit);
         const e = f.worstError && num(f.worstError.value) !== null && num(f.worstError.limit) > 0 ? Math.abs(f.worstError.value) / f.worstError.limit : null;
         const v = [a, e].filter(x => x !== null); return v.length ? Math.max(...v) : null; },
     P1: (f) => { const L = f.limits || {}; return num(f.minCell) > 0 && num(L.min) > 0 ? L.min / f.minCell : null; },
@@ -993,7 +1081,9 @@ function issues(findings) {
     for (const f of Array.isArray(findings) ? findings : []) {
         if (!f || typeof f.id !== 'string' || !CHECKS[f.id]) continue;
         const st = typeof f.status === 'string' ? f.status : status(f); if (!(st in ISSUE_STATUS)) continue;
-        const ax = axisOf(f), key = `${f.id}|${ax || ''}`;
+        // a result with a cause (a receiver signal loss, the fall or the time after a ground contact: IMP-12) is an issue of its own: its area
+        // (radio) and its item (rescue) are not those of the same check without a cause
+        const ax = axisOf(f), key = `${f.id}|${ax || ''}${f.cause ? '|cause' : ''}`;
         if (!by.has(key)) by.set(key, { key, id: f.id, axis: ax || null, list: [] });
         by.get(key).list.push({ f, st, size: sizeOf(f, st) });
     }

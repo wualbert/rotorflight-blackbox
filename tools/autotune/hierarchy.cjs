@@ -79,8 +79,11 @@ const PREREQ = [
         params: ['servo <n> <mid> <min> <max> <rneg> <rpos> <rate> <speed> <flags>', 'swash_type', 'main_rotor_dir', 'swash_roll_trim', 'swash_pitch_trim', 'swash_collective_trim',
             'swash_geo_correction', 'collective_tilt_correction_pos', 'collective_tilt_correction_neg', 'tail_rotor_mode', 'mixer input SR', 'mixer input SP', 'mixer input SC'],
         docs: [P.servoSetup, P.servos, P.mixerSetup, P.filterTuning] },
-    { id: 'rescue', title: 'Rescue', about: 'Turn on the rescue in each PID profile that you fly. Make sure that the rescue switch does not change the PID profile.',
-        checks: ['D9', 'D8', 'D6'], gates: [],
+    // D10 (no receiver signal), D11 (a motor cut in flight and the ground contact, IMP-03) and D12 (the response of the firmware when the
+    // receiver signal stops, IMP-01, IMP-11): the failsafe behaviour, as D6. They gate no block: a loss in flight does not hold the tuning
+    // of the governor or of the gains
+    { id: 'rescue', title: 'Rescue', about: 'Turn on the rescue in each PID profile that you fly. Make sure that the rescue switch does not change the PID profile. Examine the receiver signal, the failsafe values and each motor cut in flight (checks D10, D11 and D12).',
+        checks: ['D9', 'D8', 'D6', 'D10', 'D11', 'D12'], gates: [],
         params: fam('rescue_*', ['mode', 'flip', 'pull_up_collective', 'climb_collective', 'hover_collective', 'pull_up_time', 'climb_time', 'level_gain', 'flip_gain', 'max_sp_rate', 'max_sp_accel', 'flip_time', 'exit_time']),
         docs: [P.rescue] },
     { id: 'controller', title: 'Flight controller', about: 'Set the board alignment, the PID mode, the receiver and the rates before the first flight.',
@@ -284,6 +287,16 @@ function homeOf(checkId, axis) {
     return HOME.get(base) || null;
 }
 
+// the item of a finding (IMP-12): a control limit (L1-L7) or a governor change (G14) whose periods all have a cause (a receiver signal loss,
+// the fall or the time after the ground contact of an in-flight cut: f.cause) goes under the receiver signal loss (the item of D10), not
+// in its tuning block: it is not a problem of the tuning and holds no block. Else homeOf
+const CAUSED = /^(L[1-7]|G14)$/;
+function nodeOfFinding(f) {
+    if (!f) return null;
+    if (f.cause && CAUSED.test(String(f.id || '').split(':')[0])) return HOME.get('D10') || null;
+    return homeOf(f.id, f.axis === undefined ? null : f.axis);
+}
+
 const upstreamOf = (kinds, all) => { const m = new Map(NODES.map(n => [n.id, []])); for (const x of EDGES) if (kinds.includes(x.kind) && (all || !x.viaRules)) m.get(x.to).push(x.from); return m; };
 const GATE_UP = upstreamOf(['gate']), CAUSE_UP = upstreamOf(['cause']), RULE_UP = upstreamOf(['cause'], true); // RULE_UP: also the cause edges of the K rules only
 // the sequence: the prerequisites first (in the band order), then the blocks by order and lane
@@ -457,7 +470,7 @@ const byProfileKey = (a, b) => (a === '0') - (b === '0') || +a - +b; // PID prof
 // the arming profile of a log row of the worker (logsInput) when it is confirmed: an in-flight event, the CLI sections, the
 // CLI gov_headspeed, or 'headspeed' (the logged govRequest at the log start agrees with the gov_headspeed of exactly one PID
 // profile at the logged PID profile changes of the same file, user decision 2026-10-06) (armingBasis), or armingConfirmed; else null
-const CONFIRMED = new Set(['event', 'cli', 'cliTarget', 'headspeed']);
+const CONFIRMED = new Set(['snapshot', 'event', 'cli', 'cliTarget', 'headspeed']); // snapshot: param_pid_profile of a parameter snapshot
 const armingOfLog = (l) => { const p = pidOk(l && l.armingProfile); return p !== null && (l.armingConfirmed === true || (Array.isArray(l.armingBasis) && l.armingBasis.some(b => CONFIRMED.has(b)))) ? p : null; };
 // the profiles of a result: of its findings, its recommendations and the flight time of its logs (logs[].profileSeconds)
 function profilesOf(F, R, logs) {
@@ -524,7 +537,7 @@ function statusOne(findings, recs, opts, want) {
     for (const n of NODES) nodes[n.id] = { kind: n.kind, status: null, problem: false, number: null, fids: [], recs: [], findings: 0, blockedBy: [], gatedBy: [], possible: [], reason: '' };
     const byNode = new Map(NODES.map(n => [n.id, []]));
     // the item of a finding: its node when the worker set a new id, else its home (an old id of round 1 goes through LEGACY)
-    const nodeOf = (x) => { const n = BY_ID.has(x.node) ? x.node : LEGACY[x.node] && homeOf(x.id, axisOf(x)) === null ? LEGACY[x.node] : null; return n || homeOf(x.id, axisOf(x)); };
+    const nodeOf = (x) => { const n = BY_ID.has(x.node) ? x.node : LEGACY[x.node] && homeOf(x.id, axisOf(x)) === null ? LEGACY[x.node] : null; return n || (x.cause ? nodeOfFinding(x) : homeOf(x.id, axisOf(x))); };
     for (const f of F) { const id = nodeOf(f); if (byNode.has(id)) byNode.get(id).push(f); }
     const recHome = (r) => BY_ID.has(r.node) ? r.node : homeOf(r.id, r.axis);
     for (const r of RP) { const id = recHome(r); if (nodes[id]) nodes[id].recs.push(r.id); }
@@ -629,4 +642,4 @@ function statusOne(findings, recs, opts, want) {
     return { nodes, startHere, prereqProblems, profile: want, bench: [...bench].sort((a, b) => a - b) };
 }
 
-module.exports = { PREREQ, BLOCKS, NODES, EDGES, RULES, LEGACY, scopeOf, fromChecksOf, homeOf, isPrereq, isBlock, graph, status, causesOf, gateUpstream, spikeFallbacks, axisOf, compatible, profileKey, startsBefore, bySequence };
+module.exports = { PREREQ, BLOCKS, NODES, EDGES, RULES, LEGACY, scopeOf, fromChecksOf, homeOf, nodeOfFinding, isPrereq, isBlock, graph, status, causesOf, gateUpstream, spikeFallbacks, axisOf, compatible, profileKey, startsBefore, bySequence };

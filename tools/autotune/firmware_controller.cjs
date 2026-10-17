@@ -2,6 +2,7 @@
 // Executes the pinned C controller and mixer in a no-import WebAssembly module.
 // Sensor filters and RC shaping are external. Governor execution is optional.
 const schemaModule = require('./firmware/schema.cjs');
+const EQUIVALENCE = require('./firmware/equivalence.cjs'); // audited builds with the same replayed source (IMP-06)
 const SCHEMA = schemaModule.fields;
 const COMMIT = '118e9120260bb33f46df4f92052fb0e9fd4e9ebc';
 const AXES = ['roll','pitch','yaw'];
@@ -69,8 +70,17 @@ function fromHeader(header={}, values={}, context={}) {
     // The yaw O term does not exist in the pinned controller.
     put('yaw_o_gain',0,'firmware source');
     const enums={pid_mode:{PASSTHROUGH:0},iterm_relax_type:{OFF:0,RP:1,RPY:2},main_rotor_dir:{CW:0,CCW:1},tail_rotor_mode:{VARIABLE:0,MOTORIZED:1,BIDIRECTIONAL:2},swash_type:{NONE:0,PASSTHROUGH:1,THRU:1,CPPM:1,'120':2,CP120:2,'135':3,CP135:3,'140':4,CP140:4,'90L':5,CP90L:5,FP90L:5,'90V':6,CP90V:6,FP90V:6},gov_mode:{NONE:0,OFF:0,LIMIT:1,DIRECT:2,ELECTRIC:3,NITRO:4},gov_throttle_type:{NORMAL:0,SWITCH:1,FUNCTION:2},voltage_meter:{NONE:0,ADC:1,ESC:2}};
+    // 4.7 (85d7049a9): the battery values are lists of the 6 battery profiles, and bat_profile is the index in force. The
+    // configuration has the list (a CLI or snapshot value) or its elements name[0..5] (datasets.cjs): the element of bat_profile
+    const BATTERY_LISTS=/^(?:battery_cell_count|bat_capacity|vbat_(?:max|full|min|warning)_cell_voltage)$/;
+    function batteryElement(name) {
+        const k=Number(values.bat_profile);if(!BATTERY_LISTS.test(name)||!Number.isInteger(k)||k<0)return null;
+        if(own(values,name+'['+k+']'))return values[name+'['+k+']'];
+        const q=values[name];return Array.isArray(q)?q[k]:typeof q==='string'&&/,/.test(q)?q.split(/[,\s]+/)[k]:null;
+    }
     function getValue(name) {
         let x=values[name];
+        if((x==null||Array.isArray(x)||(typeof x==='string'&&/,/.test(x)))&&BATTERY_LISTS.test(name)){const e=batteryElement(name);if(e!=null)x=e;}
         const ma=/^(\w+)\[(\d+)\]$/.exec(name);
         if(x==null&&ma&&own(values,ma[1])) {const q=values[ma[1]];x=(Array.isArray(q)?q:String(q).split(/[,\s]+/))[+ma[2]];}
         const mi=/^mixer_(\w+)_(min|max|rate)$/.exec(name);
@@ -93,6 +103,8 @@ function fromHeader(header={}, values={}, context={}) {
         if(logged&&/^(?:log )?header$/.test(source)&&!loggedParameters.has(f.name))continue;
         if(numeric(x))put(f.name,x,source);
     }
+    // the configuration values that a condition of an equivalent build reads (equivalence.cjs), next to the schema values
+    for(const name of EQUIVALENCE.CONDITION_VALUES){const x=getValue(name);if(numeric(x))put(name,x,sourceOf(name));}
     const flagFields={gov_use_fallback_precomp:2,gov_use_voltage_comp:3,gov_use_pid_spoolup:4,gov_use_dyn_min_throttle:6};
     if(Object.keys(flagFields).every(k=>own(values,k))) {let flags=0;for(const [name,bit] of Object.entries(flagFields))if(values[name]===true||values[name]===1||values[name]==='ON')flags|=1<<bit;put('gov_flags',flags,'recorded configuration');}
     // battery_cell_count 0 is the firmware auto rule: with a rest voltage, the cell count that the firmware calculates
@@ -134,11 +146,22 @@ function requiredFields(config={},context={}) {
     if(config.executeGovernor&&v.gov_tta_gain===0){inactive.add('gov_tta_filter');inactive.add('gov_tta_limit');}
     return {required:SCHEMA.filter(f=>!inactive.has(f.name)).map(f=>f.name),inactive:[...inactive]};
 }
+// compatibility: the release 118e912 as before; a build of firmware/equivalence.cjs REVISIONS with its version, when each condition
+// of the hunks that this replay executes holds (status.equivalence: the caller must also pass the per-log parity of its RULES);
+// any other build is refused
 function compatibility(config={}, context={}) {
     const reasons=[],v=config.values||{},scope=requiredFields(config,context),missing=scope.required.filter(name=>!numeric(v[name]));
-    if(String(config.firmwareVersion)!=='4.6.0') reasons.push('The app cannot use this firmware version.');
-    const revision=String(config.firmwareRevision||'');
-    if(!revision.includes(COMMIT.slice(0,7))) reasons.push('The log does not identify the firmware source version.');
+    const revision=String(config.firmwareRevision||''),base=revision.includes(COMMIT.slice(0,7)),listed=base?null:EQUIVALENCE.match(revision);
+    let equivalence=null;
+    if(listed&&!listed.base) {
+        const e=listed.entry,scopes=['controller'].concat(config.servos?['servo']:[],config.executeGovernor?['governor']:[]),c=EQUIVALENCE.check(e,scopes,{values:v,servos:config.servos,modes:config.modes});
+        if(String(config.firmwareVersion)!==e.version) reasons.push('The app cannot use this firmware version.');
+        reasons.push(...c.reasons);
+        equivalence={revision:listed.id,commit:e.commit,build:e.build,version:e.version,base:COMMIT,files:c.files,conditions:c.conditions,parity:EQUIVALENCE.RULES};
+    } else {
+        if(String(config.firmwareVersion)!=='4.6.0') reasons.push('The app cannot use this firmware version.');
+        if(!base) reasons.push('The log does not identify the firmware source version.');
+    }
     if(![0,3,4].includes(v.pid_mode)) reasons.push('The app cannot use this PID mode, or the mode is unknown.');
     if(missing.length) reasons.push('The flight controller configuration has unknown values.');
     if(config.unknown&&config.unknown.some(name=>scope.required.includes(name))) reasons.push('The flight controller configuration has values that are not examined.');
@@ -158,7 +181,7 @@ function compatibility(config={}, context={}) {
     if(context.nativeRate!=null&&nominalPidHz&&(!numeric(context.nativeRate)||Math.abs(context.nativeRate/nominalPidHz-1)>0.01+1e-12)) reasons.push('The samples do not use the PID loop rate.');
     if(context.loopsPerFrame!=null&&context.loopsPerFrame!==1) reasons.push('The log does not record all control updates.');
     for(const f of SCHEMA) if(numeric(v[f.name])&&(!Number.isInteger(v[f.name])||v[f.name]<f.min||v[f.name]>f.max)) reasons.push('The flight controller value is out of its range: '+f.name+'.');
-    return {supported:reasons.length===0,reasons:[...new Set(reasons)],missing,inactive:scope.inactive,capabilities:CAPABILITIES,sourceRevision:COMMIT};
+    return {supported:reasons.length===0,reasons:[...new Set(reasons)],missing,inactive:scope.inactive,capabilities:CAPABILITIES,sourceRevision:COMMIT,equivalence};
 }
 async function bytesOf(options) {
     if(options.bytes) return options.bytes;
@@ -427,5 +450,5 @@ async function govCreate(options={}) {
     // values: the known values only, so that {...values, ...changes} for profile() does not make an assumed value known
     return {step,profile,reset,values:Object.fromEntries(Object.entries(base).filter(([n])=>!assumed.has(n))),assumed:[...assumed],required:scope.required,notes,artifactSha256:ARTIFACT};
 }
-module.exports={SCHEMA,COMMIT,ARTIFACT,CAPABILITIES,defaults,servoConfig,SERVO_FIELDS,fromHeader,pitchLimits,requiredFields,compatibility,create,replay,calibrate,govCreate,govCells,govRequiredFields};
+module.exports={SCHEMA,COMMIT,ARTIFACT,CAPABILITIES,EQUIVALENCE,defaults,servoConfig,SERVO_FIELDS,fromHeader,pitchLimits,requiredFields,compatibility,create,replay,calibrate,govCreate,govCells,govRequiredFields};
 if(require.main!==module)return;

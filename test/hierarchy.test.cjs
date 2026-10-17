@@ -123,14 +123,14 @@ test('gateUpstream: the gate edges, transitive, in sequence (the prerequisites f
 test('homes: every check id has a prerequisite or a block, and a catalog entry, and back', () => {
     const all = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'H', 'SETUP', 'R1'].concat(Array.from({ length: 11 }, (_, i) => `F${i + 1}`), Array.from({ length: 15 }, (_, i) => `G${i}`),
         Array.from({ length: 14 }, (_, i) => `C${i + 1}`), Array.from({ length: 14 }, (_, i) => `T${i + 1}`), ['D7', 'G15', 'G16', 'G17', 'G18', 'C15'],
-        ['G19', 'T15', 'D8', 'G20'], ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'], ['D9', 'P1', 'P2'], ['G21']);
+        ['G19', 'T15', 'D8', 'G20'], ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'], ['D9', 'P1', 'P2'], ['G21'], ['D10', 'D11', 'D12']);
     const home = (id, a) => H.homeOf(id, a === undefined ? null : a);
     // SPEC3 A: the prerequisites
     assert.deepEqual(['D1', 'D2', 'D3', 'D4', 'H'].map(id => home(id)), Array(5).fill('logging'));
     assert.deepEqual(['G1', 'G12', 'G20', 'G21', 'G21:gov_max_throttle:p2'].map(id => home(id)), Array(5).fill('rpm'), 'G21 and its remedy (a lower gov_max_throttle) are of the RPM signal');
     assert.deepEqual(['D5', 'G13', 'G11', 'P1', 'P2'].map(id => home(id)), Array(5).fill('power'));
     assert.deepEqual(['F7', 'C15', 'T4', 'SETUP:roll_i_gain'].map(id => home(id)), Array(4).fill('mechanics'));
-    assert.deepEqual(['D9', 'D8', 'D6', 'D6:excluded'].map(id => home(id)), Array(4).fill('rescue'));
+    assert.deepEqual(['D9', 'D8', 'D6', 'D6:excluded', 'D10', 'D11', 'D12'].map(id => home(id)), Array(7).fill('rescue')); // D10, D11, D12 (IMP-01, IMP-03, IMP-11): the failsafe, no gate
     assert.deepEqual(['SETUP', 'SETUP:pid_mode', 'SETUP:rates_type', 'D7', 'R1', 'L7'].map(id => home(id)), Array(6).fill('controller'));
     // SPEC3 B: the blocks and their evidence (the measurements are evidence: D-term noise in the filters, tracking error and time delay in the gains)
     assert.deepEqual(['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F8', 'F9', 'F10', 'F11', 'C11'].map(id => home(id)), Array(11).fill('filters'));
@@ -500,6 +500,24 @@ test('status: the results of a bench run (D7, SPEC2 D13 correction) do not count
     assert.deepEqual(st.bench, [2, 3]); assert.deepEqual(st.startHere, []);
     F = [f('a', 'G12', 2), f('b', 'F6', [2, 3])];
     assert.deepEqual(H.status(F, recs(F), { logs: [{ log: 2, class: 'bench' }] }).startHere, ['filters'], 'a result that also uses a flight log counts');
+});
+
+// IMP-12: the control limits and the governor changes of a crash (a receiver signal loss, the fall and the time after the ground contact of an
+// in-flight cut: f.cause) are under the receiver signal loss (the item of D10), not in the tuning blocks: they hold no block
+test('IMP-12: crash periods (f.cause) do not block the governor and cyclic blocks; they are results of the Rescue item', () => {
+    const L1 = { fid: 'l1', module: 'limits', id: 'L1', severity: 'note', log: 0, profile: 2, channel: 'throttle', cause: 'after contact', value: 0.62, n: 1 };
+    const L3 = { fid: 'l3', module: 'limits', id: 'L3', severity: 'note', log: 0, profile: 2, axis: 'pitch', channel: 'pitch', cause: 'receiver loss / after contact', value: 0.002, n: 1 };
+    const G14 = { fid: 'g14', module: 'more', id: 'G14', severity: 'flag', log: 0, profile: null, cause: 'receiver loss', value: 1, n: 1 };
+    const D11 = { fid: 'd11', module: 'phase', id: 'D11', severity: 'flag', log: 0, profile: 2, value: 1, n: 1 };
+    const recs = [{ id: 'G14', severity: 'check', evidence: [{ fid: 'g14' }] }, { id: 'D11', severity: 'check', profile: 2, evidence: [{ fid: 'd11' }] }];
+    assert.deepEqual([L1, L3, G14, D11].map(f => H.nodeOfFinding(f)), ['rescue', 'rescue', 'rescue', 'rescue']);
+    assert.deepEqual([H.nodeOfFinding(Object.assign({}, L1, { cause: undefined })), H.nodeOfFinding(Object.assign({}, L3, { cause: undefined })), H.nodeOfFinding(Object.assign({}, G14, { cause: undefined }))], ['governor', 'cyclic', 'governor']);
+    const st = H.status([L1, L3, G14, D11], recs), N = st.nodes;
+    assert.equal(N.rescue.status, 'problem'); assert.deepEqual(st.prereqProblems, ['rescue']);
+    for (const id of ['governor', 'cyclic', 'tail', 'tailcomp']) { assert.ok(!['blocked', 'problem', 'startHere', 'possible'].includes(N[id].status), `${id}: ${N[id].status}`); assert.deepEqual(N[id].blockedBy, [], id); }
+    // the same findings without a cause: a problem of the governor block (G14), and the limits in their blocks
+    const st2 = H.status([L1, L3, G14, D11].map(f => Object.assign({}, f, { cause: undefined })), recs);
+    assert.equal(st2.nodes.governor.status, 'startHere');
 });
 
 test('D9 and P1 (SPEC3 A, I): rescue off in a PID profile and a weak battery are prerequisite problems that gate their blocks', () => {

@@ -213,6 +213,106 @@ function snapshotState(h) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// The snapshot as a configuration (the shape of a parsed CLI dump)
+// ---------------------------------------------------------------------------------------------------------------------
+
+// cli/cli.c mixerInputNames (MIXER_IN_* of pg/mixer.h), featureNames (config/feature.h; the same in 4.6.0 and 4.7.0)
+const MIXER_INPUT_NAMES = ['-', 'SR', 'SP', 'SY', 'SC', 'ST', 'CR', 'CP', 'CY', 'CC', 'CT', 'RR', 'RP', 'RY', 'RC', 'RT', 'AUX1', 'AUX2', 'AUX3',
+    'CH9', 'CH10', 'CH11', 'CH12', 'CH13', 'CH14', 'CH15', 'CH16', 'CH17', 'CH18'];
+const FEATURE_NAMES = { 0: 'RX_PPM', 3: 'RX_SERIAL', 6: 'SOFTSERIAL', 7: 'GPS', 9: 'RANGEFINDER', 10: 'TELEMETRY', 13: 'RX_PARALLEL_PWM', 14: 'RX_MSP',
+    15: 'RSSI_ADC', 16: 'LED_STRIP', 17: 'DASHBOARD', 18: 'OSD', 19: 'CMS', 25: 'RX_SPI', 26: 'GOVERNOR', 27: 'ESC_SENSOR', 28: 'FREQ_SENSOR',
+    29: 'DYN_NOTCH', 30: 'RPM_FILTER' };
+// cli/cli.c mixerOpNames, mixerOutputNames (1 + 26 servos + 4 motors) and rxFailsafeModeCharacters; rx/rx.h
+// RXFAIL_STEP_TO_CHANNEL_VALUE(step) = RXFAIL_PULSE_MIN (875) + 5 * step. The same in 4.6.0 (118e912) and 4.7.0 (85d7049a9)
+const MIXER_OP_NAMES = ['-', 'set', 'add', 'mul'];
+const MIXER_OUTPUT_NAMES = ['-'].concat(Array.from({ length: 26 }, (_, k) => `S${k + 1}`), ['M1', 'M2', 'M3', 'M4']);
+const RXFAIL_MODES = 'ahs', RXFAIL_PULSE_MIN = 875, RXFAIL_STEP_US = 5;
+const SNAPSHOT_SOURCE = 'log snapshot';
+const cliNumber = (t) => { const s = String(t).trim(); return s !== '' && isFinite(+s) ? +s : s; };
+const cliValueOf = (t) => { const parts = String(t).split(',').map(cliNumber); return parts.length > 1 ? parts : parts[0]; };
+
+/**
+ * The values of a complete FULL snapshot (spec 2.2), at the log start, in the shape of a parsed CLI dump
+ * (health_setup.parseCli, datasets.parseCli): null for a stock log, a CHANGES log or a snapshot whose param_end does not
+ * agree (line count, FNV-1 hash). With records (assemble() or event-101 strings), the records before T0 (stamp p) are
+ * applied: the values are timeline.t0State.
+ *   { kind: 'snapshot', source: 'log snapshot', version, revision, craft, global: { name: value }, profiles: { '0'..'5' },
+ *     rateprofiles: { '0'..'5' }, features: { NAME: bool } (every named bit), mixerInputs: { SR: [min, max, rate] } (rate not 0,
+ *     as the CLI prints them), mixerRules: { n: 'oper input output weight offset' } (oper not 0, with the names of the CLI line
+ *     "mixer rule n set SC S1 1000 0"; el.mixrule has oper, input, output, offset, weight), servos: { '1'..: [mid, min, max, rneg,
+ *     rpos, rate, speed, flags] } (CLI numbers: element + 1, the param_rt servo count when the header has it), rxfail: { channel:
+ *     [mode] | ['s', us] } (the CLI line "rxfail 4 s 1500": mode a, h or s, the pulse of mode s), selectedProfile,
+ *     selectedRateProfile (CLI indexes at the log start), lines, hash }
+ * A value is a number, a text or an array of them, as a CLI line gives it.
+ */
+function snapshotCli(sysConfig, records) {
+    if (!isParamLog(sysConfig)) return null;
+    const h = parseParamHeader(sysConfig.paramHeader);
+    if (h.mode !== 'FULL' || !h.complete) return null;
+    let state = snapshotState(h);
+    if (h.pid0 !== null) state.set('pid_profile', String(h.pid0));
+    if (h.rate0 !== null) state.set('rate_profile', String(h.rate0));
+    if (records) { const tl = buildTimeline({ header: h, sysConfig, records }); if (tl) state = tl.t0State; }
+    const revision = String(sysConfig['Firmware revision'] || ''), ver = /\b(\d+\.\d+\.\d+)/.exec(revision);
+    const out = { kind: 'snapshot', source: SNAPSHOT_SOURCE, version: ver ? ver[1] : null, revision: revision || null, craft: sysConfig['Craft name'] ? String(sysConfig['Craft name']).trim() || null : null,
+        features: {}, global: {}, profiles: {}, rateprofiles: {}, mixerInputs: {}, mixerRules: {}, servos: {}, rxfail: {}, selectedProfile: null, selectedRateProfile: null, lines: h.lines, hash: h.hash };
+    for (let k = 0; k < 6; k++) { out.profiles[String(k)] = {}; out.rateprofiles[String(k)] = {}; }
+    const servoCount = Number.isInteger(h.rt.servos) && h.rt.servos >= 0 ? h.rt.servos : null;
+    let m;
+    for (const [key, text] of state) {
+        if (key === 'pid_profile') out.selectedProfile = intOr(text);
+        else if (key === 'rate_profile') out.selectedRateProfile = intOr(text);
+        else if ((m = /^p([0-5])\.(.+)$/.exec(key))) out.profiles[m[1]][m[2]] = cliValueOf(text);
+        else if ((m = /^r([0-5])\.(.+)$/.exec(key))) out.rateprofiles[m[1]][m[2]] = cliValueOf(text);
+        else if (key === 'el.feature') { const f = /^[0-9A-Fa-f]+$/.test(text) ? parseInt(text, 16) >>> 0 : null; if (f !== null) for (const [bit, name] of Object.entries(FEATURE_NAMES)) out.features[name] = ((f >>> +bit) & 1) === 1; }
+        else if ((m = /^el\.mixin\.(\d+)$/.exec(key))) { const v = String(text).split(',').map(Number), name = MIXER_INPUT_NAMES[+m[1]]; if (name && +m[1] > 0 && v.length === 3 && v[0]) out.mixerInputs[name] = [v[1], v[2], v[0]]; }
+        else if ((m = /^el\.mixrule\.(\d+)$/.exec(key))) { const v = String(text).split(',').map(Number);
+            if (v.length >= 5 && v[0]) out.mixerRules[m[1]] = [MIXER_OP_NAMES[v[0]] || v[0], MIXER_INPUT_NAMES[v[1]] || v[1], MIXER_OUTPUT_NAMES[v[2]] || v[2], v[4], v[3]].join(' '); }
+        else if ((m = /^el\.rxfail\.(\d+)$/.exec(key))) { const v = String(text).split(',').map(Number), mode = RXFAIL_MODES[v[0]];
+            if (v.length === 2 && mode) out.rxfail[m[1]] = mode === 's' ? [mode, RXFAIL_PULSE_MIN + RXFAIL_STEP_US * v[1]] : [mode]; }
+        else if ((m = /^el\.servo\.(\d+)$/.exec(key))) { const v = String(text).split(',').map(Number); if (v.length === 8 && (servoCount === null || +m[1] < servoCount)) out.servos[String(+m[1] + 1)] = v; }
+        else if (!/^(?:el|pg|boot)\./.test(key)) out.global[key] = cliValueOf(text);
+    }
+    return out;
+}
+// snapshotCli of a log header (FlightLog.getSysConfig()) once for each header object: the modules that get only the header
+// (health_setup, health_limits, health_more, datasets, filter_tune, gov_tune) call it. Records before T0 are not applied (the
+// header has no records), unless the caller that decoded the records gave the snapshot of this header (rememberSnapshot)
+const SNAPSHOTS = new WeakMap();
+function snapshotOf(sysConfig) {
+    if (!sysConfig || typeof sysConfig !== 'object') return null;
+    if (!SNAPSHOTS.has(sysConfig)) SNAPSHOTS.set(sysConfig, snapshotCli(sysConfig));
+    return SNAPSHOTS.get(sysConfig);
+}
+// The snapshot of a header object (snapshotCli(sysConfig, records): with the records before T0) for snapshotOf. A copy of a
+// header (datasets.configurationHeader) gets the snapshot of its original. Only a snapshot (not null) replaces the cache
+function rememberSnapshot(sysConfig, snap) {
+    if (sysConfig && typeof sysConfig === 'object' && snap && typeof snap === 'object') SNAPSHOTS.set(sysConfig, snap);
+    return snapshotOf(sysConfig);
+}
+
+/**
+ * The C items of the journal after the log start (not the stamp p), as changes at frame seconds:
+ *   [{ t (frameS of the frame of the stamp: timeline.frameOf, the frame at or before it, the last frame for a stamp after the
+ *      last frame), frame, key (the key of the record: 'p1.yaw_p_gain', 'battery_cell_count[0]', ...), value, old, seq,
+ *      uncertain (an interval stamp n0.c0~n1.c1: the change is at the end of the interval, n1, and its time in the interval is
+ *      not known) }]
+ * timeline: buildTimeline (its items have the point p0..p1 of every stamp kind); frameS: the time of each frame of the timeline.
+ * The worker (paramOf) and datasets.inputsOfFile use this, so that the two paths have the same times.
+ */
+function journalChanges(timeline, frameS) {
+    const out = []; if (!timeline || !Array.isArray(timeline.items) || !frameS || !frameS.length) return out;
+    const last = frameS.length - 1;
+    for (const it of timeline.items) {
+        if (it.pre || !(it.pos >= 0)) continue;
+        const f = Math.min(last, Math.max(0, timeline.frameOf(Math.floor(it.pos / RULES.tickSpan))));
+        out.push({ t: frameS[f], frame: f, key: it.element === null || it.element === undefined ? it.key : `${it.key}[${it.element}]`, value: it.value, old: it.old, seq: it.seq,
+            uncertain: it.p0 !== undefined && it.p0 < it.pos });
+    }
+    return out.sort((a, b) => a.t - b.t || a.seq - b.seq);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Records (2.4)
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -971,7 +1071,11 @@ function buildTimeline(input) {
                 let v = null;
                 if (s.p !== undefined) v = pid === null || pid === undefined ? null : get(`p${pid}.${s.p}`);
                 else if (s.r !== undefined) v = rate === null || rate === undefined ? null : get(`r${rate}.${s.r}`);
-                else if (s.m !== undefined) v = get(s.m);
+                else if (s.m !== undefined) {
+                    v = get(s.m);
+                    // at: the element [value of the key at] of a list (4.7: a cell voltage of the active battery profile)
+                    if (v !== null && s.at !== undefined) { const k = intOr(get(s.at)), e = k === null ? undefined : String(v).split(',')[k]; v = e === undefined ? null : e.trim(); }
+                }
                 else if (s.rt !== undefined) {
                     v = header.rt[s.rt] === undefined || header.rt[s.rt] === null ? null : String(header.rt[s.rt]);
                     // div: integer division by another param_rt field (classic looptime = targetLooptime / pid_denom)
@@ -1039,7 +1143,7 @@ function classicHints(sysConfig, header, sem) {
             let key = null;
             if (s.p !== undefined && pid !== null) key = `p${pid}.${s.p}`;
             else if (s.r !== undefined && rate !== null) key = `r${rate}.${s.r}`;
-            else if (s.m !== undefined) key = s.m;
+            else if (s.m !== undefined && s.at === undefined) key = s.m;   // an element of a list (at) gives no hint for the list
             if (!key) return;
             let v = sources.length === 1 ? String(lines[name]) : parts[i];
             if (s.scale) v = /^-?\d+$/.test(v) ? String(+v / s.scale) : null;
@@ -1100,7 +1204,7 @@ function collect(log) {
     return { frames, strings, resumes };
 }
 
-module.exports = { RULES, PHASE_OF_DENOM, PARAM_KEY, fnv1, crc8, unescapeValue, isParamLog, parseParamHeader, snapshotState, parsePoint, pointText,
+module.exports = { RULES, PHASE_OF_DENOM, PARAM_KEY, MIXER_INPUT_NAMES, MIXER_OP_NAMES, MIXER_OUTPUT_NAMES, FEATURE_NAMES, SNAPSHOT_SOURCE, fnv1, crc8, unescapeValue, isParamLog, parseParamHeader, snapshotState, snapshotCli, snapshotOf, rememberSnapshot, journalChanges, parsePoint, pointText,
     parseRecord, assemble, buildTimeline, selfTest, classicFromSysConfig, collect };
 if (require.main !== module) return;
 

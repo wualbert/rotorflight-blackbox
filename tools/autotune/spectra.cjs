@@ -54,7 +54,7 @@ for (const w of lib.segments(app, FILE, { whole: true, extra: EXTRA })) {
     const fl = w.flight, rate = fl.actualRate, n = w.n, raw = [0, 1, 2].map(a => w.extra[`gyroRAW[${a}]`]);
     if (!raw.every(Boolean)) continue;
     const target = w.extra.govTarget || w.hs, profile = lib.profilesOf(w, target, RULE.headspeed).p;
-    const flying = Uint8Array.from(w.hs, (h, i) => (w.airborneAt[i] && h >= RULE.headspeed) ? 1 : 0);
+    const flying = Uint8Array.from(w.hs, (h, i) => (w.airborneAt[i] && h >= RULE.headspeed && !(w.rxLossAt && w.rxLossAt[i])) ? 1 : 0); // out of a receiver signal loss (lib.cjs rxLossAt)
     let up = 0; for (let i = 0; i < n; i++) up += flying[i];
     logs.push({ log: fl.log, start: fl.start, rate: r(rate, 2), seconds: r(n / rate, 1), flyingS: r(up / rate, 1) });
 

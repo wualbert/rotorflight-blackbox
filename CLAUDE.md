@@ -40,6 +40,8 @@ node --test test/health_track.test.cjs test/health_more.test.cjs test/health_pha
 node --test test/tuning_plot.test.cjs test/tuning_snippet.test.cjs test/tuning_dialog.test.cjs test/log_lens.test.cjs test/analysis_view.test.cjs test/views.test.cjs
 AUTOTUNE_REAL_LOG=<RTFL_BLACKBOX_LOG_20261004_113720.BBL> AUTOTUNE_RESCUE_LOG=<fireball 2026-10-05 dump.bbl> node --max-old-space-size=8000 --test test/tuning_worker.test.cjs   # parity with health.cjs + health_report.cjs, the Fireball tests; about 11 min; without them the real-log tests skip
 PARAM_EPOCHS_LOG=<fireball 2026-10-05 dump.bbl> node --test test/param_epochs.test.cjs   # arms, re-arms and the parts of each log whose values are possibly not current
+PARAM_EPOCHS_LOG=analysis/fireball-crash-20261015/crash.bbl node --test test/param_epochs.test.cjs test/health_setup.test.cjs test/filter_tune.test.cjs   # a 4.7 log with a parameter snapshot (IMP-05)
+node --test test/firmware_controller.test.cjs   # with the audited builds of tools/autotune/firmware/equivalence.cjs (IMP-06; the source audit needs ~/exp/rotorflight-firmware)
 node --test test/datasets.test.cjs test/filter_tune.test.cjs   # configurations (datasets.cjs) and the filter search (filter_tune.cjs, worker command filterTune)
 node tools/autotune/datasets.cjs <log file> [--cli <dump>]        # the configurations of a file; node tools/autotune/filter_tune.cjs <out dir> <log file> [--cli <dump>]: the filter search
 node --test test/ste_text.test.cjs        # ASD-STE100 lint of every text that the app shows (docs/STE_GLOSSARY.md); about 2.5 min
@@ -134,9 +136,15 @@ python3 tools/flash_read.py /dev/cu.usbmodemXXXX --out log.bbl [--resume]
   - If the app cannot find this PID profile, show "PID profile unknown". Then give no CLI text and no export.
   - In the app, write "PID profile 1" to "PID profile 6", as the Configurator shows them. In CLI text, write `profile 0` to
     `profile 5`.
-- **No access to the flight controller.** The log is the only necessary input. A CLI dump is optional:
-  - Do not tell the pilot to load a dump or to connect the flight controller before the analysis.
+- **No access to the flight controller.** The log is the only input that the analysis must have. A CLI dump is optional,
+  but the app asks for it (user, 2026-10-15):
+  - If no CLI dump is loaded, show this clearly in the Tuning view and in the Analysis view. Ask for a CLI dump, with the
+    steps to get one (a saved file, or `diff all` and "Save to File" in the Configurator) and the "Load CLI dump" button
+    (`cliBlockHtml` in `js/tuning_dialog.js`). The helicopter is not always available, so a saved file is the first step.
   - Tell the pilot which values the log does not record. If a flight can record a value, tell the pilot how to do it.
+  - Do not fail silently without a CLI dump. If a result cannot be calculated because the log does not record a value and
+    the log data cannot give it, name the value and ask for the CLI dump there, with the "Load CLI dump" button (example:
+    the filter replay, `result.cliNeeded`, when the tail rotor notch fit fails).
   - The export does not change. The pilot uses it after the analysis.
 - **Values that are possibly not current.** Show a flag on each result, period, recommendation and log lens window that
   uses such values (user, 2026-10-06):
@@ -159,6 +167,9 @@ python3 tools/flash_read.py /dev/cu.usbmodemXXXX --out log.bbl [--resume]
   - Find each period at the limit in all flight phases, also in rescue. Do not use a guard time that removes these periods.
   - Show each period with its time, its duration, the other outputs at their limits at the same time and the errors during the period.
   - If a log has one or more periods at a limit, do not show "Satisfactory" for that output.
+  - A short period at a limit, or a period in which the output moves the gyro rate to the setpoint, is a response at the maximum rate:
+    "Monitor". A problem is a period of 0.1 s or more in which the gyro does not move to the setpoint (user, 2026-10-16). Do not use the
+    error alone: a stick that moves to its end increases the setpoint while the gyro accelerates. `stuckOf` in `health_limits.cjs`.
 - **Export.** The "CLI file" panel of the Tuning view writes a CLI script for the pilot. It writes a file or the clipboard
   only, and it does not send data to the flight controller:
   - The pilot selects the recommendations. By default, the panel selects the changes that have CLI text. It does not select

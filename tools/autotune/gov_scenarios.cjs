@@ -430,7 +430,7 @@ const TEXT = {
         all: 'The analysis selects one value for all PID profiles on the errors of all PID profiles.',
         total: (a, b) => `In the 5 s after the error, the total headspeed decrease changes from ${fmt(a, 1)} % s to ${fmt(b, 1)} % s.`,
         under: (a, b) => `The time with the headspeed at less than 90 % of the target changes from ${fmt(a, 2)} s to ${fmt(b, 2)} s.`,
-        tried: (w, x) => `Selection flights, all PID profiles, ${w}: the total headspeed decrease is ${fmt(x.loss, 1)} % s, and the lowest headspeed is ${pct(x.min, 1)} % (${many(x.n, 'error')}).`,
+        tried: (w, x) => `Selection flights, all PID profiles, ${w}: the total headspeed decrease is ${fmt(x.loss, 1)} % s. The lowest headspeed is ${pct(x.min, 1)} % (${many(x.n, 'error')}).`,
         recovery: 'RECOVERY starts at a throttle that the governor calculates from the headspeed and the motor constant. "gov_use_fallback_precomp" changes only the 0.2 s of FALLBACK.',
         drop: `The throttle decrease in FALLBACK tells the pilot that the RPM signal has an error. The analysis keeps the decrease of each error at ${RULES.scnFallback.minDrop} % or more.`,
         cue: (a, b, n) => `At the ${many(n, 'error')} at the maximum throttle, the smallest throttle decrease in FALLBACK changes from ${pct(a, 1)} % to ${pct(b, 1)} %.`,

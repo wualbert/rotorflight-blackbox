@@ -112,7 +112,8 @@ Fits are Levenberg-Marquardt with forward-difference Jacobians in log space, pse
 Per axis: roll and pitch need the prediction and frequency checks, yaw the frequency check. The open-loop yaw prediction
 is shown but is not a gate: a replay of the recorded tail command integrates every torque disturbance that the command
 cancelled. A model that agrees on some axes only is "partial": it can test the control steps of those axes
-(`eligibleSteps`). Governor gains need governor parity.
+(`eligibleSteps`). This model does not tune the governor: the governor model (`gov_tune.cjs`) tunes it (user, 2026-10-15). In the
+closed loop of the other steps, the model calculates the governor only with governor parity.
 
 ## Results (2026-10-14)
 

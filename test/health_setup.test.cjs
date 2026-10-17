@@ -107,7 +107,7 @@ test('header checks: rate, LPF, Q, D cutoff, dynamic notch, aliasing', () => {
     const m = hs.analyse(w, ctxOf(w)), F = hs.judge([{ log: 0, start: w.flight.start, header: w.flight.header, metrics: m }], hs.DEFAULT_RULES);
     assert.equal(flag(F, 'D1').length, 1);
     assert.equal(flag(F, 'F1').length, 1);
-    assert.equal(F.find(f => f.id === 'F2').severity, 'skipped');
+    assert.equal(F.find(f => f.id === 'F2').severity, 'ok', 'no gyro LPF: no cutoff adds a delay, not "Not measured"');
     const f3 = flag(F, 'F3'); assert.equal(f3.length, 1); assert.equal(f3[0].value, 1.5);
     assert.equal(F.find(f => f.id === 'F4' && f.profile === 'yaw').severity, 'note');
     assert.equal(F.find(f => f.id === 'F4' && f.profile === 'roll').severity, 'ok');
@@ -259,4 +259,97 @@ test('no dynamic LPF without an LPF1 type, and no phantom notch for a disabled s
     const w2 = makeW({ seconds: 4, raw: false, hdr: header({ gyro_rpm_notch_source_roll: [10, 11], gyro_rpm_notch_q_roll: [80, 80], gyro_rpm_notch_center_roll: [0, 0] }) }), m2 = hs.analyse(w2, ctxOf(w2));
     assert.deepEqual(m2.setup.rpm.banks.roll.map(b => b.code), [11]);
     assert.ok(!m2.F9.rows.some(r => r.code === 10));
+});
+
+// ---- D4 with a parameter snapshot (IMP-05) --------------------------------------------------------------------------------
+
+test('D4 with a parameter snapshot: every snapshot value against the dump, defaults of the dump build for a diff, the PID profile of each difference', () => {
+    const snap = { global: { dyn_notch_count: 2, gov_mode: 'ELECTRIC', debug_mode: 'NONE' }, profiles: { 0: { pitch_p_gain: 50 }, 1: { pitch_p_gain: 99, yaw_i_gain: 116 } },
+        rateprofiles: { 0: { roll_expo: 40 } }, features: { DYN_NOTCH: true, GOVERNOR: true }, mixerInputs: { SC: [-1250, 1250, 1070] } };
+    const head = '# diff all\n# Rotorflight / STM32G47X (SG47) 4.7.0-bbp-pr Oct 14 2026 / 05:24:53 (85d7049a9) MSP API: 12.10\n', body =
+        'feature -DYN_NOTCH\nfeature GOVERNOR\nmixer input SC -1250 1250 1070\nset gov_mode = ELECTRIC\nprofile 0\nprofile 1\nset pitch_p_gain = 90\nrateprofile 0\n';
+    const text = head + 'board_name MATEKG474HELI\nmanufacturer_id MTKS\n' + body, diff = hs.parseCli(text);
+    const CD = require('../tools/autotune/cli_defaults.cjs'), defaults = CD.forRevision(text);
+    assert.equal(defaults.revision, '85d7049a9'); assert.equal(diff.board, 'MATEKG474HELI');
+    // the defaults are of the board too: a dump of another board, or with no board line, gets none
+    assert.equal(CD.forRevision(head + 'board_name OTHERBOARD\n' + body), null);
+    assert.equal(CD.forRevision(head + body), null);
+    assert.equal(CD.forRevision(text.replace('(85d7049a9)', '(deadbeef1)')), null);
+    const rows = hs.compareSnapshot(snap, diff, defaults), bad = rows.filter(r => !r.match).map(r => [r.name, r.pidProfile, r.from]);
+    // dyn_notch_count 2 against the default 6, pitch_p_gain of PID profile 2, DYN_NOTCH off in the diff; yaw_i_gain 116 against the default 120
+    assert.deepEqual(bad, [['dyn_notch_count', null, 'default'], ['pitch_p_gain', 2, 'cli'], ['yaw_i_gain', 2, 'default'], ['feature DYN_NOTCH', null, 'cli']]);
+    assert.ok(rows.some(r => r.name === 'gov_mode' && r.match) && rows.some(r => r.name === 'debug_mode' && r.from === 'default' && r.match));
+    assert.ok(rows.some(r => r.name === 'mixer input SC' && r.match));
+    // a dump of another build: only the values that the dump shows
+    const other = hs.compareSnapshot(snap, diff, null);
+    assert.deepEqual(other.filter(r => !r.match).map(r => r.name), ['pitch_p_gain', 'feature DYN_NOTCH']);
+    // the D4 text of a snapshot (the STE harvest reads it here, with no real log): each difference with its PID profile, and the log wins
+    const w = makeW({ seconds: 20, lines: CLEAN_LINES }), m = hs.analyse(w, ctxOf(w)), mm = rows.filter(r => !r.match);
+    m.D4 = { basis: 'snapshot', defaults: defaults.revision, compared: rows.length, mismatches: mm, matches: rows.length - mm.length, cliKind: 'diff', cliOnly: {} };
+    const f = hs.judge([{ log: 0, start: 0, header: w.flight.header, metrics: m }], hs.DEFAULT_RULES).find(x => x.id === 'D4');
+    assert.deepEqual([f.severity, f.basis, f.value, f.n], ['flag', 'snapshot', 4, rows.length]);
+    assert.match(f.text, /^The log header has the values of all PID profiles and rate profiles\. These values and the CLI dump have 4 different values out of \d+\./);
+    assert.match(f.text, /`pitch_p_gain` of PID profile 2 is `99` in the log header\. It is `90` in the CLI dump\./);
+    assert.match(f.text, /`yaw_i_gain` of PID profile 2 is `116` in the log header\. It is `120` in the CLI dump \(default value\)\./);
+    assert.match(f.text, /For a value that the CLI dump does not show, the check uses the default value of the firmware `85d7049a9`\./);
+    assert.match(f.text, /Thus, the CLI dump is not of the time of this log\. The analysis uses the values of the log header\.$/);
+    const ok = hs.judge([{ log: 0, start: 0, header: w.flight.header, metrics: Object.assign({}, m, { D4: Object.assign({}, m.D4, { mismatches: [], defaults: null, cliKind: 'diff' }) }) }], hs.DEFAULT_RULES).find(x => x.id === 'D4');
+    assert.equal(ok.severity, 'ok'); assert.match(ok.text, /Thus, it compares only the values that the CLI dump shows\./);
+});
+
+// review IMP-05: the gear ratios and the tail mode of the parameter snapshot of the log header rank above a CLI dump (health_setup and
+// health_more gearOf); without a snapshot, the CLI dump as before
+test('gearOf: the parameter snapshot of the log header gives the gear ratios, above a CLI dump', () => {
+    const PL = require('../tools/autotune/param_log.cjs'), more = require('../tools/autotune/health_more.cjs');
+    const body = [['Param log', '1'], ['param_mode', 'FULL'], ['param_loop', '1,1,1,128'], ['param_phase', 'pos=0,sp=0,pid=0,mix=0,mot=0,fupd=0,bb=0,flush=0'], ['param_pgs', '14.0/936'],
+        ['param_fixes', '-'], ['param_rt', 'gov_mode=3,features=0,pid_denom=1,filter_denom=1,looptime=250,debug_mode=0,motors=1,servos=4'], ['param_pid_profile', '0'], ['param_rate_profile', '0'],
+        ['set.main_rotor_gear_ratio', '1,1'], ['set.tail_rotor_gear_ratio', '19,76'], ['set.tail_rotor_mode', 'VARIABLE']];
+    let hash = 2166136261; for (const [k, v] of body) hash = PL.fnv1(`H ${k}:${v}\n`, hash);
+    body.push(['param_end', `${body.length},${(hash >>> 0).toString(16)}`]);
+    const H = { paramHeader: body }, cliParsed = hs.parseCli('# diff all\nset tail_rotor_gear_ratio = 10,50\nset tail_rotor_mode = MOTORIZED\n');
+    assert.deepEqual(hs.gearOf({ cliParsed }, H), { main: [1, 1], tail: [19, 76], motorisedTail: false, source: 'log snapshot' });
+    assert.deepEqual(more.gearOf({ cli: '# diff all\nset tail_rotor_gear_ratio = 10,50\n' }, H), { main: [1, 1], tail: [19, 76], motorisedTail: false });
+    assert.deepEqual(hs.gearOf({ cliParsed }, {}).tail, [10, 50], 'no snapshot: the CLI dump');
+    assert.equal(hs.gearOf({ gear: { main: [1, 1], tail: [1, 4] } }, H).source, 'ctx.gear', 'a gear of the worker (the fit) first');
+});
+
+// review IMP-05: the 4.6.0 table is the table of 58a4bd5cc, 874f369d5 and 118e912 (the same pg and settings.c but blackbox_params),
+// and fromDumps takes a name of a dump that its diff does not list, when the dumps agree
+test('cli_defaults: the aliases of the 4.6.0 builds, and fromDumps from a dump and a diff of one session', () => {
+    const CD = require('../tools/autotune/cli_defaults.cjs'), board = 'board_name MATEKG474HELI\n';
+    for (const h of ['874f369d5', '118e912', '58a4bd5cc']) assert.equal(CD.forRevision(`# Rotorflight / STM32G47X (SG47) 4.6.0 Oct 13 2026 / 12:00:00 (${h}) MSP API: 12.9\n${board}`).revision, '58a4bd5cc', h);
+    assert.equal(CD.revisionOf('Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X'), '85d7049a9');
+    const head = '# Rotorflight / STM32G47X (SG47) 4.7.0-bbp-pr Oct 14 2026 / 05:24:53 (85d7049a9) MSP API: 12.10\n' + board;
+    const dump = head + 'feature -GPS\nfeature RX_SERIAL\nset gyro_lpf1_static_hz = 100\nset debug_mode = NONE\nprofile 0\nset roll_p_gain = 50\nprofile 1\nset roll_p_gain = 50\nrateprofile 0\nset roll_rc_rate = 50\n';
+    const diff = head + 'feature RX_SERIAL\nset gyro_lpf1_static_hz = 250\nprofile 1\nset roll_p_gain = 60\n';
+    const t = CD.fromDumps([[dump, diff]], null);
+    assert.deepEqual([t.revision, t.board], ['85d7049a9', 'MATEKG474HELI']);
+    assert.deepEqual(t.global, { debug_mode: 'NONE' }, 'gyro_lpf1_static_hz is in the diff: not a default');
+    assert.deepEqual(t.profile, { roll_p_gain: '50' }, 'profile 0 has the default, profile 1 is in the diff');
+    assert.deepEqual(t.rateprofile, { roll_rc_rate: '50' });
+    assert.deepEqual(t.features, { GPS: false, RX_SERIAL: false }, 'a feature of the diff has the other value');
+    // two sessions that do not agree on a name: no default for it
+    assert.equal(CD.fromDumps([[dump, diff], [dump.replace('debug_mode = NONE', 'debug_mode = GYRO'), diff]], null).global.debug_mode, undefined);
+});
+
+test('D4 on the crash log with the 16:53 dump: exactly the 12 differences', { skip: !process.env.PARAM_EPOCHS_LOG && 'PARAM_EPOCHS_LOG not set' }, (t) => {
+    const fs = require('node:fs'), path = require('node:path');
+    const cliFile = process.env.PARAM_EPOCHS_CLI || path.resolve(__dirname, '../analysis/fireball-rates-20261015/RTFL_cli_SAB_Fireball_20261015_165335.txt');
+    if (!fs.existsSync(cliFile)) return t.skip('no CLI dump (PARAM_EPOCHS_CLI)');
+    const cli = fs.readFileSync(cliFile, 'utf8');
+    for (const w of lib.segments(app, process.env.PARAM_EPOCHS_LOG, { whole: true, extra: hs.EXTRA })) {
+        if (w.skipped) continue;
+        if (!hs.snapshotOfHeader(w.flight.header)) return t.skip('PARAM_EPOCHS_LOG is not a param log');
+        const m = hs.analyse(w, { cli, rate: w.flight.actualRate || w.rate });
+        assert.equal(m.D4.basis, 'snapshot'); assert.equal(m.D4.defaults, '85d7049a9');
+        const names = m.D4.mismatches.map(v => (v.pidProfile ? `PID profile ${v.pidProfile} ` : '') + v.name).sort();
+        assert.deepEqual(names, ['PID profile 2 pitch_i_gain', 'PID profile 2 pitch_p_gain', 'PID profile 2 roll_i_gain', 'PID profile 2 yaw_i_gain', 'PID profile 2 yaw_p_gain',
+            'blackbox_log_esc', 'debug_mode', 'dyn_notch_count', 'dyn_notch_max_hz', 'dyn_notch_min_hz', 'dyn_notch_q', 'feature DYN_NOTCH']);
+        const f = hs.judge([{ log: w.flight.log, start: 0, header: w.flight.header, metrics: m }]).find(x => x.id === 'D4');
+        assert.equal(f.value, 12); assert.equal(f.severity, 'flag'); assert.equal(f.basis, 'snapshot');
+        // each difference with its PID profile, and the log wins
+        assert.match(f.text, /`pitch_p_gain` of PID profile 2 is `99` in the log header\. It is `90` in the CLI dump\./);
+        assert.match(f.text, /`dyn_notch_count` is `2` in the log header\. It is `6` in the CLI dump \(default value\)\./);
+        assert.match(f.text, /Thus, the CLI dump is not of the time of this log\. The analysis uses the values of the log header\./);
+    }
 });

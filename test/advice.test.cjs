@@ -699,6 +699,30 @@ test('C7: yaw P on another profile than the header: a match of P x mean stop gai
     assert.deepEqual(only(run([], { decisions: [d], cli }), 'C7').cli, ['profile 1', 'set yaw_p_gain = 63']);
 });
 
+test('IMP-07: a C7 change and a model change carry the flights that can show them; the export gives them once and the commands stay', () => {
+    const P = require('../tools/autotune/validation_power.cjs');
+    const r = only(run([], { decisions: [decision({ measured: { trackRmsSE: 0.4 } })] }), 'C7');
+    assert.deepEqual(r.cli, ['profile 0', 'set pitch_f_gain = 80']);
+    assert.equal(r.validationPower.flightsPerArm, P.flightsPerArm(0.4 * Math.sqrt(5), 1.4));
+    assert.equal(r.validationPower.metrics[0].delta, -1.4); assert.equal(r.validationPower.confirmable, true);
+    assert.equal(r.validationPower.metrics[0].id, 'decision'); assert.equal(r.validationPower.profileLabel, 'PID profile 1');
+    assert.equal(only(run([], { decisions: [decision()] }), 'C7').validationPower.available, false, 'no measured SE: no number of flights');
+    // a change group of the model (control_pipeline.tune): two changes with one plan
+    const plan = P.plan([{ id: 'tracking', axes: ['roll', 'pitch'], unit: 'deg/s', delta: -0.57, sd: 3.04, flights: 14, lowerBound: false }]);
+    const rec = (name, to) => ({ id: 'twin:x:cyclic:' + name, group: 'twin:x:cyclic', groupSize: 2, node: 'cyclic', area: 'cyclic', dataset: 'A', profile: 1, cliProfile: 0,
+        scope: 'profile', severity: 'action', parameter: name, from: 100, to, fromSource: 'log header', title: 'Test the model values', text: 'The control tests agree with the selected values.',
+        rule: 'The calculated error decrease is 0.570 deg/s.', evidence: [], cli: ['profile 0', `set ${name} = ${to}`], blockedBy: [], causes: [], caveats: [], controlTune: true, validationPower: plan });
+    const recs = [rec('roll_i_gain', 110), rec('pitch_i_gain', 110)], ids = recs.map(x => x.id);
+    const text = advice.exportScript(recs, ids, {}), without = advice.exportScript(recs.map(x => Object.assign({}, x, { validationPower: undefined })), ids, {});
+    assert.deepEqual(commands(text), commands(without), 'the commands do not change');
+    assert.deepEqual(commands(text), ['batch start', 'profile 0', 'set roll_i_gain = 110', 'set pitch_i_gain = 110', 'save']);
+    assert.match(text, /\n#   Flights to compare the values:\n#   Flights cannot show this change in the roll and pitch tracking error\.\n#   The app calculates a change of -0\.57 deg\/s\.\n/);
+    assert.match(flat(text), /Thus, 447 flights with each set of values are necessary\. The limit is 10 flights\./);
+    // a neutral back-reference: the plan of change 1 says that flights cannot show the change
+    assert.match(text, /#   Change 1 has the same text about the flights\./); assert.doesNotMatch(text, /also show this change/);
+    assert.equal(text.split('Flights cannot show this change').length, 2, 'once for the changes with the same plan');
+});
+
 test('every check id of the catalogue has a generator (C7 comes from the decisions; C8, C9, G7 are report only)', () => {
     const ids = [...Array.from({ length: 14 }, (_, i) => `C${i + 1}`), ...Array.from({ length: 14 }, (_, i) => `T${i + 1}`), ...Array.from({ length: 15 }, (_, i) => `G${i}`),
         ...Array.from({ length: 11 }, (_, i) => `F${i + 1}`), ...Array.from({ length: 6 }, (_, i) => `D${i + 1}`), 'R1', 'H', 'SETUP'];
@@ -1624,7 +1648,7 @@ test('exportScript: a change with values that are possibly not current (r.stale)
 
 test('loading: siblings only, no Node API at load, Chromium-99 safe, runs through a CommonJS shim', () => {
     const src = fs.readFileSync(path.join(ROOT, 'tools/autotune/advice.cjs'), 'utf8'), code = src.replace(/\/\*[\s\S]*?\*\//g, '');
-    assert.deepEqual([...code.matchAll(/require\(([^)]*)\)/g)].map(m => m[1]), ["'./lib.cjs'", "'./health_setup.cjs'", "'./health_gov.cjs'", "'./health_loop.cjs'", "'./health_track.cjs'", "'./health_more.cjs'", "'./hierarchy.cjs'", "'./catalog.cjs'", "'./health_phase.cjs'", "'./health_rescue.cjs'", "'./health_limits.cjs'", "'./health_config.cjs'", "'./health_power.cjs'", "'./datasets.cjs'", "'./filter_checklist.cjs'", "'./control_tune.cjs'"]);
+    assert.deepEqual([...code.matchAll(/require\(([^)]*)\)/g)].map(m => m[1]), ["'./lib.cjs'", "'./health_setup.cjs'", "'./health_gov.cjs'", "'./health_loop.cjs'", "'./health_track.cjs'", "'./health_more.cjs'", "'./hierarchy.cjs'", "'./catalog.cjs'", "'./health_phase.cjs'", "'./health_rescue.cjs'", "'./health_limits.cjs'", "'./health_config.cjs'", "'./health_power.cjs'", "'./datasets.cjs'", "'./validation_power.cjs'", "'./filter_checklist.cjs'", "'./control_tune.cjs'"]);
     assert.ok(!/\bprocess\.|\bBuffer\b|__dirname|['"]node:/.test(code));
     assert.ok(!/\.toSorted\(|\.toReversed\(|\.toSpliced\(|Object\.groupBy|Map\.groupBy|Array\.fromAsync|\.with\(/.test(code));
     const mod = { exports: {} };
@@ -1635,7 +1659,7 @@ test('loading: siblings only, no Node API at load, Chromium-99 safe, runs throug
     assert.ok(!empty.recommendations.some(r => /^D4/.test(r.id)), 'no CLI dump: no D4 recommendation (user rule 2026-10-06)');
     // health_track, health_more and hierarchy are optional in the app (js/tuning_worker.js OPTIONAL): advice loads and runs without them
     const bare = { exports: {} };
-    new Function('require', 'module', 'exports', src)((m) => { if (/health_(track|more|phase)|hierarchy|catalog/.test(m)) throw new Error(`Cannot find module '${m}'`); return require(path.join(ROOT, 'tools/autotune', m)); }, bare, bare.exports);
+    new Function('require', 'module', 'exports', src)((m) => { if (/health_(track|more|phase)|hierarchy|catalog|validation_power/.test(m)) throw new Error(`Cannot find module '${m}'`); return require(path.join(ROOT, 'tools/autotune', m)); }, bare, bare.exports);
     const out = bare.exports.advise({ findings: [C3UP], header: HEADER, logs: LOGS, headerProfile: 1 });
     assert.deepEqual(out.recommendations.find(r => r.id.startsWith('C3')).cli, ['profile 0', 'set roll_f_gain = 115']);
     assert.deepEqual(Object.keys(advice).sort(), ['CHECKS', 'COVERAGE', 'DS_RULES', 'FEATURE_NAMES', 'PARAMS', 'RANGE', 'RULES', 'advise', 'comparisons', 'configurationBases', 'defaultPicks', 'exportScript', 'filterRecommendations', 'floorsOk', 'script'], 'no unused exports');
@@ -2269,6 +2293,23 @@ test('L1-L7: one item for each output and PID profile with its periods; a proble
     assert.deepEqual(only(run([kick, late]), 'T15').causes.map(c => c.rule), [], 'K24 needs the limit before the error');
 });
 
+// user, 2026-10-16: a rate that the helicopter cannot get to with the output at its limit (health_limits stuck.unreached): the full-stick
+// rate of the rate profile to that rate or less, as text (the rate curve depends on rates_type)
+test('L4 stuck at a setpoint that the helicopter cannot get to: decrease the maximum rate of the rate profile, no CLI', () => {
+    const ev = { t: 45, t1: 45.3, tS: 45, t1S: 45.3, seconds: 0.3, phase: 'flight', rescue: null, with: [] };
+    const stuck = { kind: 'rate', axis: 'yaw', start: 100, end: 100, sp: 300, gyro: 200, limit: 30, stuck: true, tS: 45, t1S: 45.3, seconds: 0.3, unreached: true };
+    // 3 periods at +300 deg/s (the gyro 200, 250 and 260 at the end) and 1 at -300 deg/s (280): the median of the lower direction, 250 deg/s
+    const at = (sp, gyro, t) => Object.assign({}, ev, { tS: t, t1S: t + 0.3, trend: Object.assign({}, stuck, { sp, gyro }) });
+    const events = [at(300, 200, 45), at(300, 260, 50), at(300, 250, 55), at(-300, -280, 60), Object.assign(at(300, 50, 65), { seconds: 0.05 })];
+    const r = only(run([LM('L4', 'tail', { axis: 'yaw', severity: 'flag', value: 1.25, n: 5, longestS: 0.3, events, stuck })]), 'L4:tail');
+    assert.equal(r.severity, 'check'); assert.deepEqual(r.cli, []);
+    assert.match(r.text, /In 4 periods at the limit, the gyro rate does not move to the setpoint, and the setpoint is up to 300 deg\/s\. The helicopter cannot get to this yaw rate\./);
+    assert.match(r.text, /For a positive setpoint, the gyro rate at the end is 200 to 260 deg\/s \(median 250 deg\/s, 3 periods\)\. Decrease the maximum yaw rate of the rate profile to 250 deg\/s or less\./);
+    assert.match(r.rule, /is a problem if the gyro rate does not move to the setpoint, or the headspeed to the target/);
+    const calm = Object.assign({}, stuck, { sp: 0, gyro: 150, unreached: false }), kick = only(run([LM('L4', 'tail', { axis: 'yaw', severity: 'flag', value: 0.3, n: 1, longestS: 0.3, events: [Object.assign({}, ev, { trend: calm })], stuck: calm })]), 'L4:tail');
+    assert.doesNotMatch(kick.text, /maximum yaw rate/, 'a yaw rate at a setpoint of 0: no rate change');
+});
+
 // coordinator, round 2: a FALLBACK with no rescue can also be an overload (check G20 of health_rescue.cjs, Fireball 2026-10-05 log 12)
 test('L1 distinguishes an inferred throttle plateau from a confirmed maximum', () => {
     const plateau = LM('L1', 'throttle', { value: 0.33, n: 1,
@@ -2354,6 +2395,25 @@ test('round 3 M1: the from-value comes from the newest configuration of the PID 
     // without configurations: the rules before (the analysed log header)
     assert.equal(run([C3UP]).recommendations.find(x => x.id.startsWith('C3')).from, 100);
     assert.deepEqual([run([C3UP]).recommendations.find(x => x.id.startsWith('C3')).dataset, run([C3UP]).recommendations.find(x => x.id.startsWith('C3')).ab], [null, []]);
+});
+
+// review IMP-05: a value of the parameter snapshot (datasets source 'log snapshot') or of a recorded journal change ('log journal') is a
+// recorded value with CLI text. A D4 difference of a snapshot row of PID profile 2 makes the CLI value stale for PID profile 2 only
+test('a value of the parameter snapshot or of the journal: a from-value with CLI text; a D4 snapshot row is stale for its PID profile only', () => {
+    const at = (values, sources, extra = {}) => advice.advise(Object.assign({ findings: [Object.assign({}, C3UP, { dataset: 'B' })], decisions: null, header: HEADER, cli: null, logs: LOGS, fields: null, headerProfile: 1, headerLog: 5, logBase: 1,
+        datasets: DSET([DSC('A', 1, { roll_f_gain: 100 }), DSC('B', 1, values, sources)], { 1: 'B' }) }, extra)).recommendations.find(r => r.id.startsWith('C3'));
+    const snap = at({ roll_f_gain: 110 }, { roll_f_gain: 'log snapshot' });
+    assert.deepEqual([snap.from, snap.cli[0]], [110, 'profile 0']); assert.match(snap.fromSource, /^configuration B, the newest of PID profile 1, the parameter values of the log header of log 6$/);
+    const jr = at({ roll_f_gain: 120 }, { roll_f_gain: 'log journal' });
+    assert.deepEqual([jr.from, jr.cli[0]], [120, 'profile 0']); assert.match(jr.fromSource, /a parameter change that the log records$/);
+    // a CLI value of PID profile 1 and a D4 snapshot difference of the same name in PID profile 2: the value of PID profile 1 stays usable
+    const d4 = f({ module: 'setup', id: 'D4', profile: null, value: 1, basis: 'snapshot', mismatches: [{ where: 'profile 1', name: 'roll_f_gain', pidProfile: 2, rateProfile: null, logValue: 90, cliValue: 80, from: 'cli', match: false }], text: 'd4' });
+    const cli = setup.parseCli(CLI_TEXT.replace('profile 0\n', 'profile 0\nset roll_f_gain = 105\n'));
+    const viaCli = at({ roll_f_gain: 105 }, { roll_f_gain: 'cli' }, { cli, findings: [Object.assign({}, C3UP, { dataset: 'B' }), d4] });
+    assert.equal(viaCli.from, 105, J(viaCli.caveats));
+    const d4p1 = f(Object.assign({}, d4, { fid: 'd4p1', mismatches: [Object.assign({}, d4.mismatches[0], { pidProfile: 1, where: 'profile 0' })] }));
+    const stale = at({ roll_f_gain: 105 }, { roll_f_gain: 'cli' }, { cli, findings: [Object.assign({}, C3UP, { dataset: 'B' }), d4p1] });
+    assert.deepEqual([stale.from, stale.cli], [null, []], 'the D4 row of PID profile 1: the CLI value of PID profile 1 is not used');
 });
 
 test('configuration-specific advice can tune an absolute recorded LUA adjustment without treating it as an estimate', () => {
@@ -2554,4 +2614,24 @@ test('structured yaw setup and header changes keep stale gain proposals blocked'
     assert.equal(b.severity,'watch'); assert.deepEqual(b.cli,[]);
     const catalog = require('../tools/autotune/catalog.cjs');
     assert.deepEqual(catalog.headerChange({headerKey:'yawPID',from:'80',value:'100',since:4,text:'Changed wording.'}), {key:'yawPID',from:'80',to:'100',since:4});
+});
+
+// review IMP-12 and IMP-03: a control limit with a cause (a receiver signal loss, the fall) or out of flight gets no limit recommendation; a G14
+// change after the receiver signal stopped gets no governor recommendation; a D11 flag is one recommendation of the Rescue item, with no CLI text
+test('IMP-12 review: no limit recommendation for caused or out-of-flight periods, no G14 governor item for a receiver signal loss, D11 in the Rescue item', () => {
+    const L4 = (o) => f(Object.assign({ module: 'limits', id: 'L4', axis: 'yaw', channel: 'tail', field: 'mixer[2]', severity: 'flag', value: 0.4, n: 2, longestS: 0.3, limits: { lo: -1250, hi: 1250, source: 'snapshot' },
+        events: [{ tS: 30, t1S: 30.3, seconds: 0.3, side: 'lo', limit: -1250, phase: 'flight', profile: 1, rescue: null, with: [], same: [], errors: {} }] }, o));
+    const caused = L4({ severity: 'note', cause: 'receiver loss / fall', causes: ['receiver loss', 'fall'], causeChecks: ['D10', 'D11'] }), still = L4({ severity: 'note', outOfFlight: true }), normal = L4({});
+    const lim = (list) => recs(run(list), 'L4:').map(r => r.id);
+    assert.deepEqual(lim([caused]), [], 'a cause: no L4 recommendation'); assert.deepEqual(lim([still]), [], 'out of flight: no L4 recommendation');
+    assert.deepEqual(lim([normal]), ['L4:tail:p1'], 'the period in flight: the L4 recommendation');
+    const G14 = (o) => f(Object.assign({ module: 'more', id: 'G14', severity: 'flag', value: 1, n: 1, profile: null, events: [{ t: 68.6, tS: 68.645, value: 1.9, kind: 'throttle hold in flight', state: 'HOLD', rx: 'lost', rxLoss: true }] }, o));
+    assert.deepEqual(recs(run([G14({ cause: 'receiver loss' })]), 'G14').map(r => r.id), [], 'a HOLD from the rxfail values: no governor recommendation');
+    assert.deepEqual(recs(run([G14({})]), 'G14').map(r => [r.id, r.area]), [['G14', 'governor']], 'a HOLD by the pilot in flight: the governor recommendation');
+    const D11 = f({ module: 'phase', id: 'D11', severity: 'flag', value: 1, n: 1, profile: 2, by: 'receiver loss', motorCut: true, cutS: 68.6453, contactS: 70.4435, fallS: 1.798, threshold: { crashFactor: 2, limit: 0 } });
+    const out = run([D11]), d = recs(out, 'D11'); assert.equal(d.length, 1);
+    assert.deepEqual([d[0].id, d[0].node, d[0].cli, d[0].area], ['D11', 'rescue', [], 'precondition']);
+    assert.match(d[0].rule, /^Check D11 has a problem if the helicopter touches the ground in failsafe or with no receiver signal\. At the ground contact, a rate step of 2 times the largest step of the flight or more is also a problem\. Source: /);
+    assert.match(d[0].text, /The motor stops while the helicopter is in the air in .*at 68\.65 s \(the ground contact at 70\.44 s\)/);
+    const none = recs(run([Object.assign({}, D11, { motorCut: false })]), 'D11')[0]; assert.match(none.text, /\nThe flight ends in the air with no RC control in /);
 });

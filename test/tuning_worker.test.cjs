@@ -266,9 +266,9 @@ test('T0: the worker is Chromium 99 syntax as written (esbuild chrome99 output e
 
 test('T0: the toolkit files the worker runs in Chromium 99 are Chromium 99 syntax and use no newer API', (t) => {
     const { dir, names, optional } = fetchedToolkit();
-    assert.equal(names.length, 47);
-    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline',
-        'gov_twin', 'gov_data', 'gov_params', 'gov_sim', 'gov_fit', 'gov_search', 'gov_scenarios', 'gov_tune']);
+    assert.equal(names.length, 52);
+    assert.deepEqual(optional, ['health_track', 'health_more', 'health_phase', 'health_rescue', 'health_limits', 'health_config', 'health_power', 'advice', 'catalog', 'hierarchy', 'evidence', 'datasets', 'param_epochs', 'param_log', 'filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune', 'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline',
+        'gov_twin', 'gov_data', 'gov_params', 'gov_sim', 'gov_fit', 'gov_search', 'gov_scenarios', 'gov_tune', 'param_semantics', 'cli_defaults', 'firmware/equivalence', 'validation_power']);
     let esbuild = null; try { esbuild = require(path.join(REPO, 'node_modules/esbuild')); } catch (e) { /* the API check still runs */ }
     for (const n of names) {
         const file = path.join(JS, `${dir}${n}.cjs`);
@@ -287,7 +287,7 @@ test('T0: every file the worker loads is a relative URL to a file that exists an
     const list = /(?:var distSources|APP_ASSET_SOURCES) = \[([\s\S]*?)\];/.exec(gulp)[1], quoted = (s) => [...s.matchAll(/'([^']+)'/g)].map(m => m[1]);
     const scripts = quoted(/importScripts\(([^)]*)\)/.exec(src)[1]).map(u => path.posix.join('js', u));
     const toolkit = names.map(n => path.posix.normalize(path.posix.join('js', `${dir}${n}.cjs`)));
-    assert.equal(scripts.length, 12); assert.equal(names.length, 47);
+    assert.equal(scripts.length, 12); assert.equal(names.length, 52); // 52: param_log, param_semantics, cli_defaults, firmware/equivalence (IMP-05, IMP-06), validation_power (IMP-07)
     toolkit.forEach((f, i) => { if (optional.includes(names[i]) && !fs.existsSync(path.join(REPO, f))) { t.diagnostic(`${f} is not in the repo yet: an optional module`); toolkit[i] = null; } });
     for (const f of scripts.concat(toolkit.filter(Boolean))) {
         assert.ok(!/^\/|^[a-z]+:/i.test(f) && !f.startsWith('..'), `${f} relative to the app root`);
@@ -441,7 +441,7 @@ test('T2: TuningResult schema, both scopes', async () => {
     const L = await W.result({ cmd: 'analyseLog', fileName: 'sim.bbl', logIndex: 1, logCount: S.count, options: {} }, S.slice(1));
     const F = await W.result({ cmd: 'analyseFile', fileName: 'sim.bbl', selectedLog: 4, options: { flightRpm: TRUTH.rpm } }, S.bytes);
     const KEYS = ['version', 'scope', 'selection', 'fileName', 'logIndex', 'logs', 'flightRpm', 'cli', 'timing', 'records', 'flights', 'benchRuns', 'noData', 'profiles', 'header', 'headerLog', 'fields', 'findings', 'decisions', 'groups', 'advice', 'hierarchy', 'curves',
-        'datasets', 'issues', 'top', 'areas', 'notchFit', 'epochs', 'freshness', 'cliStatus', 'reportMarkdown', 'notes'];   // round 3: datasets (M1), issues, top, areas (M3), noData (M4); notchFit (the notch orders of the log); epochs, freshness, cliStatus (values that are possibly not current)
+        'datasets', 'issues', 'top', 'areas', 'notchFit', 'epochs', 'freshness', 'cliStatus', 'paramSnapshot', 'reportMarkdown', 'notes'];   // round 3: datasets (M1), issues, top, areas (M3), noData (M4); notchFit (the notch orders of the log); epochs, freshness, cliStatus (values that are possibly not current)
     const SUMMARY = ['log', 'segment', 'start', 'durationS', 'fromS', 'seconds', 'flown', 'flyingS', 'rate', 'actualRate', 'bodyRate', 'profileSeconds', 'targetOf', 'govStateLogged', 'excluded', 'normalS', 'skipped', 'errors', 'timeMap',
         'logClass', 'phases', 'flights', 'phaseSeconds', 'profiles', 'noData', 'noDataReason'];
     const RANK = { error: 0, flag: 1, note: 2, ok: 3, skipped: 4 };
@@ -735,6 +735,37 @@ test('governor masks (review A5, A7): rescue, level modes and failsafe only, no 
     assert.ok(H.findings.some(f => f.module === 'gov' && f.log === 0 && f.id === 'G1') && H.findings.filter(f => f.module === 'gov' && f.log === 0).every(f => f.phase === 'all' || f.phase === 'ground+flight'));
 });
 
+// IMP-01, IMP-02 (review 2026-10-16): a receiver signal loss in a flight log that health.cjs does not call flown still gives D10 (every
+// phase while armed); the governor tracking mask leaves out the cut, the masks of all phases and of the rotor keep it
+const lossBytes = (o, from, seconds) => { const log = bbl.simulateFlight(o), a = Math.round(from * 1000), b = Math.round((from + seconds) * 1000);
+    log.slow.rxSignalReceived = Float64Array.from(log.slow.rxSignalReceived, (v, i) => i >= a && i < b ? 0 : v); log.slow.rxFlightChannelsValid = Float64Array.from(log.slow.rxSignalReceived);
+    return bbl.encode([log]).bytes; };
+test('D10 on a short flight (not flown for health.cjs) and the governor masks of a receiver signal loss', async () => {
+    const opt = { flightRpm: TRUTH.rpm, curves: false, keepMetrics: true };
+    const S = await worker().result({ cmd: 'analyseLog', fileName: 'short.bbl', logIndex: 0, options: opt }, lossBytes({ seconds: 40, seed: 19, airborne: [6, 11], start: '2026-10-04T18:10:00.000+00:00' }, 8, 1)), r0 = S.records[0];
+    assert.deepEqual([r0.logClass, r0.flown, !!(r0.metrics.more && r0.metrics.more.d10Only)], ['flight', false, true], J({ c: r0.logClass, f: r0.flown, m: Object.keys(r0.metrics) }));
+    const d10 = S.findings.filter(f => f.id === 'D10');
+    assert.equal(d10.length, 1, J(d10)); assert.equal(d10[0].severity, 'flag'); assert.equal(d10[0].events.length, 1); within(d10[0].events[0].seconds, 1.0, 0.001, 'the period');
+    assert.match(d10[0].text, /from 8\.00 s to 9\.00 s/);
+    assert.ok(S.findings.filter(f => f.module === 'more' && f.id !== 'D10').every(f => f.severity === 'skipped'), 'the other checks of health_more are skipped');
+    // a long flight with a loss of 2 s at 40 s and the same flight without it: tracking loses the cut (0.1 s + 2 s + 1 s), all and rotor keep it
+    const base = { seconds: 80, seed: 7, airborne: [6, 76], start: '2026-10-04T18:20:00.000+00:00' }, R = require('../tools/autotune/lib.cjs').RX_LOSS;
+    const W = worker({ 'health_phase.cjs': STUB_PHASE }), run = (bytes) => W.result({ cmd: 'analyseLog', fileName: 'loss.bbl', logIndex: 0, options: opt }, bytes);
+    const A = await run(lossBytes(base, 40, 2)), B = await run(lossBytes(base, 40, 0)), pa = A.records[0].metrics.gov.phaseMasks, pb = B.records[0].metrics.gov.phaseMasks;
+    assert.equal(pa.all.seconds, pb.all.seconds); assert.equal(pa.rotor.seconds, pb.rotor.seconds);
+    within(pb.tracking.seconds - pa.tracking.seconds, R.lastFrameLeadS + R.guardS + 2 + R.settleS, 0.15, 'the tracking mask leaves out the cut');
+    assert.equal(A.findings.filter(f => f.id === 'D10').length, 1);
+});
+
+test('sliceSegment: a loss with a frame in the slice is a span of it; a slice with only the settle time of a loss has its cut and no span', () => {
+    const TW = worker().ctx.TuningWorker, n = 10000, cut = new Uint8Array(n).fill(1, 2990, 5000);
+    const w = { n, rate: 1000, fromS: 0, flight: { actualRate: 1000 }, extra: {}, hs: new Float64Array(n), sp: [null, null, null], gyro: [null, null, null], u: [null, null, null], P: [null, null, null], I: [null, null, null], D: [null, null, null], F: [null, null, null], B: [null, null, null],
+        rxLoss: [{ i0: 3100, i1: 4000, signal: true, cause: 'signal', returned: true, lastFrameUs: 3e6, cut0: 2990, cut1: 5000 }], rxLossAt: cut };
+    const a = TW.sliceSegment(w, 2000, 4500); assert.equal(a.rxLoss.length, 1); assert.deepEqual([a.rxLoss[0].i0, a.rxLoss[0].i1, a.rxLoss[0].cut0, a.rxLoss[0].cut1, a.rxLoss[0].returned], [1100, 2000, 990, 2500, true]);
+    const b = TW.sliceSegment(w, 4200, 9000); assert.deepEqual(b.rxLoss, [], 'the settle time only: no span'); assert.ok(b.rxLossAt && b.rxLossAt[0] === 1 && b.rxLossAt[799] === 1 && b.rxLossAt[800] === 0, 'its cut');
+    const c = TW.sliceSegment(w, 6000, 9000); assert.deepEqual(c.rxLoss, []); assert.equal(c.rxLossAt, null);
+});
+
 // review A3, D-H4: report.cjs gets an extract.cjs segment only if 90 % of it is in the attitude mask (the flight phases less rescue,
 // level modes and failsafe) and it lies from a liftoff to the touchdown + 0.1 s of that flight
 const threeFlights = (o = {}) => bbl.encode([1, 2, 3].map(k => bbl.simulateFlight(Object.assign({ seconds: 40, seed: 40 + k, airborne: [6, 34], start: `2026-10-04T19:0${k}:00.000+00:00` }, o)))).bytes;
@@ -751,10 +782,12 @@ test('gains (review A3, D-H4): only segments in the attitude mask, from liftoff 
         assert.ok(fl.some(f => q.t0 >= f.t0 - 1e-3 && q.t1 <= f.t1 + 0.1 + 0.01), `segment ${J(q)} inside a flight of ${J(fl)}`);
     }
     // the three segments of extract.cjs start where the airborne flag sets (logs 1, 3, 4) and end where it drops (log 3, 4) or at a
-    // change of profile: a liftoff 0.5 s after the flag, or a touchdown 0.5 s before its drop, drops them (with a note)
-    for (const [lift, down, want] of [[0.5, 0, 3], [0, 0.5, 2], [0.5, 0.5, 3]]) { const R = await gains(stubPhaseAt(lift, down), {});
-        assert.deepEqual(dropped(R), [want, 3], `liftoff +${lift} s, touchdown -${down} s: ${J(R.notes)}`);
-        if (want === 3) assert.equal(R.decisions, null, 'no segment left: report.cjs does not run'); }
+    // change of profile: with a liftoff 0.5 s after the flag, or a touchdown 0.5 s before its drop, extract.cjs cuts them to the flight
+    // (IMP-04: --clip with the flights of the records, not a drop), and they reach report.cjs inside the flights
+    for (const [lift, down] of [[0.5, 0], [0, 0.5], [0.5, 0.5]]) { const R = await gains(stubPhaseAt(lift, down), {});
+        assert.deepEqual(dropped(R), [0, null], `liftoff +${lift} s, touchdown -${down} s: ${J(R.notes)}`); assert.ok(kept(R), `liftoff +${lift} s, touchdown -${down} s: decisions`);
+        if (has('evidence.cjs')) for (const d of R.decisions) for (const q of d.evidence.spans) {
+            const fl = R.flights.filter(f => f.log === q.log); assert.ok(fl.some(f => q.t0 >= f.t0 - 1e-3 && q.t1 <= f.t1 + 0.1 + 0.01), `cut segment ${J(q)} inside a flight of ${J(fl)}`); } }
     // touchdown 0.05 s before the flag drops: within SEGMENT.touchdownS, kept
     assert.deepEqual(dropped(await gains(stubPhaseAt(0, 0.05), {})), [0, null]);
     // flights in ANGLE mode throughout (review A3: normalS 0, levelModeS 28 s each): no segment reaches report.cjs
@@ -860,7 +893,7 @@ test('control autotune requires real samples and cannot export legacy proposals 
     const reply = await W.post({cmd:'controlTune',analysis,configuration:'A',step:'governor'});
     assert.equal(reply.type,'controlTuned',reply.message);
     assert.equal(reply.result.rows.length,0);
-    assert.equal(reply.result.status,'model-required');
+    assert.equal(reply.result.status,'unsupported-step','the governor model tunes the governor (user, 2026-10-15)');
     assert.equal(reply.result.verifiedInFlight,false);
     const exp = await W.post({cmd:'export',recs:reply.result.recommendations,withPlan:true});
     assert.equal(exp.type,'exported',exp.message);
@@ -1523,9 +1556,9 @@ module.exports = { advise: (i) => ({ recommendations: [], coverage: [], notes: [
     const X = await one(1, { cliText: cliX, cliName: 'x.txt' });
     assert.deepEqual([arm(X, 1).profile, arm(X, 1).basis, arm(X, 1).confirmed, arm(X, 1).conflict, arm(X, 1).headspeed.why, arm(X, 1).headspeed.dumpSections], [1, ['headspeed'], true, false, null, [2]], J(arm(X, 1)));
     assert.deepEqual(X.cliStatus, { name: 'x.txt', used: true, conflicts: [{ what: 'profile', profile: 1, sections: [2], logs: [1],
-        text: 'The log header of log 2 agrees with the CLI section `profile 1`. But "govRequest" at the start of the log shows PID profile 1. The app uses PID profile 1.' }] });
+        text: 'Log 2: the governor headspeed shows PID profile 1, and the app uses it. But the values at the start of the log agree with PID profile 2 in the CLI dump.' }] });
     for (const t of ['At the start of log 2, "govRequest" is 2500 rpm. In the PID profile changes of this log, only PID profile 1 has this value (1 change in 1 log). Thus, this log starts in PID profile 1.',
-        'The CLI dump "x.txt" does not agree with the log. The app uses the values of the log.']) assert.ok(X.notes.includes(t), `${t}\n${X.notes.join('\n')}`);
+        'The CLI dump "x.txt" has values that are different from the logs. The analysis uses the values in the logs.']) assert.ok(X.notes.includes(t), `${t}\n${X.notes.join('\n')}`);
     assert.ok(!X.notes.some(n => /PID profile at the start of the log is unknown/.test(n)), X.notes.join('\n'));
     assert.ok(X.findings.filter(f => f.profile === 0 && f.id !== 'D4').every(f => f.pidProfile === 1), 'label 0 is PID profile 1');
     const Xn = await one(1, { cliText: cliX }, N.slice);
@@ -1536,12 +1569,12 @@ module.exports = { advise: (i) => ({ recommendations: [], coverage: [], notes: [
     const Y = await one(1, { cliText: CLI.replace('profile 0\nset gov_headspeed = 2500\n', 'profile 0\nset gov_headspeed = 2400\n') });
     assert.deepEqual([arm(Y, 1).profile, arm(Y, 1).basis, arm(Y, 1).confirmed, arm(Y, 1).conflict, arm(Y, 1).headspeed.why], [1, ['headspeed'], true, false, null], J(arm(Y, 1)));
     assert.deepEqual(Y.cliStatus, { name: null, used: false, conflicts: [
-        { what: 'gov_headspeed', profile: 1, cli: 2400, log: [2500], text: 'In the CLI dump, `gov_headspeed` of `profile 0` is 2400. The PID profile changes in this log show 2500 rpm for PID profile 1. The app uses the values of the log.' },
-        { what: 'header', logs: [1], text: 'No section of the CLI dump agrees with the log header of log 2.' }] });
-    assert.ok(Y.notes.includes('The CLI dump does not agree with the log. The app uses the values of the log.'), Y.notes.join('\n'));
+        { what: 'gov_headspeed', profile: 1, cli: 2400, log: [2500], text: 'PID profile 1: `gov_headspeed` is 2400 rpm in the CLI dump, but the PID profile changes in this log show 2500 rpm.' },
+        { what: 'header', logs: [1], text: 'Log 2: the values at the start of the log do not agree with the CLI dump.' }] });
+    assert.ok(Y.notes.includes('The CLI dump has values that are different from the logs. The analysis uses the values in the logs.'), Y.notes.join('\n'));
     // the fixture dump (a short `diff all`: the 4.6 defaults for the gains) agrees with the header of log 4 only; the headspeeds agree.
     // Without a dump: no status
-    assert.deepEqual(T.cliStatus, { name: null, used: true, conflicts: [{ what: 'header', logs: [0, 1, 4, 5], text: 'No section of the CLI dump agrees with the log header of logs 1, 2, 5 and 6.' }] });
+    assert.deepEqual(T.cliStatus, { name: null, used: true, conflicts: [{ what: 'header', logs: [0, 1, 4, 5], text: 'Logs 1, 2, 5 and 6: the values at the start of each log do not agree with the CLI dump.' }] });
     assert.equal(R.cliStatus, null);
 });
 
@@ -1810,9 +1843,12 @@ test('T3: Gaui X4 dump in file scope: only #49, #50, #51 and #58 are analysed, t
     assert.equal(R.headerLog, 50);
     // review A3, D-H4: the gains use only the extract.cjs segments in the flight from liftoff to touchdown + 0.1 s. Of the 10, #49
     // 31.25 s and #50 14.89 s start before the liftoff (0.12 and 0.57 s), and #49, #50, #51 and #58 end 0.95 to 2.16 s after the
-    // touchdown: 4 are left, too few for a decision of report.cjs (a headspeed bin needs 3 flights)
-    assert.ok(Array.isArray(R.decisions) && R.notes.includes('6 of the 10 segments of "extract.cjs" are not in a flight, or they have rescue, a level mode or failsafe. Thus, the app does not use them to calculate the gains.'),
-        R.notes.filter(n => /segment/.test(n)).join('\n'));
+    // touchdown. Before IMP-04 these 6 were dropped: 4 were left, too few for a decision (a headspeed bin needs 3 flights). IMP-04: extract.cjs
+    // --clip cuts each one to its flight, so none is dropped, and report.cjs decides at 2250 rpm (measured 2026-10-16: roll and pitch from 4
+    // flights, yaw 2 flights of the most-flown gain set, 3 needed; no change)
+    assert.ok(Array.isArray(R.decisions) && !R.notes.some(n => /segments of "extract\.cjs" are not in a flight/.test(n)), R.notes.filter(n => /segment/.test(n)).join('\n'));
+    assert.deepEqual(R.decisions.map(d => [d.axis, d.bin, d.flights]), [['roll', 2250, 4], ['pitch', 2250, 4], ['yaw', 2250, 2]], J(R.decisions.map(d => [d.axis, d.bin, d.flights, d.reason])));
+    // the spans of a decision are the clipped segments in frame seconds (the frame clock of #58 runs 1.28 % slower than the sample count)
     if (has('evidence.cjs')) for (const d of R.decisions) for (const q of d.evidence.spans) assert.ok(R.flights.some(f => f.log === q.log && q.t0 >= f.t0 - 1e-3 && q.t1 <= f.t1 + 0.15), `C7 segment ${J(q)}`);
     // D12: PID profiles of the flights; no rate profile change in this dump
     assert.ok(Object.keys(R.profiles.pid).length >= 2 && R.profiles.rateChanges.length === 0, J(R.profiles));
@@ -1948,6 +1984,27 @@ test('flight selection (SPEC3 D): only the selected logs and flights; a log with
     assert.equal(bad.type,'error');assert.match(bad.message,/does not contain a selected flight/);
 });
 
+test('scanFlights (2026-10-15): the flights, bench runs and logs with no data of the analysis of the file, with no checks; flight k of the scan is flight k of a selection', async () => {
+    const S = sim(), W = worker();
+    const R = await W.result({ cmd: 'analyseFile', fileName: 'sim.bbl', selectedLog: 1, options: { cliText: CLI, curves: false, datasets: false } }, S.bytes);
+    const m = await W.send({ cmd: 'scanFlights', fileName: 'sim.bbl', options: {} }, S.bytes);
+    assert.equal(m.type, 'flightsScanned', m.message);
+    const F = m.result, key = (q) => [q.log, q.segment, q.t0, q.t1];
+    assert.equal(F.scope, 'scan');
+    assert.ok(R.flights.length >= 3 && R.benchRuns.length >= 1 && R.noData.length >= 1, 'the file has flights, a bench run and a log with no data');
+    sameJson(F.flights.map(key), R.flights.map(key), 'the flights, to the frame');
+    sameJson(F.benchRuns.map(b => b.log), R.benchRuns.map(b => b.log), 'the bench runs');
+    sameJson(F.noData, R.noData, 'the logs with no data');
+    sameJson(F.flightRpm, R.flightRpm, 'the flight rpm of every log');
+    assert.ok(F.records.every(l => !('metrics' in l) && !('header' in l)), 'no checks, no headers');
+    // two flights in log 2: the time of flight 2 of the scan is the time of the selected flight 2
+    const bytes = bbl.encode([bbl.simulateFlight({ seconds: 40, seed: 7, airborne: [6, 34], start: '2026-10-04T14:50:00.000+00:00' }), twoFlights()]).bytes;
+    const two = (await W.send({ cmd: 'scanFlights', fileName: 'two.bbl', options: { flightRpm: TRUTH.rpm } }, bytes)).result.flights.filter(q => q.log === 1);
+    const sel = await W.result({ cmd: 'analyseFile', fileName: 'two.bbl', selectedLog: 1, options: { flightRpm: TRUTH.rpm, curves: false, flights: [{ log: 1, flight: 1 }] } }, bytes);
+    assert.equal(two.length, 2);
+    sameJson(sel.selection.flights.map(q => [q.t0, q.t1]), [[two[1].t0, two[1].t1]], 'flight 2 of log 2');
+});
+
 test('invalid flight selections fail closed in file analysis and digital twin input selection',async()=>{
     const echo=`module.exports={identify(input){return {logs:[...new Set(input.items.map(item=>item.source.logIndex))]};}};`;
     const W=worker({'control_pipeline.cjs':echo}),bytes=bbl.encode([0,1].map(i=>bbl.simulateFlight({seconds:35,
@@ -1986,6 +2043,50 @@ test('round 2: Gaui X4 #50 in the worker: P1 not measured (Vbat 0), D9 for the P
     assert.ok(d9.length >= 1 && d9.every(f => f.module === 'config' && f.node === 'rescue' && f.tuner === false), J(d9.map(f => [f.severity, f.profile])));
     assert.ok(R.hierarchy.graph.prereq.length === 6 && R.hierarchy.graph.blocks.length === 6 && Array.isArray(R.hierarchy.prereqProblems));
 });
+// IMP-03, IMP-04, IMP-12 on the Fireball crash log 2026-10-15 (analysis/fireball-crash-20261015/crash.bbl, no CLI dump, about 5 s): the flight ends
+// at the last RC frame (an in-flight cut, not the AIRBORNE drop 1 s early), the attitude checks keep the flight before it, the gain segment
+// reaches report.cjs (one flight: no decision), and the periods at a limit after the receiver signal stops are under check D10, not in a tuning block
+const CRASH_LOG = path.join(__dirname, '../analysis/fireball-crash-20261015/crash.bbl');
+test('the crash log 2026-10-15: flight end at the cut, normalS, C8, gains with "No result", D11, and the crash periods under the receiver signal loss (IMP-03, IMP-04, IMP-12)', { skip: !fs.existsSync(CRASH_LOG) || !has('health_phase.cjs') ? 'analysis/fireball-crash-20261015/crash.bbl is not here' : false }, async () => {
+    const R = await worker().result({ cmd: 'analyseFile', fileName: 'crash.bbl', selectedLog: 0, options: { flightRpm: null, excludeAbnormal: true, phases: true, curves: false, gains: true, keepMetrics: true } }, new Uint8Array(fs.readFileSync(CRASH_LOG)));
+    const rec = R.records[0], fl = rec.flights[0];
+    assert.equal(rec.flights.length, 1); assert.equal(fl.touchdownBy, 'in-flight cut'); assert.ok(Math.abs(fl.t1 - 68.344) <= 0.003, `the end of the flight ${fl.t1} s`);
+    const ph = (p) => rec.phases.filter(q => q.phase === p); assert.equal(ph('fall').length, 1); assert.ok(Math.abs(ph('fall')[0].t1 - 70.4435) <= 0.003, J(ph('fall')));
+    assert.ok(rec.normalS >= 44.0, `normalS ${rec.normalS}`);
+    const c8 = R.findings.find(f => f.id === 'C8' && f.axis === 'roll' && f.pidProfile === 2); assert.ok(c8 && c8.n >= 10, J(c8 && { n: c8.n, text: c8.text }));
+    assert.ok(typeof R.reportMarkdown === 'string' && /## 2\. Gains in effect/.test(R.reportMarkdown) && /No result: 0 segments, 6 necessary\./.test(R.reportMarkdown), 'the gain report');
+    assert.deepEqual(R.decisions, [], 'one flight: fewer than 3 for a decision');
+    const d11 = R.findings.find(f => f.id === 'D11'); assert.deepEqual([d11.severity, d11.node, d11.area, d11.status], ['flag', 'rescue', 'radio', 'problem']);
+    assert.ok(Math.abs(d11.contactS - 70.4435) <= 0.002 && Math.abs(d11.fallS - 1.798) <= 0.003, J({ contactS: d11.contactS, fallS: d11.fallS }));
+    const caused = R.findings.filter(f => f.cause);
+    assert.ok(caused.some(f => f.id === 'L7') && caused.some(f => f.id === 'L1') && caused.some(f => f.id === 'G14'), J(caused.map(f => f.id)));
+    for (const f of caused) { assert.equal(f.node, 'rescue', `${f.id} ${f.channel}`); assert.equal(f.area, 'radio', `${f.id} ${f.channel}`); assert.notEqual(f.status, 'satisfactory'); }
+    const N = R.hierarchy.nodes, fids = new Set(caused.map(f => f.fid));
+    for (const id of ['governor', 'cyclic', 'tail', 'tailcomp']) { assert.ok(!(N[id].problemFids || []).some(x => fids.has(x)), `${id}: ${J(N[id].problemFids)}`); assert.ok(!(N[id].blockedBy || []).includes('rescue'), id); }
+    assert.ok(R.findings.filter(f => f.id === 'L4' && !f.cause).some(f => (f.events || []).some(e => e.phase === 'flight' && Math.abs(e.tS - 32.639) <= 0.003 && e.limit === -1517)), 'the in-flight tail limit from the snapshot');
+    // review IMP-12: the periods out of flight (the pre-flight stick check at IDLE: L3 pitch 5.07-5.54 s, L4 tail 3.61-4.71 s) are a value to monitor
+    // in their block, never a problem there, with no limit recommendation; the issues of a cause are issues of their own (the radio card)
+    const still = R.findings.filter(f => f.outOfFlight), byFid = new Map(R.findings.map(f => [f.fid, f]));
+    assert.ok(still.some(f => f.id === 'L3' && f.channel === 'pitch') && still.some(f => f.id === 'L4' && f.channel === 'tail'), J(still.map(f => [f.id, f.channel, f.pidProfile])));
+    for (const f of still) { assert.equal(f.status, 'monitor', f.fid); assert.ok((f.events || []).every(e => e.phase !== 'flight'), f.fid); }
+    for (const id of ['cyclic', 'tailcomp', 'tail']) assert.ok(!(N[id].problemFids || []).some(x => { const f = byFid.get(x); return f && /^L\d$/.test(f.id) && (f.events || []).length && f.events.every(e => e.phase !== 'flight' && !e.rescue); }), `${id}: ${J(N[id].problemFids)}`);
+    assert.ok(!R.advice.recommendations.some(r => /^L[1-7]:/.test(r.id) && r.evidence.some(e => still.some(f => f.fid === e || f.fid === (e && e.fid)))), J(R.advice.recommendations.map(r => r.id)));
+    const radio = R.areas.radio && R.areas.radio.issues || [], issue = (k) => R.issues.find(x => x.key === k);
+    assert.ok(radio.includes('L4|yaw|cause') && issue('L4|yaw|cause').area === 'radio', J(radio));
+    assert.ok(issue('L4|yaw') && issue('L4|yaw').area === 'limits' && issue('L4|yaw').fids.every(x => !byFid.get(x).cause), J(issue('L4|yaw')));
+    // G14 (review IMP-12): the HOLD of the rxfail values is in flight (the fall), the RECOVERY after the ground contact is not; no governor recommendation for it
+    const g14 = R.findings.find(f => f.id === 'G14' && f.cause === 'receiver loss'); assert.ok(g14, J(R.findings.filter(f => f.id === 'G14').map(f => f.fid)));
+    const census = R.records[0].metrics.more.G14.states; assert.ok(census.HOLD.secondsAirborne > 1.5 && census.RECOVERY.secondsAirborne === 0, J(census));
+    assert.ok(!R.hierarchy.nodes.governor.recs.includes('G14') && !R.advice.recommendations.some(r => r.id === 'G14' && r.node === 'governor'), J(R.hierarchy.nodes.governor.recs));
+    assert.doesNotMatch(g14.text, /Examine the throttle switch/); assert.match(g14.text, /check D10/);
+    // D11: the phases of the finding (catalog CHECKS.D11.phases), and the recommendation of the Rescue item with no CLI text
+    assert.deepEqual(d11.phases, ['flight', 'fall', 'aftercontact']);
+    const d11r = R.advice.recommendations.filter(r => r.id === 'D11'); assert.equal(d11r.length, 1); assert.deepEqual([d11r[0].node, d11r[0].cli], ['rescue', []]);
+    // the governor and power checks of all phases leave out the fall and the time after the ground contact
+    const pm = R.records[0].metrics.gov && R.records[0].metrics.gov.phaseMasks;
+    assert.ok(pm && !pm.all.phases.includes('fall') && !pm.all.phases.includes('aftercontact') && pm.all.seconds < R.records[0].seconds - 4, J(pm && pm.all));
+});
+
 test('round 2: Fireball 2026-10-05 in file scope: P1 at the load steps of each flight log, P2 not measured, D9 from the rescues, G20 at each FALLBACK (AUTOTUNE_RESCUE_LOG)', { skip: !FB || !fs.existsSync(FB) || !has('health_power.cjs') }, async () => {
     const R = await worker().result({ cmd: 'analyseFile', fileName: path.basename(FB), selectedLog: 15, options: { flightRpm: null, excludeAbnormal: true, phases: true, curves: false, gains: false } }, new Uint8Array(fs.readFileSync(FB)));
     const p1 = R.findings.filter(f => f.id === 'P1' && f.severity !== 'skipped'), p2 = R.findings.filter(f => f.id === 'P2');
@@ -2458,9 +2559,9 @@ test('a CLI dump that disagrees with the log: the log wins, a PID profile that t
     assert.deepEqual(D.profiles.arming.map(q => q.profile), [2, 1, 3]);
     const hs = D.cliStatus.conflicts.filter(c => c.what === 'gov_headspeed');
     assert.deepEqual(hs.map(c => [c.profile, c.cli, c.log]), [[1, 1800, [2300]], [2, 1800, [2500]], [3, 1800, [2700]]]);
-    assert.equal(hs[0].text, 'In the CLI dump, `gov_headspeed` of `profile 0` is 1800. The PID profile changes in this file show 2300 rpm for PID profile 1. The app uses the values of the log.');
+    assert.equal(hs[0].text, 'PID profile 1: `gov_headspeed` is 1800 rpm in the CLI dump, but the PID profile changes in this file show 2300 rpm.');
     assert.equal(D.cliStatus.name, 'old.txt');
-    assert.ok(D.notes.includes('The CLI dump "old.txt" does not agree with the log. The app uses the values of the log.'), D.notes.join('\n'));
+    assert.ok(D.notes.includes('The CLI dump "old.txt" has values that are different from the logs. The analysis uses the values in the logs.'), D.notes.join('\n'));
     assert.ok(!D.notes.some(n => /PID profile unknown|start of the log is unknown/.test(n)), D.notes.join('\n'));
     const f0 = D.findings.filter(f => logsOf(f).length === 1 && logsOf(f)[0] === 0 && f.profile === 0 && !['D4', 'F4', 'H'].includes(f.id));
     assert.ok(f0.length && f0.every(f => f.pidProfile === 2), J(f0.map(f => [f.fid, f.pidProfile])));
@@ -2745,7 +2846,7 @@ test('governorTune: the runs of every flight log reach gov_tune.cjs autotune wit
     // log 6 of the viewer: the decoder cannot read a log without the headspeed field; the cause and the setting that records it
     assert.equal(R.skipped.find(q => q.log === 6).reason, `${GDM.TEXT.noHs} To record the headspeed, set "blackbox_log_rpm" to ON.`);
     for (const t of [GDM.TEXT.noMotor, GDM.TEXT.noGov]) assert.ok(R.notes.includes(`${t.replace(/\.$/, '')} (log 6).`), `${t}\n${R.notes.join('\n')}`);
-    assert.ok(R.notes.includes('The governor analysis does not use bench runs (1 log).'), R.notes.join('\n'));
+    assert.ok(R.notes.includes('The governor autotune does not use bench runs (1 log).'), R.notes.join('\n'));
     // each segment of a flight log is a run, with its phases (log 2 of the viewer has a logging gap: two runs). The PID profile before
     // the first logged change (frame 0) is the profile at the start of the log that the CLI dump and govRequest confirm (PID profile 1)
     assert.deepEqual(R.seen.map(q => [q.log, q.segment, q.cls, q.hasGovernor, q.phase, q.rate]), [[1, 0, 'flight', true, true, 1000], [1, 1, 'flight', true, true, 1000], [3, 0, 'flight', true, true, 1000], [4, 0, 'flight', true, true, 1000]]);
@@ -2758,7 +2859,7 @@ test('governorTune: the runs of every flight log reach gov_tune.cjs autotune wit
     assert.ok(R.timing.totalS >= R.timing.modelS && R.timing.decodeS > 0 && R.timing.model === null, J(R.timing)); // the stub gives no timing
     // progress: the logs, then the model texts of the toolkit in 0.45..0.99, in order
     const P = W.progress.filter(p => p.id === 1), gov = P.filter(p => p.stage === 'governor');
-    assert.ok(P.some(p => p.text === 'The app loads log 2 of 7 for the governor analysis.'), J(P.map(p => p.text)));
+    assert.ok(P.some(p => p.text === 'The app loads log 2 of 7 for the governor autotune.'), J(P.map(p => p.text)));
     assert.deepEqual(gov.map(p => [p.text, p.fraction]), [['The app makes the governor model from 3 flight logs.', 0.45], ['The stub examines the runs.', 0.585], ['The stub is complete.', 0.99]]);
     assert.ok(P.every((p, i) => !i || p.fraction >= P[i - 1].fraction), 'the fraction does not decrease');
     // without a CLI dump: cli null (the log is the only necessary input); options.logs and the flight selection: whole logs
@@ -2766,7 +2867,7 @@ test('governorTune: the runs of every flight log reach gov_tune.cjs autotune wit
     assert.deepEqual([L.cli, L.cliName, L.logs, L.benchRuns, L.seen.map(q => q.log)], [null, null, [3], [0], [3]]);
     const F = await govTune(W, { flightRpm: TRUTH.rpm, flights: [{ log: 1, flight: 0 }] }, S.bytes);
     assert.deepEqual([F.logs, F.selection, F.seen.map(q => [q.log, q.segment])], [[1], { logs: [1], whole: true }, [[1, 0], [1, 1]]]);
-    assert.ok(F.notes.includes('The governor analysis uses all of each log with a selected flight, because the governor model starts when the pilot arms the helicopter.'), F.notes.join('\n'));
+    assert.ok(F.notes.includes('The governor autotune uses all of each log with a selected flight, because the governor model starts when the pilot arms the helicopter.'), F.notes.join('\n'));
 });
 
 test('governorTune: without the necessary fields or without a flight log, status unavailable with the reasons in STE, and gov_tune.cjs does not run', async () => {
@@ -2783,8 +2884,8 @@ test('governorTune: without the necessary fields or without a flight log, status
     const U = await govTune(W, { flightRpm: TRUTH.rpm, logs: [2] }, S.bytes);
     assert.deepEqual([U.status, U.reasons], ['unavailable', ['The app cannot read this log.']]);
     const B = await govTune(W, { flightRpm: TRUTH.rpm, logs: [0, 2] }, S.bytes);
-    assert.deepEqual([B.status, B.reasons, B.benchRuns, B.skipped], ['unavailable', ['The selected logs have no flight. The governor analysis does not use bench runs.'], [0], [{ log: 2, reason: 'The app cannot read this log.' }]]);
-    assert.ok(B.notes.includes('The governor analysis does not use bench runs (1 log).'), B.notes.join('\n'));
+    assert.deepEqual([B.status, B.reasons, B.benchRuns, B.skipped], ['unavailable', ['The selected logs have no flight. The governor autotune does not use bench runs.'], [0], [{ log: 2, reason: 'The app cannot read this log.' }]]);
+    assert.ok(B.notes.includes('The governor autotune does not use bench runs (1 log).'), B.notes.join('\n'));
 });
 
 test('governorTune: cancel between logs and during the model (cancelled() of autotune); errors of the toolkit are named', async () => {
@@ -2894,11 +2995,11 @@ test('governorTune: each part of a flight log is a flight run (segmentClass keep
     assert.equal(R.seen[1].armed, R.seen[1].n, 'part 2 is armed from its first sample');
 });
 
-test('governorTune: when the flight phases of a part stop, the note says that the governor analysis does not use that part', async () => {
+test('governorTune: when the flight phases of a part stop, the note says that the governor autotune does not use that part', async () => {
     const S = sim(), stop = STUB_PHASE + "\nconst own = module.exports.phases; module.exports.phases = (w, ctx) => { if (w.fromS > 50) throw new Error('stub stop'); return own(w, ctx); };";
     const R = await govTune(worker({ 'health_phase.cjs': stop, 'gov_tune.cjs': STUB_GOV_TUNE }), { flightRpm: TRUTH.rpm, logs: [1] }, S.bytes);
     assert.deepEqual(R.seen.map(q => [q.log, q.segment, q.cls]), [[1, 0, 'flight']]);
-    assert.ok(R.notes.includes('The app cannot find the flight phases of a part of this log. Thus, the governor analysis does not use that part (log 2).'), R.notes.join('\n'));
+    assert.ok(R.notes.includes('The app cannot find the flight phases of a part of this log. Thus, the governor autotune does not use that part (log 2).'), R.notes.join('\n'));
     assert.ok(R.notes.includes('The function "phases" of "health_phase.cjs" stopped. The error is "stub stop" (log 2).'), R.notes.join('\n'));
     assert.ok(!R.notes.some(t => /airborne time|do not record all the values/.test(t)), R.notes.join('\n'));
 });
@@ -3018,4 +3119,73 @@ test('governorTune real dump: status, the 42 names, JSON of a sane size and the 
         `${text.length} bytes, ${wallS.toFixed(0)} s (${J(R.timing)})\n`);
     for (const x of R.recommendations.filter(q => q.severity === 'action' || q.optIn)) process.stderr.write(`#   ${x.severity}${x.optIn ? ' opt-in' : ''} ${x.parameter} ${x.profile ? `PID profile ${x.profile}` : 'all'}: ${J(x.from)} -> ${J(x.to)} ${J(x.cli.length ? x.cli : x.optIn ? x.optIn.cli : [])}\n`);
     for (const t of R.reasons) process.stderr.write(`#   reason: ${t}\n`);
+});
+
+// IMP-05: a log of firmware with blackbox_params (a complete FULL parameter snapshot in the header, the 4 S fields): the PID
+// profile at the start comes from param_pid_profile, every PID profile has the snapshot values (datasets source 'log snapshot'),
+// and the epochs are the journal epochs of the timeline (check 'journal'), with their own caveat
+test('a log with a parameter snapshot (IMP-05): the start profile from the snapshot, its values from the snapshot, the journal epochs', async () => {
+    const PL = require(path.join(REPO, 'tools/autotune/param_log.cjs'));
+    const f = bbl.simulateFlight({ seconds: 20, seed: 23, airborne: [6, 18], start: '2026-10-04T20:00:00.000+00:00' }), n = f.w.n, h = f.header;
+    const pid = (ax, k) => [].concat(h[`${ax}PID`] || [])[k], prof2 = (v, w) => `${v}|${w}||||`;
+    const body = [['Param log', '1'], ['param_mode', 'FULL'], ['param_loop', `${h.pid_process_denom || 1},1,1,128`], ['param_phase', 'pos=0,sp=0,pid=0,mix=0,mot=0,fupd=0,bb=0,flush=0'],
+        ['param_pgs', '14.0/936,12.4/300'], ['param_fixes', '-'], ['param_rt', 'gov_mode=3,features=0,pid_denom=1,filter_denom=1,looptime=1000,debug_mode=0,motors=1,servos=4'],
+        ['param_pid_profile', '0'], ['param_rate_profile', '0'], ['set.gov_mode', 'ELECTRIC'], ['set.tail_rotor_gear_ratio', '19,76'],
+        ['set@p.roll_p_gain', prof2(pid('roll', 0), 77)], ['set@p.yaw_p_gain', prof2(pid('yaw', 0), 55)], ['set@p.yaw_i_gain', prof2(pid('yaw', 1), 116)], ['set@r.roll_rc_rate', '120|||||']];
+    let hash = 2166136261; for (const [k, v] of body) hash = PL.fnv1(`H ${k}:${v}\n`, hash);
+    body.push(['param_end', `${body.length},${(hash >>> 0).toString(16)}`]);
+    f.header = Object.assign({}, h, Object.fromEntries(body));
+    // journal records: at frame 15000, yaw_p_gain of PID profile 2 from 55 to 60 (not in force: the log flies PID profile 1); at frame
+    // 16000, roll_rc_rate of rate profile 1 (in force, read live) from 120 to 130. The S-frame paramSeq is the seq of the last record
+    const recs = [[15000, 'PC1 15000.0 s=m.202 n=1 p1.yaw_p_gain=60<55'], [16000, 'PC2 16000.0 s=m.204 n=1 r0.roll_rc_rate=130<120']], seq = new Uint8Array(n).fill(1, 15000).fill(2, 16000);
+    f.events = (f.events || []).concat(recs.map(([at, rec]) => [at, bbl.EV.CUSTOM_STRING, { string: `${rec}*${PL.crc8(rec).toString(16).toUpperCase().padStart(2, '0')}` }]));
+    f.slow = Object.assign({}, f.slow, { pidProfile: new Uint8Array(n), rateProfile: new Uint8Array(n), armed: new Uint8Array(n).fill(1), paramSeq: seq });
+    const R = await worker(NO_PHASE).result({ cmd: 'analyseLog', fileName: 'param.bbl', logIndex: 0, options: { flightRpm: TRUTH.rpm, curves: false } }, bbl.encode([f]).bytes);
+    const a = (R.profiles.arming || [])[0];
+    assert.deepEqual([a && a.profile, a && a.basis, a && a.confirmed], [1, ['snapshot'], true], J(R.profiles.arming));
+    if (has('param_epochs.cjs')) {
+        const E = (R.epochs || []).find(e => e.log === 0);
+        assert.ok(E && E.spans.length && E.spans.every(s => s.check === 'journal' && s.source.pid === 'journal'), J(R.epochs));
+        // the parts after the change of a value in force have the reason 'changed' with its key (some checks use the values at the start of
+        // the log); the change of PID profile 2 gives no cause, because the log flies PID profile 1
+        assert.ok(E.spans.filter(s => s.t0 >= 15.99).every(s => s.reasons.includes('changed') && s.keys.changed.join() === 'r0.roll_rc_rate') && E.spans.filter(s => s.t1 <= 16.01).every(s => s.fresh), J(E.spans.map(s => [s.t0, s.t1, s.reasons])));
+        assert.ok(E.spans.some(s => s.t0 >= 15.99), J(E.spans.map(s => [s.t0, s.t1, s.reasons])));
+        assert.equal(E.spans.find(s => s.t0 >= 15.99).text, 'For "roll_rc_rate" of rate profile 1, some checks use the value at the start of log 1. ' +
+            'The log records a new value at 16 s, and the configurations use it from that time. For the other values, the app uses the parameter values in the log header of log 1.');
+        assert.equal(R.freshness.caveat, 'The log records each parameter change. Only the parts of the log that have a cause can have values that the log does not show.');
+    }
+    if (has('datasets.cjs') && R.datasets) {
+        const ds = R.datasets.datasets || [], one = ds.find(d => d.pidProfile === 1);
+        assert.ok(one && one.sources.yaw_p_gain === 'log snapshot' && one.values.yaw_p_gain === pid('yaw', 0), J(ds));
+    }
+});
+
+// review IMP-05: the same kind of log with a PID profile change (1 to 2 at 10 s) and a CLI dump that does not agree with the snapshot:
+// the conflict 'snapshot' of result.cliStatus, no note that asks for a log that starts in PID profile 2 (the snapshot has its values),
+// no gear fit (the snapshot gives the gear ratios), result.paramSnapshot, and the flags of PID profile 2 have no cause 'switched'
+test('a log with a parameter snapshot and a CLI dump of a different time (IMP-05): the conflict, no note for PID profile 2, no gear fit', async () => {
+    const PL = require(path.join(REPO, 'tools/autotune/param_log.cjs'));
+    const f = bbl.simulateFlight({ seconds: 20, seed: 29, airborne: [4, 18], start: '2026-10-04T21:00:00.000+00:00', profiles: [{ from: 0, profile: 1, target: 2500 }, { from: 10, profile: 2, target: 2700 }] }), n = f.w.n, h = f.header;
+    const pid = (ax, k) => [].concat(h[`${ax}PID`] || [])[k];
+    const body = [['Param log', '1'], ['param_mode', 'FULL'], ['param_loop', `${h.pid_process_denom || 1},1,1,128`], ['param_phase', 'pos=0,sp=0,pid=0,mix=0,mot=0,fupd=0,bb=0,flush=0'],
+        ['param_pgs', '14.0/936,12.4/300'], ['param_fixes', '-'], ['param_rt', 'gov_mode=3,features=0,pid_denom=1,filter_denom=1,looptime=1000,debug_mode=0,motors=1,servos=4'],
+        ['param_pid_profile', '0'], ['param_rate_profile', '0'], ['set.gov_mode', 'ELECTRIC'], ['set.main_rotor_gear_ratio', '1,1'], ['set.tail_rotor_gear_ratio', '19,76'],
+        ['set@p.roll_p_gain', `${pid('roll', 0)}|77||||`], ['set@p.yaw_p_gain', `${pid('yaw', 0)}|55||||`], ['set@p.gov_headspeed', '2500|2700|1000|||']];
+    let hash = 2166136261; for (const [k, v] of body) hash = PL.fnv1(`H ${k}:${v}\n`, hash);
+    body.push(['param_end', `${body.length},${(hash >>> 0).toString(16)}`]);
+    f.header = Object.assign({}, h, Object.fromEntries(body));
+    const pp = new Uint8Array(n).fill(1, 10000);
+    f.slow = Object.assign({}, f.slow, { pidProfile: pp, rateProfile: new Uint8Array(n), armed: new Uint8Array(n).fill(1), paramSeq: new Uint8Array(n) });
+    const cli = '# diff all\n# Rotorflight / STM32G47X (SG47) 4.7.0-bbp-pr Oct 14 2026 / 05:24:53 (85d7049a9) MSP API: 12.10\nboard_name MATEKG474HELI\nset gov_mode = ELECTRIC\nprofile 1\nset yaw_p_gain = 45\nset roll_p_gain = 77\n';
+    const R = await worker(NO_PHASE).result({ cmd: 'analyseLog', fileName: 'param2.bbl', logIndex: 0, options: { flightRpm: TRUTH.rpm, curves: false, cliText: cli, cliName: 'old.txt' } }, bbl.encode([f]).bytes);
+    const c = R.cliStatus && (R.cliStatus.conflicts || []).find(x => x.what === 'snapshot');
+    assert.ok(c && c.count >= 1, J(R.cliStatus));
+    assert.match(c.text, /^Log 1: \d+ parameter values? in the log header (is|are) different from the CLI dump\.$/);
+    assert.ok(!R.notes.some(t => /No flight log in the analysis starts in PID profile 2\./.test(t)), J(R.notes));
+    assert.equal(R.notchFit, null, 'the snapshot gives the gear ratios: no fit');
+    assert.deepEqual(R.paramSnapshot, { logs: [0], all: true });
+    if (has('param_epochs.cjs')) {
+        const E = (R.epochs || []).find(e => e.log === 0);
+        assert.ok(E.spans.every(s => !s.reasons.includes('switched')), J(E.spans.map(s => s.reasons)));
+    }
 });

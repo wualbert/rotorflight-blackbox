@@ -296,7 +296,7 @@ const fromSpans = (rec, list, keep) => (Array.isArray(list) ? list : []).filter(
     .map(q => { const run = Array.isArray(q.runs) && q.runs.length && Array.isArray(q.runs[0]) ? q.runs[0] : null; return cand(rec, run ? run[0] : q.t0, run ? run[1] : num(q.t1) !== null ? q.t1 : q.t0, 0, 0, q.value, q); });
 const D2_LABEL = [[/^loop stall/, 'Loop stall'], [/^time jump/, 'Sudden time change'], [/^time not increasing/, 'Time does not increase'], [/^loopIteration jump/, 'Loop count change']];
 const d2Label = (e) => (D2_LABEL.find(([re]) => re.test(String(e.kind || ''))) || [null, 'Frame interval'])[1];
-const REASON = { failsafe: 'Failsafe', rescue: 'Rescue', levelMode: 'Level mode', ground: 'Ground contact' };
+const REASON = { rxLoss: 'No receiver signal', failsafe: 'Failsafe', rescue: 'Rescue', levelMode: 'Level mode', ground: 'Ground contact' };
 
 // the facts of a finding that its fields do not hold, from the metrics of its records (no text is read)
 function factsOf(f, recs) {
@@ -331,8 +331,8 @@ function factsOf(f, recs) {
 // Flight phases (SPEC2 D13): the phase of every span when the record has its phase spans
 // ---------------------------------------------------------------------------------------------
 
-const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];
-const PHASE_LABEL = { idle: 'IDLE', spoolup: 'Spool-up', ground: 'Ground', flight: 'Flight', spooldown: 'Spool-down' };
+const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'];
+const PHASE_LABEL = { idle: 'IDLE', spoolup: 'Spool-up', ground: 'Ground', flight: 'Flight', spooldown: 'Spool-down', fall: 'Before the ground contact', aftercontact: 'After the ground contact' };
 // The phase spans of a record in frame seconds, from rec.phases (js/tuning_worker.js) or the health_phase metrics
 // (rec.metrics.phase.phases, analyse), as a list or as { spans }. A span with samples i0, i1 (health_phase.cjs phases)
 // goes through the time map of the record; a span with t0, t1 only is in frame seconds already (the worker's)
@@ -435,6 +435,11 @@ const CAND = {
     R1: (f, recs) => recs.flatMap(rec => { const s = mt(rec, 'track') && mt(rec, 'track').stick && mt(rec, 'track').stick[f.axis]; return s ? fromSpans(rec, s.blocksAt || s.worst) : []; }),
     C5: (f, recs) => oscEvents(f, recs), T1: (f, recs) => oscEvents(f, recs),
     D6: (f, recs) => recs.flatMap(rec => { const d = mt(rec, 'more') && mt(rec, 'more').D6; return fromEvents(rec, f.events || (d && d.events), [1, 1], (e) => e.value, (e) => REASON[e.reason] || null); }),
+    // D10 (IMP-01): each period from the inferred last RC frame (tS) to the RX return (t1S), frame seconds already; a problem first
+    // the record (segment) that contains the last RC frame: the last one that starts at or before it and does not end before it
+    D10: (f, recs) => (Array.isArray(f.events) ? f.events : []).filter(e => e && num(e.tS) !== null).map(e => Object.assign(frameCand(recs.filter(rc => num(rc.fromS) !== null && rc.fromS <= e.tS && (num(rc.seconds) === null || e.tS <= rc.fromS + rc.seconds)).pop()
+        || recs.filter(rc => num(rc.fromS) !== null && rc.fromS <= e.tS).pop() || recs[0] || null,
+        e.tS, num(e.t1S) !== null ? e.t1S : e.tS, e.seconds, e, e.rotor ? 'No receiver signal, rotor at the flight rpm' : 'No receiver signal'), { rank: (e.rotor ? 1000 : 0) + (num(e.seconds) || 0) })),
     F10: (f, recs) => recs.flatMap(rec => { const g = mt(rec, 'more') && mt(rec, 'more').F10 && mt(rec, 'more').F10[f.axis] && mt(rec, 'more').F10[f.axis].byProfile && mt(rec, 'more').F10[f.axis].byProfile[f.profile];
         if (g && Array.isArray(g.worst)) return fromSpans(rec, g.worst);
         return f.axis === 'yaw' && loc(rec) ? fromSpans(rec, loc(rec).C11, (q) => q.axis === f.axis && sameProfile(q.profile, f.profile)) : []; }), // the same windows and share as C11
@@ -448,6 +453,9 @@ const CAND = {
         return fromSpans(rec, sel.length ? sel : list); }),
     F6: (f, recs, x) => x.row ? recs.flatMap(rec => fromEvents(rec, x.row.events, [0, 0], (e) => -e.value, null, (e) => e.t + SETUP.RULE.order.revolutions * 60 / (e.headspeed || x.headspeed || 1e9), (e) => e.value)) : [],
     D7: (f, recs) => flightCands(f, recs),
+    // D11 (IMP-03): each cut in flight from the end of the flight (tS) to the ground contact (t1S), frame seconds already; a contact first
+    D11: (f, recs) => (Array.isArray(f.events) ? f.events : []).filter(e => e && num(e.tS) !== null).map(e => Object.assign(frameCand(recs.filter(rc => num(rc.fromS) !== null && rc.fromS <= e.tS).pop() || recs[0] || null,
+        e.tS, num(e.t1S) !== null ? e.t1S : e.tS, e.fallS, e, e.contactS !== null ? 'Motor cut in flight and ground contact' : 'Motor cut in flight'), { rank: (e.contactS !== null ? 1000 : 0) + (num(e.fallS) || 0) })),
 };
 function loopEvents(f, recs, pick, score, pads, stat) {
     return recs.flatMap(rec => { const m = mt(rec, 'loop'), g = m ? pick(m) : null; return g ? fromEvents(rec, (g.events || []).filter(e => sameProfile(e.profile, f.profile)), pads, score, null, null, stat) : []; });
@@ -548,6 +556,9 @@ const ROWS = {
     D7: (f, rec, recs) => phaseRows(f, recs),
     // D9 (health_config.cjs): rescue_mode and the other rescue values of the PID profile (CLI dump or defaults), or the PID
     // profiles that the analysis cannot read
+    // D12 (health_config.cjs, IMP-11): the rxfail value of the throttle, the values of the calculation and the response
+    D12: (f) => (Array.isArray(f.rxfail) ? [{ key: 'rxfail 4', value: f.rxfail.join(' ') }] : []).concat(f.values && typeof f.values === 'object' ? Object.entries(f.values).map(([k, v]) => ({ key: k, value: str(v) })) : [],
+        num(f.value) !== null ? [{ key: 'throttle', value: `${f.value} µs` }] : [], f.band ? [{ key: 'band', value: str(f.band) }] : [], f.stateLog ? [{ key: 'governor', value: str(f.stateLog) }] : []),
     D9: (f) => (f.mode ? [{ key: 'rescue_mode', value: str(f.mode) }] : []).concat(f.params && typeof f.params === 'object' ? Object.entries(f.params).filter(([k]) => k !== 'rescue_mode').map(([k, v]) => ({ key: k, value: str(v), default: Array.isArray(f.defaults) && f.defaults.includes(k) })) : [])
         .concat(Array.isArray(f.unknownProfiles) && f.unknownProfiles.length ? [{ key: 'PID profiles not known', value: f.unknownProfiles.join(', ') }] : []),
 };
@@ -594,6 +605,7 @@ const CAPTION = {
     C14: () => 'The points compare pitch I + O with the collective, and the slope estimates a feedforward change.',
     C15: () => 'The curves are the roll or pitch rate, the collective and the headspeed on the ground, and an oscillation that increases is a problem.',
     D6: () => 'The points are the parts of the log that the analysis does not use.',
+    D10: () => 'The points are the periods with no receiver signal, at the time of the last RC frame.',
     D8: () => 'The points are the PID profile changes at the rescues, and each change is a problem.',
     F5: () => 'The curve is the spectrum of the raw gyro, and the lines mark the peak and the nearest notch filters.',
     F6: (f, R) => `The points are the decrease of each notch filter, and the limit is ${lim(R.minDb, 'dB') || 'the minimum'}.`,
@@ -624,6 +636,7 @@ const KIND_CAPTION = { table: 'The table gives the values of the log header for 
     transmission: 'The curves are the response of this check.' };
 function captionOf(f, c, R, x, kind) {
     if (f.id === 'D9') return 'The table gives the rescue values of this PID profile.';
+    if (f.id === 'D12') return 'The table gives the values that set the response of the firmware when the receiver signal stops.';
     if (kind === 'table' && c.evidence.source === 'header') return KIND_CAPTION.table;
     try { const t = CAPTION[f.id] ? CAPTION[f.id](f, R || {}, x || {}) : null; if (typeof t === 'string' && t && !/\b(null|undefined|NaN)\b/.test(t)) return t; } catch (e) { /* the sentence of the kind */ }
     return KIND_CAPTION[kind] || KIND_CAPTION.time;
@@ -634,7 +647,8 @@ function phaseRows(f, recs) {
     if (own) for (const p of PHASES) { if (num(own[p]) !== null) sec[p] = own[p]; }
     else for (const rec of recs) for (const q of phaseSpansOf(rec)) sec[q.phase] = (sec[q.phase] || 0) + Math.max(0, q.t1 - q.t0);
     const k = Array.isArray(f.flights) ? f.flights.length : num(f.flights);
-    return (k !== null ? [{ key: 'Flights', value: String(k) }] : []).concat(PHASES.filter(p => sec[p] !== undefined).map(p => ({ key: PHASE_LABEL[p], value: `${C.fmt(sec[p], 1)} s` })));
+    const rare = new Set(['fall', 'aftercontact']); // after an in-flight cut only (IMP-03): no row at 0 s
+    return (k !== null ? [{ key: 'Flights', value: String(k) }] : []).concat(PHASES.filter(p => sec[p] !== undefined && !(rare.has(p) && !(sec[p] > 0))).map(p => ({ key: PHASE_LABEL[p], value: `${C.fmt(sec[p], 1)} s` })));
 }
 
 function plotOf(f, c, spans, recs, a, axis, x, ctx) {
@@ -678,6 +692,7 @@ function fallbackOf(f, c, a, axis, x, R) {
 // spans of other findings in the same log that overlap: what can explain this finding (SPEC2 3.3 context)
 const CONTEXT = [
     ['D6', 'more', (m) => (m.D6 && m.D6.events) || [], (e) => [e.t, e.t + (e.seconds || 0)], (e) => REASON[e.reason] || 'Time not used'],
+    ['D10', 'more', (m) => (m.D10 && m.D10.spans) || [], (e) => [e.t, e.t1], () => 'No receiver signal'],
     ['D2', 'setup', (m) => ((m.D2 && m.D2.events) || []).filter(e => /^loop stall|^time jump/.test(String(e.kind || ''))), (e) => [e.t - 0.05, e.t + 0.05], d2Label],
     ['C2', 'loop', (m) => (m.C2 && m.C2.events) || [], (e) => [e.t, e.t + (e.seconds || 0)], () => 'Cyclic output limit'],
     ['T8', 'loop', (m) => (m.T8 && m.T8.events) || [], (e) => [e.t, e.t + (e.seconds || 0)], () => 'Tail output limit'],

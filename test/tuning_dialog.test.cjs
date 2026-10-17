@@ -207,7 +207,16 @@ function setup({ result, logCount = 3, current = 1, sysConfig = {}, liveHook = t
         // js/main.js loadLogFile, as for a file dropped on the window while the view is open: new bytes, name and
         // FlightLog, and no show()
         load(b, name, log) { bytes = b; fileName = name; flightLog = log; },
-        show() { dialog.show(flightLog); },
+        // open(): the pilot opens the view (no analysis starts, 2026-10-15). show(): the view opens, the scan of the flights ends and
+        // the pilot clicks "Start analysis" (nothing new when the result on display is of these values)
+        open() { dialog.show(flightLog); },
+        show() { dialog.show(flightLog); const s = this.scanWorker(); if (s && !s.terminated) this.scanDone(); jq.fire('click', '.tuning-analyse'); }, // the button waits for the scan
+        // the worker of the flight scan (scanFlights), and of the newest analysis
+        scanWorker() { return workers.filter((w) => w.sent.length && w.sent[0].msg.cmd === 'scanFlights').pop(); },
+        // the scan ends ("Start analysis" waits for it), by default with no flights
+        scanDone(result = { scope: 'scan', records: [], flights: [], benchRuns: [], noData: [] }) { this.scanWorker().reply({ type: 'flightsScanned', result }); },
+        analysisWorker() { return this.runs.at(-1); },
+        get runs() { return workers.filter((w) => w.sent.length && /^analyse/.test(w.sent[0].msg.cmd)); },
         tab(key) { return jq.fire('click', '.tuning-tab', { 'data-tab': key }); },
         // the derive worker: the one whose first message is init
         deriveWorker() { return workers.find((w) => w.sent.length && w.sent[0].msg.cmd === 'init'); },
@@ -415,7 +424,7 @@ function analysed(opts = {}) {
     const app = setup(opts);
     app.show();
     app.result = opts.result || synthResult();
-    app.workers[0].reply({ type: 'result', result: app.result });
+    app.analysisWorker().reply({ type: 'result', result: app.result });
     return app;
 }
 
@@ -1073,18 +1082,20 @@ test('runAnalysis of the Analysis view: a run for another file or log stops firs
     // the Tuning view starts a run with other settings: the run of the Analysis view stops
     const pr = d.dialog.runAnalysis();
     d.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
+    d.scanDone();
     d.jq.fire('click', '.tuning-analyse');
     await assert.rejects(pr, reason('replaced'));
     // "All logs in the file": a run for another selected log gives the findings of this log too, so it goes on
     const f = setup();
     f.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
+    f.scanDone();
     const pf = f.dialog.runAnalysis();
     f.flightLog.openLog(2);
     const pf2 = f.dialog.runAnalysis();
-    assert.equal(f.workers.length, 1, 'no second run of the file');
-    assert.equal(f.workers[0].sent[0].msg.cmd, 'analyseFile');
+    assert.equal(f.runs.length, 1, 'no second run of the file');
+    assert.equal(f.runs[0].sent[0].msg.cmd, 'analyseFile');
     const rf = synthResult({ scope: 'file', logs: [0, 1, 2] });
-    f.workers[0].reply({ type: 'result', result: rf });
+    f.runs[0].reply({ type: 'result', result: rf });
     assert.equal(await pf, rf);
     assert.equal(await pf2, rf);
     // no file
@@ -1369,6 +1380,35 @@ test('PID profiles: the selector, the status of each PID profile in the diagram,
     cov.tab('coverage');
     assert.match(cov.pane('coverage'), /<td>Log rate<div class="tuning-muted">Log<\/div><\/td>/);
     assert.match(cov.pane('coverage'), /<tr><td>Data<\/td>/);
+});
+
+test('IMP-07: the flights that can show a change: a recommendation card and the control result show the plan, the CLI text stays', async () => {
+    const P = require('../tools/autotune/validation_power.cjs');
+    const no = Object.assign(P.plan([{ id: 'tracking', axes: ['roll'], unit: 'deg/s', delta: -0.57, deltaSe: 0.1, sd: 3.04, flights: 14, configurations: 1, df: 13, lowerBound: false },
+        { id: 'uncommanded', axes: ['roll'], unit: 'deg/s', band: [0.5, 8], delta: -0.2, sd: 0.1, flights: 2, configurations: 1, df: 1, lowerBound: true }]), { profile: 1, profileLabel: 'PID profile 1' });
+    const yes = P.plan([{ id: 'transfer', axes: ['yaw'], unit: '%', hz: 10, delta: 16, sd: 12, flights: 6, windowS: 2, pooled: 24,
+        null: { windows: 16, mean: 31, sd: 8 }, activity: { band: [9, 11], minCoherence: 0.5, flights: 6, coherent: 2, setpointRms: 14.2 } }]);
+    const result = synthResult(), rec = result.advice.recommendations.find((r) => r.id === 'T7:yaw_collective_ff_gain:p1'), cli = rec.cli.slice();
+    rec.validationPower = yes;
+    let app = analysed({ result }); app.tab('recs');
+    const recs = app.pane('recs');
+    assert.match(recs, /Flights to compare the values<\/div><p>Flights can show this change in the yaw tracking error at 10 Hz, as a percentage of the setpoint\./);
+    assert.match(recs, /Fly 9 flights with the previous values and 9 flights with the new values\./);
+    assert.match(recs, /<th>Flights for each set of values<\/th><\/tr><\/thead><tbody><tr><td>The yaw tracking error at 10 Hz, as a percentage of the setpoint<\/td><td>16 %<\/td><td>12 % \(6 flights\)<\/td><td>9<\/td>/);
+    assert.deepEqual(app.result.advice.recommendations.find((r) => r.id === rec.id).cli, cli, 'the CLI text stays');
+    // the control result: one plan for the change group
+    app = analysed({ result: controlResult() }); app.tab('cyclic'); app.jq.fire('click', '.tuning-ct-start');
+    const q = controlRequest(app), out = acceptedControlFixture(require('../tools/autotune/control_tune.cjs').tune(plain(q)));
+    out.validationPower = no; for (const r of out.recommendations) r.validationPower = no;
+    controlWorker(app).reply({ type: 'controlTuned', result: out }, q.id); await tick();
+    const html = app.pane('cyclic');
+    assert.equal(html.split('Flights cannot show this change').length, 2, 'once');
+    assert.match(html, /tuning-power is-caveat/); assert.match(html, /447 flights with each set of values are necessary\./);
+    // a neutral label with the PID profile; the range of the number of flights; a lower bound is marked "minimum"
+    assert.match(html, /<div class="tuning-label">Flights to compare the values · PID profile 1<\/div>/); assert.doesNotMatch(html, /Flights that can show the change/);
+    assert.match(html, /<td>3\.04 deg\/s \(14 flights\)<\/td><td>447 \(170 to 1703\)<\/td>/);
+    assert.match(html, /<td>0\.1 deg\/s \(minimum\) \(2 flights\)<\/td><td>4 \(minimum\)<\/td>/);
+    assert.deepEqual(app.errors, []);
 });
 
 test('an unknown PID profile: no CLI text, and not in the CLI file', () => {
@@ -1656,7 +1696,7 @@ test('worker errors, cancel, bad input and no log are reported, escaped', () => 
     assert.equal(app.workers[0].terminated, true);
     assert.match(app.html('.tuning-notices'), /The analysis stopped because of an error\.<\/strong> <span data-ste="quoted">&lt;script&gt;bad\(\)&lt;\/script&gt;<\/span>/);
     assert.match(app.html('.tuning-notices'), /<details><summary>More information<\/summary><pre class="tuning-stack">at &lt;anonymous&gt;/);
-    app.show();
+    app.open();
     assert.equal(app.workers.length, 1, 'a failed run is not repeated on reopening');
 
     app.jq.fire('click', '.tuning-analyse');
@@ -1666,7 +1706,7 @@ test('worker errors, cancel, bad input and no log are reported, escaped', () => 
     assert.match(app.jq.node('.tuning-progress-text').text, /^Canceled after 0:00$/);
     app.workers[1].reply({ type: 'result', result: synthResult() });
     assert.equal(app.pane('overview'), '', 'a canceled run is ignored');
-    app.show();
+    app.open();
     assert.equal(app.workers.length, 2, 'a canceled run is not started again on reopening');
 
     // no log open: main.js has no FlightLog yet, or a host without getFlightLog passes none to show()
@@ -1728,16 +1768,18 @@ test('results are cached per file, scope, log and CLI dump', async () => {
     assert.match(app.html('.tuning-notices'), /The file is not a Rotorflight CLI dump \(&quot;diff all&quot; or &quot;dump&quot;\)\. <span data-ste="quoted">notes\.txt<\/span>/);
     const dump = '# diff all\nprofile 0\nset gov_mode = 1\n';
     app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: '<b>dump</b>.txt', text: dump }] });
-    assert.match(app.html('.tuning-cli-name'), /&lt;b&gt;dump&lt;\/b&gt;\.txt/);
+    assert.match(app.html('.tuning-cli-line'), /&lt;b&gt;dump&lt;\/b&gt;\.txt/);
     app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
     assert.match(app.html('.tuning-notices'), /The logs, the flights or the CLI dump are different from this result\. To use them, click "Start analysis"\./);
+    assert.equal(app.scanWorker().sent[0].msg.cmd, 'scanFlights', '"All flights in the file": the flights of each log, for the "Logs" control');
+    app.scanDone();
     app.jq.fire('click', '.tuning-analyse');
-    const { msg } = app.workers[1].sent[0];
+    const { msg } = app.analysisWorker().sent[0];
     assert.equal(msg.cmd, 'analyseFile');
     assert.equal(msg.bytes.byteLength, 400);
     assert.equal(msg.selectedLog, 1);
     assert.deepEqual(plain(msg.options), { flightRpm: null, cliText: dump, cliName: '<b>dump</b>.txt', excludeAbnormal: true, gains: true });
-    app.workers[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
+    app.analysisWorker().reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
     assert.match(app.pane('overview'), /All flights in the file \(3 logs\): /);
     app.tab('checks');
     assert.match(app.pane('checks'), /<th class="tuning-sortable" data-sort="log">Log<\/th>/, 'file scope lists the log');
@@ -1748,13 +1790,13 @@ test('results are cached per file, scope, log and CLI dump', async () => {
     app.tab('overview');
     assert.match(app.pane('overview'), /<div class="tuning-summary"><div>Log 2 of 3: /);
     app.show();
-    assert.equal(app.workers.length, 2);
+    assert.equal(app.runs.length, 2);
 
     // another file: the old result is dropped and the new log is analysed
     app.setFile(Uint8Array.from({ length: 400 }, (_, i) => (i * 13) & 0xff), 'other.bbl');
     app.show();
-    assert.equal(app.workers.length, 3);
-    assert.equal(app.workers[2].sent[0].msg.fileName, 'other.bbl');
+    assert.equal(app.runs.length, 3);
+    assert.equal(app.analysisWorker().sent[0].msg.fileName, 'other.bbl');
     assert.equal(app.pane('overview'), '');
 });
 
@@ -1763,37 +1805,39 @@ test('results are cached per file, scope, log and CLI dump', async () => {
 test('a file result is cached for the file: another log in the viewer keeps it, and "Start analysis" takes the curves of the log on display', () => {
     const app = analysed(); // log 2, this log
     app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
+    app.scanDone();
     app.jq.fire('click', '.tuning-analyse');
-    assert.equal(app.workers[1].sent[0].msg.selectedLog, 1);
-    app.workers[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: 1 }) });
+    assert.equal(app.analysisWorker().sent[0].msg.selectedLog, 1);
+    app.analysisWorker().reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: 1 }) });
     assert.match(app.html('.tuning-context'), /<div>All flights in the file \(3 logs\)<\/div><div>Curves of log 2<\/div>/);
     app.hooks.selectLog(2); // the viewer shows log 3
-    app.show();
-    assert.equal(app.workers.length, 2, 'the result of the file stays: no new run');
+    app.open();
+    assert.equal(app.runs.length, 2, 'the result of the file stays: no new run');
     assert.match(app.html('.tuning-context'), /<div>Curves of log 2<\/div>/);
     assert.match(app.html('.tuning-notices'), /The curves, the log data and the header values of the recommendations are for log 2\. The log viewer shows log 3\. To examine log 3, click &quot;Start analysis&quot;\./);
     // the selected log is a bench run: the worker takes the header of the recommendations from a flight log (headerLog)
     const h = analysed();
     h.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
+    h.scanDone();
     h.jq.fire('click', '.tuning-analyse');
-    h.workers[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: 1, headerLog: 0 }) });
+    h.analysisWorker().reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: 1, headerLog: 0 }) });
     assert.match(h.html('.tuning-notices'), /Log 2 is not a flight log\. Thus, the recommendations use the log header of log 1\./);
     h.hooks.selectLog(2);
-    h.show();
+    h.open();
     assert.match(h.html('.tuning-notices'), /The curves and the log data are for log 2\. The log viewer shows log 3\./);
     // "Start analysis": the file again, with the curves and the header of log 3; the new result replaces the old one
     app.jq.fire('click', '.tuning-analyse');
-    assert.equal(app.workers[2].sent[0].msg.selectedLog, 2);
-    app.workers[2].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: 2, curves: synthCurves(2) }) });
+    assert.equal(app.analysisWorker().sent[0].msg.selectedLog, 2);
+    app.analysisWorker().reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: 2, curves: synthCurves(2) }) });
     assert.match(app.html('.tuning-context'), /<div>All flights in the file \(3 logs\)<\/div><div>Curves of log 3<\/div>/);
     assert.equal(app.html('.tuning-notices'), '');
     app.hooks.selectLog(1);
-    app.show();
-    assert.equal(app.workers.length, 3, 'one result for the file');
+    app.open();
+    assert.equal(app.runs.length, 3, 'one result for the file');
     assert.match(app.html('.tuning-context'), /<div>Curves of log 3<\/div>/);
     assert.match(app.html('.tuning-notices'), /are for log 3\. The log viewer shows log 2\./);
     // the key: "*" for the log of a file or flights run, the log for "This log"
-    assert.deepEqual(app.workers.slice(1).map((w) => w.sent[0].msg.cmd), ['analyseFile', 'analyseFile']);
+    assert.deepEqual(app.runs.slice(1).map((w) => w.sent[0].msg.cmd), ['analyseFile', 'analyseFile']);
 });
 
 test('filters, sorting, copy and save', async () => {
@@ -1914,11 +1958,11 @@ test('V1: a CLI dump goes with its file: a different file removes it with a noti
     app.jq.fire('click', '.tuning-analyse');
     assert.equal(app.workers[1].sent[0].msg.options.cliText, DUMP('SAB Fireball'), 'the same craft name: the analysis uses the dump');
     app.workers[1].reply({ type: 'result', result: synthResult() });
-    assert.match(app.html('.tuning-cli-name'), /fireball_cli_dump\.txt/);
+    assert.match(app.html('.tuning-cli-line'), /fireball_cli_dump\.txt/);
     // the same file opened again (same name, length and bytes): the dump stays
     app.load(Uint8Array.from(app.bytes), '<i>flight</i>.bbl', fakeLog({ sysConfig: { 'Craft name': 'SAB Fireball' } }));
     app.show();
-    assert.match(app.html('.tuning-cli-name'), /fireball_cli_dump\.txt/);
+    assert.match(app.html('.tuning-cli-line'), /fireball_cli_dump\.txt/);
     assert.ok(!/removed the CLI dump/.test(app.html('.tuning-notices')));
     // a different file (the Gaui logs have no craft name): the dump goes, the notice says why, the run has no CLI text
     const before = app.workers.length;
@@ -1927,7 +1971,7 @@ test('V1: a CLI dump goes with its file: a different file removes it with a noti
     assert.equal(app.workers.length, before + 1, 'the automatic run of the new log');
     assert.equal(app.workers[before].sent[0].msg.options.cliText, null);
     assert.equal(app.workers[before].sent[0].msg.options.cliName, null);
-    assert.equal(app.html('.tuning-cli-name'), '');
+    assert.match(app.html('.tuning-cli-line'), /No CLI dump\./, 'the dump went: the request for a CLI dump');
     assert.match(app.html('.tuning-notices'), /The app removed the CLI dump <span data-ste="quoted">fireball_cli_dump\.txt<\/span>, because a different file is open\. The analysis of this file uses only the log\./);
     app.workers[before].reply({ type: 'result', result: synthResult() });
     assert.match(app.html('.tuning-notices'), /removed the CLI dump/, 'the notice stays after the result');
@@ -1960,9 +2004,10 @@ test('V1: the craft names of the CLI dump and of the log header are not the same
     app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'fireball_cli_dump.txt', text: DUMP('SAB Fireball') }] });
     const warn = /The craft name in the CLI dump \(<span data-ste="quoted">SAB Fireball<\/span>\) is not the same as the craft name in the log header \(<span data-ste="quoted">Gaui X4<\/span>\)\. Thus, the analysis does not use the CLI dump\. It uses only the values of the log\./;
     assert.match(app.html('.tuning-notices'), warn);
-    assert.match(app.html('.tuning-cli-name'), /fireball_cli_dump\.txt<\/span> <span class="tuning-cli-off">\(not used\)<\/span>/);
+    assert.match(app.html('.tuning-cli-line'), /fireball_cli_dump\.txt<\/span> <span class="tuning-cli-off">\(not used\)<\/span>/);
     assert.ok(!/different from this result/.test(app.html('.tuning-notices')), 'the key has no CLI dump: the result on display is for it');
     app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
+    app.scanDone();
     app.jq.fire('click', '.tuning-analyse');
     const msg = app.workers[app.workers.length - 1].sent[0].msg;
     assert.equal(msg.cmd, 'analyseFile');
@@ -1980,12 +2025,12 @@ test('V1: the craft names of the CLI dump and of the log header are not the same
     noRawMarkup(app);
 });
 
-// --- V9: "Start analysis" while the automatic run of one log operates ---------------------------------------------------------
+// --- V9: "Start analysis" while the run of one log operates ------------------------------------------------------------------
 
-test('V9: "Start analysis" stops the automatic run and starts the run that the pilot asked for; a run for the same values goes on', async () => {
+test('V9: "Start analysis" for other values stops the run that operates and starts the run that the pilot asked for; a run for the same values goes on', async () => {
     const app = setup();
     app.show();
-    const auto = app.workers[0], waiting = app.dialog.runAnalysis(); // the Analysis view waits for the automatic run
+    const auto = app.workers[0], waiting = app.dialog.runAnalysis(); // the Analysis view waits for the run that the pilot started
     assert.equal(auto.sent[0].msg.cmd, 'analyseLog');
     assert.equal(app.jq.node('.tuning-analyse').props.disabled, false);
     // the same values: the run goes on, and the view says so
@@ -1997,14 +2042,17 @@ test('V9: "Start analysis" stops the automatic run and starts the run that the p
     app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
     // no CLI dump: the notice does not name it (the log is the only necessary input)
     assert.match(app.html('.tuning-notices'), /The analysis that operates at this time uses different logs\. To use the values that you selected, click "Start analysis"\./);
+    app.scanDone();
     app.jq.fire('click', '.tuning-analyse');
-    assert.equal(auto.terminated, true, 'the automatic run stops');
-    assert.equal(app.workers.length, 2);
-    assert.equal(app.workers[1].sent[0].msg.cmd, 'analyseFile');
+    assert.equal(auto.terminated, true, 'the run for other values stops');
+    assert.equal(app.runs.length, 2);
+    assert.equal(app.runs[1].sent[0].msg.cmd, 'analyseFile');
     await assert.rejects(waiting, (e) => e.reason === 'replaced', 'the waiter of the old run hears that it stopped');
     assert.ok(!/operates at this time/.test(app.html('.tuning-notices')), 'the run is for the values on display');
-    app.workers[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
-    assert.equal(app.jq.node('.tuning-analyse').props.disabled, false);
+    app.runs[1].reply({ type: 'result', result: synthResult({ scope: 'file', logs: [0, 1, 2], logIndex: undefined }) });
+    assert.equal(app.jq.node('.tuning-analyse').props.disabled, true, 'the result on display is of these values: no new run');
+    app.jq.fire('click', '.tuning-analyse');
+    assert.equal(app.runs.length, 2, 'a click on the disabled button starts nothing');
     assert.deepEqual(app.errors, []);
 });
 
@@ -2331,12 +2379,12 @@ test('SPEC3 D: "Selected flights" lists the logs and the known flights, sends op
     const app = setup({ logCount: 3, current: 1 });
     app.setFile(datedFile(), 'gaui.bbl');
     app.flightLog.getLogError = (i) => (i === 2 ? 'Log truncated <b>x</b>' : false);
-    app.show(); // "This log": the automatic run of log 2
+    app.show(); // "This log": the run of log 2
     const rec = Object.assign({}, synthResult().records[0], { log: 1, flights: [{ t0: 14.3, t1: 87, seconds: 72.7 }, { t0: 100, t1: 130 }] });
     app.workers[0].reply({ type: 'result', result: synthResult({ records: [rec] }) });
     assert.ok(app.jq.node('.tuning-fsel').classes.has('tuning-hide'), 'no list for "This log"');
-    assert.match(app.html('#tuningBody'), /<option value="file" selected>All flights in the file<\/option><option value="flights">Selected flights<\/option><option value="log">This log<\/option>/,
-        '"Logs": all flights of the file first, the default of the view (2026-10-06)');
+    assert.match(app.html('#tuningBody'), /<option value="file">All flights in the file<\/option><option value="flights" selected>Selected flights<\/option><option value="log">This log<\/option>/,
+        '"Logs": all flights of the file first; "Selected flights" is the default of the view, with the flight list (2026-10-15)');
 
     app.jq.fire('change', '.tuning-scope', {}, { value: 'flights' });
     let list = app.html('.tuning-fsel');
@@ -2344,7 +2392,8 @@ test('SPEC3 D: "Selected flights" lists the logs and the known flights, sends op
     // the default selection is every flight that the analysis can use, and the list is closed under its head (2026-10-06)
     assert.match(list, /^<details class="tuning-fsel-box"><summary class="tuning-fsel-head" title="Open or close the list of the flights"><strong>Flights in the analysis:<\/strong> <span class="tuning-fsel-count">2 of 2 flights, all flights of 1 of 1 other log \(1 log with no data\)<\/span><\/summary><div class="tuning-fsel-body">/);
     assert.match(list, /<div class="tuning-fsel-actions"><button type="button" class="btn btn-default btn-xs tuning-fsel-all">Select all flights<\/button><button type="button" class="btn btn-default btn-xs tuning-fsel-none">Remove the selection<\/button><\/div>/);
-    assert.match(list, /The list shows the flights of a log after an analysis of that log\. For the other logs, select the full log\./);
+    assert.match(list, /The app finds the flights in each log\. Before the list shows the flights of a log, you can select only the full log\./, 'the scan of the flights operates');
+    assert.equal(app.scanWorker().sent[0].msg.cmd, 'scanFlights');
     // log 1: the date of its header, its length from the log index, its flights not known; log 2: no date, its two flights
     // with their times, closed under its row; log 3: no data, not selectable, its error in the title as quoted text
     assert.match(list, /data-log="0" checked aria-label="Log 1"><\/td><td>Log 1<\/td><td><span data-ste="quoted">2026-10-04 17:54:08<\/span><\/td><td class="tuning-num">8\.0 s<\/td><td><span class="tuning-muted">All flights of this log<\/span>/);
@@ -2354,7 +2403,8 @@ test('SPEC3 D: "Selected flights" lists the logs and the known flights, sends op
     app.jq.fire('click', '.tuning-fsel-head', {}, { parentNode: { open: false } });
     app.jq.fire('click', '.tuning-fsel-sub > summary', {}, { parentNode: { open: false, getAttribute: () => '1' } });
 
-    // no selection: the analysis does not start, and the view says what to do
+    // the scan ends ("Start analysis" waits for it). No selection: the analysis does not start, and the view says what to do
+    app.scanDone();
     app.jq.fire('click', '.tuning-fsel-none');
     assert.match(app.html('.tuning-fsel'), /^<details class="tuning-fsel-box" open>[\s\S]*?tuning-fsel-count">no flight \(1 log with no data\)<\/span>/);
     assert.match(app.html('.tuning-fsel'), /<details class="tuning-fsel-sub" data-log="1" open><summary title="Open or close the list of the flights of this log">0 of 2 flights<\/summary>/);
@@ -2407,14 +2457,17 @@ test('SPEC3 D: "Selected flights" lists the logs and the known flights, sends op
     noRawMarkup(app);
 });
 
-test('SPEC3 D: a bench run cannot be selected; before a result each log is a full log; the selection goes with its file', () => {
+test('SPEC3 D: a bench run cannot be selected; before the scan or a result each log is a full log; the scan of the flights fills the list; the selection goes with its file', () => {
     const app = setup({ logCount: 3, current: 0 });
     app.setFile(datedFile(), 'gaui.bbl');
     app.show();
-    // before a result: each log as a full log, the help says so
+    // before the scan and a result: each log as a full log, the help says so
     app.jq.fire('change', '.tuning-scope', {}, { value: 'flights' });
     let list = app.html('.tuning-fsel');
-    assert.match(list, /The list shows the flights of a log after an analysis of that log\. Before that, select the full log\./);
+    assert.match(list, /The app finds the flights in each log\. Before the list shows the flights of a log, you can select only the full log\./);
+    app.scanWorker().reply({ type: 'progress', stage: 'decode', fraction: 0.6, text: 'The app finds the flights in log 2 of 3 <b>.' });
+    assert.match(app.html('.tuning-fsel'), /The app finds the flights in each log\. The app finds the flights in log 2 of 3 &lt;b&gt;\. Before the list/, 'the progress, as text');
+    assert.match(app.jq.node('.tuning-progress-text').text, /^The analysis starts\./, 'the progress of an analysis that operates comes first');
     assert.equal((list.match(/All flights of this log/g) || []).length, 3);
     // a result that finds no flight in log 1: "Bench run (no analysis)", not selectable
     const bench = Object.assign({}, synthResult().records[0], { log: 0, logClass: 'bench', phases: [], flights: [] });
@@ -2424,14 +2477,40 @@ test('SPEC3 D: a bench run cannot be selected; before a result each log is a ful
     assert.match(list, /tuning-fsel-count">all flights of 2 of 2 logs \(1 bench run\)</, 'the default selection without the bench run');
     app.jq.fire('click', '.tuning-fsel-none');
     app.jq.fire('change', '.tuning-fsel-log', { 'data-log': 2 }, { checked: true });
+    app.scanDone();
     app.jq.fire('click', '.tuning-analyse');
     const run = analyseWorkers(app, 'analyseFile')[0];
     assert.deepEqual(plain(run.sent[0].msg.options.flights), [{ log: 2, flight: null }]);
     assert.equal(run.sent[0].msg.selectedLog, 2, 'the open log is not selected: the first selected log');
-    // another file: its own selection, the default again (all flights of its 3 logs)
+    // another file: its own selection, the default again (all flights of its 3 logs), and its own scan. Opening the view starts no analysis
     app.load(Uint8Array.from({ length: 400 }, (_, i) => i & 0xff), 'other.bbl', fakeLog({ count: 3, current: 0 }));
-    app.show();
+    const old = app.scanWorker();
+    app.open();
     assert.match(app.html('.tuning-fsel'), /tuning-fsel-count">all flights of 3 of 3 logs</);
+    const scan = app.scanWorker(), runs = app.runs.length;
+    assert.ok(scan !== old && old.terminated, 'the scan of the other file stops');
+    assert.equal(scan.sent[0].msg.fileName, 'other.bbl');
+    assert.equal(scan.sent[0].transfer[0], scan.sent[0].msg.bytes, 'a copy of the file, transferred');
+    // the flights of the scan: log 1 a bench run, log 2 two flights, log 3 no data
+    const two = [{ t0: 5, t1: 30, seconds: 25 }, { t0: 40, t1: 70, seconds: 30 }];
+    old.reply({ type: 'flightsScanned', result: { scope: 'scan', records: [], flights: [], benchRuns: [{ log: 1 }], noData: [] } });
+    assert.match(app.html('.tuning-fsel'), /all flights of 3 of 3 logs/, 'the result of a scan that stopped does not apply');
+    scan.reply({ type: 'flightsScanned', result: { scope: 'scan', records: [{ log: 0, segment: 0, logClass: 'bench', phases: [], flights: [] },
+        { log: 1, segment: 0, logClass: 'flight', flights: two }, { log: 2, segment: 0, skipped: 'parser: Log truncated', noData: true }],
+        flights: two.map((q) => Object.assign({ log: 1, segment: 0 }, q)), benchRuns: [{ log: 0 }], noData: [{ log: 2, reason: 'parser: Log truncated' }] } });
+    assert.equal(scan.terminated, true);
+    list = app.html('.tuning-fsel');
+    assert.match(list, /tuning-fsel-count">2 of 2 flights \(1 bench run, 1 log with no data\)</);
+    assert.match(list, /data-log="0" disabled aria-label="Log 1"><\/td><td>Log 1<\/td>[\s\S]*?Bench run \(no analysis\)/);
+    assert.match(list, /data-log="1" data-flight="0" data-count="2" checked> Flight 1: 5 s to 30 s/);
+    assert.match(list, /data-log="1" data-flight="1" data-count="2" checked> Flight 2: 40 s to 70 s/);
+    assert.match(list, /data-log="2" disabled aria-label="Log 3"/);
+    assert.match(list, /Select the flights for the analysis\. Then click &quot;Start analysis&quot;\. The analysis does not use bench runs\./);
+    assert.equal(app.runs.length, runs, 'the scan starts no analysis');
+    // the pilot removes flight 1 and starts the analysis
+    app.jq.fire('change', '.tuning-fsel-one', { 'data-log': 1, 'data-flight': 0, 'data-count': 2 }, { checked: false });
+    app.jq.fire('click', '.tuning-analyse');
+    assert.deepEqual(plain(app.analysisWorker().sent[0].msg.options.flights), [{ log: 1, flight: 1 }]);
     assert.deepEqual(app.errors, []);
 });
 
@@ -2491,40 +2570,82 @@ test('SPEC3 E: "Show results with not sufficient data" and "Show satisfactory re
 const fileResult = (over = {}) => synthResult(Object.assign({ scope: 'file', logs: [0, 1, 2], logIndex: 1, benchRuns: [0],
     flights: [{ log: 1, t0: 14.3, t1: 87, seconds: 72.7 }, { log: 2, t0: 2, t1: 6 }] }, over));
 
-test('the default of "Logs" is all flights of the file: the view starts the file run at once, and another log in the viewer does not start it again', async () => {
+test('the default of "Logs" is "Selected flights" with every flight of the scan: opening the view scans the flights and starts no analysis; "Start analysis" runs them, and another log in the viewer keeps the result (2026-10-15)', async () => {
     const app = setup({ scope: null });
-    assert.match(app.html('#tuningBody'), /<option value="file" selected>All flights in the file<\/option><option value="flights">Selected flights<\/option><option value="log">This log<\/option>/);
-    app.show();
-    assert.equal(app.workers.length, 1, 'the automatic run');
-    const { msg } = app.workers[0].sent[0];
-    assert.equal(msg.cmd, 'analyseFile', 'all flights of the file, not the log on display');
+    assert.match(app.html('#tuningBody'), /<option value="file">All flights in the file<\/option><option value="flights" selected>Selected flights<\/option><option value="log">This log<\/option>/);
+    app.open();
+    assert.equal(app.workers.length, 1, 'only the scan of the flights');
+    const scan = app.scanWorker(), s = scan.sent[0].msg;
+    assert.deepEqual([s.cmd, s.fileName, s.bytes.byteLength], ['scanFlights', '<i>flight</i>.bbl', 400], 'the whole file');
+    assert.equal(app.runs.length, 0, 'no analysis before the pilot clicks "Start analysis"');
+    assert.equal(app.jq.node('.tuning-progress-text').text, 'The app finds the flights in each log.', 'the scan operates');
+    assert.match(app.html('.tuning-empty'), /Select the flights in the list\. Then click "Start analysis"\./);
+    assert.equal(app.jq.node('.tuning-analyse').props.disabled, true, 'no start before the scan ends');
+    assert.equal(app.jq.node('.tuning-analyse').attrs.title, 'The app finds the flights in each log. When this is complete, click "Start analysis".');
+    assert.equal(app.dialog.scopePanel().scanning, true, 'the Analysis view waits too');
+    app.open();
+    assert.equal(app.workers.length, 1, 'one scan for each file');
+    scan.reply({ type: 'progress', stage: 'decode', fraction: 0.6, text: 'The app finds the flights in log 2 of 3.' });
+    assert.equal(app.jq.node('.tuning-progress-text').text, 'The app finds the flights in log 2 of 3. (60 %)', 'the progress of the scan, before a result');
+    assert.equal(app.jq.node('.tuning-progress').attrs.class, 'tuning-progress is-running');
+    // the flights of the scan: log 1 a bench run, logs 2 and 3 one flight each
+    const flights = [{ log: 1, segment: 0, t0: 14.3, t1: 87, seconds: 72.7 }, { log: 2, segment: 0, t0: 2, t1: 6, seconds: 4 }];
+    scan.reply({ type: 'flightsScanned', result: { scope: 'scan', records: [{ log: 0, segment: 0, logClass: 'bench', phases: [], flights: [] },
+        { log: 1, segment: 0, logClass: 'flight', flights: [flights[0]] }, { log: 2, segment: 0, logClass: 'flight', flights: [flights[1]] }], flights, benchRuns: [{ log: 0 }], noData: [] } });
+    assert.match(app.html('.tuning-fsel'), /tuning-fsel-count">2 of 2 flights \(1 bench run\)</);
+    assert.equal(app.jq.node('.tuning-progress-text').text, 'No result');
+    assert.equal(app.jq.node('.tuning-scope option[value="file"]').text, 'All flights in the file (2 flights)', 'the scan knows the flights of each log');
+    assert.deepEqual([app.jq.node('.tuning-analyse').props.disabled, app.jq.node('.tuning-analyse').attrs.title, app.dialog.scopePanel().scanning], [false, null, false], 'the scan ended');
+    app.jq.fire('click', '.tuning-analyse');
+    const { msg } = app.analysisWorker().sent[0];
+    assert.equal(msg.cmd, 'analyseFile');
     assert.equal(msg.selectedLog, 1, 'the curves and the header of the log on display');
-    assert.equal(msg.bytes.byteLength, 400, 'the whole file');
-    assert.equal(msg.options.flights, undefined, 'the worker leaves out the bench runs and the logs with no data');
-    assert.equal(app.jq.node('.tuning-scope-text').text, 'Flights in the analysis: all flights of 3 of 3 logs.');
-    assert.equal(app.jq.node('.tuning-scope option[value="file"]').text, 'All flights in the file', 'no result knows the flights yet');
-    app.workers[0].reply({ type: 'result', result: fileResult() });
-    assert.equal(app.jq.node('.tuning-scope-text').text, 'Flights in the analysis: 2 of 2 flights (1 bench run).');
-    assert.equal(app.jq.node('.tuning-scope option[value="file"]').text, 'All flights in the file (2 flights)');
-    assert.match(app.html('.tuning-context'), /<div>All flights in the file \(3 logs\)<\/div><div>Curves of log 2<\/div>/);
-    assert.match(app.jq.node('.tuning-progress-text').text, /^Analysis completed: All flights in the file \(3 logs\)/);
+    assert.deepEqual(plain(msg.options.flights), [{ log: 1, flight: null }, { log: 2, flight: null }], 'every flight log, no bench run');
+    app.analysisWorker().reply({ type: 'result', result: fileResult() });
+    assert.match(app.html('.tuning-context'), /<div>Selected flights<\/div>/);
+    assert.equal(app.jq.node('.tuning-analyse').props.disabled, true, 'the result is of these flights: no new run');
     // the pilot looks at log 3 in the viewer: the same result, no new run (its key has no log)
     app.hooks.selectLog(2);
-    app.show();
-    assert.equal(app.workers.length, 1);
-    assert.match(app.html('.tuning-notices'), /are for log 2\. The log viewer shows log 3\./);
+    app.open();
+    assert.equal(app.runs.length, 1);
+    assert.equal(app.jq.node('.tuning-analyse').props.disabled, false, 'the curves of log 3: the pilot can start the run again');
+    // "All flights in the file" stays a choice: the worker finds the flights itself
+    app.jq.fire('change', '.tuning-scope', {}, { value: 'file' });
+    assert.equal(app.jq.node('.tuning-scope-text').text, 'Flights in the analysis: 2 of 2 flights (1 bench run).');
+    app.jq.fire('click', '.tuning-analyse');
+    assert.equal(app.analysisWorker().sent[0].msg.options.flights, undefined, 'the worker leaves out the bench runs and the logs with no data');
+    app.analysisWorker().reply({ type: 'result', result: fileResult() });
+    assert.match(app.jq.node('.tuning-progress-text').text, /^Analysis completed: All flights in the file \(3 logs\)/);
     // the report says what the analysis used
     app.jq.fire('click', '.tuning-save');
     await new Promise((resolve) => setImmediate(resolve));
     const md = app.saved[0].text;
     assert.match(md, /\| Analysis \| All flights in the file \(3 logs\) \|/);
     assert.match(md, /\| Flights in the analysis \| 2 flights in 2 logs, 1 bench run \|/);
-    // "This log" stays a choice, kept while the app is open: the next show uses it
+    // "This log" stays a choice, kept while the app is open: the next run uses it
     app.jq.fire('change', '.tuning-scope', {}, { value: 'log' });
     assert.equal(app.jq.node('.tuning-scope-text').text, 'The analysis uses only log 3. The log viewer shows this log.');
     app.show();
     assert.equal(app.workers.at(-1).sent[0].msg.cmd, 'analyseLog');
     assert.equal(app.workers.at(-1).sent[0].msg.logIndex, 2);
+    assert.equal(app.workers.filter((w) => w.sent[0].msg.cmd === 'scanFlights').length, 1, 'one scan for the file');
+    assert.deepEqual(app.errors, []);
+});
+test('"Selected flights" with a bench run on display: the run takes the curves of the first selected log, and "Start analysis" stays disabled for its result (2026-10-15)', () => {
+    const app = setup({ scope: null, current: 0 });
+    app.open();
+    const flights = [{ log: 1, segment: 0, t0: 14.3, t1: 87, seconds: 72.7 }, { log: 2, segment: 0, t0: 2, t1: 6, seconds: 4 }];
+    app.scanWorker().reply({ type: 'flightsScanned', result: { scope: 'scan', records: [{ log: 0, segment: 0, logClass: 'bench', phases: [], flights: [] },
+        { log: 1, segment: 0, logClass: 'flight', flights: [flights[0]] }, { log: 2, segment: 0, logClass: 'flight', flights: [flights[1]] }], flights, benchRuns: [{ log: 0 }], noData: [] } });
+    app.jq.fire('click', '.tuning-analyse');
+    assert.equal(app.analysisWorker().sent[0].msg.selectedLog, 1, 'the bench run on display is not selected: the first selected log');
+    app.analysisWorker().reply({ type: 'result', result: fileResult({ logIndex: 1 }) });
+    assert.equal(app.jq.node('.tuning-analyse').props.disabled, true, 'a new run gives the same curves');
+    assert.doesNotMatch(app.html('.tuning-notices'), /To examine log 1/);
+    app.hooks.selectLog(2);
+    app.open();
+    assert.equal(app.jq.node('.tuning-analyse').props.disabled, false, 'log 3 is selected: a new run gives its curves');
+    assert.match(app.html('.tuning-notices'), /The log viewer shows log 3\. To examine log 3, click &quot;Start analysis&quot;\./);
     assert.deepEqual(app.errors, []);
 });
 
@@ -2568,7 +2689,7 @@ test('selecting logs and flights keeps the table scroll position and keyboard fo
     const app = setup({ scope: 'file' });
     app.setFile(datedFile(), 'gaui.bbl');
     app.show();
-    app.workers[0].reply({ type: 'result', result: fileResult() });
+    app.analysisWorker().reply({ type: 'result', result: fileResult() });
     app.dialog.scopeAction({ kind: 'scope', value: 'flights' });
     app.dialog.scopeAction({ kind: 'open', on: true });
     const node = app.jq.node('.tuning-fsel'), root = node.element;
@@ -2602,17 +2723,21 @@ test('selecting logs and flights keeps the table scroll position and keyboard fo
 });
 
 test('the "Logs" control of the Analysis view: scopePanel, scopeAction and onSettings share the settings and the flight list of the Tuning view', () => {
-    const app = setup({ scope: null });
+    // the Analysis view can be the first view of a file: its control starts the scan of the flights, and no analysis
+    const first = setup({ scope: null });
+    assert.equal(first.dialog.scopePanel().scope, 'flights', 'the default: Selected flights');
+    assert.deepEqual(first.workers.map((w) => w.sent[0].msg.cmd), ['scanFlights']);
+    const app = setup({ scope: 'file' });
     app.setFile(datedFile(), 'gaui.bbl');
     const told = [];
     const off = app.dialog.onSettings(() => told.push(app.dialog.scopePanel().scope));
     app.show();
     let p = app.dialog.scopePanel();
     assert.equal(p.scope, 'file');
-    assert.equal(p.running, true, 'the automatic run of the file');
+    assert.equal(p.running, true, 'the run of the file that the pilot started');
     assert.match(p.html, /^<div class="tuning-scope-bar"><label class="tuning-field">Logs <select class="form-control input-sm tuning-scope" title="The logs and the flights that the analysis uses"><option value="file" selected>All flights in the file<\/option>/);
-    assert.match(p.html, /<span class="tuning-scope-text tuning-muted">Flights in the analysis: all flights of 3 of 3 logs\.<\/span><\/div>$/, 'no list for all flights');
-    app.workers[0].reply({ type: 'result', result: fileResult() });
+    assert.match(p.html, /<span class="tuning-scope-text tuning-muted">Flights in the analysis: all flights of 3 of 3 logs\.<\/span><\/div><div class="tuning-cli-line">/, 'no list for all flights, then the CLI dump');
+    app.analysisWorker().reply({ type: 'result', result: fileResult() });
     assert.equal(app.dialog.scopePanel().stale, false);
     // the pilot selects flights in the Analysis view: the same selection as the Tuning view, closed at first
     assert.equal(app.dialog.scopeAction({ kind: 'scope', value: 'flights' }), true);
@@ -2623,7 +2748,7 @@ test('the "Logs" control of the Analysis view: scopePanel, scopeAction and onSet
     assert.equal(p.stale, false, 'every flight is selected: the result of all flights is for these flights');
     const runs = app.workers.length;
     app.show();
-    assert.equal(app.workers.length, runs, '"Selected flights": no automatic run, the pilot starts it after the selection');
+    assert.equal(app.workers.length, runs, '"Selected flights" of every flight: the result of all flights, no new run');
     app.dialog.scopeAction({ kind: 'open', on: true });
     assert.match(app.dialog.scopePanel().html, /<details class="tuning-fsel-box" open>/, 'opened in one view, open in both');
     app.dialog.scopeAction({ kind: 'flight', log: 2, flight: 0, count: 1, on: false });
@@ -2654,6 +2779,7 @@ test('SPEC3 D: the context bar of a run of selected flights: the selection with 
     app.jq.fire('change', '.tuning-scope', {}, { value: 'flights' });
     app.jq.fire('click', '.tuning-fsel-none');
     app.jq.fire('change', '.tuning-fsel-log', { 'data-log': 1 }, { checked: true });
+    app.scanDone();
     app.jq.fire('click', '.tuning-analyse');
     const run = analyseWorkers(app, 'analyseFile')[0], rec = synthResult().records[0];
     // the worker found the flights of each log of the file, and used the flight of log 2
@@ -3111,24 +3237,53 @@ test('M4: a log with no data that the app can read: "No data that the app can re
 // --- The log is the only necessary input (user rule 2026-10-06): the optional CLI dump, the coverage, the basis of the PID
 // profile at the start of each log, the notch orders of the log and a CLI dump that does not agree with the log ----------------
 
-test('the CLI dump is an optional line under the controls; without one, no text names it: overview, report, intro, coverage', () => {
+// review IMP-05: the causes of a part of a log with a parameter journal (param_epochs.cjs fromTimeline) and the source "journal" have
+// STE labels, not the raw keys
+test('the causes of a log with a parameter journal and the source "journal" have labels', () => {
+    const I = setup().internals;
+    for (const k of ['mixed', 'uncertain', 'pending', 'unknown', 'effect-unknown', 'lost', 'snapshot-incomplete', 'chain-mismatch', 'order-unknown', 'unexplained-runtime', 'changed']) {
+        assert.ok(typeof I.FRESH_CAUSE[k] === 'string' && /^[A-Z]/.test(I.FRESH_CAUSE[k]), k); assert.ok(I.FRESH_ORDER.includes(k), k); }
+    assert.equal(I.FRESH_SOURCE.journal, 'parameter values in the log header and the recorded changes');
+    assert.equal(I.sourceLabel({ source: { pid: 'journal', rate: 'journal' }, pidProfile: 1 }, {}), 'Parameter values in the log header and the recorded changes');
+});
+
+test('without a CLI dump, a request with its steps is under the controls and in the Analysis view (user 2026-10-15); overview, report, intro, coverage', () => {
     const app = setup();
     const body = app.jq.node('#tuningBody').html, controls = body.indexOf('<div class="tuning-controls">'), line = body.indexOf('<div class="tuning-cli-line">');
     assert.ok(controls >= 0 && line > body.indexOf('tuning-actions'), 'the CLI dump is not in the main controls: its own line after them');
-    for (const s of ['<span class="tuning-cli-label">Optional: CLI dump</span>', 'class="btn btn-default btn-xs tuning-cli-load"', '>Load</button>', '<span class="tuning-cli-name tuning-muted"></span>',
-        '<input type="file" class="tuning-cli-input tuning-hide"',
-        '<div class="tuning-cli-about tuning-muted">A CLI dump is the text of <code>diff all</code> from the CLI tab of the Configurator. The analysis is complete without a CLI dump. ' +
-            'A CLI dump can add values that the log does not record, for example the rescue mode and the servo limits.</div>']) {
-        assert.ok(body.slice(line).includes(s), s);
-    }
+    assert.ok(body.slice(line).includes('<input type="file" class="tuning-cli-input tuning-hide"'));
     assert.ok(!body.slice(controls, line).includes('tuning-cli'), 'nothing of the CLI dump in the main controls');
-    assert.ok(!/Load the output|Load CLI dump/.test(body), 'no instruction to load a CLI dump');
     app.show();
+    const req = app.html('.tuning-cli-line');
+    for (const s of ['<div class="tuning-notice is-warn tuning-cli-missing"><p><strong>No CLI dump.</strong> The log does not record some values. ',
+        '<button type="button" class="btn btn-primary btn-xs tuning-cli-load">Load CLI dump</button>',
+        '<li>If you have a CLI dump file of this helicopter, click &quot;Load CLI dump&quot; and select the newest file.</li>',
+        'write <code>diff all</code> and push the Enter key.', 'Click <span data-ste="quoted">&quot;Save to File&quot;</span>.',
+        'After each change of the configuration, save a new CLI dump. Then the app can use it when the helicopter is not available.']) assert.ok(req.includes(s), s);
+    // the Analysis view: the same request in its "Logs" bar; its button opens the file input of the Tuning view
+    assert.ok(app.dialog.scopePanel().html.includes('<div class="tuning-cli-line"><div class="tuning-notice is-warn tuning-cli-missing">'));
+    const clicks = app.jq.node('.tuning-cli-input').clicks;
+    assert.equal(app.dialog.scopeAction({ kind: 'cli' }), true);
+    assert.equal(app.jq.node('.tuning-cli-input').clicks, clicks + 1);
+    // with a CLI dump: its name and how the app uses it, no request; the Analysis view can remove it
+    app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'fireball.txt', text: '# diff all\nprofile 0\nset gov_mode = 1\n' }] });
+    assert.match(app.html('.tuning-cli-line'), /^<span class="tuning-cli-label">CLI dump<\/span> <span class="tuning-cli-name"><span data-ste="quoted">fireball\.txt<\/span>/);
+    assert.match(app.html('.tuning-cli-line'), /If the log and the CLI dump do not agree, the app uses the log\./);
+    assert.ok(!/No CLI dump/.test(app.html('.tuning-cli-line')) && !/No CLI dump/.test(app.dialog.scopePanel().html));
+    assert.equal(app.dialog.scopeAction({ kind: 'cliClear' }), true);
+    assert.match(app.html('.tuning-cli-line'), /No CLI dump\./);
     const intro = app.html('.tuning-empty');
     assert.match(intro, /The analysis uses only the log file\.<\/p>/);
     assert.ok(!/With a CLI dump|notch filters/.test(intro), 'the old intro is gone');
     app.workers[0].reply({ type: 'result', result: synthResult() });
     assert.ok(!/CLI dump/.test(app.pane('overview')), 'overview: no "No CLI dump"');
+    assert.match(app.html('.tuning-cli-line'), /No CLI dump\.<\/strong> The log does not record some values\./, 'a result with no parameter snapshot');
+    // review IMP-05: every flight log of the result has a parameter snapshot (firmware with "blackbox_params"): the block keeps the
+    // request and the button, and names the values that such a log does not record
+    const snap = app.internals.cliBlockHtml({ name: null, off: false, snapshot: true });
+    assert.ok(snap.includes('<strong>No CLI dump.</strong> The log header records the parameter values of all PID profiles and rate profiles, the gear ratios, the mixer and the servos. ' +
+        'The log does not record the modes, the adjustment ranges and the serial ports.'), snap);
+    assert.ok(snap.includes('tuning-cli-load">Load CLI dump</button>') && !/the gains of other PID profiles/.test(snap));
     // coverage: "not-in-log" has its own label, not the label of "not-assessable"; no remedy that asks for a CLI dump
     app.tab('coverage');
     const c = app.pane('coverage'), I = app.internals;
@@ -3165,6 +3320,8 @@ test('D12: the basis of the PID profile at the start of a log: context bar, flig
         '(2 changes in 2 logs).">Start: PID profile 1, from &quot;govRequest&quot;</span></div>'), ctx);
     // the other bases, and a PID profile that is not confirmed
     eq(I.startBasisText({ profile: 2, basis: ['event'], confirmed: true }, 'this file'), 'The log records a change to PID profile 2 at the first frame.');
+    // review IMP-05: a log of firmware with "blackbox_params" records the PID profile at its start in the header
+    eq(I.startBasisText({ profile: 1, basis: ['snapshot'], confirmed: true }, 'this file'), 'The log header records the PID profile at the start of the log ("param_pid_profile").');
     eq(I.startBasisText({ profile: 3, basis: ['cli', 'cliTarget'], confirmed: true }, 'this file'),
         'Only the CLI section of PID profile 3 agrees with the log header. At the start of the log, the governor target agrees with the "gov_headspeed" of PID profile 3 in the CLI dump.');
     eq(I.startBasisText({ profile: 0, basis: [], confirmed: false, estimate: 2 }, 'this file'),
@@ -3255,23 +3412,23 @@ test('notchFit: the tail rotor notch filters from the log in the vibration plots
 
 test('result.cliStatus: a CLI dump that does not agree with the log gives a notice, the conflicts and the report; the log wins', () => {
     // the shapes of js/tuning_worker.js cliStatusOf: the text says what, with the names in backticks
-    const conflicts = [{ what: 'gov_headspeed', profile: 1, cli: 1800, log: [3500], text: 'In the CLI dump, `gov_headspeed` of `profile 0` is 1800. The PID profile changes in this file show 3500 rpm for PID profile 1. The app uses the values of the log.' },
-        { what: 'header', logs: [5], text: 'No section of the CLI dump agrees with the log header of log 6 <b>.' }, { what: 'profile' }];
+    const conflicts = [{ what: 'gov_headspeed', profile: 1, cli: 1800, log: [3500], text: 'PID profile 1: `gov_headspeed` is 1800 rpm in the CLI dump, but the PID profile changes in this file show 3500 rpm.' },
+        { what: 'header', logs: [5], text: 'Log 6 <b>: the values at the start of the log do not agree with the CLI dump.' }, { what: 'profile' }];
     const app = analysed({ result: synthResult({ cliStatus: { name: 'fireball_0904.txt', used: true, conflicts } }) });
     const n = app.html('.tuning-notices');
-    assert.ok(n.includes('<div class="tuning-notice is-warn"><strong>The CLI dump does not agree with the log.</strong> The analysis uses the values of the log.<ul class="tuning-cli-conflicts">' +
-        '<li>In the CLI dump, <span class="tuning-param" title="gov_headspeed">Governor headspeed</span> of <code>profile 0</code> is 1800. The PID profile changes in this file show 3500 rpm for PID profile 1. The app uses the values of the log.</li>' +
-        '<li>No section of the CLI dump agrees with the log header of log 6 &lt;b&gt;.</li><li><span data-ste="quoted">profile</span></li></ul></div>'), n);
+    assert.ok(n.includes('<div class="tuning-notice is-warn"><strong>The CLI dump has values that are different from the logs.</strong> This occurs if you changed values between the flights and the CLI dump. The analysis uses the values in the logs.<ul class="tuning-cli-conflicts">' +
+        '<li>PID profile 1: <span class="tuning-param" title="gov_headspeed">Governor headspeed</span> is 1800 rpm in the CLI dump, but the PID profile changes in this file show 3500 rpm.</li>' +
+        '<li>Log 6 &lt;b&gt;: the values at the start of the log do not agree with the CLI dump.</li><li><span data-ste="quoted">profile</span></li></ul></div>'), n);
     assert.ok(!/Load the CLI dump|load it again/.test(n), 'no instruction to load a CLI dump');
     const md = app.internals.markdown({ result: app.result, label: 'x', finishedAt: 0, scope: 'log', cliName: 'fireball_0904.txt' });
-    assert.ok(md.includes('> **The CLI dump does not agree with the log.** The analysis uses the values of the log.\n\n- In the CLI dump, `gov_headspeed` of `profile 0` is 1800. ' +
-        'The PID profile changes in this file show 3500 rpm for PID profile 1. The app uses the values of the log.\n- No section of the CLI dump agrees with the log header of log 6 <b>.\n- profile'), md);
+    assert.ok(md.includes('> **The CLI dump has values that are different from the logs.** This occurs if you changed values between the flights and the CLI dump. The analysis uses the values in the logs.\n\n' +
+        '- PID profile 1: `gov_headspeed` is 1800 rpm in the CLI dump, but the PID profile changes in this file show 3500 rpm.\n- Log 6 <b>: the values at the start of the log do not agree with the CLI dump.\n- profile'), md);
     // many conflicts: 12 and the number of the others
     const many = Array.from({ length: 15 }, (_, i) => ({ what: 'p' + i, text: 'Different.' }));
     assert.match(app.internals.cliStatusHtml({ cliStatus: { name: 'x', used: true, conflicts: many } }), /<li>3 other differences\.<\/li><\/ul><\/div>$/);
     // a CLI dump that the analysis does not use, and one that agrees with the log or none: no conflict notice
     assert.equal(app.internals.cliStatusHtml({ cliStatus: { name: 'x', used: false, conflicts: [] } }),
-        '<div class="tuning-notice is-info">The analysis does not use the CLI dump. The analysis uses the values of the log.</div>');
+        '<div class="tuning-notice is-info">The analysis does not use the CLI dump. The analysis uses the values in the logs.</div>');
     assert.equal(app.internals.cliStatusHtml({ cliStatus: { name: 'x', used: true, conflicts: [] } }), '');
     assert.equal(app.internals.cliStatusHtml({ cliStatus: null }), '');
     const none = analysed();
@@ -3481,7 +3638,8 @@ test('values possibly different: the Configurations tab has the caveat of result
     eq((fresh.match(/<tr><td>2<\/td>/g) || []).length, 4, 'the 4 parts of log 2 with a cause, not the part with no cause');
     // the pure parts
     const I = app.internals;
-    eq(I.causeText(['grace', 'switched', 'mixed']), 'Disarmed, different PID profile or rate profile, mixed', 'a cause that the view does not know, as it is');
+    eq(I.causeText(['grace', 'switched', 'later-cause']), 'Disarmed, different PID profile or rate profile, later-cause', 'a cause that the view does not know, as it is');
+    eq(I.causeText(['mixed', 'changed']), 'Parameter change during a frame, recorded parameter change', 'the journal causes have labels (review IMP-05)');
     eq(I.sourceLabel({ pidProfile: 3, source: { pid: 'cli', rate: 'cli' } }), 'CLI dump');
     eq(I.sourceLabel({ source: { pid: 'recovered', rate: 'adjustment' } }), 'Calculated gains (PID profile), in-flight adjustment (rate profile)');
     eq(I.sourceLabel(null), 'Unknown');
@@ -3895,6 +4053,25 @@ test('failed filter coverage identifies excluded periods without claiming model 
     assert.match(html,/tuning-ft-save" disabled/);
 });
 
+test('a filter replay that needs values the log does not record asks for the CLI dump (user 2026-10-15)', () => {
+    const app=analysed(), res=synthFilterTune({version:2,mode:'autotune'});
+    res.model.passed=false;res.recommended.status='no flight log';res.recommended.params={};res.cliFile='';
+    res.bench=[0,1].map(()=>({log:0,reason:'The frequency of an active RPM notch filter is unknown.',cliValues:['tail_rotor_gear_ratio']})); // two segments of one log
+    res.recommended.reasons=['The log does not record all the values that are necessary for the filter replay.'];
+    res.cliNeeded={values:['tail_rotor_gear_ratio'],text:'The log does not record `tail_rotor_gear_ratio`. To calculate the filter values, load a CLI dump of this helicopter.'};
+    app.tab('filters');app.jq.fire('click','.tuning-ft-start');ftWorker(app).reply({type:'filterTuned',result:res});
+    let html=app.pane('filters');
+    assert.match(html,/<div class="tuning-notice is-warn">The log does not record .*tail_rotor_gear_ratio.*To calculate the filter values, load a CLI dump of this helicopter\. <button type="button" class="btn btn-default btn-xs tuning-cli-load">Load CLI dump<\/button><\/div>/);
+    assert.match(html,/Flight periods not used/);
+    assert.equal(html.split('RPM notch filter is unknown.').length,2,'one line for the two segments of the log');
+    assert.doesNotMatch(html,/Select a different flight/,'a different flight does not give the missing values');
+    // with a CLI dump, the panel does not ask for it
+    app.jq.fire('change','.tuning-cli-input',{},{files:[{name:'fireball.txt',text:'# diff all\nset tail_rotor_gear_ratio = 19,76\n'}]});
+    html=app.pane('filters'); // the open tab is drawn again, with no tab change
+    assert.doesNotMatch(html,/is-warn">The log does not record/);
+    assert.match(html,/tuning-ft-start/,'Autotune again with the CLI dump');
+});
+
 test('autotune without a feasible candidate and failed recorded replay retain failure diagnostics', () => {
     const I=setup().internals;
     for (const mode of ['autotune','simulation']) {
@@ -3955,7 +4132,7 @@ test('filter sources preserve original flight numbers and identify every recorde
     eq(I.filterBaseline(partial,sources[0]).map(q=>[q.id,q.t0,q.t1]),[['C',140,200]],'the selected flight clips baseline intervals');
     app.tab('filters');
     let html=app.pane('filters');
-    assert.ok(html.indexOf('Flight data for this tune')<html.indexOf('Autotune</button>'));
+    assert.ok(html.includes('Flight data for this tune') && html.indexOf('tuning-ft-start')<html.indexOf('Flight data for this tune'), 'the autotune bar in the heading, as on each tab');
     assert.match(html,/Recorded output includes 2 configurations/);
     assert.match(html,/14 s to 130 s/);assert.match(html,/130 s to 200 s/);
     const res=synthFilterTune({version:2,mode:'autotune'});
@@ -4029,10 +4206,10 @@ function acceptedControlFixture(out) {
 }
 test('export only this trial removes other control groups and preserves the chosen atomic group',async()=>{
     const r=controlResult(), original=r.advice.byDataset.C[0];
-    r.datasets.datasets.find(d=>d.id==='C').values.gov_p_gain=30;
-    r.advice.byDataset.C.push({...original,id:'gov-trial',node:'governor',area:'governor',parameter:'gov_p_gain',from:30,to:40,
-        cli:['profile 0','set gov_p_gain = 40'],title:'Increase the governor P gain'});
-    const app=analysed({result:r});app.tab('governor');app.jq.fire('click','.tuning-ct-start');answerControl(app);await tick();
+    r.datasets.datasets.find(d=>d.id==='C').values.yaw_p_gain=30;
+    r.advice.byDataset.C.push({...original,id:'tail-trial',node:'tail',area:'tail',axis:'yaw',parameter:'yaw_p_gain',from:30,to:35,
+        cli:['profile 0','set yaw_p_gain = 35'],title:'Increase the yaw P gain'});
+    const app=analysed({result:r});app.tab('tail');app.jq.fire('click','.tuning-ct-start');answerControl(app);await tick();
     app.tab('cyclic');app.jq.fire('click','.tuning-ct-start');answerControl(app);await tick();
     app.tab('export');await tick();assert.match(app.pane('export'),/Different flight tests/);
     app.tab('cyclic');app.jq.fire('click','.tuning-ct-trial');await tick();
@@ -4237,36 +4414,36 @@ test('blocked autotune shows the quantitative proposal and prerequisite action w
 });
 
 test('control output limits retain the unresolved diagnosis and do not invent a load correction',async()=>{
-    const r=controlResult();r.advice.byDataset.C=[{id:'limit',node:'governor',dataset:'C',profile:1,
-        severity:'check',title:'Throttle limit',text:'Compare the throttle and headspeed before the limit.',rule:'The output limit must be examined.',evidence:[{id:'L1',fid:'limit',value:2.5,unit:'s',profile:1}]}];
-    const app=analysed({result:r});app.tab('governor');app.jq.fire('click','.tuning-ct-start');
+    const r=controlResult();r.advice.byDataset.C=[{id:'limit',node:'tail',dataset:'C',profile:1,
+        severity:'check',title:'Tail limit',text:'Compare the tail output and the yaw rate before the limit.',rule:'The output limit must be examined.',evidence:[{id:'L4',fid:'limit',value:2.5,unit:'s',profile:1}]}];
+    const app=analysed({result:r});app.tab('tail');app.jq.fire('click','.tuning-ct-start');
     answerControl(app);await tick();
-    assert.match(app.pane('governor'),/The problem is not corrected/);
-    assert.match(app.pane('governor'),/Next steps and measurements/);
-    assert.match(app.pane('governor'),/Compare the throttle and headspeed before the limit/);
-    assert.doesNotMatch(app.pane('governor'),/10 % less|Recommended load test/);
+    assert.match(app.pane('tail'),/The problem is not corrected/);
+    assert.match(app.pane('tail'),/Next steps and measurements/);
+    assert.match(app.pane('tail'),/Compare the tail output and the yaw rate before the limit/);
+    assert.doesNotMatch(app.pane('tail'),/10 % less|Recommended load test/);
     assert.deepEqual(app.errors,[]);
 });
 
 test('next actions precede measurements before and after autotune without authorizing a change',async()=>{
     const r=controlResult();
-    const procedure={title:'Examine the battery and ESC before you increase governor gains.',
-        steps:['Open a period at full throttle with "Show in the log".','At full throttle, examine battery voltage.'],
-        after:'After these checks, record the same maneuver again.',success:'The headspeed must stay at its target.'};
-    const rec={id:'G6',node:'governor',dataset:'C',profile:1,severity:'check',title:'Throttle headroom',
-        text:'The measured throttle is 90 %.',rule:'The output limit must be examined.',procedure,cli:[],evidence:[]};
-    r.advice.byDataset.C=[rec,{...rec,id:'L1'}];
-    const app=analysed({result:r});app.tab('governor');
-    const initial=app.pane('governor');
+    const procedure={title:'Examine the tail servo before you increase tail gains.',
+        steps:['Open a period of a fast yaw stop with "Show in the log".','At the yaw stop, examine the tail servo output.'],
+        after:'After these checks, record the same maneuver again.',success:'The yaw rate must stay at its target.'};
+    const rec={id:'T8',node:'tail',dataset:'C',profile:1,severity:'check',title:'Tail authority',
+        text:'The measured tail output is 90 %.',rule:'The output limit must be examined.',procedure,cli:[],evidence:[]};
+    r.advice.byDataset.C=[rec,{...rec,id:'L4'}];
+    const app=analysed({result:r});app.tab('tail');
+    const initial=app.pane('tail');
     assert.equal((initial.match(/aria-label="Next steps"/g)||[]).length,1,'shared instructions show once before autotune');
     assert.ok(initial.indexOf('Do next')<initial.indexOf('Recorded problems'),'next action is visible first');
     app.jq.fire('click','.tuning-ct-start');const out=answerControl(app);await tick();
-    const html=app.pane('governor');
+    const html=app.pane('tail');
     assert.equal((html.match(/aria-label="Next steps"/g)||[]).length,1,'shared instructions show once after autotune');
-    assert.ok(html.indexOf('Do next')<html.indexOf('The measured throttle'));
+    assert.ok(html.indexOf('Do next')<html.indexOf('The measured tail output'));
     assert.ok(html.indexOf('Next steps and measurements')<html.indexOf('Recorded problems'));
     assert.match(html,/<details class="tuning-action-measurements"><summary>Measurements<\/summary>/);
-    assert.match(html,/<ol><li>Open a period at full throttle/);
+    assert.match(html,/<ol><li>Open a period of a fast yaw stop/);
     assert.deepEqual(out.recommendations,[]);
     assert.equal(out.status,'diagnosis-required');
     assert.deepEqual(app.errors,[]);
@@ -4294,24 +4471,24 @@ test('long prerequisite lists show available work before held actions and keep a
     assert.deepEqual(app.errors,[]);
 });
 
-test('contextual overload does not defer RPM diagnosis while governor tuning waits for RPM',async()=>{
+test('contextual overload does not defer RPM diagnosis while a gain change waits for RPM',async()=>{
     for(const holds of [false,true]) {
     const r=controlResult();
-    r.datasets.datasets.find(d=>d.id==='C').values.gov_f_gain=20;
+    r.datasets.datasets.find(d=>d.id==='C').values.yaw_f_gain=20;
     r.advice.byDataset.C=[
-        {id:'G3',node:'governor',area:'governor',dataset:'C',profile:1,scope:'profile',fromSource:'log header',severity:'action',
-            title:'Governor F: an increase to examine',parameter:'gov_f_gain',from:20,to:25,
-            text:'The governor change must wait for the RPM check.',cli:[],blockedBy:['Correct check G1 first.'],
-            gate:{held:['rpm']},rule:'The measured decrease is more than the limit.',evidence:[{id:'G3',value:0.08,se:0.002}]},
+        {id:'T3',node:'tail',area:'tail',axis:'yaw',dataset:'C',profile:1,scope:'profile',fromSource:'log header',severity:'action',
+            title:'Yaw F: an increase to examine',parameter:'yaw_f_gain',from:20,to:24,
+            text:'The tail change must wait for the RPM check.',cli:[],blockedBy:['Correct check G1 first.'],
+            gate:{held:['rpm']},rule:'The measured decrease is more than the limit.',evidence:[{id:'T3',value:0.08,se:0.002}]},
         {id:'G1',node:'rpm',dataset:'C',severity:'check',title:'RPM signal',
             text:'Examine the RPM signal and power response at the same time.',cli:[],evidence:[],
             causes:[{rule:'K22',ids:['G19','L1'],holds,first:['Examine the RPM signal and power response.']}]}
     ];
-    const app=analysed({result:r});app.tab('governor');app.jq.fire('click','.tuning-ct-start');
+    const app=analysed({result:r});app.tab('tail');app.jq.fire('click','.tuning-ct-start');
     const out=answerControl(app);await tick();
     assert.equal(out.status,'prerequisites-required');
     assert.equal(out.recommendations.length,0);
-    const html=app.pane('governor'), prerequisite=html.split('Prerequisite steps</h6>')[1].split('</article>')[0];
+    const html=app.pane('tail'), prerequisite=html.split('Prerequisite steps</h6>')[1].split('</article>')[0];
     assert.match(prerequisite,/Examine the RPM signal and power response/);
     assert.match(prerequisite,/Related checks/);
     assert.doesNotMatch(prerequisite,/This change must wait|Correct checks G19|Complete first/);
@@ -4570,6 +4747,20 @@ test('control success accepts a sensor check without gyroRAW and a partial twin 
     assert.equal(ok(r=>{r.twin.status='partial';r.twin.eligibleSteps=['cyclic','cycomp'];},'tail'),false);
     assert.equal(ok(r=>{r.twin.status='partial';}),false,'partial without eligibleSteps');
     assert.equal(ok(r=>{r.twin.model=null;}),false,'a refused fit has no model');
+});
+
+// user, 2026-10-16: identical results (the same check and output) are one card in "Recorded problems", with the list of where they occur
+test('Recorded problems: one card for the same check and output, with each result where it occurs', () => {
+    const result = synthResult(), finding = result.findings.find(f => f.id === 'C12');
+    result.findings.push(...[1, 2, 3, 4].map(log => ({ ...finding, fid: 'ring-' + log, id: 'L3', noun: 'cyclic limit', channel: 'ring', axis: null, log, node: 'cyclic', severity: 'flag' })));
+    const app = analysed({ result });
+    app.tab('cyclic');
+    const pane = app.pane('cyclic'), cards = pane.match(/<h6>cyclic limit[^<]*<\/h6>/g) || [];
+    assert.deepEqual(cards, ['<h6>cyclic limit (4 results)</h6>'], 'one card for the 4 results');
+    assert.match(pane, /The same result occurs 4 times\. The text above is about the first result\./);
+    for (const log of [1, 2, 3]) assert.ok(pane.includes('data-key="ring-' + log + '"'), 'result ' + log);
+    assert.ok(!pane.includes('data-key="ring-4"') && pane.includes('Show 1 other result'), 'the fourth result is in a closed part');
+    assert.deepEqual(app.errors, []);
 });
 
 test('large control results keep closed checks and secondary plots out of the tab', () => {
@@ -4869,7 +5060,7 @@ function synthGovTune(over = {}) {
         bands: [{ x0: 13, x1: 12, label: 'FALLBACK' }], note: 'The model uses the recorded throttle and collective.' }];
     return Object.assign({ status: 'validated', reasons: ['The open-loop headspeed error is 0.53 % of the target.'], limitations: ['The analysis starts the motor constant of the governor at 0 in each log.'],
         twin: { params: { kv: 320.5, tm: 0.41, te: 0.1 }, uncertainty: { kv: [311.7, 336.5], tm: { lo: 0.35, hi: 0.47 }, te: { se: 0.01 } }, validation: {}, plots: twinPlots },
-        rows, recommendations, plots, logs: [1], benchRuns: [0], skipped: [{ log: 2, reason: 'The app cannot read this log.' }], notes: ['The governor analysis does not use bench runs <b>.'],
+        rows, recommendations, plots, logs: [1], benchRuns: [0], skipped: [{ log: 2, reason: 'The app cannot read this log.' }], notes: ['The governor autotune does not use bench runs <b>.'],
         rules: { search: { id: 'GT20', text: 'The search keeps a change only if it decreases the error.' }, rpmFilter: { id: 'GT12', text: 'The RPM filter must keep the delay small.' } } }, over);
 }
 
@@ -4882,7 +5073,7 @@ function gmTuned(app, over, result) {
     return w;
 }
 
-test('governor model: "Start the governor analysis" posts governorTune with the inputs of the analysis, then the progress', () => {
+test('governor model: "Autotune" posts governorTune with the inputs of the analysis, then the progress', () => {
     const r = synthResult();
     r.hierarchy.nodes.governor.blockedBy = ['rpm'];
     r.hierarchy.nodes.governor.gatedBy = ['rpm', 'filters'];
@@ -4890,8 +5081,15 @@ test('governor model: "Start the governor analysis" posts governorTune with the 
     app.tab('governor');
     let p = app.pane('governor');
     assert.ok(p.includes('<section class="tuning-ct-section tuning-gm" aria-label="Governor model">') && p.includes('<h5 class="tuning-h">Governor model</h5>'));
-    assert.ok(p.includes('<button type="button" class="btn btn-primary btn-sm tuning-gm-start">Start the governor analysis</button>'));
-    assert.ok(p.indexOf('Recorded response') < p.indexOf('aria-label="Governor model"'), 'after the recorded response');
+    assert.ok(p.includes('<button type="button" class="btn btn-primary btn-sm tuning-gm-start">Autotune</button>'));
+    // the governor model is the only autotune of the Governor tab, never the helicopter model (user, 2026-10-15): in "Tuning result",
+    // before the recorded response, with no button of the helicopter model and no request for it
+    assert.ok(p.indexOf('Tuning result') < p.indexOf('aria-label="Governor model"') && p.indexOf('aria-label="Governor model"') < p.indexOf('Recorded response'), 'in the tuning result');
+    assert.ok(p.includes('<span class="tuning-ct-eyebrow">GOVERNOR AUTOTUNE</span>') && !p.includes('CONTROL LOOP AUTOTUNE'));
+    assert.ok(!p.includes('tuning-ct-start') && !p.includes('Parameters in selected logs') && !p.includes('helicopter model'), 'no helicopter model on the Governor tab');
+    assert.equal((p.match(/>Autotune<\/button>/g) || []).length, 1, 'one autotune');
+    app.jq.fire('click', '.tuning-ct-start', {});
+    assert.ok(!app.workers.some((w) => w.sent.some((q) => q.msg.cmd === 'controlTune')), 'no controlTune for the governor');
     app.jq.fire('click', '.tuning-gm-start', {});
     const w = gmWorker(app), { msg, transfer } = w.sent[0];
     eq([w.url, msg.cmd, msg.fileName, msg.logCount, msg.bytes.byteLength, transfer[0] === msg.bytes], ['js/tuning_worker.js', 'governorTune', '<i>flight</i>.bbl', 3, 400, true], 'the whole file, a copy transferred');
@@ -4908,7 +5106,7 @@ test('governor model: "Start the governor analysis" posts governorTune with the 
     const f = fileResult({ selection: { flights: [{ log: 2, flight: 0, t0: 3, t1: 40 }], windows: [], logs: [2], text: '' }, logs: [1, 2] });
     const a2 = setup({ scope: 'file' });
     a2.show();
-    a2.workers[0].reply({ type: 'result', result: f });
+    a2.analysisWorker().reply({ type: 'result', result: f });
     a2.tab('governor');
     a2.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'configuration.txt', text: '# diff all\nprofile 0\nset gov_headspeed = 2400\n' }] });
     a2.jq.fire('click', '.tuning-gm-start', {});
@@ -4929,8 +5127,8 @@ test('governor model: the result shows the status with its reasons, the plots of
         '<li><span data-ste="quoted">The analysis starts the motor constant of the governor at 0 in each log.</span></li>', 'Flight test necessary.',
         'Model and recorded data (3 plots)', '<p class="tuning-plot-caption" data-ste="quoted">The model uses the recorded throttle and collective.</p>',
         '<span data-ste="quoted">Error at each time after the start</span> Not available: the result has no data for this plot.</p>', 'Model parameters (3)',
-        '<h6 class="tuning-h">Governor parameters (10 rows)</h6>', '<div class="tuning-label">Logs that the governor analysis does not use</div><ul><li>Log 1: Bench run (no analysis).</li><li>Log 3: <span data-ste="quoted">The app cannot read this log.</span></li></ul>',
-        '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul><li>The governor analysis does not use bench runs &lt;b&gt;.</li></ul></details>']) assert.ok(p.includes(s), s);
+        '<h6 class="tuning-h">Governor parameters (10 rows)</h6>', '<div class="tuning-label">Logs that the governor autotune does not use</div><ul><li>Log 1: Bench run (no analysis).</li><li>Log 3: <span data-ste="quoted">The app cannot read this log.</span></li></ul>',
+        '<details class="tuning-toolkit" data-ste="quoted"><summary>Analysis information</summary><ul><li>The governor autotune does not use bench runs &lt;b&gt;.</li></ul></details>']) assert.ok(p.includes(s), s);
     assert.doesNotMatch(p, /tuning-gm-start/, 'no start button for a current result');
     // the plots of the model quality reach TuningPlot, the generic specs mapped onto its contract
     const specs = app.plots.slice(before).map((q) => q.spec), hs = specs.find((s) => s.title === 'Headspeed of log 2, recorded and calculated'), map = specs.find((s) => s.title === 'Throttle for each collective position');
@@ -5021,8 +5219,8 @@ test('governor model: the selected changes go into the CLI file of advice.export
     app.jq.fire('change', '.tuning-cli-input', {}, { files: [{ name: 'configuration.txt', text: '# diff all\nprofile 0\nset gov_headspeed = 2400\n' }] });
     app.tab('governor');
     const g = app.pane('governor');
-    assert.ok(g.includes('This result is for different flights or a different CLI dump. To use the selected inputs, start the governor analysis again.'));
-    assert.ok(g.includes('To select changes of the governor model for the CLI file, start the governor analysis again.') && g.includes('tuning-gm-start'));
+    assert.ok(g.includes('This result is for different flights or a different CLI dump. To use the selected inputs, click &quot;Autotune&quot; again.'));
+    assert.ok(g.includes('To select changes of the governor model for the CLI file, click &quot;Autotune&quot; again.') && g.includes('tuning-gm-start'));
     const part = g.slice(g.indexOf('aria-label="Governor model"'), g.indexOf('data-tuning-detail-key="governor:checks"'));
     assert.ok(part.includes('Model checks satisfactory.') && !part.includes('class="tuning-pick"') && !part.includes('<pre>'), 'the old result without boxes and CLI text');
     app.tab('export');
@@ -5064,7 +5262,7 @@ test('governor model: a model that is not satisfactory gives no CLI text for a c
     gmTuned(a2, { status: 'unavailable', reasons: ['The log has no battery voltage.'], twin: { params: null, uncertainty: null, validation: null, plots: null }, plots: [], rows: [], recommendations: [] });
     const q = a2.pane('governor');
     assert.ok(q.includes('<span class="tuning-badge st-nodata">Model not available</span>') && q.includes('The log has no battery voltage.') && !q.includes('Model and recorded data'));
-    assert.ok(q.includes('<h6 class="tuning-h">Governor parameters (0 rows)</h6>') && q.includes('The result has no parameter rows.') && q.includes('The governor analysis has no change with CLI text.'));
+    assert.ok(q.includes('<h6 class="tuning-h">Governor parameters (0 rows)</h6>') && q.includes('The result has no parameter rows.') && q.includes('The governor autotune has no change with CLI text.'));
     const a3 = analysed();
     gmTuned(a3, { status: 'partial' });
     assert.ok(a3.pane('governor').includes('<span class="tuning-badge st-monitor">Some model checks not satisfactory</span>') && a3.pane('governor').includes('<pre>profile 0\nset gov_i_gain = 60</pre>'), 'a partial model keeps the CLI text');
@@ -5079,7 +5277,7 @@ test('governor model: cancel, an error of the worker with the error mark of the 
     app.jq.fire('click', '.tuning-gm-cancel', {});
     assert.equal(w.terminated, true);
     let p = app.pane('governor');
-    assert.ok(p.includes('<p role="status">You canceled the governor analysis.</p>') && p.includes('tuning-gm-start'));
+    assert.ok(p.includes('<p role="status">You canceled the governor autotune.</p>') && p.includes('tuning-gm-start'));
     w.reply({ type: 'governorTuned', result: synthGovTune() });
     assert.ok(!app.pane('governor').includes('Model checks satisfactory'), 'a canceled run gives no result');
     app.jq.fire('click', '.tuning-gm-start', {});
@@ -5087,7 +5285,7 @@ test('governor model: cancel, an error of the worker with the error mark of the 
     w.reply({ type: 'error', message: 'The toolkit file "gov_tune.cjs" <b>' });
     assert.equal(w.terminated, true);
     p = app.pane('governor');
-    assert.ok(p.includes('The governor analysis stopped because of an error. <span data-ste="quoted">The toolkit file &quot;gov_tune.cjs&quot; &lt;b&gt;</span>'));
+    assert.ok(p.includes('The governor autotune stopped because of an error. <span data-ste="quoted">The toolkit file &quot;gov_tune.cjs&quot; &lt;b&gt;</span>'));
     assert.equal(app.jq.node('.tuning-tab[data-tab="governor"]').classes.has('st-error'), true, 'the tab shows the error');
     w = gmTuned(app);
     assert.equal(app.jq.node('.tuning-tab[data-tab="governor"]').classes.has('st-error'), false, 'a new result removes the error');
@@ -5101,8 +5299,8 @@ test('governor model: cancel, an error of the worker with the error mark of the 
     r.records = r.records.map((q) => Object.assign({}, q, { flown: false }));
     const bench = analysed({ result: r });
     bench.tab('governor');
-    assert.ok(bench.pane('governor').includes('<button type="button" class="btn btn-primary btn-sm tuning-gm-start" disabled>Start the governor analysis</button>'));
-    assert.ok(bench.pane('governor').includes('The logs have no flight. The governor analysis does not use bench runs.'));
+    assert.ok(bench.pane('governor').includes('<button type="button" class="btn btn-primary btn-sm tuning-gm-start" disabled>Autotune</button>'));
+    assert.ok(bench.pane('governor').includes('The logs have no flight. The governor autotune does not use bench runs.'));
     bench.jq.fire('click', '.tuning-gm-start', {});
     assert.equal(gmWorker(bench), undefined, 'no run');
     // a different file: the run stops
@@ -5146,8 +5344,12 @@ test('governor model: the pure parts (govModelHtml without the dialog, the plot 
     eq(env.extra.map((q) => q.spec.title), ['Headspeed of log 2, recorded and calculated', 'Throttle for each collective position']);
     assert.equal(env.extra[0].spec.onClick, undefined, 'no seek without env.seek');
     assert.ok(!out.html.includes('class="tuning-pick"') && out.html.includes('Changes for the CLI file'));
-    assert.ok(I.govModelHtml({ state: 'none' }, env, {}).html.includes('tuning-gm-start'));
-    assert.ok(I.govModelHtml({ state: 'running', fraction: 2, text: 'x' }, env, {}).html.includes('style="width: 100.0%"'), 'the fraction is clamped');
+    // the button and the progress: the autotune bar of the tab heading, the same on each tab (user, 2026-10-17)
+    assert.ok(!I.govModelHtml({ state: 'none' }, env, {}).html.includes('tuning-gm-start'), 'not in the panel');
+    assert.ok(I.govBarHtml({ state: 'none' }).includes('tuning-gm-start'));
+    assert.ok(I.govBarHtml({ state: 'running', fraction: 2, text: 'x' }).includes('style="width: 100.0%"'), 'the fraction is clamped');
+    assert.match(I.govBarHtml({ state: 'none', unavailable: 'No flight.' }), /tuning-gm-start" disabled>Autotune<\/button><span class="tuning-at-why">No flight\.<\/span>/, 'the reason next to the button');
+    assert.match(I.govBarHtml({ state: 'done', result: synthGovTune() }), /Autotune completed\. The result is below\./);
     assert.ok(I.govModelHtml({ state: 'done', result: synthGovTune({ status: 'odd' }) }, env, {}).html.includes('Model not available'), 'a status that the view does not know');
     // the generic spec: a log of the run for the time plots without their own, the segment, and the bad shapes
     const seeks = [], e2 = { seekFrame: (li, t, what) => seeks.push([li, t, what.graphs.length]) };
@@ -5350,5 +5552,90 @@ test('governor model: its changes are one flight test of the CLI file, and "Sele
     const text = advice.exportScript(plain(last().recs), plain(last().picks), plain(last().meta));
     assert.doesNotMatch(text, /DYN_NOTCH|roll_d_cutoff/);
     assert.match(text, /set gov_i_gain = 60[\s\S]*set gov_rpm_filter = 15/);
+    assert.deepEqual(app.errors, []);
+});
+
+test('"Autotune all": every autotune starts at once, each with its progress on its tab, and the view tab shows the mean', async () => {
+    const progress = [];
+    const app = analysed({ result: controlResult(), hooks: { autotuneProgress: (p) => progress.push(p && plain(p)) } });
+    const cmds = () => app.workers.filter((w) => w.sent.length && /Tune$/.test(w.sent[0].msg.cmd)).map((w) => w.sent[0].msg.cmd + (w.sent[0].msg.step ? ':' + w.sent[0].msg.step : ''));
+    const running = () => ['filters', 'governor', 'cyclic', 'tail', 'cycomp', 'tailcomp'].filter((t) => app.jq.node(`.tuning-tab[data-tab="${t}"]`).classes.has('is-autotune'));
+    const ctWorker = (step) => app.workers.filter((w) => w.sent.length && w.sent[0].msg.cmd === 'controlTune' && w.sent[0].msg.step === step).at(-1);
+    const button = app.jq.node('.tuning-autotune-all');
+    assert.equal(button.props.disabled, false, 'the analysis is current');
+    app.jq.fire('click', '.tuning-autotune-all');
+    eq(cmds(), ['filterTune', 'governorTune', 'controlTune:cyclic', 'controlTune:tail', 'controlTune:cycomp', 'controlTune:tailcomp'], 'all at once');
+    eq(running(), ['filters', 'governor', 'cyclic', 'tail', 'cycomp', 'tailcomp']);
+    assert.equal(button.text, 'Cancel autotune all');
+    assert.equal(ctWorker('cyclic').sent[0].msg.configuration, app.dialog.getConfiguration(), 'the configuration on display');
+    ftWorker(app).reply({ type: 'progress', fraction: 0.5, text: 'The app tries 12 sets of values.' });
+    gmWorker(app).reply({ type: 'progress', fraction: 0.25, text: 'The app makes the governor model.' });
+    assert.equal(app.jq.node('.tuning-tab[data-tab="filters"] .tuning-tab-bar > span').css.width, '50.0%', 'the bar of the tab, also on a different tab');
+    assert.equal(app.jq.node('.tuning-tab[data-tab="governor"] .tuning-tab-bar > span').css.width, '25.0%');
+    assert.ok(app.jq.node('.tuning-tab[data-tab="cyclic"]').classes.has('is-busy'), 'no fraction yet: the busy bar');
+    eq(progress.at(-1), { fraction: 0.75 / 6 }, 'the view tab: the mean of all runs');
+    ftWorker(app).reply({ type: 'filterTuned', result: synthFilterTune() });
+    eq(running(), ['governor', 'cyclic', 'tail', 'cycomp', 'tailcomp']);
+    eq(progress.at(-1), { fraction: 1.25 / 6 }, 'a run that stopped counts as 1');
+    gmWorker(app).reply({ type: 'governorTuned', result: synthGovTune() });
+    for (const step of ['cyclic', 'tail', 'cycomp', 'tailcomp']) {
+        const w = ctWorker(step);
+        w.onmessage({ data: { id: w.sent[0].msg.id, type: 'error', message: 'No model.' } }); await tick();
+    }
+    eq(cmds().length, 6, 'each step once');
+    eq(running(), []);
+    assert.equal(button.text, 'Autotune all');
+    assert.equal(progress.at(-1), null, 'no autotune runs');
+    // a second "Autotune all" starts only the steps with no current result: the failed control steps
+    app.jq.fire('click', '.tuning-autotune-all');
+    eq(cmds().slice(6), ['controlTune:cyclic', 'controlTune:tail', 'controlTune:cycomp', 'controlTune:tailcomp']);
+    // cancel: every run stops
+    app.jq.fire('click', '.tuning-autotune-all');
+    assert.ok(['cyclic', 'tail', 'cycomp', 'tailcomp'].every((step) => ctWorker(step).terminated));
+    await tick();
+    eq(cmds().length, 10);
+    eq(running(), []);
+    assert.equal(button.text, 'Autotune all');
+    assert.equal(progress.at(-1), null);
+    assert.deepEqual(app.errors, []);
+});
+
+// user, 2026-10-17: "Autotune all" was disabled after the analysis. The result of "Selected flights" had the key of the flights that the run
+// sent, and the view leaves out the logs that the result finds as bench runs: the result was not current for its own selection
+test('"Selected flights": a result that finds a bench run that the scan did not know stays current ("Start analysis", "Autotune all")', () => {
+    // "Start analysis" waits for the scan, so the run cannot come before the scan ends
+    for (const [name, over] of [['the scan before the run, the result finds log 3 a bench run', { benchRuns: [0, 2], flights: [{ log: 1, t0: 14.3, t1: 87, seconds: 72.7 }] }]]) {
+        const app = setup({ scope: null, result: controlResult() });
+        app.open();
+        const flights = [{ log: 1, segment: 0, t0: 14.3, t1: 87, seconds: 72.7 }, { log: 2, segment: 0, t0: 2, t1: 6, seconds: 4 }];
+        const scanReply = () => app.scanWorker().reply({ type: 'flightsScanned', result: { scope: 'scan', records: [{ log: 0, segment: 0, logClass: 'bench', phases: [], flights: [] },
+            { log: 1, segment: 0, logClass: 'flight', flights: [flights[0]] }, { log: 2, segment: 0, logClass: 'flight', flights: [flights[1]] }], flights, benchRuns: [{ log: 0 }], noData: [] } });
+        app.jq.fire('click', '.tuning-analyse');
+        assert.equal(app.runs.length, 0, `${name}: no run before the scan ends`);
+        scanReply();
+        app.jq.fire('click', '.tuning-analyse');
+        const cr = controlResult();
+        app.analysisWorker().reply({ type: 'result', result: Object.assign(cr, fileResult(over), { findings: cr.findings, configurations: cr.configurations }) });
+        assert.equal(app.jq.node('.tuning-analyse').props.disabled, true, `${name}: the result is of these flights`);
+        assert.equal(app.jq.node('.tuning-autotune-all').props.disabled, false, `${name}: "Autotune all" is available`);
+        assert.equal(app.jq.node('.tuning-autotune-all').attrs.title, 'Start the autotune of each tab');
+        assert.deepEqual(app.errors, []);
+    }
+});
+
+// user, 2026-10-17: the autotune of each tab has the same bar at the right of the tab heading: "Autotune", the reason of a disabled button, the
+// progress with "Cancel", or "Autotune completed"
+test('the autotune bar is the same on the Filters, Governor and control tabs', () => {
+    const app = analysed({ result: controlResult() });
+    for (const [tab, cls] of [['filters', 'ft'], ['governor', 'gm'], ['cyclic', 'ct'], ['tail', 'ct'], ['cycomp', 'ct'], ['tailcomp', 'ct']]) {
+        app.tab(tab);
+        const html = app.pane(tab), head = html.slice(0, html.indexOf('</h5>') + 600);
+        assert.match(head, new RegExp(`<div class="tuning-ft-actions"><div class="tuning-at"><button type="button" class="btn btn-primary btn-sm tuning-${cls}-start"[^>]*>Autotune</button>`), `${tab}: the bar in the heading`);
+        assert.equal((html.match(new RegExp(`tuning-${cls}-start`, 'g')) || []).length, 1, `${tab}: one autotune button`);
+    }
+    const I = app.internals;
+    assert.match(I.autotuneBarHtml({ cls: 'ct', state: 'running', fraction: null, text: 'x' }), /tuning-progress-track is-busy[\s\S]*tuning-ct-progress-text">x<\/span>[\s\S]*tuning-ct-cancel/);
+    assert.match(I.autotuneBarHtml({ cls: 'ft', state: 'none', disabled: true, reason: 'Open a log.' }), /disabled>Autotune<\/button><span class="tuning-at-why">Open a log\.<\/span>/);
+    assert.match(I.autotuneBarHtml({ cls: 'gm', current: true }), /<span class="tuning-at-done">Autotune completed\. The result is below\.<\/span>/);
     assert.deepEqual(app.errors, []);
 });

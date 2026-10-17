@@ -202,3 +202,42 @@ test('load passes the arming events of each log; the real data reproduce the arm
         }
     }
 });
+
+// IMP-02 (review 2026-10-16): a receiver signal loss removes only its cut (lib.cjs rxLossAt) from the runs: partsOf gives the parts out
+// of it, and fromSegment one run for each part (the time, the phases, the flights and the DISARM events of that part)
+const lossFile = (o, from, seconds) => { // a simulated 4.6 flight (test/helpers/bbl_encode.cjs) with both flags at 0, read back with lib.segments
+    const bbl = require('./helpers/bbl_encode.cjs'), lib = require('../tools/autotune/lib.cjs'), log = bbl.simulateFlight(o), a = Math.round(from * 1000), b = Math.round((from + seconds) * 1000);
+    log.slow.rxSignalReceived = Float64Array.from(log.slow.rxSignalReceived, (v, i) => i >= a && i < b ? 0 : v); log.slow.rxFlightChannelsValid = Float64Array.from(log.slow.rxSignalReceived);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'govloss-')), file = path.join(dir, 'loss.bbl');
+    try { fs.writeFileSync(file, require('./helpers/bbl_encode.cjs').encode([log]).bytes); return [...lib.segments(lib.loadApp(), file, { whole: true, extra: [...new Set(GD.EXTRA.concat(['time']))] })].filter(s => !s.skipped)[0]; }
+    finally { fs.rmSync(dir, { recursive: true, force: true }); }
+};
+test('a receiver signal loss removes only its cut from the governor runs (partsOf, fromSegment with i0 and i1)', () => {
+    const lib = require('../tools/autotune/lib.cjs'), R = lib.RX_LOSS, PHm = require('../tools/autotune/health_phase.cjs');
+    // a loss of 0.5 s at 1 s on the ground: the part before it (0.89 s) is less than RULES.rxLossMinS, the rest of the log stays
+    const g = lossFile({ seconds: 60, seed: 5, airborne: [6, 54] }, 1, 0.5), P = GD.partsOf(g);
+    assert.equal(P.parts.length, 1); assert.equal(P.parts[0][0], g.rxLoss[0].cut1); assert.equal(P.parts[0][1], g.n);
+    assert.ok(Math.abs(P.cutS - (0.5 + R.lastFrameLeadS + R.guardS + R.settleS + 1 - R.lastFrameLeadS - R.guardS)) < 0.01, `cut ${P.cutS} s`);
+    const ph = PHm.phases(g, { rate: g.flight.actualRate, govState: g.govStateAt, flightRule: { headspeed: 2000 } });
+    const run = GD.fromSegment(g, { phases: ph, segment: 0, i0: P.parts[0][0], i1: P.parts[0][1] });
+    assert.ok(run.n / 1000 > 57 && run.n / 1000 < 58, `the run keeps ${run.n / 1000} s`); assert.equal(run.class, 'flight'); assert.equal(run.flights.length, 1);
+    assert.ok(Math.abs(run.fromS - 2.5) < 0.01, `the run starts at ${run.fromS} s`); assert.equal(run.time[0], 0); assert.deepEqual(run.part, P.parts[0]);
+    assert.equal(run.flights[0].i0, ph.flights[0].i0 - P.parts[0][0], 'the flight in the samples of the part');
+    // a loss of 2 s at 40 s in flight: two runs, the first one ends at the cut, the second one starts at the RX return + settleS
+    const w = lossFile({ seconds: 80, seed: 7, airborne: [6, 76] }, 40, 2), Q = GD.partsOf(w), s = w.rxLoss[0];
+    assert.deepEqual(Q.parts, [[0, s.cut0], [s.cut1, w.n]]); assert.ok(Math.abs(Q.cutS - (s.cut1 - s.cut0) / 1000) < 0.002);
+    const legacy = GD.fromSegment(w, {}); assert.equal(legacy.n, s.cut0); assert.equal(legacy.rxLossEnd, w.n - s.cut0, 'without i0 and i1: the first part');
+    const second = GD.fromSegment(w, { i0: s.cut1, i1: w.n, segment: 1, events: [{ t: 30, event: 15 }, { t: 79, event: 15 }, { t: 20, name: 'ADJ' }] });
+    assert.deepEqual(second.disarms.map(i => Math.round(second.time[i])), [79 - 43], 'only the DISARM events of the part'); assert.ok(second.events.some(e => e.name === 'ADJ'));
+    // no loss: one part, all of the segment, and fromSegment as before
+    const none = lossFile({ seconds: 30, seed: 9, airborne: [6, 26] }, 0, 0); assert.deepEqual(GD.partsOf(none), { parts: [[0, none.n]], cutS: 0 });
+});
+
+const CRASH = path.join(__dirname, '../analysis/fireball-crash-20261015/crash.bbl');
+test('real: the Fireball crash log 2026-10-15: the governor run stops at the cut (68.33 s), and the part after the RX return is a run of its own', { skip: !fs.existsSync(CRASH) ? 'analysis/fireball-crash-20261015/crash.bbl is not here' : false }, () => {
+    const lib = require('../tools/autotune/lib.cjs'), w = [...lib.segments(lib.loadApp(), CRASH, { whole: true, extra: [...new Set(GD.EXTRA.concat(['time']))] })].find(s => !s.skipped);
+    const P = GD.partsOf(w), T = w.extra.time, at = (i) => w.fromS + (T[Math.min(w.n - 1, i)] - T[0]) / 1e6;
+    assert.equal(P.parts.length, 2); assert.ok(Math.abs(at(P.parts[0][1]) - 68.334) < 0.002, `the first part ends at ${at(P.parts[0][1])} s`); assert.ok(Math.abs(at(P.parts[1][0]) - 71.541) < 0.002);
+    const run = GD.fromSegment(w, { segment: 0, i0: P.parts[0][0], i1: P.parts[0][1] }), end = run.fromS + run.time[run.n - 1];
+    assert.ok(end <= 68.334 && end > 68.32, `the run ends at ${end} s`);
+});

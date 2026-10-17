@@ -55,6 +55,7 @@ for (const w of lib.segments(app, FILE, { whole: true, extra: EXTRA })) {
             const idx = []; for (let k = s; k < s + N; k += 8) idx.push(R.index[k]);
             let lo = Infinity, hi = -Infinity; for (const i of idx) { if (w.hs[i] < lo) lo = w.hs[i]; if (w.hs[i] > hi) hi = w.hs[i]; }
             if (lo < RULE.headspeed || hi - lo > pass.steady) continue;
+            if (w.rxLossAt && idx.some(i => w.rxLossAt[i])) continue; // a receiver signal loss (lib.cjs rxLossAt)
             for (let a = 0; a < 3; a++) { const c = R.columns[a]; let m = 0; for (let i = 0; i < N; i++) m += c[s + i]; m /= N; for (let i = 0; i < N; i++) buf[i] = (c[s + i] - m) * win[i]; fft.simple(X[a], buf, 'real'); }
             const P = new Float64Array(Math.min(N / 2, bin(6)));
             for (let k = 0; k < P.length; k++) for (let a = 0; a < 3; a++) P[k] += X[a][2 * k] ** 2 + X[a][2 * k + 1] ** 2;

@@ -136,7 +136,9 @@ function dNoise(w, rate, prof, ok) {
     const n = w.n;
     const R = RULE.dNoise, N = Math.max(1, Math.round(R.windowS * rate)), res = {};
     for (const a of [0, 1, 2]) {
-        const D = w.D && w.D[a]; if (!D || !D.some(v => v !== 0)) { res[AXES[a]] = { skipped: 'axisD is 0, or the log does not record it.' }; continue; }
+        // no axisD field: not measured. axisD always 0 (the D gain is 0: Gaui X4 II rollPID 50,100,0): there is no D-term noise to measure
+        const D = w.D && w.D[a]; if (!D) { res[AXES[a]] = { skipped: `The log does not record axisD[${a}].` }; continue; }
+        if (!D.some(v => v !== 0)) { res[AXES[a]] = { zero: true, byProfile: {} }; continue; }
         if (R.hz >= 0.45 * rate) { res[AXES[a]] = { skipped: `The log rate of ${r(rate, 0)} Hz is too low for the check at ${R.hz} Hz.` }; continue; }
         const hp = lib.bandpass(D, R.hz, 0.45 * rate, rate), acc = {};
         for (let s = 0; s + N <= n; s += N) {
@@ -629,6 +631,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
         // C11
         if (M.C11) { const R = RULES.C11; for (const ax of ['roll', 'pitch']) { const m = M.C11[ax]; if (!m) continue;
             if (m.skipped) { add('C11', 'skipped', f, null, { axis: ax, text: m.skipped }); continue; }
+            if (m.zero) { add('C11', 'ok', f, null, { axis: ax, value: 0, n: 0, dZero: true, text: `The ${ax} axisD is 0 in this log: the D gain is 0. Thus, the D-term noise is 0.` }); continue; }
             for (const [p, s] of Object.entries(m.byProfile)) { if (s.windows < R.minWindows) { add('C11', 'note', f, p, { axis: ax, value: s.share, n: s.windows, text: thin(s.windows, R.minWindows, 'windows') }); continue; }
                 const flag = s.share > R.share;
                 add('C11', flag ? 'flag' : 'ok', f, p, { axis: ax, value: s.share, se: s.perWindow.se, n: s.windows, threshold: `> ${R.share}`, text: `The ${ax} axisD power at more than ${RULE.dNoise.hz} Hz is ${fmt(s.share * 100, 0)} % of its total power. The mean of the window percentages is ${fmt(s.perWindow.mean * 100, 0)} ± ${fmt(s.perWindow.se * 100, 1)} %.` + (flag ? ' High-frequency D power can come from vibration. Examine the gyro spectra.' : '') }); } } }

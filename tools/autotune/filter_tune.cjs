@@ -288,11 +288,14 @@ const pad16 = (a) => Array.from({ length: FW.rpmBanks }, (_, i) => (a && +a[i]) 
  *         logGear (tailOrder().gear: the notch orders that the log shows, used only when neither gear nor the CLI gives them) }
  */
 function config(header, opts = {}) {
-    const h = header || {}, cli = opts.cli ? (typeof opts.cli === 'string' ? setup.parseCli(opts.cli) : opts.cli) : null, g = cli ? cli.global : {};
+    // a parameter snapshot in the log header (blackbox_params FULL) has every value that the CLI dump gives, of the time of the log:
+    // it is used in place of the CLI dump, with the source 'header' (IMP-05)
+    const h = header || {}, snap = typeof setup.snapshotOfHeader === 'function' ? setup.snapshotOfHeader(h) : null;
+    const cli = snap || (opts.cli ? (typeof opts.cli === 'string' ? setup.parseCli(opts.cli) : opts.cli) : null), g = cli ? cli.global : {}, cliFrom = snap ? 'header' : 'cli';
     const s = {}, from = {}, notes = [];
     const take = (name, hv, cv, def) => {
         if (hv !== null && hv !== undefined) { s[name] = hv; from[name] = 'header'; }
-        else if (cv !== null && cv !== undefined) { s[name] = cv; from[name] = 'cli'; }
+        else if (cv !== null && cv !== undefined) { s[name] = cv; from[name] = cliFrom; }
         else { s[name] = def; from[name] = 'default'; }
     };
     const el = (k, i) => { const v = arr(hk(h, k)); return v && v.length > i ? +v[i] : null; };
@@ -338,7 +341,7 @@ function config(header, opts = {}) {
     let gear = opts.gear || null;
     if (!gear && cli) {
         const dflt = cli.kind === 'diff' ? [1, 1] : null, mode = g.tail_rotor_mode === undefined || g.tail_rotor_mode === null ? 'VARIABLE' : String(g.tail_rotor_mode).trim().toUpperCase();
-        gear = { main: arr(g.main_rotor_gear_ratio) || dflt, tail: arr(g.tail_rotor_gear_ratio) || dflt, motorisedTail: mode !== 'VARIABLE' && mode !== '0', source: 'cli' };
+        gear = { main: arr(g.main_rotor_gear_ratio) || dflt, tail: arr(g.tail_rotor_gear_ratio) || dflt, motorisedTail: mode !== 'VARIABLE' && mode !== '0', source: snap ? 'log snapshot' : 'cli' };
     }
     // no CLI dump: the notch orders that the log shows (tailOrder), the configured values that the firmware notches use
     if (!gear && opts.logGear) gear = Object.assign({}, opts.logGear);
@@ -351,12 +354,12 @@ function config(header, opts = {}) {
     const pidCli = {};
     if (cli) for (const [k, sec] of Object.entries(cli.profiles)) pidCli[+k + 1] = Object.fromEntries(AXES.map(ax => [ax, {
         gyro_cutoff: sec[`${ax}_gyro_cutoff`] !== undefined ? +sec[`${ax}_gyro_cutoff`] : null, d_cutoff: sec[`${ax}_d_cutoff`] !== undefined ? +sec[`${ax}_d_cutoff`] : null,
-        P: sec[`${ax}_p_gain`] !== undefined ? +sec[`${ax}_p_gain`] : null, D: sec[`${ax}_d_gain`] !== undefined ? +sec[`${ax}_d_gain`] : null, from: 'cli' }]));
+        P: sec[`${ax}_p_gain`] !== undefined ? +sec[`${ax}_p_gain`] : null, D: sec[`${ax}_d_gain`] !== undefined ? +sec[`${ax}_d_gain`] : null, from: cliFrom }]));
     if (cli) for (const [k, sec] of Object.entries(cli.profiles)) {
         if (Number.isFinite(sec.yaw_ccw_stop_gain) && Number.isFinite(sec.yaw_cw_stop_gain))
             pidCli[+k + 1].yaw.stopGain = [sec.yaw_ccw_stop_gain / 100, sec.yaw_cw_stop_gain / 100];
     }
-    return { s, from, rates, gear, pid: { header: pidHeader, cli: pidCli }, notes, cliKind: cli ? cli.kind : null };
+    return { s, from, rates, gear, pid: { header: pidHeader, cli: pidCli }, notes, cliKind: cli ? cli.kind : null, snapshot: !!snap };
 }
 
 // the settings with some CLI names changed (a candidate); arrays are copied
@@ -1180,7 +1183,8 @@ function maskOf(w, item, opts) {
     if (!phase) return { mask: null, flight: false, source: 'health_phase.cjs is missing' };
     const ctx = { rate: w.rate, flightRule: { headspeed: opts.flightRpm || lib.FLIGHT_RPM } }, ph = item.phases || phase.phases(w, ctx), fm = phase.flightMask(w, ctx, ph);
     if (w.rescueAt) for (let i = 0; i < w.n; i++) if (w.rescueAt[i]) fm[i] = 0;
-    return { mask: fm, flight: ph.class === 'flight', source: 'health_phase flightMask, rescue out' };
+    if (w.rxLossAt) for (let i = 0; i < w.n; i++) if (w.rxLossAt[i]) fm[i] = 0; // a receiver signal loss (lib.cjs rxLossAt)
+    return { mask: fm, flight: ph.class === 'flight', source: w.rxLossAt ? 'health_phase flightMask, rescue and receiver signal loss out' : 'health_phase flightMask, rescue out' };
 }
 
 /**
@@ -1966,7 +1970,7 @@ const motorOrderOf = (g) => !g ? null : g.motorOrder > 0 ? g.motorOrder : g.main
 function summarizeFit(fit, L) {
     if (!fit) return null;
     const g = L && L.cfg && L.cfg.gear, used = !!(g && g.source === 'log notch');
-    return Object.assign({}, fit, { used, cli: g && g.source === 'cli' ? { tailOrder: r(tailOrderOf(g), 4), motorOrder: r(motorOrderOf(g), 4) } : null });
+    return Object.assign({}, fit, { used, cli: g && (g.source === 'cli' || g.source === 'log snapshot') ? { tailOrder: r(tailOrderOf(g), 4), motorOrder: r(motorOrderOf(g), 4) } : null });
 }
 function summarizeNoise(prep, ev, units) {
     const tot = [0, 0, 0], gy = [0, 0, 0], n = sum(prep.logs.map(L => L.windows.n));
@@ -2110,8 +2114,8 @@ function tune(logs, opts = {}) { return require('./filter_autotune.cjs').tune(lo
 module.exports = { FW, FW_RANGE, RULES, RULE, EXTRA, PRESETS, config, withSettings, compile, effectiveBanks, chainResponse, pidResponse, pidPath, runChain, centresAt,
     prepare, findLines, decompose, parity, usableMasks, evaluate, delayOf, delayChange, score, movesOf, guards, greedy, choose, looValidate, cliLines, curves, tune,
     lowpassSections, biquad, firstOrderLpf, difSection, pt1Gain, notchQ, notchCutoffFor, notchAt, mulSection, fftPlan, fft, twoSpectra, tvKey, texts,
-    tailOrder, tailOrderStart, tailOrderAdd, tailOrderFit, fitCauseText, orderSpectra, fitOrderAt, tailOrderOf, motorOrderOf,
-    _t: { sumUnits, dipCandidates, cleanBanks, inViewBanks, banksAt, fitQAt, bankDip, revHeadspeed, dynStep } /* stateful SDFT processing shared with native-rate replay */ };
+    tailOrder, tailOrderStart, tailOrderAdd, tailOrderFit, fitCauseText, notchFitText, orderSpectra, fitOrderAt, tailOrderOf, motorOrderOf,
+    _t: { sumUnits, dipCandidates, cleanBanks, inViewBanks, banksAt, fitQAt, bankDip, revHeadspeed, dynStep, maskOf } /* stateful SDFT processing shared with native-rate replay; maskOf: tests */ };
 if (require.main !== module) return;
 
 // ---------------------------------------------------------------------------------------------

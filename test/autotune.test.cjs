@@ -228,3 +228,58 @@ test('steady segments leave rescue out', () => {
     const segs = [...lib.steadySegments(w)].map(s => [s.i0, s.i1]);
     assert.deepEqual(segs, [[0, 40 * RATE], [50 * RATE, n]]);
 });
+
+// IMP-02: a receiver signal loss (lib.cjs RX_LOSS) ends the analysis segments, and a new one starts only after it with the airborne
+// and headspeed rules again. A simulated flight (test/helpers/bbl_encode.cjs) with rxSignalReceived and rxFlightChannelsValid at 0
+// from 40 to 42 s: the governor stays ACTIVE and the airborne flag stays 1 (as with `rxfail 4 h`), so only the loss removes it
+test('a receiver signal loss of 2 s at 40 s with the governor kept ACTIVE: no segment crosses 39.9-41.0 s', () => {
+    const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), bbl = require('./helpers/bbl_encode.cjs'), H = require('../tools/autotune/health.cjs');
+    const log = bbl.simulateFlight({ seconds: 80, seed: 7, airborne: [6, 76], profiles: [{ from: 0, profile: 1, target: 3200 }] }); // above minHeadspeed (5/6 of the flight rpm)
+    log.slow.rxSignalReceived = Float64Array.from(log.slow.rxSignalReceived, (v, i) => i >= 40 * RATE && i < 42 * RATE ? 0 : v);
+    log.slow.rxFlightChannelsValid = Float64Array.from(log.slow.rxSignalReceived);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rxloss-')), file = path.join(dir, 'loss.bbl'); fs.writeFileSync(file, bbl.encode([log]).bytes);
+    try {
+        const app = lib.loadApp(), R = lib.RX_LOSS, crosses = (a, b) => a < 41.0 && b > 39.9;
+        const segs = [...lib.segments(app, file, { extra: ['time'] })].filter(s => !s.skipped).map(s => [s.fromS, s.fromS + (s.extra.time[s.n - 1] - s.extra.time[0]) / 1e6]);
+        assert.ok(segs.length >= 2, `a segment before and after the loss: ${JSON.stringify(segs)}`);
+        for (const [a, b] of segs) assert.ok(!crosses(a, b) && (b <= 40 - R.lastFrameLeadS || a >= 42 + R.settleS - 0.002), `segment ${a}-${b} s`);
+        const w = [...lib.segments(app, file, { whole: true, extra: ['time'] })].find(s => !s.skipped);
+        assert.equal(w.rxLoss.length, 1); assert.ok(w.govStateAt.subarray(40 * RATE, 42 * RATE).every(g => g === 4), 'the governor stays ACTIVE');
+        // the cut: the inferred last RC frame (40 s - 0.1 s) less guardS to the RX return (42 s) plus settleS
+        assert.equal(w.rxLoss[0].cut0, Math.round((40 - R.lastFrameLeadS - R.guardS) * RATE)); assert.equal(w.rxLoss[0].cut1, Math.round((42 + R.settleS) * RATE));
+        for (const s of lib.steadySegments(w)) assert.ok(!crosses(w.fromS + s.i0 / RATE, w.fromS + s.i1 / RATE), `steady segment ${s.i0}-${s.i1}`);
+        const { flying } = H.flightMask(w, RATE, Object.assign({}, H.RULE.flight, { headspeed: 2000 }));
+        for (let i = Math.round(39.9 * RATE); i < 41 * RATE; i++) assert.equal(flying[i], 0, `in-flight mask at ${i / RATE} s`);
+        assert.equal(flying[35 * RATE], 1); assert.equal(flying[50 * RATE], 1);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// IMP-04: extract.cjs --clip cuts a segment to its flight (js/tuning_worker.js passes the flights of the flight logs), and report.cjs survives
+// a section 5 with fewer yaw observations than regressors (lib.solve gives null for no row; the report says "No result")
+test('IMP-04: a segment that ends 1 s after the flight end is cut to the flight and reaches report.cjs; no yaw observation gives "No result"', () => {
+    const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), cp = require('node:child_process'), bbl = require('./helpers/bbl_encode.cjs');
+    assert.equal(lib.solve([], []), null); assert.equal(lib.solve([[]], [1]), null);
+    const log = bbl.simulateFlight({ seconds: 80, seed: 7, airborne: [6, 76], profiles: [{ from: 0, profile: 1, target: 3200 }] });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clip-')), file = path.join(dir, 'clip.bbl'), out = path.join(dir, 'out'), clip = path.join(dir, 'clip.json');
+    const X = path.join(__dirname, '../tools/autotune/extract.cjs'), Rp = path.join(__dirname, '../tools/autotune/report.cjs');
+    const node = (args) => cp.execFileSync(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        fs.writeFileSync(file, bbl.encode([log]).bytes);
+        node([X, path.join(dir, 'full'), file]);
+        const full = JSON.parse(fs.readFileSync(path.join(dir, 'full', 'segments.json'), 'utf8')).segments;
+        assert.equal(full.length, 1); const end = full[0].fromS + full[0].seconds, flightEnd = end - 1;   // the segment ends 1 s after this flight end
+        fs.writeFileSync(clip, JSON.stringify({ 0: [[full[0].fromS - 1, flightEnd]] }));
+        node([X, out, file, `--clip=${clip}`]);
+        const S = JSON.parse(fs.readFileSync(path.join(out, 'segments.json'), 'utf8')).segments;
+        assert.equal(S.length, 1); within(S[0].fromS, full[0].fromS, 0.002, 'the start'); within(S[0].fromS + S[0].seconds, flightEnd, 0.01, 'the end: the flight end');
+        node([Rp, out]);
+        const md = fs.readFileSync(path.join(out, 'report.md'), 'utf8'); assert.match(md, /## 2\. Gains in effect/);
+        // the same segment with no yaw P gain of each direction: 0 observations in section 5
+        const one = JSON.parse(fs.readFileSync(path.join(out, 'segments.json'), 'utf8')); delete one.segments[0].axes.yaw.gains.P_cw; fs.writeFileSync(path.join(out, 'segments.json'), JSON.stringify(one));
+        node([Rp, out]);
+        assert.match(fs.readFileSync(path.join(out, 'report.md'), 'utf8'), /No result: 0 segments, 6 necessary\. Each segment is 30 s or more, with the yaw P gain of each direction and the yaw D gain\./);
+        // a span that the segment does not overlap: the segment is skipped; a cut shorter than 20 s: skipped
+        fs.writeFileSync(clip, JSON.stringify({ 0: [[full[0].fromS + 5, full[0].fromS + 15]] })); node([X, out, file, `--clip=${clip}`]);
+        assert.equal(JSON.parse(fs.readFileSync(path.join(out, 'segments.json'), 'utf8')).segments.length, 0);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

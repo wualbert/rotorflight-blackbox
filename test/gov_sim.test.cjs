@@ -180,6 +180,34 @@ test('configOf excludes a log with an STE reason: no throttle input, BYPASS, an 
     assert.ok(c2.unknown.some(u => u.name === 'gov_tracking_time' && u.used) && c2.unknown.some(u => u.name === 'gov_bypass_throttle' && !u.used));
 });
 
+// review IMP-05: a log with a parameter snapshot (blackbox_params FULL) gives every governor value of every PID profile at the start
+// of the log. configOf ranks it first, above a CLI dump that does not agree (the crash log: gov_spooldown_time 80,
+// gov_throttle_hold_timeout 50, gov_handover_throttle 25 with no CLI dump)
+const PL = require(path.join(ROOT, 'tools/autotune/param_log.cjs')), GTU = require(path.join(ROOT, 'tools/autotune/gov_tune.cjs'));
+function snapshotHeader(over = {}) {
+    const text = (v) => Array.isArray(v) ? v.join(',') : String(v), def = (n) => over[n] !== undefined ? over[n] : GTU.REG[n].default;
+    const body = [['Param log', '1'], ['param_mode', 'FULL'], ['param_loop', '2,1,1,128'], ['param_phase', 'pos=0,sp=0,pid=0,mix=0,mot=0,fupd=0,bb=0,flush=0'],
+        ['param_pgs', '14.0/936'], ['param_fixes', '-'], ['param_rt', 'gov_mode=3,features=0,pid_denom=2,filter_denom=1,looptime=500,debug_mode=0,motors=1,servos=4'],
+        ['param_pid_profile', '0'], ['param_rate_profile', '0'], ['set.main_rotor_gear_ratio', '1,1'], ['set.battery_meter', 'ADC']];
+    for (const n of GP.GLOBAL) body.push([`set.${n}`, text(def(n))]);
+    for (const n of GP.PROFILE) body.push([`set@p.${n}`, [0, 1, 2, 3, 4, 5].map(k => text(over[`${n}@${k}`] !== undefined ? over[`${n}@${k}`] : def(n))).join('|')]);
+    let hash = 2166136261; for (const [k, v] of body) hash = PL.fnv1(`H ${k}:${v}\n`, hash);
+    body.push(['param_end', `${body.length},${(hash >>> 0).toString(16)}`]);
+    return { looptime: 500, pid_process_denom: 2, vbatcellvoltage: [330, 350, 430], 'Firmware revision': 'Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X', paramHeader: body };
+}
+test('configOf: the parameter snapshot of the log ranks first, above a CLI dump that does not agree; the closed loop is not excluded', () => {
+    const R = { profileMap: { byHeadspeed: {}, basis: {} }, items: [], epochs: [], flags: [], unknown: [] };
+    const run = synth(2, hover); run.header = snapshotHeader({ gov_mode: 'ELECTRIC', gov_spooldown_time: 80, gov_throttle_hold_timeout: 50, gov_handover_throttle: 25, 'gov_headspeed@0': 3500, 'gov_headspeed@1': 4500 });
+    assert.ok(PL.snapshotOf(run.header), 'a complete snapshot');
+    const cli = '# diff all\nset gov_mode = ELECTRIC\nset gov_spooldown_time = 100\nprofile 0\nset gov_headspeed = 3000\n';
+    for (const c of [GS.configOf([run], R)['0'], GS.configOf([run], R, { cli })['0']]) {
+        assert.equal(c.excluded, null, c.excluded);
+        assert.deepEqual([c.cli.global.gov_spooldown_time, c.cli.global.gov_throttle_hold_timeout, c.cli.global.gov_handover_throttle, c.cli.profiles[1].gov_headspeed], [80, 50, 25, 3500]);
+        assert.equal(c.sources.gov_spooldown_time, 'log header (the parameter values of log 1)'); assert.equal(c.profileSources[1].gov_headspeed, 'log header (the parameter values of log 1)');
+        assert.deepEqual([c.gear, c.voltageSource], [[1, 1], 'ADC']);
+    }
+});
+
 // ---- the real data: parity with analysis/governor-twin/parity.cjs (out/parity.json, 2026-10-14) ----
 
 const DATA = path.join(ROOT, 'analysis/governor-20261014/data'), OUT = path.join(ROOT, 'analysis/governor-twin/out');

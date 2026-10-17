@@ -86,9 +86,9 @@ for (const file of FILES) {
         seen.set(fl.id, file);
         const target = x.govTarget || w.hs, { p: profile, targetOf } = lib.profilesOf(w, target, RULE.flight.headspeed);
 
-        // in flight?
-        const flying = new Uint8Array(n); let up = 0, turn = 0;
-        for (let i = 0; i < n; i++) if (w.airborneAt[i] && w.hs[i] >= RULE.flight.headspeed) { flying[i] = 1; up++; turn += w.gyro[0][i] ** 2 + w.gyro[1][i] ** 2 + w.gyro[2][i] ** 2; }
+        // in flight? (out of the cut of a receiver signal loss, lib.cjs rxLossAt)
+        const flying = new Uint8Array(n), rx = w.rxLossAt || null; let up = 0, turn = 0;
+        for (let i = 0; i < n; i++) if (w.airborneAt[i] && w.hs[i] >= RULE.flight.headspeed && !(rx && rx[i])) { flying[i] = 1; up++; turn += w.gyro[0][i] ** 2 + w.gyro[1][i] ** 2 + w.gyro[2][i] ** 2; }
         const bodyRate = up ? Math.sqrt(turn / up) : 0, flown = up / rate >= 5 && bodyRate >= RULE.flight.rate;
         if (!flown) flying.fill(0);
         let rec = flights.find(f => f.id === fl.id);

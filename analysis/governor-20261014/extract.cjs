@@ -26,7 +26,9 @@ for (const s of L.segments(app, file, { whole: true, extra: EXTRA, logs })) {
     const h = s.flight.header;
     meta.push({ name, log: s.flight.log, n: s.n, rate: s.rate, actualRate: s.flight.actualRate, fromS: s.fromS, timeStartUs: s.extra.time ? s.extra.time[0] : null,
         columns: names, craft: s.flight.craft, start: s.flight.start, durationS: s.flight.durationS, gaps: s.flight.gaps,
-        header: { govPID: h.govPID, vbatref: h.vbatref, vbatcellvoltage: [h.vbatmincellvoltage, h.vbatwarningcellvoltage, h.vbatmaxcellvoltage], currentMeterScale: h.currentMeterScale, currentMeterOffset: h.currentMeterOffset, collectiveRange: h.collectiveRange, yaw_tta: h.yaw_tta, looptime: h.looptime, pid_process_denom: h.pid_process_denom, minthrottle: h.minthrottle, maxthrottle: h.maxthrottle, features: h.features } });
+        header: { govPID: h.govPID, vbatref: h.vbatref, vbatcellvoltage: [h.vbatmincellvoltage, h.vbatwarningcellvoltage, h.vbatmaxcellvoltage], currentMeterScale: h.currentMeterScale, currentMeterOffset: h.currentMeterOffset, collectiveRange: h.collectiveRange, yaw_tta: h.yaw_tta, looptime: h.looptime, pid_process_denom: h.pid_process_denom, minthrottle: h.minthrottle, maxthrottle: h.maxthrottle, features: h.features,
+            // a log of firmware with blackbox_params: the parameter snapshot (gov_tune.cjs uses its values, IMP-05)
+            ...(h.paramHeader ? { paramHeader: h.paramHeader, 'Firmware revision': h['Firmware revision'] } : {}) } });
     console.log(name, s.n, (s.n / s.rate).toFixed(1) + 's', 'from', s.fromS.toFixed(2));
 }
 fs.writeFileSync(path.join(out, 'meta.json'), JSON.stringify({ file: path.basename(file), segments: meta }, null, 1));

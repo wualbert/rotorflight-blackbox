@@ -13,7 +13,8 @@
  *
  * With --cli, the dump is parsed once (health_setup.parseCli) and its per-profile gov_headspeed and gov_max_throttle and
  * its battery_cell_count reach the governor module (cliContext). CLI profile q is log profile q + 1 (the log's
- * PID-profile event value is 1-based, as health_setup D4 maps it).
+ * PID-profile event value is 1-based, as health_setup D4 maps it). A log with a parameter snapshot (blackbox_params FULL)
+ * gives these values from its header instead, for every PID profile (snapshotContext), and the dump is not used for them.
  */
 
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
@@ -23,10 +24,11 @@ const MODULES = { setup: require('./health_setup.cjs'), gov: require('./health_g
 
 const RULE = { flight: { headspeed: lib.FLIGHT_RPM, rate: 10, minS: 5 } }; // as wag.cjs RULE.flight; comparisons are >=
 
-// in-flight mask of a whole segment: airborne and headspeed >= RULE.flight.headspeed; all zero unless the log was flown
+// in-flight mask of a whole segment: airborne and headspeed >= RULE.flight.headspeed, out of the cut of a receiver signal loss
+// (lib.cjs rxLossAt: the RC values there are not the pilot's); all zero unless the log was flown
 function flightMask(w, rate, rule = RULE.flight) {
-    const n = w.n, flying = new Uint8Array(n); let up = 0, turn = 0;
-    for (let i = 0; i < n; i++) if (w.airborneAt[i] && w.hs[i] >= rule.headspeed) { flying[i] = 1; up++; turn += w.gyro[0][i] ** 2 + w.gyro[1][i] ** 2 + w.gyro[2][i] ** 2; }
+    const n = w.n, flying = new Uint8Array(n), rx = w.rxLossAt || null; let up = 0, turn = 0;
+    for (let i = 0; i < n; i++) if (w.airborneAt[i] && w.hs[i] >= rule.headspeed && !(rx && rx[i])) { flying[i] = 1; up++; turn += w.gyro[0][i] ** 2 + w.gyro[1][i] ** 2 + w.gyro[2][i] ** 2; }
     const bodyRate = up ? Math.sqrt(turn / up) : 0, flown = up / rate >= rule.minS && bodyRate >= rule.rate;
     if (!flown) flying.fill(0);
     return { flying, up, bodyRate, flown };
@@ -53,12 +55,34 @@ function cliContext(cli) {
     return out;
 }
 
-// the context every module gets
-function buildCtx(w, fl, { flying, profile, cli, cliParsed, app }) {
-    return Object.assign({ flying, profile, govState: w.govStateAt || null, rate: fl.actualRate, header: fl.header, cli, app, flightRule: RULE.flight }, cliContext(cliParsed));
+// The same values from the parameter snapshot of a log header (param_log.cjs snapshotOf: a complete FULL snapshot of a
+// blackbox_params log), keyed by log profile (snapshot profile q + 1), or {} without one. These are the values at the start of
+// the log: they rank above a CLI dump (IMP-05), and the worker does not compare them with the dump (cliMaxThrottle).
+// battery_cell_count: a list of the 6 battery profiles in 4.7 (the element of bat_profile), one value in 4.6; 0 is "auto"
+const SNAPSHOT_WORDS = 'parameter values in the log header';
+const optional = (name) => { try { return require(name); } catch (e) { return null; } };
+function snapshotContext(header) {
+    const PL = optional('./param_log.cjs'), snap = PL && typeof PL.snapshotOf === 'function' ? PL.snapshotOf(header) : null, out = {};
+    if (!snap) return out;
+    const gh = {}, mt = {};
+    for (const [q, set] of Object.entries(snap.profiles || {})) { const p = +q + 1;
+        if (typeof set.gov_headspeed === 'number' && set.gov_headspeed > 0) gh[p] = set.gov_headspeed;
+        if (typeof set.gov_max_throttle === 'number' && set.gov_max_throttle > 0) mt[p] = set.gov_max_throttle; }
+    out.paramSnapshot = true;
+    if (Object.keys(gh).length) { out.govHeadspeed = gh; out.govHeadspeedSource = `gov_headspeed (${SNAPSHOT_WORDS})`; }
+    if (Object.keys(mt).length) { out.maxThrottle = mt; out.maxThrottleSource = `gov_max_throttle (${SNAPSHOT_WORDS})`; }
+    const g = snap.global || {}, k = Number.isInteger(g.bat_profile) ? g.bat_profile : 0, c = Array.isArray(g.battery_cell_count) ? g.battery_cell_count[k] : g.battery_cell_count;
+    if (typeof c === 'number' && c > 0) { out.cells = c; out.cellsSource = `battery_cell_count (${SNAPSHOT_WORDS})`; }
+    return out;
 }
 
-module.exports = { RULE, flightMask, profileSeconds, cliContext, buildCtx };
+// the context every module gets: the values of the parameter snapshot of the log when it has one, else those of the CLI dump
+function buildCtx(w, fl, { flying, profile, cli, cliParsed, app }) {
+    const snap = snapshotContext(fl.header);
+    return Object.assign({ flying, profile, govState: w.govStateAt || null, rate: fl.actualRate, header: fl.header, cli, app, flightRule: RULE.flight }, snap.paramSnapshot ? snap : cliContext(cliParsed));
+}
+
+module.exports = { RULE, SNAPSHOT_WORDS, flightMask, profileSeconds, cliContext, snapshotContext, buildCtx };
 if (require.main !== module) return;
 
 const args = process.argv.slice(2), ci = args.indexOf('--cli');

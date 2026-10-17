@@ -10,12 +10,14 @@ const C = require('../tools/autotune/catalog.cjs');
 const H = require('../tools/autotune/hierarchy.cjs');
 
 const NEW = ['D7', 'G15', 'G16', 'G17', 'G18', 'C15'];   // health_phase.cjs (SPEC2 D13, section 6)
+const CUT = ['D11'];                                        // health_phase.cjs: a motor cut in flight and the ground contact (IMP-03)
 const RESCUE = ['G19', 'T15', 'D8', 'G20'];                     // health_rescue.cjs
 const LIMITS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7']; // health_limits.cjs (CLAUDE.md "Control limits")
 const ROUND2 = ['D9', 'P1', 'P2'];                          // health_config.cjs and health_power.cjs (SPEC3 A, I)
 const RPM = ['G21'];                                        // health_gov.cjs: the RPM signal at the throttle maximum (analysis/rpm-spikes)
+const RXLOSS = ['D10', 'D12'];                              // health_more.cjs D10 (no receiver signal) and health_config.cjs D12 (the failsafe throttle): IMP-01, IMP-11
 const IDS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'H', 'SETUP', 'R1', 'C7'].concat(Array.from({ length: 11 }, (_, i) => `F${i + 1}`), Array.from({ length: 15 }, (_, i) => `G${i}`),
-    Array.from({ length: 14 }, (_, i) => `C${i + 1}`).filter(id => id !== 'C7'), Array.from({ length: 14 }, (_, i) => `T${i + 1}`), NEW, RESCUE, LIMITS, ROUND2, RPM);
+    Array.from({ length: 14 }, (_, i) => `C${i + 1}`).filter(id => id !== 'C7'), Array.from({ length: 14 }, (_, i) => `T${i + 1}`), NEW, RESCUE, LIMITS, ROUND2, RPM, RXLOSS, CUT);
 const SOURCES = ['events', 'blocks', 'windows', 'runs', 'header', 'flight'];
 const KINDS = ['time', 'spectrum', 'transmission', 'phase', 'governor', 'events', 'scatter', 'table'];
 
@@ -240,11 +242,14 @@ test('new checks (health_phase.cjs, SPEC2 section 6): the unit of the finding ch
     assert.equal(C.status(cases[0][0]), 'information', 'D7 gives information');
     assert.equal(C.status(byId('C15')), 'problem'); assert.equal(C.status(byId('C15', 1)), 'monitor'); assert.equal(C.status(byId('G18', 1)), 'insufficient');
     // the phases each check uses (SPEC2 D13 correction): attitude and filter checks the flight only, governor and power all phases
-    const ALL = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];
+    // IMP-03: the fall and the time after the ground contact of an in-flight cut; the governor and power checks leave them out (LOAD)
+    const ALL = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'], LOAD = ALL.slice(0, 5);
     for (const id of IDS) { const p = C.CHECKS[id].phases; assert.ok(p === null || (Array.isArray(p) && p.length && p.every(x => ALL.includes(x))), `${id}: phases ${p}`);
         assert.equal(p === null, C.CHECKS[id].evidence.source === 'header', `${id}: header checks have no phase`); }
     for (const id of ['C12', 'T11', 'C5', 'T1', 'C11', 'F5', 'F10', 'F11', 'R1', 'C7']) assert.deepEqual(C.CHECKS[id].phases, ['flight'], id);
-    for (const id of ['G1', 'G6', 'G13', 'D5', 'G14', 'D7']) assert.deepEqual(C.CHECKS[id].phases, ALL, id);
+    for (const id of ['G1', 'G6', 'G13', 'D5', 'P1']) assert.deepEqual(C.CHECKS[id].phases, LOAD, id);
+    for (const id of ['G14', 'D7', 'D10', 'L1', 'L7']) assert.deepEqual(C.CHECKS[id].phases, ALL, id);
+    assert.deepEqual(C.CHECKS.D11.phases, ['flight', 'fall', 'aftercontact']);
     assert.deepEqual(['G15', 'G16', 'G17', 'G18', 'C15'].map(id => C.CHECKS[id].phases), [['spoolup'], ['spoolup', 'ground', 'flight'], ['idle', 'spoolup', 'ground'], ['idle'], ['ground']], 'G16: a change after the liftoff is in flight');
 });
 
@@ -509,4 +514,30 @@ test('G21 issue (review 2026-10-15): the strongest result is the headline; a con
     assert.match(sa, /In PID profile 1, the headspeed signal has no sudden change at the throttle maximum, and 1 sudden change at less than the maximum\. The throttle is at its maximum for 6\.95 % of the time\./);
     assert.doesNotMatch(sa, /`p` is `1`/);
     for (const s of sentences(sa)) assert.ok(words(s).length <= 25, s);
+});
+
+// review 2026-10-16: the D6 cause of a failsafe flag from the firmware (stage 2 off on 4.3 to 4.7: the switch only), the D10 delay of the
+// rxfail values from its fields, and the D12 summary of the governor that stays in ACTIVE
+test('D6, D10 and D12 texts from the fields: the failsafe cause, the delay of the rxfail values, a governor that stays in ACTIVE', () => {
+    const d6 = (o) => C.summary(Object.assign({ id: 'D6', module: 'more', severity: 'flag', value: 1.5, unit: 's', log: 0, profile: null, text: 'x' }, o));
+    assert.match(d6({ stage2Off: true, failsafePhaseOff: true }), /Failsafe in flight shows that the failsafe switch is on\. Check D10/);
+    assert.match(d6({ stage2Off: false, failsafePhaseOff: false }), /Failsafe in flight shows that the failsafe switch is on, or that the receiver did not get the signal\./);
+    const d10 = C.summary({ id: 'D10', module: 'more', severity: 'flag', value: 2.1, n: 1, unit: 's', log: 0, profile: 2, stage1Delay: [0.3, 0.4], text: 'x' });
+    assert.match(d10, /Then the firmware holds the last stick positions, and 0\.3 s to 0\.4 s after the last RC frame, it sets the `rxfail` values\./);
+    const d12 = C.summary({ id: 'D12', module: 'config', severity: 'note', value: 1700, rxfail: ['s', 1700], mode: 's', band: 'MAX', state: 'ACTIVE', stateLog: 'ACTIVE', cut: false, unbounded: true, cutDelayS: [0.3, 0.4], unit: 'µs', log: 0, text: 'x' });
+    assert.match(d12, /With `rxfail 4 s 1700`, the throttle is 1700 µs in the MAX band\. The governor stays in ACTIVE, and the motor does not stop\./);
+    assert.doesNotMatch(d12, /changes to ACTIVE/);
+});
+
+// review IMP-12: a result with a cause is an issue of its own (its area and item are the radio card and the Rescue item), and the D11 phases of
+// health_phase.cjs are the phases of the catalog
+test('IMP-12 review: issues keep a caused result apart from the same check and axis with no cause; D11 phases agree', () => {
+    const lim = (o) => Object.assign({ id: 'L4', module: 'limits', axis: 'yaw', channel: 'tail', severity: 'note', value: 0.3, n: 1, longestS: 0.3, profile: 1, log: 0, unit: 's',
+        events: [{ tS: 30, t1S: 30.3, seconds: 0.3, phase: 'flight' }] }, o);
+    const a = lim({ fid: 'a', severity: 'flag' }), b = lim({ fid: 'b', profile: 2, cause: 'receiver loss / fall', causes: ['receiver loss', 'fall'], causeChecks: ['D10', 'D11'], events: [{ tS: 69.1, t1S: 69.5, seconds: 0.4, phase: 'fall' }] });
+    const I = C.issues([a, b]), own = I.issues.find(x => x.key === 'L4|yaw'), caused = I.issues.find(x => x.key === 'L4|yaw|cause');
+    assert.ok(own && caused, JSON.stringify(I.issues.map(x => x.key)));
+    assert.deepEqual([own.area, own.fids, own.status, caused.area, caused.node, caused.fids], ['limits', ['a'], 'problem', 'radio', 'rescue', ['b']]);
+    assert.ok(I.areas.radio.issues.includes('L4|yaw|cause') && !I.areas.limits.issues.includes('L4|yaw|cause'));
+    assert.deepEqual(require('../tools/autotune/health_phase.cjs').PHASES_OF.D11, C.CHECKS.D11.phases);
 });

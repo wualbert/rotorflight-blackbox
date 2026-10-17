@@ -110,7 +110,7 @@ const version = (h) => String((h && h.firmwareVersion) || '').split('.').map(Num
 const statesOf = (h) => { const v = version(h); return v[0] === 4 && v[1] < 6 ? STATES_OLD : STATES46; };
 const modeBits = (h) => { const v = version(h); return v.length >= 2 && v[0] === 4 && v[1] < 3 ? RULE.modeBits.rf42 : RULE.modeBits.rf46; }; // health_more modeBits
 const ACTIVE = 4, LEAVE = new Set([3, 6, 8]), RAMP = new Set([2, 3, 8]); // the changes from ACTIVE that the pilot does not command; the states that ramp from the current headspeed
-const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];  // health_phase PHASES
+const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'];  // health_phase PHASES
 
 // The clocks of a segment: F(i) frame seconds (the time field), t(i) index seconds, at(s) the first sample at frame s or later
 function clocks(w, rate) {

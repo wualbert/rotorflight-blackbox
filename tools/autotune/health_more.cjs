@@ -3,11 +3,15 @@
 /**
  * Normal-flight mask, and the health checks the other modules do not make (docs/TUNING_KNOWLEDGE.md section 10; new ids):
  *
- *   normalMask   in flight and not in rescue, a level mode, failsafe or ground contact, each span widened by RULE.spanGuardS.
+ *   normalMask   in flight and not in a receiver signal loss, rescue, a level mode, failsafe or ground contact, each span widened by
+ *                RULE.spanGuardS (a receiver signal loss by its own guard, RULE.rxLoss guardS and settleS).
  *                Ground contact: out of the flight phase (liftoff to touchdown) of health_phase.cjs, the one source of the
  *                flights (SPEC2 D13); without that module, RULE.ground. The in-app engine ANDs the mask into ctx.flying for
  *                every module (then passes ctx.normal).
  *   D6   excluded spans: in-flight seconds per reason; failsafe while airborne
+ *   D10  receiver signal loss (IMP-01): each run of rxSignalReceived or rxFlightChannelsValid at 0 while armed (lib.cjs RX_LOSS), with
+ *        the inferred last RC frame, the time of the rxfail values, the rssi 0 run and the rssi before it, the governor state, the
+ *        headspeed, and the flight phase and PID profile of each part. A problem when the rotor turns at the flight rpm or more
  *   F10  noise into the loop and servos: axisD power above 30 Hz (C11's measure; C11 does not judge yaw), mixer rms above 30 Hz;
  *        findings: yaw D share, and the mixer noise of roll and pitch (their D share is C11's finding)
  *   F11  gyro filter delay, measured: phase of gyroRAW -> gyroADC at 8-16 Hz, and the passband gain
@@ -40,6 +44,11 @@
  *     the sign of the median tail control in flight, the anti-torque side (health_loop.cjs rotation). T14 fits that term
  *     on the rotor speed in space (yaw gyro in place of the setpoint, rampEvents).
  *   - SPOOLUP ramps the throttle at 10 / gov_spoolup_time per second (governor.c:1603-1609), so the time is 1000 / (%/s).
+ *   - failsafePhase is always 0 on 4.3 to 4.7: failsafeStartMonitoring() has its only statement commented out (failsafe.c:118-122,
+ *     "RTFL: Keep disabled until code refactored", commit d864d6496; release/4.3.0, 4.5.0, 4.6.0, the bbp builds 58a4bd5cc and
+ *     874f369d5, and 4.7.0 85d7049a9). A receiver signal loss shows only in rxSignalReceived, rxFlightChannelsValid and rssi (D10).
+ *   - rssi of a CRSF receiver with crsf_use_rx_snr OFF: scaleRange(uplink dBm, -130, 0, 0, 1023) (crsf.c:240), so dBm = -130 +
+ *     rssi x 130 / 1023; serialrx_provider 9 is SERIALRX_CRSF (rx.h).
  */
 
 const lib = require('./lib.cjs');
@@ -65,9 +74,21 @@ const RULE = {
     vibMinWindows: 3,                                   // curves vib.byProfile: fewest 1 s windows for a profile's spectrum
     maxEvents: 200,
     worst: 3,                                           // F10, T13, C14: windows, runs or blocks kept per profile as evidence
+    // G14 (IMP-12): a HOLD from ACTIVE is in flight when the phase beforeS before it is the flight or the fall (health_phase), else the
+    // airborne flag there (the firmware clears AIRBORNE 1 ms after HOLD, airborne.c); a landing when the touchdown of that flight comes
+    // landingS or less after it; the headspeed afterS after it
+    hold: { beforeS: 0.1, afterS: 1, landingS: 0.5 },
+    // D10 and the normal mask: the receiver signal loss (lib.cjs RX_LOSS, with the firmware lines in its source); maxParts: the parts
+    // (flight phase, PID profile) kept for each loss; stage2Off: the firmware versions whose failsafePhase is always 0 (failsafe.c
+    // failsafeStartMonitoring); crsf: the serialrx_provider value of CRSF (rx.h SERIALRX_CRSF) and the rssi scale (crsf.c:240)
+    // rotorAfterS: the rotor rule of D10 is the median headspeed from the inferred last RC frame to the RX return, or to this time after
+    // the rxfail values when the signal comes back later (one false RPM reading, check G21, does not change a median)
+    rxLoss: Object.assign({}, lib.RX_LOSS, { maxParts: 12, maxSpans: 20, stage2Off: ['4.3', '4.4', '4.5', '4.6', '4.7'], crsf: { provider: 9, minDbm: -130, maxRssi: 1023 }, rotorAfterS: 0.1,
+        source: Object.assign({}, lib.RX_LOSS.source, { rotorAfterS: 'pipeline, unvalidated: the rotor turns at the flight rpm when the median headspeed from the last RC frame to the RX return (at most 0.1 s after the rxfail values) is at the flight rpm or more' }) }),
 };
 
-const EXTRA = ['flightModeFlags', 'failsafePhase', 'mixer[3]', 'axisO[0]', 'axisO[1]', 'gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'govTarget', 'govSum', 'govI', 'motor[0]'];
+const EXTRA = ['flightModeFlags', 'failsafePhase', 'mixer[3]', 'axisO[0]', 'axisO[1]', 'gyroRAW[0]', 'gyroRAW[1]', 'gyroRAW[2]', 'govTarget', 'govSum', 'govI', 'motor[0]',
+    'rxSignalReceived', 'rxFlightChannelsValid', 'rssi', 'time'];
 
 // the sources are shown to the pilot (quoted, review V3): no file name. C14 pitch FF: pid.c:937-942; T14 inertia: pid.c:893-904;
 // G14 states: governor.c:1090-1240
@@ -75,18 +96,21 @@ const P = 'pipeline, unvalidated';
 const DEFAULT_RULES = {
     sig: 2,                    // a flag with an SE must pass its threshold by this many SE
     D6: { source: `${P}; report only, except failsafe while airborne` },
+    D10: { source: 'firmware 4.6.0 and 4.7.0: rxSignalReceived and rxFlightChannelsValid go to 0 when no RC frame comes for 100 ms; a loss while the rotor turns at the flight rpm or more is a problem',
+        note: 'flag: a loss with the headspeed at the flight rpm (health.cjs RULE.flight, the worker flight rpm) or more from the inferred last RC frame to the RX return; note: a loss on the ground' },
     F10: { share: 0.5, minWindows: 10, minBlocks: 3, source: `${P}; the rule of check C11, for the yaw axis` },   // health_loop C11
     F11: { flagMs: 10, minWindows: 10, minBlocks: 3, source: P },
     T13: { share: 0.15, minBlocks: 3, nearLimit: 0.8, source: `${P}; doc MIXS: a constant hover I means tail centre or zero-pitch trim, not gain`, note: 'nearLimit: hover mixer[2] at this share of the authority is called near the tail limit, not normal' },
     C14: { flag: 20, minGainChange: 10, minBlocks: 8, source: `${P}; gain change from the formula of the firmware`, note: 'flag in pitch I + O per 1000 collective (20 = 10 gain units); minBlocks of RULE.pitch.slowBlockS (30 s): a jackknife over fewer long blocks is not trusted' },
     T14: { minEvents: 3, consistent: 0.8, minGainChange: 15, relGainChange: 0.15, source: `${P}; gain from the formula of the firmware`,
         note: 'judged on the regression gain change, not on the peak yaw: the precomp lags the torque (PT2 20 Hz, difFilter 2.5 Hz), so in simulated loops (a rate plant and the Gaui integrator plant, test/health_more.test.cjs) the peak stayed at 8-32 deg/s for every gain from 0 to 250 and changed sign at 50-90 % of the matching gain. minGainChange, relGainChange: there the regression read -1 to +14 % off at gain 0 and 5-13 units high at the matching gain, so a change must pass max(15, 0.15 x header gain) by 2 SE; on a wagging tail without inertia torque (1-8 Hz, peak about 26 deg/s) it flagged 0 of 300 logs, the peak rule 11 %. consistent: share of the per-event fits of the pooled sign' },
-    G14: { hover: 300, autoS: 0.5, source: `${P}; the governor states of the firmware`, note: 'landing autorotations (in the landing ground-contact span) do not count' },
+    G14: { hover: 300, autoS: 0.5, source: `${P}; the governor states of the firmware`,
+        note: 'landing autorotations (in the landing ground-contact span) do not count; a HOLD from ACTIVE in flight (RULE.hold, IMP-12) is a problem, not at a landing' },
 };
-const UNITS = { D6: 's', F10: 'fraction', F11: 'ms', T13: 'fraction', C14: 'per 1000 collective', T14: 'gain units', G14: 'entries' }, IDS = Object.keys(UNITS);
+const UNITS = { D6: 's', D10: 's', F10: 'fraction', F11: 'ms', T13: 'fraction', C14: 'per 1000 collective', T14: 'gain units', G14: 'entries' }, IDS = Object.keys(UNITS);
 const AXIS = { T13: 'yaw', C14: 'pitch', T14: 'yaw' }; // the one axis of these checks, as a field (code never reads it from the text)
 // the flight phase of each check (SPEC2 D13 correction): the flight only, but G14 (the governor states of all phases: null)
-const PHASE_OF = { D6: 'flight', F10: 'flight', F11: 'flight', T13: 'flight', C14: 'flight', T14: 'flight', G14: null };
+const PHASE_OF = { D6: 'flight', D10: 'all', F10: 'flight', F11: 'flight', T13: 'flight', C14: 'flight', T14: 'flight', G14: null }; // D10: every phase while armed
 const STATES = setup.GOV_STATES;
 
 // ---------------------------------------------------------------------------------------------
@@ -217,10 +241,10 @@ function cliOf(ctx) {
     return cliOf.last.cli;
 }
 
-// gear ratios for the tail notch orders: ctx.gear, else the CLI (as health_setup.cjs gearOf, which it does not export)
-function gearOf(ctx) {
+// gear ratios for the tail notch orders: ctx.gear, else the parameter snapshot of the log header H, else the CLI (as health_setup.cjs gearOf)
+function gearOf(ctx, H) {
     if (ctx.gear) return ctx.gear;
-    const cli = cliOf(ctx); if (!cli) return null;
+    const snap = H && typeof setup.snapshotOfHeader === 'function' ? setup.snapshotOfHeader(H) : null, cli = snap || cliOf(ctx); if (!cli) return null;
     const g = cli.global, dflt = cli.kind === 'diff' ? [1, 1] : null;
     const mode = g.tail_rotor_mode === undefined || g.tail_rotor_mode === null ? 'VARIABLE' : String(g.tail_rotor_mode).trim().toUpperCase();
     return { main: arr(g.main_rotor_gear_ratio) || dflt, tail: arr(g.tail_rotor_gear_ratio) || dflt, motorisedTail: mode !== 'VARIABLE' && mode !== '0' };
@@ -236,10 +260,26 @@ function modeBits(h) {
     return v.length >= 2 && v[0] === 4 && v[1] < 3 ? RULE.modeBits.rf42 : RULE.modeBits.rf46;
 }
 
-// raw abnormal spans (Uint8Array each), not widened, and what could not be applied
+// the receiver signal losses of w (lib.cjs RX_LOSS): lib.segments gives them (w.rxLoss, w.rxLossAt: armed from the field armed or the
+// DISARM events); a segment of another source has them from its columns (w.extra rxSignalReceived, rxFlightChannelsValid, time,
+// flightModeFlags and armed; without armed the ARM switch, bit 0 of flightModeFlags, else every sample armed). -> { spans (null: the
+// log has neither flag; only the spans with a frame of the loss in w), cut (Uint8Array or null), fields }
+function rxLossOf(w, rate) {
+    const X = w.extra || {}, n = w.n, rs = X.rxSignalReceived, rv = X.rxFlightChannelsValid, fields = { rxSignalReceived: !!rs, rxFlightChannelsValid: !!rv, rssi: !!X.rssi, flightModeFlags: !!X.flightModeFlags };
+    // a span of another segment (only its cut here) is not a loss of this one
+    if (w.rxLoss !== undefined) return { spans: w.rxLoss === null ? null : w.rxLoss.filter(s => s && s.i1 > 0 && s.i0 < n), cut: w.rxLossAt || null, fields: w.rxLoss === null ? Object.assign(fields, { rxSignalReceived: false, rxFlightChannelsValid: false }) : fields };
+    if (!rs && !rv) return { spans: null, cut: null, fields };
+    const T = X.time && X.time.length === n ? X.time : null, arm = X.armed && X.armed.length === n ? X.armed : null, fm = X.flightModeFlags && X.flightModeFlags.length === n ? X.flightModeFlags : null;
+    return Object.assign(lib.rxLossSpans(n, T ? (i) => T[i] : (i) => (w.fromS + i / rate) * 1e6, (i) => (!!rs && rs[i] === 0) || (!!rv && rv[i] === 0), (i) => !!rs && rs[i] === 0, (i) => arm ? arm[i] !== 0 : !fm || (fm[i] & 1) === 1,
+        RULE.rxLoss, fm ? (i) => (fm[i] >> RULE.rxLoss.failsafeBit) & 1 : null), { fields });
+}
+
+// raw abnormal spans (Uint8Array each), not widened, and what could not be applied. rxLoss: the cut of each receiver signal loss
+// (its guard and settle time included: normalMask does not widen it), rxSpans and rxFields as rxLossOf gives them
 function spans(w, ctx) {
     const n = w.n, rate = ctx.rate || w.rate, X = w.extra || {}, H = ctx.header || (w.flight && w.flight.header) || {}, S = (s) => Math.max(1, Math.round(s * rate));
-    const out = { rescue: new Uint8Array(n), levelMode: new Uint8Array(n), failsafe: new Uint8Array(n), ground: new Uint8Array(n), notes: [], rescueActivations: 0 };
+    const out = { rescue: new Uint8Array(n), levelMode: new Uint8Array(n), failsafe: new Uint8Array(n), ground: new Uint8Array(n), rxLoss: new Uint8Array(n), notes: [], rescueActivations: 0 };
+    { const L = rxLossOf(w, rate); if (L.cut) out.rxLoss.set(L.cut.subarray(0, n)); out.rxSpans = L.spans; out.rxFields = L.fields; }
     const fm = X.flightModeFlags, fp = X.failsafePhase, B = modeBits(H), bits = (list) => list.reduce((m, b) => m | (1 << b), 0);
     if (fm) {
         const mr = bits(B.rescue), ml = bits(B.level), mf = bits(B.failsafe);
@@ -267,7 +307,9 @@ function spans(w, ctx) {
     const air = w.airborneAt, coll = X['mixer[3]'] || w.coll, G = RULE.ground, hsMin = (ctx.flightRule || { headspeed: lib.FLIGHT_RPM }).headspeed, ph = phaseOf(w, ctx);
     out.hasAirborne = !!air && air.some(v => !v);
     out.groundSource = ph ? 'phases' : 'airborne';
-    if (ph) { for (let i = 0; i < n; i++) if (ph.code[i] !== FLIGHT_PHASE) out.ground[i] = 1; }
+    // the fall after an in-flight cut (IMP-03) is not ground contact: it is out of the flight phase, and it is not widened into the
+    // flight before it (the end of that flight is the last RC frame or the motor cut, not a touchdown)
+    if (ph) { const fall = phaseNames().indexOf('fall'); for (let i = 0; i < n; i++) if (ph.code[i] !== FLIGHT_PHASE && ph.code[i] !== fall) out.ground[i] = 1; }
     else if (!out.hasAirborne) out.notes.push('The log does not record AIRBORNE_STATE. Thus, the analysis cannot remove ground contact.');
     else {
         const A = Uint8Array.from(air);
@@ -279,32 +321,37 @@ function spans(w, ctx) {
             if (e < n) out.ground.fill(1, Math.max(s, e - S(G.beforeEndS)), e);
         }
     }
+    Object.defineProperty(out, 'phases', { value: ph, enumerable: false }); // G14: the phase before a HOLD (IMP-12)
     return out;
 }
 
-const REASONS = ['failsafe', 'rescue', 'levelMode', 'ground']; // attribution order of an excluded sample
+const REASONS = ['rxLoss', 'failsafe', 'rescue', 'levelMode', 'ground']; // attribution order of an excluded sample
+const OWN_GUARD = new Set(['rxLoss']); // spans with their own guard (RULE.rxLoss guardS, settleS): not widened by RULE.spanGuardS
 const FLIGHT_PHASE = 3; // health_phase PHASES.indexOf('flight')
 // the phases of w: ctx.phases (the engine runs health_phase.cjs first), else health_phase.cjs here, loaded on first use;
 // null without that module or with ctx.phases false (then the ground-contact rule of RULE.ground)
 let PHASE;
+const phaseModule = () => { if (PHASE === undefined) { try { PHASE = require('./health_phase.cjs'); } catch (e) { PHASE = null; } } return PHASE; };
 function phaseOf(w, ctx) {
     if (ctx.phases === false) return null;
     if (ctx.phases && ctx.phases.code) return ctx.phases;
-    if (PHASE === undefined) { try { PHASE = require('./health_phase.cjs'); } catch (e) { PHASE = null; } }
-    return PHASE ? PHASE.phases(w, ctx) : null;
+    return phaseModule() ? PHASE.phases(w, ctx) : null;
 }
+// the names of the phase codes (health_phase PHASES)
+const phaseNames = () => phaseModule() && Array.isArray(PHASE.PHASES) ? PHASE.PHASES : ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'];
 
 /**
- * mask = ctx.flying and none of rescue (RESCUE_STATE events and the switch, the switch plus RULE.rescueExitS without
- * events), level mode, failsafe, ground contact, each widened by RULE.spanGuardS. excluded: in-flight seconds removed per
- * reason (a sample counts once, in REASONS order; guardS = removed only by the widening).
+ * mask = ctx.flying and none of a receiver signal loss (lib.cjs RX_LOSS: from the inferred last RC frame less guardS to the RX
+ * return plus settleS), rescue (RESCUE_STATE events and the switch, the switch plus RULE.rescueExitS without events), level
+ * mode, failsafe, ground contact, each but the receiver signal loss widened by RULE.spanGuardS. excluded: in-flight seconds
+ * removed per reason (a sample counts once, in REASONS order; guardS = removed only by the widening).
  */
 function normalMask(w, ctx, sp = spans(w, ctx)) {
     const n = w.n, rate = ctx.rate || w.rate, g = Math.round(RULE.spanGuardS * rate), bad = new Uint8Array(n), mask = new Uint8Array(n), count = { guard: 0 };
-    for (const k of REASONS) { count[k] = 0; for (const [s, e] of runs(n, i => sp[k][i])) bad.fill(1, Math.max(0, s - g), Math.min(n, e + g)); }
+    for (const k of REASONS) { count[k] = 0; const p = OWN_GUARD.has(k) ? 0 : g; for (const [s, e] of runs(n, i => sp[k][i])) bad.fill(1, Math.max(0, s - p), Math.min(n, e + p)); }
     for (let i = 0; i < n; i++) { if (!ctx.flying[i]) continue; if (!bad[i]) { mask[i] = 1; continue; }
         const why = REASONS.find(k => sp[k][i]); count[why || 'guard']++; }
-    const excluded = { rescueS: r(count.rescue / rate, 2), levelModeS: r(count.levelMode / rate, 2), failsafeS: r(count.failsafe / rate, 2), groundS: r(count.ground / rate, 2), guardS: r(count.guard / rate, 2) };
+    const excluded = { rxLossS: r(count.rxLoss / rate, 2), rescueS: r(count.rescue / rate, 2), levelModeS: r(count.levelMode / rate, 2), failsafeS: r(count.failsafe / rate, 2), groundS: r(count.ground / rate, 2), guardS: r(count.guard / rate, 2) };
     return { mask, excluded, notes: sp.notes, rescueSource: sp.rescueSource, groundSource: sp.groundSource };
 }
 
@@ -317,19 +364,29 @@ function analyse(w, ctx) {
     const prof = ctx.profile, gov = ctx.govState, t = (i) => r(w.fromS + i / rate, 3), S = (s) => Math.max(1, Math.round(s * rate));
     const out = { module: 'health_more', rule: RULE, rate: r(rate, 2), fromS: r(w.fromS, 3), seconds: r(n / rate, 1), notes: [] };
     const base = rawFlying(w, ctx), sp = spans(w, ctx); let baseN = 0; for (let i = 0; i < n; i++) baseN += base[i];
+    // --- D10: receiver signal losses, in all phases (also with no sample in flight)
+    out.D10 = rxLossCheck(w, ctx, sp, rate, t);
     if (!baseN) { out.skipped = 'The log has no samples in flight.'; return out; }
     const coll = X['mixer[3]'] || w.coll, blockN = S(RULE.blockS);
 
-    // --- D6: excluded spans
+    // --- D6: excluded spans. The health.cjs mask (base) leaves out the cut of a receiver signal loss (lib.cjs rxLossAt): its samples
+    // in the flight phase (ctx.flightMask, else the phases of the ground contact), else airborne at the flight rpm, are flight that the
+    // analysis does not use (rxLossS)
     {
-        const nm = normalMask(w, Object.assign({}, ctx, { flying: base }), sp), air = sp.hasAirborne ? w.airborneAt : base, ev = [];
+        const hsFl = (ctx.flightRule || { headspeed: lib.FLIGHT_RPM }).headspeed, fp = ctx.flightMask && ctx.flightMask.length === n ? ctx.flightMask : null;
+        const inFlight = (i) => fp ? !!fp[i] : sp.phases && sp.phases.code ? sp.phases.code[i] === FLIGHT_PHASE : sp.groundSource === 'phases' ? !sp.ground[i] : !!w.airborneAt && !!w.airborneAt[i] && w.hs[i] >= hsFl; // the fall (IMP-03) is not flight
+        let d6 = base; if (sp.rxLoss.indexOf(1) >= 0) { d6 = Uint8Array.from(base); for (let i = 0; i < n; i++) if (sp.rxLoss[i] && !d6[i] && inFlight(i)) d6[i] = 1; }
+        let d6N = 0; for (let i = 0; i < n; i++) d6N += d6[i];
+        const nm = normalMask(w, Object.assign({}, ctx, { flying: d6 }), sp), air = sp.hasAirborne ? w.airborneAt : base, ev = [];
         let fsAir = 0; for (let i = 0; i < n; i++) if (sp.failsafe[i] && air[i]) fsAir++;
-        for (const k of REASONS) for (const [s, e] of runs(n, i => sp[k][i])) { let fl = 0; for (let i = s; i < e; i++) fl += base[i];
+        for (const k of REASONS) for (const [s, e] of runs(n, i => sp[k][i])) { let fl = 0; for (let i = s; i < e; i++) fl += d6[i];
             if (fl) ev.push({ t: t(s), seconds: r((e - s) / rate, 3), value: r(fl / rate, 3), reason: k }); }
         let normN = 0; for (let i = 0; i < n; i++) normN += nm.mask[i];
-        out.D6 = { flyingS: r(baseN / rate, 1), normalS: r(normN / rate, 1), excluded: nm.excluded, rescueActivations: sp.rescueActivations, failsafeAirborneS: r(fsAir / rate, 3),
-            applied: !!ctx.normal, notes: nm.notes, rescueSource: sp.rescueSource, groundSource: sp.groundSource, events: cap(ev),
-            definition: 'in-flight seconds removed per reason (a sample counts once: failsafe, rescue, level mode, ground contact); guard = removed only by the RULE.spanGuardS widening. Rescue = the RESCUE switch, or RESCUE_STATE != 0 when logged (the exit blend of any rescue_exit_time), else the switch plus RULE.rescueExitS. Ground contact (groundSource phases) = out of the flight phase of health_phase.cjs, else (airborne) RULE.ground around the AIRBORNE_STATE runs' };
+        // failsafePhase is always 0 on 4.3 to 4.7 (RULE.rxLoss.stage2Off): the note says so, and names check D10
+        const fsNote = X.failsafePhase && stage2Off(H) ? [`On Rotorflight ${H.firmwareVersion}, \`failsafePhase\` is always 0, because the firmware does not operate failsafe "stage 2". Check D10 finds the periods with no receiver signal from \`rxSignalReceived\` and \`rxFlightChannelsValid\`.`] : [];
+        out.D6 = { flyingS: r(d6N / rate, 1), normalS: r(normN / rate, 1), excluded: nm.excluded, rescueActivations: sp.rescueActivations, failsafeAirborneS: r(fsAir / rate, 3),
+            applied: !!ctx.normal, notes: nm.notes.concat(fsNote), rescueSource: sp.rescueSource, groundSource: sp.groundSource, events: cap(ev), failsafePhaseOff: fsNote.length > 0, stage2Off: stage2Off(H),
+            definition: 'in-flight seconds removed per reason (a sample counts once: receiver signal loss, failsafe, rescue, level mode, ground contact); guard = removed only by the RULE.spanGuardS widening. Receiver signal loss = the cut of D10 (lib.cjs RX_LOSS: the inferred last RC frame less guardS to the RX return plus settleS), not widened. Rescue = the RESCUE switch, or RESCUE_STATE != 0 when logged (the exit blend of any rescue_exit_time), else the switch plus RULE.rescueExitS. Ground contact (groundSource phases) = out of the flight phase of health_phase.cjs, else (airborne) RULE.ground around the AIRBORNE_STATE runs' };
     }
 
     // --- G14: governor states
@@ -493,11 +550,83 @@ function analyse(w, ctx) {
 
 function appOf(ctx) { return ctx.app || appOf.cache || (appOf.cache = lib.loadApp()); } // FFT host; lib.loadApp needs Node (CLI and tests only)
 
+// the firmware of header H has failsafePhase always 0 (RULE.rxLoss.stage2Off, by major.minor of firmwareVersion)
+function stage2Off(H) {
+    const v = String((H && H.firmwareVersion) || '').split('.');
+    return v.length >= 2 && RULE.rxLoss.stage2Off.includes(`${+v[0]}.${+v[1]}`);
+}
+// rssi in dBm for header H (RULE.rxLoss.crsf): a CRSF receiver (serialrx_provider of the snapshot, the CLI dump or the header) with
+// crsf_use_rx_snr OFF (the snapshot, else the CLI dump, else its default OFF: basis 'default'). { crsf, snr, basis, dbm(v) or null }
+function rssiScale(H, ctx) {
+    const snap = H && typeof setup.snapshotOfHeader === 'function' ? setup.snapshotOfHeader(H) : null, cli = snap || cliOf(ctx), g = (cli && cli.global) || {}, C = RULE.rxLoss.crsf;
+    const prov = g.serialrx_provider !== undefined ? g.serialrx_provider : H ? H.serialrx_provider : undefined;
+    const crsf = prov === C.provider || prov === String(C.provider) || String(prov).trim().toUpperCase() === 'CRSF';
+    const raw = g.crsf_use_rx_snr, snr = raw === undefined || raw === null ? false : raw === 1 || String(raw).trim().toUpperCase() === 'ON';
+    return { crsf, snr, basis: !crsf ? null : raw === undefined || raw === null ? 'default' : snap ? 'snapshot' : 'cli',
+        dbm: crsf && !snr ? (v) => r(C.minDbm - C.minDbm * v / C.maxRssi, 1) : null };
+}
+
+// D10: each receiver signal loss of the segment (lib.cjs RX_LOSS), in frame seconds (the time column; index time without it): startS
+// (the flag goes to 0), cause ('signal', 'switch' or 'channel', see causeOf), lastFrameS (the inferred last RC value of the pilot:
+// startS less lastFrameLeadS for a signal loss, startS for the failsafe switch, startS less holdS for a channel out of its range),
+// stage1S (the rxfail values: holdS after the last frame, at the recheckS steps after startS for a signal loss; null when the signal
+// comes back first), returnS (both flags at 1 again; null when the segment ends first), seconds (returnS - startS), the rssi 0 run
+// (rssiZero) and the last rssi before it (raw and dBm), the governor state at the last frame and stateLagS after stage1S, the
+// headspeed, rotor (the median headspeed at the flight rpm or more from the last frame to the return, RULE.rxLoss.rotorAfterS: a
+// problem), and the flight phase and raw PID profile label of each part. t and t1: the same span (last frame to return) in index
+// time, for the evidence
+function rxLossCheck(w, ctx, sp, rate, t) {
+    const n = w.n, X = w.extra || {}, R = RULE.rxLoss, H = ctx.header || (w.flight && w.flight.header) || {};
+    if (!sp.rxSpans) return { skipped: 'The log does not record `rxSignalReceived` and `rxFlightChannelsValid`. Thus, this check did not operate.', fields: sp.rxFields };
+    const T = X.time && X.time.length === n ? X.time : null, F = (i) => T ? w.fromS + (T[Math.max(0, Math.min(n - 1, i))] - T[0]) / 1e6 + (i > n - 1 ? (i - n + 1) / rate : 0) : w.fromS + i / rate;
+    const at = (s) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (F(m) < s) lo = m + 1; else hi = m; } return lo; };
+    const hsMin = (ctx.flightRule || { headspeed: lib.FLIGHT_RPM }).headspeed, gov = ctx.govState || w.govStateAt || null, prof = ctx.profile || w.profileAt || null, rssi = X.rssi || null, mot = X['motor[0]'] || null;
+    const ph = phaseOf(w, ctx), names = phaseNames(), scale = rssiScale(H, ctx);
+    const state = (i) => gov && i >= 0 && i < n ? gov[i] : null, stateName = (i) => state(i) === null ? null : STATES[state(i)] || String(state(i));
+    const fm = X.flightModeFlags && X.flightModeFlags.length === n ? X.flightModeFlags : null;
+    // the cause (lib.cjs rxLossSpans): 'signal' (no RC frame), 'switch' (the failsafe switch: the RC values of the pilot stop at the
+    // flag, the rxfail values come holdS later) or 'channel' (a control channel out of rx_pulse_min..rx_pulse_max: the flag goes to 0
+    // only at the rxfail values, holdS after the last good value)
+    const causeOf = (s) => s.cause || (s.signal ? 'signal' : fm && (fm[Math.min(n - 1, Math.max(0, s.i0))] >> R.failsafeBit) & 1 ? 'switch' : 'channel');
+    const spans = sp.rxSpans.slice(0, R.maxSpans).map(s => {
+        const cause = causeOf(s), startS = F(s.i0), returnS = s.returned ? F(s.i1) : null, lastS = startS - (cause === 'signal' ? R.lastFrameLeadS : cause === 'channel' ? R.holdS : 0);
+        const k0 = Math.min(s.i0, at(lastS)), k1 = s.returned ? s.i1 : n;
+        const delay = cause === 'signal' ? Math.ceil((R.holdS - R.lastFrameLeadS) / R.recheckS - 1e-9) * R.recheckS : cause === 'switch' ? R.holdS : 0, s1 = startS + delay, reached = returnS === null ? F(n - 1) >= s1 : s1 < returnS;
+        const j1 = reached ? Math.min(n - 1, at(s1 + R.stateLagS)) : null;
+        // the rotor: the median headspeed from the last RC frame to the RX return, at most rotorAfterS after the rxfail values
+        const kr = Math.max(k0 + 1, Math.min(k1, at(s1 + R.rotorAfterS))), hsMed = median(Array.prototype.slice.call(w.hs, k0, kr));
+        let zero = null, before = null;
+        if (rssi) { let a = k0; while (a < k1 && rssi[a] !== 0) a++;
+            if (a < k1) { let b = a; while (b < n && rssi[b] === 0) b++; zero = { t0S: r(F(a), 4), t1S: b < n ? r(F(b), 4) : null, seconds: b < n ? r(F(b) - F(a), 4) : null, lastStatsS: r(F(a) - R.rssiTimeoutS, 4) }; }
+            for (let i = Math.min(k0, n - 1); i >= 0; i--) if (rssi[i] > 0) { before = rssi[i]; break; } }
+        let hsMax = 0; for (let i = k0; i < k1; i++) if (w.hs[i] > hsMax) hsMax = w.hs[i];
+        const parts = [];
+        for (let i = k0; i < k1;) { const c = ph ? ph.code[i] : null, p = prof ? prof[i] : null; let j = i + 1; while (j < k1 && (ph ? ph.code[j] : null) === c && (prof ? prof[j] : null) === p) j++;
+            if (parts.length < R.maxParts) parts.push({ t0S: r(F(i), 4), t1S: r(F(j), 4), phase: c === null ? null : names[c] || String(c), profile: p }); i = j; }
+        const secs = returnS === null ? F(n - 1) - startS : returnS - startS;
+        return { t: t(k0), t1: t(k1), tS: r(lastS, 4), t1S: r(returnS === null ? F(n - 1) : returnS, 4), seconds: r(secs, 4), value: r(secs, 4), cause, switchKnown: !!fm || !!s.signal, returned: s.returned,
+            startS: r(startS, 4), lastFrameS: r(lastS, 4), returnS: returnS === null ? null : r(returnS, 4), stage1S: reached ? r(s1, 4) : null, stage1DelayS: r(delay + startS - lastS, 3),
+            govBefore: state(k0), govBeforeName: stateName(k0), govAtStage1: j1 === null ? null : state(j1), govAtStage1Name: j1 === null ? null : stateName(j1),
+            headspeed: r(w.hs[k0], 0), headspeedAtReturn: s.returned ? r(w.hs[Math.min(n - 1, s.i1)], 0) : null, headspeedMax: r(hsMax, 0), headspeedMedian: r(hsMed, 0), throttle: mot ? r(mot[k0] / 1000, 3) : null,
+            airborne: w.airborneAt ? !!w.airborneAt[k0] : null, rotor: hsMed !== null && hsMed >= hsMin, inFlight: parts.some(q => q.phase === 'flight'),
+            rssiZero: zero, rssiBefore: before, rssiBeforeDbm: before !== null && scale.dbm ? scale.dbm(before) : null, profile: prof ? prof[k0] : null, parts };
+    });
+    return { spans, n: sp.rxSpans.length, flightRpm: hsMin, fields: sp.rxFields, rssiScale: { crsf: scale.crsf, snr: scale.snr, basis: scale.basis }, firmware: H.firmwareVersion || null, stage2Off: stage2Off(H),
+        cut: sp.rxSpans.slice(0, R.maxSpans).map(s => ({ t0S: r(F(s.cut0), 4), t1S: r(F(s.cut1), 4) })),
+        stage1Delay: [R.holdS, r(R.holdS + R.recheckS, 3)],
+        definition: 'receiver signal loss: rxSignalReceived or rxFlightChannelsValid at 0 while armed (lib.cjs RX_LOSS); times are frame seconds; cause signal (rxSignalReceived 0): lastFrameS = startS - lastFrameLeadS (rx.c DELAY_100_MS), stage1S = startS + ceil((holdS - lastFrameLeadS) / recheckS) x recheckS (rx.c MAX_INVALID_PULSE_TIME_MS and the 100 ms rechecks); cause switch (BOXFAILSAFE, flightModeFlags bit failsafeBit, at startS): lastFrameS = startS, stage1S = startS + holdS; cause channel (rxSignalReceived 1, no switch: a control channel out of rx_pulse_min..rx_pulse_max): lastFrameS = startS - holdS, stage1S = startS; stage1Delay: the rxfail values after the last RC frame [holdS, holdS + recheckS]; rssi 0 after rssiTimeoutS with no link-statistics frame (crsf.c); rotor: the median headspeed from the last frame to the return (at most rotorAfterS after stage1S) at the flight rpm or more, headspeedMax for information only; cut: the samples that the analysis does not use (lastFrameS - guardS to returnS + settleS)' };
+}
+
 // G14: seconds and entries per state, over the whole segment and while airborne; spool-ups; autorotation and bailout entries
 function governorCensus(w, ctx, sp, base, coll, rate, t) {
     const n = w.n, g = ctx.govState, X = w.extra || {}, mot = X['motor[0]'], S = (s) => Math.max(1, Math.round(s * rate));
     if (!g) return { skipped: 'The log does not record GOVSTATE.' };
-    const air = sp.hasAirborne ? w.airborneAt : base, states = {}, spoolups = [], entries = [];
+    // in flight (IMP-12): the flight or the fall phase of health_phase, never the time after a ground contact (the firmware sets AIRBORNE
+    // again on the ground with the collective high: crash log 2026-10-15, RECOVERY after the contact). The airborne flag without the phases
+    const ph = sp.phases || null, names = phaseNames(), FALL = names.indexOf('fall');
+    const air = ph && ph.code && ph.code.length === n ? Uint8Array.from(ph.code, (c) => c === FLIGHT_PHASE || c === FALL ? 1 : 0) : sp.hasAirborne ? w.airborneAt : base, states = {}, spoolups = [], entries = [];
+    const rs = X.rxSignalReceived, rxOf = (i) => ({ rx: rs ? (rs[i] ? 'received' : 'lost') : null, rxLoss: !!(sp.rxLoss && sp.rxLoss[i]) });
+    const T = X.time && X.time.length === n ? X.time : null, F = (i) => T ? w.fromS + (T[i] - T[0]) / 1e6 : w.fromS + i / rate;
     const slope = (x, s, e) => { if (!x || e - s < 10) return null; let mt = 0, mx = 0; for (let i = s; i < e; i++) { mt += i; mx += x[i]; } mt /= e - s; mx /= e - s;
         let sxy = 0, sxx = 0; for (let i = s; i < e; i++) { sxy += (i - mt) * (x[i] - mx); sxx += (i - mt) ** 2; } return sxy / sxx * rate; };
     for (let s = 0, e = 1; s < n; s = e, e = s + 1) {
@@ -511,14 +640,24 @@ function governorCensus(w, ctx, sp, base, coll, rate, t) {
                 impliedSpoolupTime: thr > 0 ? Math.round(1000 / (thr / 10)) : null, headspeedEnd: r(w.hs[e - 1], 0) }); }
         if (s > 0 && (g[s] === 7 || g[s] === 8) && air[s]) {
             const c = coll ? mean(coll, Math.max(0, s - S(0.2)), s) : null;
-            entries.push({ t: t(s), state: name, from: STATES[g[s - 1]], seconds: r((e - s) / rate, 3), value: r((e - s) / rate, 3), collective: r(c, 0), headspeed: r(w.hs[s], 0), landing: !!sp.ground[s], inFlight: !!base[s] });
+            entries.push(Object.assign({ t: t(s), tS: r(F(s), 4), state: name, from: STATES[g[s - 1]], seconds: r((e - s) / rate, 3), value: r((e - s) / rate, 3), collective: r(c, 0), headspeed: r(w.hs[s], 0), landing: !!sp.ground[s], inFlight: !!base[s] }, rxOf(s)));
+        }
+        // a HOLD from ACTIVE in flight (IMP-12): the firmware clears AIRBORNE 1 ms after it (airborne.c), so the phase before it decides
+        if (s > 0 && g[s] === 5 && g[s - 1] === 4) {
+            // the flight of the HOLD, its fall included; a landing: the touchdown (an in-flight cut: the ground contact) landingS or less after it
+            const G = RULE.hold, k = Math.max(0, s - S(G.beforeS)), phase = ph ? names[ph.code[k]] || null : null, fl = ph ? (ph.flights || []).find(q => k >= q.i0 && k < (q.cut ? Math.max(q.i1, q.cut.fallEnd) : q.i1)) : null;
+            const inFlight = ph ? phase === 'flight' || phase === 'fall' : !!air[k];
+            const landing = ph ? !!fl && (fl.cut ? !!fl.cut.contact && fl.cut.contact.i - s <= S(G.landingS) : fl.i1 - s <= S(G.landingS)) : !!sp.ground[s];
+            if (inFlight) { const c = coll ? mean(coll, Math.max(0, s - S(0.2)), s) : null, a = Math.min(n - 1, s + S(G.afterS));
+                entries.push(Object.assign({ t: t(s), tS: r(F(s), 4), state: name, from: 'ACTIVE', seconds: r((e - s) / rate, 3), value: r((e - s) / rate, 3), collective: r(c, 0), headspeed: r(w.hs[s], 0), landing, inFlight: true,
+                    phase, kind: 'throttle hold in flight', headspeedAfter: r(w.hs[a], 0), afterS: G.afterS, tAfterS: r(F(a), 4) }, rxOf(s))); }
         }
     }
     for (const k in states) { states[k].seconds = r(states[k].seconds, 2); states[k].secondsAirborne = r(states[k].secondsAirborne, 2); }
     const done = spoolups.filter(q => q.to === 'ACTIVE'), thr = stat(done.map(q => q.throttlePctPerS));
-    return { states, spoolups: spoolups.slice(0, RULE.maxEvents), entries: entries.slice(0, RULE.maxEvents), airborneFrom: sp.hasAirborne ? 'AIRBORNE_STATE events' : 'in-flight mask (no AIRBORNE_STATE events)',
+    return { states, spoolups: spoolups.slice(0, RULE.maxEvents), entries: entries.slice(0, RULE.maxEvents), airborneFrom: ph && ph.code ? 'the flight and fall phases (health_phase)' : sp.hasAirborne ? 'AIRBORNE_STATE events' : 'in-flight mask (no AIRBORNE_STATE events)',
         spoolup: { n: done.length, seconds: stat(done.map(q => q.seconds)), throttlePctPerS: thr, rpmPerS: stat(done.map(q => q.rpmPerS)), impliedSpoolupTime: thr.mean > 0 ? Math.round(1000 / thr.mean) : null },
-        definition: 'states from GOVSTATE events; entries counted at the state change (airborne by the firmware flag); spool-up ramps are OLS slopes of motor[0] / 10 (%/s) and headspeed over the SPOOLUP state; implied gov_spoolup_time = 1000 / (%/s), unit 0.1 s (governor.c:1603-1609); landing = entry inside the landing ground-contact span' };
+        definition: 'states from GOVSTATE events; entries counted at the state change (in flight: the flight and fall phases of health_phase, else the firmware flag; a HOLD from ACTIVE by the phase RULE.hold.beforeS before it); spool-up ramps are OLS slopes of motor[0] / 10 (%/s) and headspeed over the SPOOLUP state; implied gov_spoolup_time = 1000 / (%/s), unit 0.1 s (governor.c:1603-1609); landing = entry inside the landing ground-contact span' };
 }
 
 // T14: rotor speed ramps the governor makes in flight (target change, profile switch), outside governor state changes.
@@ -609,18 +748,63 @@ function judge(flights, RULES = DEFAULT_RULES) {
     if (odd.length) t13Pool.conflict = `The CLI dump gives the limits ${cl.cliLimit.lo} and ${cl.cliLimit.hi} for the SY mixer input, but the logs show an output limit at ${odd.map(sd => `${median(t13Pool[sd].det)}`).join(' and ')}. ` +
         'Thus, the CLI dump is not from the time of these flights.';
 
+    // D10: the receiver signal losses of one log (all phases), one result for each log (the records of its segments joined: a logging gap
+    // or a slice of the app). A problem when the median headspeed from the last RC frame to the RX return is at the flight rpm or more,
+    // else a value to monitor. The three largest losses are in the text (problems first), every loss (RULE.rxLoss.maxSpans or fewer) in
+    // events, with the frame seconds tS (the last RC frame) and t1S (the RX return)
+    const joinD10 = (list) => { const live = list.filter(d => d && !d.skipped); if (!live.length) return list[0];
+        const pairs = [].concat(...live.map(d => (d.spans || []).map((s, i) => [s, (d.cut || [])[i] || null]))).sort((a, b) => (a[0].startS || 0) - (b[0].startS || 0)).slice(0, RULE.rxLoss.maxSpans);
+        const fields = {}; for (const d of live) for (const [k, v] of Object.entries(d.fields || {})) fields[k] = !!fields[k] || !!v;
+        return Object.assign({}, live[0], { spans: pairs.map(q => q[0]), cut: pairs.map(q => q[1]), n: live.reduce((a, d) => a + (d.n || 0), 0), fields }); };
+    const d10 = (f, d) => {
+        if (d.skipped) return add('D10', 'skipped', f, null, { text: d.skipped, fields: d.fields });
+        const R = RULE.rxLoss, stage1Delay = Array.isArray(d.stage1Delay) ? d.stage1Delay : [R.holdS, r(R.holdS + R.recheckS, 3)];
+        const list = d.spans || [], o = { n: list.length, unit: 's', threshold: { flightRpm: d.flightRpm }, flightRpm: d.flightRpm, fields: d.fields, rssiScale: d.rssiScale, cut: d.cut, stage1Delay };
+        if (!list.length) return add('D10', 'ok', f, null, Object.assign(o, { value: 0, events: [], text: 'The flight controller gets RC frames from the receiver during all of the log.' }));
+        const bad = list.filter(s => s.rotor), top = list.slice().sort((a, b) => (b.rotor - a.rotor) || (b.seconds - a.seconds)).slice(0, 3), total = r(list.reduce((s, q) => s + (q.seconds || 0), 0), 4);
+        const f2 = (v) => fmt(v, 2), cutOf = (s) => (d.cut || [])[list.indexOf(s)] || null, until = (s) => s.returnS === null ? 'the end of the log' : `${f2(s.returnS)} s`;
+        const cause = (s) => s.cause === 'signal' ? `The flight controller gets no RC frames from the receiver for ${f2(s.seconds)} s, from ${f2(s.startS)} s to ${until(s)}. The last RC frame comes at approximately ${f2(s.lastFrameS)} s, ${f2(R.lastFrameLeadS)} s before \`rxSignalReceived\` changes to 0.`
+            : s.cause === 'switch' ? `The flight controller does not use the RC values of the receiver for ${f2(s.seconds)} s, from ${f2(s.startS)} s to ${until(s)}. The failsafe switch is on: \`rxFlightChannelsValid\` is 0, and \`rxSignalReceived\` stays at 1.`
+            : `The flight controller does not use the RC values of the receiver for ${f2(s.seconds)} s, from ${f2(s.startS)} s to ${until(s)}. \`rxSignalReceived\` stays at 1, and \`rxFlightChannelsValid\` is 0.`
+                + (s.switchKnown === false ? ' The failsafe switch is on, or a control channel has a value out of the range from `rx_pulse_min` to `rx_pulse_max`. The log does not record `flightModeFlags`, which shows the failsafe switch.'
+                    : ' The failsafe switch is off. Thus, a control channel has a value out of the range from `rx_pulse_min` to `rx_pulse_max`.')
+                + ` The last correct value comes at approximately ${f2(s.lastFrameS)} s, ${f2(R.holdS)} s before \`rxFlightChannelsValid\` changes to 0.`;
+        const one = (s) => { const c = cutOf(s);
+            return para(cause(s), (s.govBeforeName ? ` At the last RC frame, the headspeed is ${fmt(s.headspeed, 0)} rpm, and the governor is in ${s.govBeforeName}.` : ` At the last RC frame, the headspeed is ${fmt(s.headspeed, 0)} rpm.`)
+                + (s.rotor ? ` The rotor turns at the flight rpm (${fmt(d.flightRpm, 0)} rpm) or more during this time.` : ` The headspeed stays less than the flight rpm (${fmt(d.flightRpm, 0)} rpm) during this time.`)
+                + (typeof s.headspeedMedian === 'number' ? ` The median headspeed is ${fmt(s.headspeedMedian, 0)} rpm.` : ''),
+                (s.stage1S !== null ? `At ${f2(s.stage1S)} s, the firmware sets the \`rxfail\` values` + (s.govAtStage1Name ? s.govAtStage1Name === s.govBeforeName ? `, and the governor stays in ${s.govAtStage1Name}.` : `, and the governor changes to ${s.govAtStage1Name}.` : '.')
+                    : 'The signal comes back before the firmware sets the `rxfail` values. Until then, the firmware holds the last stick positions.')
+                + (!d.fields || !d.fields.rssi ? ' The log does not record `rssi`. To record `rssi`, set `blackbox_log_rssi = ON`.' : s.rssiZero ? ` The \`rssi\` value is 0 for ${s.rssiZero.seconds === null ? 'the remaining part of the log' : `${f2(s.rssiZero.seconds)} s`}.` : ' The `rssi` value does not change to 0.')
+                + (s.rssiBefore !== null ? ` Before this, \`rssi\` is ${fmt(s.rssiBefore, 0)}${s.rssiBeforeDbm !== null ? ` (${fmt(s.rssiBeforeDbm, 1)} dBm)` : ''}.` : '')
+                + (c ? ` The results of the attitude, the filters, the gains and the headspeed error of the governor do not use the data from ${f2(c.t0S)} s to ${f2(c.t1S)} s.` : '')); };
+        const head = list.length > 1 ? `The receiver signal stops ${many(list.length, 'time')}, for ${f2(total)} s in total. ` + (bad.length ? `On ${bad.length} of these, the rotor turns at the flight rpm or more.` : 'Each time, the headspeed stays less than the flight rpm.') : '';
+        const tail = (bad.length ? 'Before the next flight, examine the receiver, its power supply, its connectors and its antennas. ' : '') + 'Check D12 gives the response of the firmware when the receiver signal stops.';
+        const lead1 = (bad[0] || list[0]);
+        return add('D10', bad.length ? 'flag' : 'note', f, lead1.profile, Object.assign(o, { value: total, rotor: bad.length > 0, events: list.slice(0, RULE.rxLoss.maxSpans),
+            text: [head, ...top.map(one), list.length > top.length ? `${many(list.length - top.length, 'more period').replace(/^./, (c) => c.toUpperCase())} with no receiver signal ${list.length - top.length === 1 ? 'is' : 'are'} in the events of this result.` : '', tail].filter(Boolean).join('\n') }));
+    };
+    const d10Logs = new Map(), logKey = (f) => JSON.stringify(f.log === undefined ? null : f.log);
+    for (const f of flights) { const M = f.metrics || {}; if (M.D10) { const k = logKey(f); (d10Logs.get(k) || d10Logs.set(k, []).get(k)).push(f); } }
+    for (const list of d10Logs.values()) d10(list[0], joinD10(list.map(f => f.metrics.D10)));
+    const d10Skipped = new Set();
+
     for (const f of flights) {
         const M = f.metrics || {};
-        if (M.skipped) { for (const id of IDS) add(id, 'skipped', f, null, { text: M.skipped }); continue; }
+        if (M.skipped) { for (const id of IDS) { if (id === 'D10' && (d10Logs.has(logKey(f)) || d10Skipped.has(logKey(f)))) continue; if (id === 'D10') d10Skipped.add(logKey(f)); add(id, 'skipped', f, null, { text: M.skipped }); } continue; }
         // D6
-        if (M.D6) { const d = M.D6, x = d.excluded, tot = r(x.rescueS + x.levelModeS + x.failsafeS + x.groundS + x.guardS, 2), fsEv = d.events.filter(e => e.reason === 'failsafe');
-            const parts = series([[x.rescueS, 'rescue'], [x.levelModeS, 'a level mode'], [x.failsafeS, 'failsafe'], [x.groundS, 'ground contact']].filter(([v]) => v > 0).map(([v, w]) => `${fmt(v)} s is ${w}`));
+        if (M.D6) { const d = M.D6, x = d.excluded, tot = r((x.rxLossS || 0) + x.rescueS + x.levelModeS + x.failsafeS + x.groundS + x.guardS, 2), fsEv = d.events.filter(e => e.reason === 'failsafe');
+            const parts = series([[x.rxLossS || 0, 'a period with no receiver signal'], [x.rescueS, 'rescue'], [x.levelModeS, 'a level mode'], [x.failsafeS, 'failsafe'], [x.groundS, 'ground contact']].filter(([v]) => v > 0).map(([v, w]) => `${fmt(v)} s is ${w}`));
             const used = tot > 0 ? `The analysis does not use ${fmt(tot, 1)} s of the ${fmt(d.flyingS, 1)} s of flight.` + (parts ? ` Of this time, ${parts}.` : '') + ` The ${parts ? 'remaining ' : ''}${fmt(x.guardS)} s is the ${RULE.spanGuardS} s before and after each of these periods.`
                 : `The analysis uses all ${fmt(d.flyingS, 1)} s of flight.`;
-            const text = (head) => para(`${head} ${used}` + (d.rescueActivations ? ` Rescue operated ${many(d.rescueActivations, 'time')}, and the rescue time includes the exit time.` : ''), d.rescueSource, ...d.notes);
-            if (d.failsafeAirborneS > 0) add('D6', 'flag', f, null, { value: d.failsafeAirborneS, n: fsEv.length, threshold: 'failsafe while airborne > 0 s', unit: 's', events: fsEv,
+            // the cut of each receiver signal loss of this segment (check D10), in all phases: the health.cjs flight mask leaves it out first
+            const rxCuts = (M.D10 && Array.isArray(M.D10.cut) ? M.D10.cut : []).filter(c => c && typeof c.t0S === 'number' && typeof c.t1S === 'number' && c.t1S > c.t0S);
+            const rxText = rxCuts.length ? ` The analysis does not use the data near ${rxCuts.length === 1 ? 'the period' : `the ${rxCuts.length} periods`} with no receiver signal (check D10), from ${series(rxCuts.map(c => `${fmt(c.t0S)} s to ${fmt(c.t1S)} s`))}.` : '';
+            const text = (head) => para(`${head} ${used}` + rxText + (d.rescueActivations ? ` Rescue operated ${many(d.rescueActivations, 'time')}, and the rescue time includes the exit time.` : ''), d.rescueSource, ...d.notes);
+            const fsInfo = { failsafePhaseOff: !!d.failsafePhaseOff, stage2Off: !!d.stage2Off };
+            if (d.failsafeAirborneS > 0) add('D6', 'flag', f, null, { value: d.failsafeAirborneS, n: fsEv.length, threshold: 'failsafe while airborne > 0 s', unit: 's', events: fsEv, ...fsInfo,
                 text: text(`Failsafe was active for ${fmt(d.failsafeAirborneS)} s in flight${fsEv.length ? `, first at ${fsEv.map(e => e.t).sort((a, b) => a - b)[0]} s` : ''}. Examine the receiver link and the failsafe adjustments.`) });
-            else add('D6', tot > 0 ? 'note' : 'ok', f, null, { value: tot, n: d.events.length, threshold: 'report only; failsafe while airborne > 0 s flags', unit: 's', events: d.events, text: text('') }); }
+            else add('D6', tot > 0 ? 'note' : 'ok', f, null, { value: tot, n: d.events.length, threshold: 'report only; failsafe while airborne > 0 s flags', unit: 's', events: d.events, ...fsInfo, text: text('') }); }
         // F10
         if (M.F10) { const R = RULES.F10; if (M.F10.skipped) add('F10', 'skipped', f, null, { text: M.F10.skipped });
             else for (const ax of AXES) { const m = M.F10[ax]; if (!m) continue;
@@ -720,16 +904,24 @@ function judge(flights, RULES = DEFAULT_RULES) {
                 add('T14', flag ? 'flag' : 'note', f, null, Object.assign(o, m.n < R.minEvents ? { thin: true, text: para(thin('headspeed changes', m.n, R.minEvents), p1, p2, p3) } : { text: para(p1, p2, verdict, p3) })); } }
         // G14
         if (M.G14) { const R = RULES.G14, m = M.G14; if (m.skipped) add('G14', 'skipped', f, null, { text: m.skipped });
-            else { const bad = m.entries.filter(e => !e.landing && (e.state === 'BAILOUT' || (e.state === 'AUTOROTATION' && e.collective !== null && e.collective >= R.hover && e.seconds > R.autoS)));
+            else { const bad = m.entries.filter(e => !e.landing && (e.state === 'BAILOUT' || (e.state === 'AUTOROTATION' && e.collective !== null && e.collective >= R.hover && e.seconds > R.autoS) || e.kind === 'throttle hold in flight'));
+                const at = (e) => fmt(typeof e.tS === 'number' ? e.tS : e.t, 3), holds = bad.filter(e => e.kind === 'throttle hold in flight'), rxCause = bad.length > 0 && bad.every(e => e.rx === 'lost' || e.rxLoss);
                 const st = Object.entries(m.states).sort((a, b) => b[1].seconds - a[1].seconds).map(([k, q]) => `${k} for ${fmt(q.seconds, 1)} s (${fmt(q.secondsAirborne, 1)} s in flight, ${many(q.entries, 'time')})`);
                 const states = []; for (let i = 0; i < st.length; i += 4) states.push(`${i ? 'It was also' : 'The governor was'} ${series(st.slice(i, i + 4))}.`);
                 const sp = m.spoolup, spTxt = !sp.n ? 'There is no spool-up to ACTIVE.' : `The spool-up to ACTIVE was ${fmt(sp.seconds.mean, 2)} s long, at ${fmt(sp.throttlePctPerS.mean, 2)} %/s of throttle and ${fmt(sp.rpmPerS.mean, 0)} rpm/s` +
                     `${sp.n > 1 ? ` (the mean of ${sp.n} spool-ups)` : ''}.` + (sp.impliedSpoolupTime ? ` This agrees with a gov_spoolup_time of approximately ${sp.impliedSpoolupTime}.` : '');
-                const en = m.entries.map(e => `In flight, the governor went to ${e.state} at ${e.t} s for ${fmt(e.seconds, 2)} s${e.collective === null ? '' : `, with a collective of ${e.collective}`}${e.landing ? ' at the landing' : ''}.`), enP = [];
+                const en = m.entries.map(e => `In flight, the governor went to ${e.state} at ${at(e)} s for ${fmt(e.seconds, 2)} s${e.collective === null ? '' : `, with a collective of ${e.collective}`}${e.landing ? ' at the landing' : ''}.`), enP = [];
+                // a throttle hold in flight (IMP-12): the headspeed after it, and the receiver signal at it
+                const holdTxt = holds.slice(0, 3).map(e => `At ${at(e)} s, the governor changes from ACTIVE to HOLD while the helicopter is in the air. The headspeed decreases from ${fmt(e.headspeed, 0)} rpm to ${fmt(e.headspeedAfter, 0)} rpm in ${fmt(e.afterS, 1)} s.`
+                    + (e.rx === 'lost' || e.rxLoss ? ' The flight controller gets no receiver signal at this time (check D10).' : ''));
                 for (let i = 0; i < en.length; i += 6) enP.push(en.slice(i, i + 6).join(' '));
-                add('G14', bad.length ? 'flag' : 'note', f, null, { value: bad.length, n: m.entries.length, unit: 'entries', threshold: `BAILOUT in flight, or AUTOROTATION in flight with collective >= ${R.hover} for > ${R.autoS} s (landings excluded)`, events: bad.map(e => ({ t: e.t, value: e.seconds })),
-                    text: para(bad.length ? `The governor went to AUTOROTATION or BAILOUT ${many(bad.length, 'time')} in flight (${bad.map(e => `${e.state} at ${e.t} s`).join(', ')}). ` +
-                        'Examine the throttle switch and the throttle hold adjustments.' : '', `${states.join(' ')} ${spTxt}`, ...enP) }); } }
+                add('G14', bad.length ? 'flag' : 'note', f, null, { value: bad.length, n: m.entries.length, unit: 'entries', threshold: `BAILOUT in flight, AUTOROTATION in flight with collective >= ${R.hover} for > ${R.autoS} s, or HOLD from ACTIVE in flight (landings excluded)`,
+                    events: bad.map(e => Object.assign({ t: e.t, value: e.seconds }, e.kind ? { tS: e.tS, kind: e.kind, state: e.state, headspeed: e.headspeed, headspeedAfter: e.headspeedAfter, tAfterS: e.tAfterS, rx: e.rx, rxLoss: e.rxLoss, phase: e.phase } : {})), holds: holds.length,
+                    // every change in flight comes after the receiver signal stopped (the rxfail values): its cause is the receiver signal loss (IMP-12, hierarchy nodeOfFinding)
+                    ...(rxCause ? { cause: 'receiver loss' } : {}),
+                    text: para(bad.length ? `The governor went to ${series([...new Set(bad.map(e => e.state))])} ${many(bad.length, 'time')} in flight (${bad.map(e => `${e.state} at ${at(e)} s`).join(', ')}). ` +
+                        (rxCause ? 'The receiver signal stopped before each of these changes (check D10). Check D12 gives the response of the firmware to the `rxfail` values.' : 'Examine the throttle switch and the throttle hold adjustments.') : '',
+                        ...holdTxt, `${states.join(' ')} ${spTxt}`, ...enP) }); } }
     }
     return F;
 }
@@ -777,7 +969,7 @@ function curves(w, ctx, metrics) {
             phaseDeg: hasRaw ? phaseDeg(S.re[a], S.im[a], S.pw[a]) : null }]; }));
     const vib = Object.assign({ filtOnly: !hasRaw, windows: V.windows }, spectra(V));
     const flyHs = []; for (let i = 0; i < n; i += 5) if (ctx.flying[i]) flyHs.push(w.hs[i]);
-    const hsMed = median(flyHs), banks = setup.rpmBanks(H, gearOf(ctx));
+    const hsMed = median(flyHs), banks = setup.rpmBanks(H, gearOf(ctx, H));
     const notchesAt = (hs) => Object.fromEntries(AXES.map(ax => [ax, banks[ax].map(b => ({ code: b.code, q: b.q, order: r(b.order, 4), hz: b.order === null || hs === null || hs === undefined ? null : r(b.order * hs / 60, 1), label: `${b.kind} ${b.harmonic}x` }))]));
     vib.rotorHz = Object.fromEntries(Object.entries(medHs).map(([p, v]) => [p, r(v / 60, 2)]));
     vib.notches = notchesAt(hsMed);
@@ -809,4 +1001,4 @@ function curves(w, ctx, metrics) {
     return { gov: govOut, vib, dterm, control, tail };
 }
 
-module.exports = { EXTRA, RULE, DEFAULT_RULES, normalMask, analyse, judge, curves };
+module.exports = { EXTRA, RULE, DEFAULT_RULES, normalMask, analyse, judge, curves, gearOf };

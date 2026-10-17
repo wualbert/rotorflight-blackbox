@@ -845,3 +845,69 @@ test('round trip: bbl_encode writes the parameter section, the 4 S fields and ev
     assert.equal(tl.valueAt('p0.roll_p_gain', 300).stored, '100');
     assert.equal(tl.valueAt('p0.roll_p_gain', 301).running, '100');
 });
+
+// ---- the snapshot as a configuration (IMP-05) ------------------------------------------------------------------------
+
+test('snapshotCli: a complete FULL snapshot in the shape of a parsed CLI dump; CHANGES, a bad hash and a stock log give null', () => {
+    const sc = { paramHeader: headerLines({ pid0: 1, rate0: 0 }), 'Firmware revision': 'Rotorflight 4.6.0-bbp (58a4bd5cc) STM32G47X', 'Craft name': 'Test' };
+    const s = PL.snapshotCli(sc);
+    assert.equal(s.kind, 'snapshot'); assert.equal(s.source, 'log snapshot'); assert.equal(s.version, '4.6.0'); assert.equal(s.craft, 'Test');
+    assert.equal(s.selectedProfile, 1); assert.equal(s.selectedRateProfile, 0);
+    assert.deepEqual([0, 1, 2, 3, 4, 5].map(k => s.profiles[k].roll_p_gain), [50, 51, 52, 53, 54, 55]);
+    assert.deepEqual([0, 3].map(k => s.profiles[k].yaw_p_gain), [70, 80]);
+    assert.deepEqual(s.profiles[2].iterm_relax_cutoff, [10, 10, 15]);
+    assert.equal(s.rateprofiles[5].rates_type, 'ROTORFLIGHT');
+    assert.equal(s.global.gov_mode, 'ELECTRIC'); assert.equal(s.global.deadband, 2);
+    // el.servo.0-2 as CLI servos 1-3 (param_rt servos=4), el.mixin.4 as the CLI mixer input SC [min, max, rate], el.feature 8 = RX_SERIAL
+    assert.deepEqual(s.servos, { 1: [1500, -700, 700, 500, 500, 333, 0, 0], 2: [1500, -700, 700, 500, 500, 333, 0, 0], 3: [1500, -700, 700, 500, 500, 333, 0, 0] });
+    assert.deepEqual(s.mixerInputs, { SC: [-200, 200, 1000] });
+    assert.equal(s.features.RX_SERIAL, true); assert.equal(s.features.GOVERNOR, false);
+    assert.equal(PL.snapshotOf(sc), PL.snapshotOf(sc), 'once for each header object');
+    assert.equal(PL.snapshotCli({ paramHeader: headerLines({ mode: 'CHANGES' }) }), null);
+    assert.equal(PL.snapshotCli({ paramHeader: headerLines({ endHash: 12345 }) }), null, 'param_end does not agree');
+    assert.equal(PL.snapshotCli({ firmwareVersion: '4.6.0', rollPID: [50, 100, 0, 100, 0] }), null, 'a stock log');
+    // a record before T0 (stamp p) is applied with the records: its new value is the value at the log start
+    const recs = PL.assemble([ev('C', 1, 'p', 's=v', 'n=1', 'p3.yaw_p_gain=90<80')]);
+    assert.equal(PL.snapshotCli(sc, recs).profiles[3].yaw_p_gain, 90);
+    assert.equal(PL.snapshotCli(sc).profiles[3].yaw_p_gain, 80);
+});
+
+// review IMP-05: the mixer rules with the names of the CLI line ("mixer rule n set SC S1 weight offset"; el.mixrule has oper, input,
+// output, offset, weight), and the rxfail values in the CLI shape (mode a, h or s; the pulse 875 + 5 x step of mode s)
+test('snapshotCli: mixer rules with the CLI names, rxfail in the CLI shape, and the interval stamp changes of journalChanges', () => {
+    const body = BODY.concat([['el.mixrule.0', '1,4,1,0,1000'], ['el.mixrule.1', '0,0,0,0,0'], ['el.mixrule.2', '2,11,27,-50,500'],
+        ['el.rxfail.0', '0,125'], ['el.rxfail.3', '1,125'], ['el.rxfail.4', '2,125']]);
+    const s = PL.snapshotCli({ paramHeader: headerLines({ body }), 'Firmware revision': 'Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X' });
+    assert.deepEqual(s.mixerRules, { 0: 'set SC S1 1000 0', 2: 'add RR M1 500 -50' });
+    assert.deepEqual(s.rxfail, { 0: ['a'], 3: ['h'], 4: ['s', 1500] });
+    const HS = require('../tools/autotune/health_setup.cjs'), cli = HS.parseCli('# diff all\nrxfail 4 s 1500\nrxfail 3 h\nmixer rule 0 set SC S1 1000 0\n');
+    assert.deepEqual(cli.rxfail, { 3: ['h'], 4: ['s', 1500] }, 'the same shape as the parsed CLI dump');
+    const DS = require('../tools/autotune/datasets.cjs');
+    assert.equal(DS.parseCli('mixer rule 0 set SC S1 1000 0\n').mixerRules[0], s.mixerRules[0], 'a snapshot rule and a CLI rule compare equal');
+    // journalChanges: an exact stamp at its frame, an interval stamp at the end of its interval (uncertain), a stamp after the last
+    // frame at the last frame, a record before T0 not at all
+    const F = frames(400, { seq: (i) => i >= 300 ? 3 : i >= 200 ? 2 : i >= 100 ? 1 : 0 });
+    const recs = PL.assemble([ev('C', 1, '100.0', 's=m.202', 'n=1', 'p0.roll_p_gain=60<50'), ev('C', 2, '150.0~200.1', 's=m.202', 'n=1', 'p0.yaw_p_gain=75<70'),
+        ev('C', 3, '900.0', 's=m.202', 'n=1', 'debug_mode=GOVERNOR<NONE')]);
+    const tl = PL.buildTimeline({ header: headerLines(), records: recs, frames: F }), frameS = Float64Array.from(F.time, t => (t - F.time[0]) / 1e6);
+    assert.deepEqual(PL.journalChanges(tl, frameS).map(q => [q.key, q.frame, q.uncertain]), [['p0.roll_p_gain', 100, false], ['p0.yaw_p_gain', 200, true], ['debug_mode', 399, false]]);
+    assert.equal(PL.journalChanges(tl, frameS)[1].t, frameS[200]);
+});
+
+test('param_semantics: the 4.7.0 table knows error_decay_gain_cyclic and gives the cell voltages of bat_profile to the classic line', () => {
+    const t = PS.forFirmware('Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X', []);
+    assert.equal(t.known, true); assert.equal(t.firmware, 'Rotorflight 4.7.0');
+    assert.equal(t.classify('p1.error_decay_gain_cyclic').use[0].loader, 'pid');
+    assert.equal(t.classify('p1.horizon_angle_limit').use[0].loader, 'pid');
+    assert.equal(PS.forFirmware('Rotorflight 4.8.0 (abcdef1) X', []).known, false);
+    // only the audited 4.7.0 build: another 4.7.0 build has no table (review IMP-05)
+    assert.equal(PS.forFirmware('Rotorflight 4.7.0-bbp-pr (deadbee11) STM32G47X', []).known, false);
+    assert.equal(PS.forFirmware('Rotorflight 4.7.0 (a88bec8f8) STM32G47X', []).known, false);
+    assert.equal(PS.forFirmware('Rotorflight 4.6.0 (118e912) X', []).classic, PS.CLASSIC_46, 'a 4.6.0 log keeps the 4.6.0 table');
+    const body = BODY.concat([['set.bat_profile', '1'], ['set.vbat_min_cell_voltage', '330,320,330,330,330,330'], ['set.vbat_warning_cell_voltage', '350,340,350,350,350,350'],
+        ['set.vbat_max_cell_voltage', '430,420,430,430,430,430']]);
+    const tl = PL.buildTimeline({ header: headerLines({ body }), records: PL.assemble([]), frames: frames(100), semantics: t });
+    assert.equal(tl.classicAtHeader().vbatcellvoltage, '320,340,420');
+    const st = PL.selfTest(tl, { vbatcellvoltage: '320,340,420' });
+    assert.equal(st.compared, 1); assert.equal(st.mismatches.length, 0);
+});

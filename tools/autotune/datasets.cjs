@@ -44,7 +44,12 @@
  *   - values that only the CLI dump shows (gov_mode, mixer, servos, ...): the CLI dump, for every log. One dump cannot
  *     show a change between two logs, so these values never split a dataset of one PID profile;
  *   - in-flight adjustments (ADJUST) change the value of their parameter from the event to the end of the log;
- *   - a CLI dump whose craft name is not the craft name of the log header is not used for that log (CLAUDE.md).
+ *   - a CLI dump whose craft name is not the craft name of the log header is not used for that log (CLAUDE.md);
+ *   - a log with a parameter snapshot (blackbox_params FULL, param_log.cjs snapshotOf: complete, its hash agrees) has the values
+ *     of all PID profiles and rate profiles and the global values at the start of the log, source 'log snapshot'. It ranks above
+ *     the CLI dump, and its param_pid_profile gives the PID profile at the start. logs[].journal [{ t, key, value }] (the C items
+ *     of the parameter journal after the log start, frame seconds) change their values from that time; with a journal, the
+ *     in-flight adjustment events (other than the profile switches) are not used: the journal has their values.
  *
  * Texts that the app shows (notes, labels, reasons, titles) are ASD-STE100 (docs/STE_GLOSSARY.md); parameter names are
  * quoted in backticks. Code reads the fields, never the texts. No Node API call at module load: the worker loads this
@@ -87,6 +92,8 @@ const PROFILE_NAMES = [
     'gov_d_gain', 'gov_f_gain', 'gov_p_limit', 'gov_i_limit', 'gov_d_limit', 'gov_f_limit', 'gov_tta_gain', 'gov_tta_limit',
     'gov_yaw_ff_weight', 'gov_cyclic_ff_weight', 'gov_collective_ff_weight', 'gov_max_throttle', 'gov_min_throttle',
     'gov_fallback_drop', 'gov_collective_curve', 'gov_dyn_min_throttle',
+    // 4.7.0 (85d7049a9 cli/settings.c PROFILE_VALUE)
+    'error_decay_gain_cyclic', 'horizon_angle_limit',
     // 4.4.0 header names (Gaui X4 dump, log 0) that are PID profile values
     'yaw_precomp_impulse', 'piro_compensation',
 ];
@@ -113,7 +120,7 @@ const GROUPS = [
     { id: 'iterm', flight: true, title: 'I-term and offset limits', reason: 'They set the limits of the I-term and of the offset, and the I-term relax.', names: [
         'error_limit', 'offset_limit', 'error_decay_time_ground', 'error_decay_time_cyclic', 'error_decay_time_yaw',
         'error_decay_limit_cyclic', 'error_decay_limit_yaw', 'offset_flood_relax_level', 'offset_flood_relax_cutoff',
-        'iterm_relax_type', 'iterm_relax_level', 'iterm_relax_cutoff'] },
+        'iterm_relax_type', 'iterm_relax_level', 'iterm_relax_cutoff', 'error_decay_gain_cyclic'] },
     { id: 'precomp', flight: true, title: 'Precompensation and cross-coupling', reason: 'They add feedforward from the collective and the cyclic to the tail and to the pitch axis.', names: [
         'yaw_precomp_cutoff', 'yaw_cyclic_ff_gain', 'yaw_collective_ff_gain', 'yaw_inertia_precomp_gain',
         'yaw_inertia_precomp_cutoff', 'pitch_collective_ff_gain', 'cyclic_cross_coupling_gain', 'cyclic_cross_coupling_ratio',
@@ -149,7 +156,8 @@ const GROUPS = [
     { id: 'unusedFeatures', flight: true, title: 'Other features', reason: 'Rotorflight 4.6 does not use these features. Thus, the app uses them as parameters that change the flight.', names: ['feature other bits'] },
     { id: 'loop', flight: true, title: 'Gyro and loop rate', reason: 'They set the gyro and the rate of the PID loop.', names: [
         'gyro_to_use', 'gyro_overflow_detect', 'gyro_high_range', 'gyro_rate_sync', 'pid_process_denom', 'filter_process_denom',
-        'cpu_overclock', 'scheduler_relax_rx', 'scheduler_relax_osd', 'looptime', 'gyro_sync_denom'] },
+        'cpu_overclock', 'scheduler_relax_rx', 'scheduler_relax_osd', 'looptime', 'gyro_sync_denom',
+        'airborne_mode', 'airborne_gyro_threshold', 'airborne_acc_threshold'] }, // airborne_*: 4.7.0, the airborne state of the PID loop (error decay)
     { id: 'firmware', flight: true, title: 'Firmware and flight controller', reason: 'They identify the firmware and the flight controller. A different firmware or flight controller can change the flight.', names: [
         'Firmware revision', 'Board information'] },
     { id: 'alignment', flight: true, title: 'Gyro alignment', reason: 'They set the gyro alignment and the board alignment.', names: [
@@ -189,7 +197,7 @@ const GROUPS = [
         'gps_rescue_alt_mode', 'gps_rescue_use_mag'] },
     { id: 'levelModes', flight: false, title: 'Level modes', reason: 'They operate only in angle mode, horizon mode and trainer mode. The analysis does not use these periods.', names: [
         'angle_level_strength', 'angle_level_limit', 'horizon_level_strength', 'horizon_transition', 'horizon_tilt_effect',
-        'horizon_tilt_expert_mode', 'acro_trainer_angle_limit', 'acro_trainer_lookahead_ms', 'acro_trainer_gain'] },
+        'horizon_tilt_expert_mode', 'acro_trainer_angle_limit', 'acro_trainer_lookahead_ms', 'acro_trainer_gain', 'horizon_angle_limit'] },
     { id: 'attitude', flight: false, title: 'Attitude and altitude', reason: 'They give the attitude and the altitude to the level modes and to the rescue. The PID loop does not use them.', names: [
         'acc_hardware', 'acc_high_range', 'acc_lpf_hz', 'acc_trim_pitch', 'acc_trim_roll', 'acc_calibration', 'align_mag',
         'mag_align_roll', 'mag_align_pitch', 'mag_align_yaw', 'mag_hardware', 'mag_calibration', 'baro_hardware', 'imu_dcm_kp',
@@ -203,7 +211,7 @@ const GROUPS = [
         'blackbox_log_acc', 'blackbox_log_mag', 'blackbox_log_alt', 'blackbox_log_gps', 'blackbox_log_battery',
         'blackbox_log_motors', 'blackbox_log_servos', 'blackbox_log_rpm', 'blackbox_log_rssi', 'blackbox_log_vbec',
         'blackbox_log_vbus', 'blackbox_log_temp', 'blackbox_log_esc', 'blackbox_log_bec', 'blackbox_log_esc2',
-        'blackbox_log_governor', 'blackbox_initial_erase_kb', 'blackbox_rolling_erase', 'blackbox_grace_period', 'debug_mode',
+        'blackbox_log_governor', 'blackbox_initial_erase_kb', 'blackbox_rolling_erase', 'blackbox_grace_period', 'blackbox_params', 'debug_mode',
         'debug_axis', 'fields_mask', 'frameIntervalI', 'frameIntervalPNum', 'frameIntervalPDenom'] },
     { id: 'failsafe', flight: false, title: 'Failsafe', reason: 'They operate only when the flight controller gets no signal from the receiver.', names: [
         'failsafe_delay', 'failsafe_off_delay', 'failsafe_throttle', 'failsafe_switch_mode', 'failsafe_throttle_low_delay',
@@ -332,7 +340,7 @@ const HEADER = {
     vbatmaxcellvoltage: 'vbat_max_cell_voltage', currentMeterOffset: 'ibata_offset', currentMeterScale: 'ibata_scale',
 };
 for (const ax of AX) for (const k of ['source', 'center', 'q']) HEADER[`gyro_rpm_notch_${k}_${ax}`] = { base: `gyro_rpm_notch_${k}_${ax}` };
-const SKIP_KEYS = new Set(['frameDefs', 'unknownHeaders', 'features', 'loggedHeaderFields']); // containers; features: the bits (FEATURES)
+const SKIP_KEYS = new Set(['frameDefs', 'unknownHeaders', 'features', 'loggedHeaderFields', 'paramHeader']); // containers; features: the bits (FEATURES); paramHeader: the parameter snapshot (snapshotOf)
 
 // CLI lookup values of the names that the header records as numbers (settings.c lookup tables, 4.6.0)
 const OFF_ON = ['OFF', 'ON'], LPF = ['NONE', 'FIRST_ORDER', 'SECOND_ORDER', 'PT1', 'PT2', 'PT3', 'ORDER1', 'BUTTER', 'BESSEL', 'DAMPED'];
@@ -477,6 +485,8 @@ function headerValues(h) {
 // absent from this configuration stay unknown, never inherited from another PID profile.
 function configurationHeader(header, dataset) {
     const h = {...header}, values = dataset.values || {}, keys = new Set(Object.keys(values));
+    // the copy has the parameter snapshot of the original (param_log.cjs rememberSnapshot: with the records before the log start)
+    const PL = optional('./param_log.cjs'); if (PL && typeof PL.rememberSnapshot === 'function' && header && header.paramHeader) PL.rememberSnapshot(h, PL.snapshotOf(header));
     const scalar = (name) => Object.prototype.hasOwnProperty.call(values, name) ? values[name] : null;
     for (const [key, spec] of Object.entries(HEADER)) {
         const names = typeof spec === 'string' ? [spec] : Array.isArray(spec) ? spec : spec.names || [];
@@ -499,6 +509,18 @@ function configurationHeader(header, dataset) {
     // Explicit values take precedence over parser unknownHeaders.
     h.unknownHeaders = (h.unknownHeaders || []).filter(x => !keys.has(x.name));
     return h;
+}
+
+// The parameter snapshot of a log header (param_log.cjs snapshotCli: a complete FULL snapshot of a blackbox_params log) as the
+// values of cliValues, with start and rateStart (the PID profile and the rate profile at the start, 1-6; 0: unknown); null for a
+// log without one or without param_log.cjs. logs[].snapshot (a snapshotCli result or null) replaces the snapshot of the header
+const optional = (name) => { try { return require(name); } catch (e) { return null; } };
+function snapshotValues(l) {
+    let raw = l.snapshot;
+    if (raw === undefined) { const PL = optional('./param_log.cjs'); raw = PL && typeof PL.snapshotOf === 'function' ? PL.snapshotOf(l.header) : null; }
+    if (!raw) return null;
+    const one = (k) => Number.isInteger(k) && k >= 0 && k <= 5 ? k + 1 : 0;
+    return Object.assign(cliValues(raw), { start: one(raw.selectedProfile), rateStart: one(raw.selectedRateProfile) });
 }
 
 // The CLI dump: 'set', 'profile', 'rateprofile', 'feature', 'mixer input', 'mixer rule', 'servo' and the craft name. The
@@ -591,7 +613,9 @@ function runsOf(l) {
     const end = isFinite(l.durationS) ? +l.durationS : Array.isArray(l.flights) && l.flights.length ? Math.max(...l.flights.map(f => +f.t1)) : 0;
     return end > 0 ? [{ t0: 0, t1: end, profile: arming }] : [];
 }
-const armingOfLog = (l, runs) => l.armingProfile > 0 ? +l.armingProfile : 0;
+const armingOfLog = (l) => l.armingProfile > 0 ? +l.armingProfile : 0;
+const SNAPSHOT = 'log snapshot'; // the source of a value of the parameter snapshot (param_log.cjs SNAPSHOT_SOURCE)
+const JOURNAL = 'log journal';   // the source of a value that a C record of the parameter journal set (logs[].journal): recorded in the log
 function splitScopes(values) {
     const out = { global: {}, profile: {}, rate: {} };
     for (const [n, v] of Object.entries(values)) out[scopeOf(n)][n] = v;
@@ -613,7 +637,8 @@ function differ(va, vb) {
 /**
  * datasets(logs, cli, options) -> {
  *   datasets: [{ id: 'A', pidProfile (1-6 | null: unknown), values { name: value | null (unknown) } (flight values only),
- *     sources { name: 'header' | 'cli' | 'log N' (the header of log N, 0-based) | 'adjustment' | 'none' }, logs [log], flights
+ *     sources { name: 'header' | 'log snapshot' | 'log journal' (a change that the parameter journal records) | 'cli' | 'log N' (the header
+ *     of log N, 0-based) | 'adjustment' | 'none' }, logs [log], flights
  *     [{ log, flight (0-based in its log), t0, t1, seconds (of this dataset) }], seconds, flightSeconds, assumed (every stretch is
  *     assumed), assumedSeconds, assumedFrom [{ log, t0, t1, from: log | 'cli' | null, bracketed }], unknown [names with no value],
  *     sameValuesAs [ids: datasets whose values agree where both are known], coverage [{ group, known, unknown, missing }] (the groups
@@ -635,12 +660,14 @@ function datasets(logs, cli, options = {}) {
     const note = (t) => { if (!noteSet.has(t)) { noteSet.add(t); notes.push(t); } };
     const parsed = cli ? (typeof cli === 'string' ? parseCli(cli) : cli) : null, CV = parsed ? cliValues(parsed) : null;
     const items = (logs || []).filter(l => l && l.header && Number.isFinite(+l.log)).slice().sort((a, b) => a.log - b.log).map((l, order) => {
-        const H = headerValues(l.header), runs = runsOf(l), arming = armingOfLog(l, runs), craft = l.header['Craft name'] ? String(l.header['Craft name']).trim() : null;
+        // a parameter snapshot gives the PID profile at the start (param_pid_profile) when the caller does not confirm one
+        const SV = snapshotValues(l), arming = armingOfLog(l) || (SV && SV.start) || 0, runs = runsOf(Object.assign({}, l, { armingProfile: arming }));
+        const H = headerValues(l.header), craft = l.header['Craft name'] ? String(l.header['Craft name']).trim() : null;
         const cliUsed = !!CV && !(CV.craft && craft && CV.craft !== craft);
         if (CV && !cliUsed) note(`The craft name of the CLI dump is not the craft name of log ${N(l.log)}. Thus, the app does not use the CLI dump for log ${N(l.log)}.`);
         const fit = cliUsed ? fitOf(H.values, CV, arming) : null, bench = Array.isArray(l.flights) && l.flights.length === 0;
         const estimate = !arming && l.armingEstimate > 0 ? +l.armingEstimate : 0;
-        return { l, log: +l.log, order, H, S: splitScopes(H.values), runs, arming, estimate, cliUsed, fit, bench };
+        return { l, log: +l.log, order, H, S: splitScopes(H.values), runs, arming, estimate, cliUsed, fit, bench, SV };
     });
     const unknownNames = new Map(); for (const it of items) for (const n of it.H.unknown) (unknownNames.get(n) || unknownNames.set(n, new Set()).get(n)).add(it.log);
     // the header profile values of the logs armed (confirmed) in each PID profile, bench runs included (a header is a fact)
@@ -655,7 +682,14 @@ function datasets(logs, cli, options = {}) {
         const cliSec = it.cliUsed && p > 0 ? CV.profiles[p] : null, src = {}, vals = {};
         const addCli = (onlyMissing) => { if (!cliSec) return; for (const [n, v] of Object.entries(cliSec)) if (!onlyMissing || vals[n] === undefined) { vals[n] = v; src[n] = 'cli'; } };
         let res;
-        if (p === 0 || p === it.arming) {
+        const snapSec = it.SV && p > 0 ? it.SV.profiles[p] : null;
+        if (snapSec) {
+            // the snapshot: every value of this PID profile at the start of the log; the header fills a name that it does not have
+            for (const [n, v] of Object.entries(snapSec)) { vals[n] = v; src[n] = SNAPSHOT; }
+            if (p === it.arming) for (const [n, v] of Object.entries(it.S.profile)) if (vals[n] === undefined) { vals[n] = v; src[n] = 'header'; }
+            addCli(true);
+            res = { vals, src, assumed: false, from: 'snapshot' };
+        } else if (p === 0 || p === it.arming) {
             Object.assign(vals, it.S.profile); for (const n of Object.keys(vals)) src[n] = 'header'; addCli(true);
             res = { vals, src, assumed: false, from: 'header' };
         } else if (o.useEstimates && p === it.estimate) {
@@ -686,7 +720,12 @@ function datasets(logs, cli, options = {}) {
     }
     // the rate values after a switch to rate profile q (null: the rate profile at the start of the log, in the header)
     function resolveRate(it, q) {
-        const vals = {}, src = {};
+        const vals = {}, src = {}, snapSec = it.SV ? it.SV.rates[q === null ? it.SV.rateStart : q] : null;
+        if (snapSec) {
+            for (const [n, v] of Object.entries(snapSec)) { vals[n] = v; src[n] = SNAPSHOT; }
+            if (q === null) for (const [n, v] of Object.entries(it.S.rate)) if (vals[n] === undefined) { vals[n] = v; src[n] = 'header'; }
+            return { vals, src, assumed: false, from: 'snapshot' };
+        }
         if (q === null) { Object.assign(vals, it.S.rate); for (const n of Object.keys(vals)) src[n] = 'header'; return { vals, src, assumed: false, from: 'header' }; }
         const sec = it.cliUsed ? CV.rates[q] : null;
         if (sec) { for (const [n, v] of Object.entries(sec)) { vals[n] = v; src[n] = 'cli'; } for (const n of Object.keys(it.S.rate)) if (vals[n] === undefined) { vals[n] = null; src[n] = 'none'; } return { vals, src, assumed: !(it.fit && it.fit.fits), from: 'cli' }; }
@@ -702,21 +741,39 @@ function datasets(logs, cli, options = {}) {
         const l = it.l, runAt = (t) => { let q = null; for (const x of it.runs) if (x.t0 <= t) q = x; else break; return q && t < q.t1 ? q : null; };
         const events = [];
         for (const e of l.rateChanges || []) if (isFinite(e.t) && e.profile > 0) events.push({ t: +e.t, rate: +e.profile });
+        const journal = Array.isArray(l.journal) ? l.journal : null;
         for (const e of l.adjustments || []) if (e && isFinite(e.t)) {
             if (e.func === 1 && e.value > 0) events.push({ t: +e.t, rate: +e.value });
-            else if (e.func !== 2 && e.func !== 0 && e.func !== undefined) events.push({ t: +e.t, adj: e });
+            else if (e.func !== 2 && e.func !== 0 && e.func !== undefined && !journal) events.push({ t: +e.t, adj: e });
+        }
+        // the parameter journal: each change after the log start. The PID profile switches are the runs (profileRuns). A rate profile
+        // switch is a rate event (CLI index + 1): the journal records the switches of MSP, of the Lua script and of the Configurator,
+        // which have no adjustment event. A switch that an adjustment event also gives sets the same rate profile again
+        for (const e of journal || []) if (e && isFinite(e.t) && typeof e.key === 'string') {
+            if (e.key === 'rate_profile') { const q = Number.parseInt(e.value, 10); if (q >= 0 && q <= 5) events.push({ t: +e.t, rate: q + 1 }); }
+            else if (!/^pid_profile$|^(?:el|pg|boot)\./.test(e.key)) events.push({ t: +e.t, jr: e });
         }
         events.sort((a, b) => a.t - b.t);
         const cuts = new Set([it.runs[0].t0, it.runs[it.runs.length - 1].t1]);
         for (const q of it.runs) { cuts.add(q.t0); cuts.add(q.t1); }
         for (const e of events) if (e.t > it.runs[0].t0 && e.t < it.runs[it.runs.length - 1].t1) cuts.add(e.t);
-        const T = [...cuts].sort((a, b) => a - b), over = { profile: new Map(), rate: new Map(), global: {} };
+        // over: the in-flight adjustments (source 'adjustment'); jover: the changes that the parameter journal records (source JOURNAL)
+        const T = [...cuts].sort((a, b) => a - b), over = { profile: new Map(), rate: new Map(), global: {} }, jover = { profile: new Map(), rate: new Map(), global: {} };
         let rateNow = null, ei = 0;
         for (let k = 0; k + 1 < T.length; k++) {
             const a = T[k], b = T[k + 1]; if (!(b > a)) continue;
             for (; ei < events.length && events[ei].t <= a; ei++) {
                 const e = events[ei];
                 if (e.rate !== undefined) { rateNow = e.rate; continue; }
+                if (e.jr) {
+                    // a journal key: p<k>.<name> (PID profile k + 1), r<k>.<name> (rate profile k + 1), else a global name
+                    const m = /^([pr])([0-5])\.(.+)$/.exec(e.jr.key), name = m ? m[3] : e.jr.key, put = (target) => expand(name, parseList(e.jr.value), (n, x) => { target[n] = enumValue(n, norm(x)); });
+                    if (m && m[1] === 'p') { const pk = +m[2] + 1; put(jover.profile.get(pk) || jover.profile.set(pk, {}).get(pk)); }
+                    else if (m) { const rk = +m[2] + 1; for (const k of it.SV && rk === it.SV.rateStart ? [rk, 'start'] : [rk]) put(jover.rate.get(k) || jover.rate.set(k, {}).get(k)); }
+                    else put(jover.global);
+                    if (isFlight(name)) note(`In log ${N(it.log)}, \`${name}\` changed at ${t3(e.t)} s. The log records this change. Thus, the time after this change is a different configuration.`);
+                    continue;
+                }
                 const spec = ADJUST[e.adj.func], name = spec ? spec[0] : `adjustment ${e.adj.func}`, value = spec ? norm(Math.round(e.adj.value / spec[1] * 1000) / 1000) : norm(e.adj.value);
                 const sc = scopeOf(name), at = runAt(e.t), pk = at ? at.profile : 0, rk = rateNow === null ? 'start' : rateNow;
                 if (sc === 'profile') { const m = over.profile.get(pk) || over.profile.set(pk, {}).get(pk); m[name] = value; }
@@ -729,8 +786,10 @@ function datasets(logs, cli, options = {}) {
             const p = run.profile, P = resolveProfile(it, p), R = resolveRate(it, rateNow), values = {}, sources = {};
             const set = (vals, src) => { for (const [n, v] of Object.entries(vals)) { values[n] = v; sources[n] = src[n] || src; } };
             if (it.cliUsed) { const g = {}; for (const [n, v] of Object.entries(CV.global)) if (it.S.global[n] === undefined) g[n] = v; set(g, 'cli'); }
+            if (it.SV) { const g = {}; for (const [n, v] of Object.entries(it.SV.global)) if (it.S.global[n] === undefined) g[n] = v; set(g, SNAPSHOT); }
             set(it.S.global, 'header'); set(P.vals, P.src); set(R.vals, R.src);
             set(over.global, 'adjustment'); set(over.profile.get(p) || {}, 'adjustment'); set(over.rate.get(rateNow === null ? 'start' : rateNow) || {}, 'adjustment');
+            set(jover.global, JOURNAL); set(jover.profile.get(p) || {}, JOURNAL); set(jover.rate.get(rateNow === null ? 'start' : rateNow) || {}, JOURNAL);
             const pid = p > 0 ? p : null, flight = flightOf(values), key = `${pid}|${stable(flight)}`;
             let fs = 0; for (const f of l.flights || []) fs += overlap(a, b, +f.t0, +f.t1);
             const s = { log: it.log, order: it.order, t0: a, t1: b, pidProfile: pid, key, values, sources, assumed: P.assumed || R.assumed, profileFrom: P.from, rateFrom: R.from, bracketed: !!P.bracketed, viaEstimate: !!P.viaEstimate, flightSeconds: fs };
@@ -755,13 +814,15 @@ function datasets(logs, cli, options = {}) {
         for (const [n, v] of Object.entries(s.values)) if (isFlight(n)) { const src = s.sources[n]; if (d.sources[n] === undefined || (d.sources[n] !== 'header' && src === 'header')) { d.values[n] = v; d.sources[n] = src; } }
         s.dataset = d.id; s.index = d.index;
     }
-    const flightsOf = new Map(items.map(it => [it.log, (it.l.flights || []).map((f, i) => ({ i, t0: +f.t0, t1: +f.t1 }))]));
+    // flight: the index of the flight in the log (cutFlights: the parts of a flight out of the cut of a receiver signal loss), else its place
+    const flightsOf = new Map(items.map(it => [it.log, (it.l.flights || []).map((f, i) => ({ i: Number.isInteger(f.flight) ? f.flight : i, t0: +f.t0, t1: +f.t1 }))]));
     for (const d of list) {
         const fl = new Map(); let sec = 0, fsec = 0, asec = 0;
         d.assumedFrom = [];
         for (const s of d.stretches) {
             sec += s.t1 - s.t0; fsec += s.flightSeconds; if (s.assumed) { asec += s.t1 - s.t0; d.assumedFrom.push({ log: s.log, t0: t3(s.t0), t1: t3(s.t1), from: s.profileFrom === 'header' ? null : s.profileFrom, rateFrom: s.rateFrom, bracketed: s.bracketed, viaEstimate: s.viaEstimate }); }
-            for (const f of flightsOf.get(s.log) || []) { const ov = overlap(s.t0, s.t1, f.t0, f.t1); if (ov > 0) { const k = `${s.log}|${f.i}`, e = fl.get(k) || fl.set(k, { log: s.log, flight: f.i, t0: t3(f.t0), t1: t3(f.t1), seconds: 0 }).get(k); e.seconds += ov; } }
+            for (const f of flightsOf.get(s.log) || []) { const ov = overlap(s.t0, s.t1, f.t0, f.t1); if (ov > 0) { const k = `${s.log}|${f.i}`, e = fl.get(k) || fl.set(k, { log: s.log, flight: f.i, t0: t3(f.t0), t1: t3(f.t1), seconds: 0 }).get(k);
+                e.seconds += ov; e.t0 = Math.min(e.t0, t3(f.t0)); e.t1 = Math.max(e.t1, t3(f.t1)); } }
         }
         Object.assign(d, { logs: [...new Set(d.stretches.map(s => s.log))], flights: [...fl.values()].map(f => Object.assign(f, { seconds: t3(f.seconds) })), seconds: t3(sec), flightSeconds: t3(fsec),
             assumed: d.stretches.every(s => s.assumed), assumedSeconds: t3(asec), unknown: Object.keys(d.values).filter(n => d.values[n] === null),
@@ -825,18 +886,19 @@ function datasets(logs, cli, options = {}) {
     info.sort((a, b) => nameOrder(a.name, b.name));
 
     const labels = stretches.map(s => ({ log: s.log, t0: t3(s.t0), t1: t3(s.t1), dataset: s.dataset, index: s.index, pidProfile: s.pidProfile, assumed: s.assumed, flightSeconds: t3(s.flightSeconds),
-        source: { profile: s.profileFrom === 'header' ? 'header' : s.profileFrom === 'cli' ? 'cli' : s.profileFrom === 'estimate' ? 'estimate' : typeof s.profileFrom === 'number' ? `log ${s.profileFrom}${s.viaEstimate ? ' (estimate)' : ''}` : 'none', rate: s.rateFrom === 'header' ? 'header' : s.rateFrom === 'cli' ? 'cli' : 'none' } }));
+        source: { profile: s.profileFrom === 'header' ? 'header' : s.profileFrom === 'snapshot' ? SNAPSHOT : s.profileFrom === 'cli' ? 'cli' : s.profileFrom === 'estimate' ? 'estimate' : typeof s.profileFrom === 'number' ? `log ${s.profileFrom}${s.viaEstimate ? ' (estimate)' : ''}` : 'none',
+            rate: s.rateFrom === 'header' ? 'header' : s.rateFrom === 'snapshot' ? SNAPSHOT : s.rateFrom === 'cli' ? 'cli' : 'none' } }));
     const flown = stretches.filter(s => s.flightSeconds > 0), lastOf = (arr) => arr.length ? arr.reduce((x, y) => (y.order > x.order || (y.order === x.order && y.t0 >= x.t0)) ? y : x) : null;
     const newestS = lastOf(flown) || lastOf(stretches), newestByProfile = {};
     for (const p of new Set(stretches.map(s => s.pidProfile))) { const s = lastOf(flown.filter(x => x.pidProfile === p)) || lastOf(stretches.filter(x => x.pidProfile === p)); newestByProfile[p === null ? 'unknown' : p] = s.dataset; }
-    if (!CV && list.length) note('The log header does not record the values of the mixer, the servos and most governor parameters.');
+    if (!CV && list.length && !items.every(it => it.SV || it.bench)) note('The log header does not record the values of the mixer, the servos and most governor parameters.');
     if (unknownNames.size) note(`The app does not know these parameters: ${[...unknownNames.keys()].map(n => `\`${n}\``).join(', ')}. Thus, the app uses them as parameters that change the flight.`);
 
     const out = {
         version: 1,
         datasets: list.map(d => { const c = Object.assign({}, d); delete c.stretches; delete c.index; c.newest = !!newestS && newestS.dataset === d.id; return c; }),
         labels, diff, pairs, info,
-        logs: items.map(it => ({ log: it.log, bench: it.bench, armingProfile: it.arming || null, armingEstimate: it.estimate || null, cli: it.fit ? { used: true, fits: it.fit.fits, compared: it.fit.compared, profileCompared: it.fit.profileCompared, mismatches: it.fit.mismatches } : { used: false }, unknownNames: it.H.unknown })),
+        logs: items.map(it => ({ log: it.log, bench: it.bench, armingProfile: it.arming || null, armingEstimate: it.estimate || null, snapshot: !!it.SV, cli: it.fit ? { used: true, fits: it.fit.fits, compared: it.fit.compared, profileCompared: it.fit.profileCompared, mismatches: it.fit.mismatches } : { used: false }, unknownNames: it.H.unknown })),
         unknownNames: [...unknownNames].map(([name, logs]) => ({ name, logs: [...logs] })),
         benchRuns, newest: newestS ? newestS.dataset : null, newestByProfile, cli: CV ? { kind: CV.kind, craft: CV.craft, profiles: Object.keys(CV.profiles).map(Number), rateProfiles: Object.keys(CV.rates).map(Number) } : null,
         notes, rules: RULES,
@@ -1003,6 +1065,23 @@ function predict(cmp, name, from, to) {
     return null;
 }
 
+// The flights of a segment without the cut of each receiver signal loss (lib.cjs rxLoss cut0..cut1, IMP-02): the RC values there are
+// not the pilot's. flights: [{ i0, i1 }] in samples (health_phase phases().flights), rxLoss: the losses of the segment (w.rxLoss) or
+// null. -> [{ i0, i1, flight (k: the index of the flight in the list), rxLossCut (true when a cut removed samples) }], in order: a flight
+// gives one item for each part out of the cuts, and a flight fully in a cut one empty item (i0 = i1), so that flight k stays flight k
+// and a flight log stays a flight log. Also used by the worker (dsInput), so that the app and the command line agree
+function cutFlights(flights, rxLoss) {
+    const cuts = (Array.isArray(rxLoss) ? rxLoss : []).filter(s => s && isFinite(s.cut0) && isFinite(s.cut1) && s.cut1 > s.cut0).map(s => [s.cut0, s.cut1]).sort((a, b) => a[0] - b[0]), out = [];
+    (Array.isArray(flights) ? flights : []).forEach((f, k) => {
+        if (!f || !isFinite(f.i0) || !isFinite(f.i1)) return;
+        let a = f.i0, parts = 0;
+        for (const [c0, c1] of cuts) { if (c1 <= a || c0 >= f.i1) continue; if (c0 > a) { out.push({ i0: a, i1: c0, flight: k, rxLossCut: true }); parts++; } a = Math.max(a, c1); }
+        if (a < f.i1) { out.push({ i0: a, i1: f.i1, flight: k, rxLossCut: a !== f.i0 || parts > 0 }); parts++; }
+        if (!parts) out.push({ i0: f.i0, i1: f.i0, flight: k, rxLossCut: true });
+    });
+    return out;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Node: the inputs of datasets() from a log file (headers, PID profile runs, events, flights)
 // ---------------------------------------------------------------------------------------------
@@ -1017,11 +1096,22 @@ function predict(cmp, name, from, to) {
 function inputsOfFile(file, opts = {}) {
     const lib = require('./lib.cjs'), phase = require('./health_phase.cjs'), app = opts.app || lib.loadApp();
     const rpm = opts.flightRpm || lib.FLIGHT_RPM, CV = opts.cli ? cliValues(typeof opts.cli === 'string' ? parseCli(opts.cli) : opts.cli) : null;
-    const ADJ = app.FlightLogEvent ? app.FlightLogEvent.INFLIGHT_ADJUSTMENT : 13, Log = app.FlightLog, events = new Map();
+    const ADJ = app.FlightLogEvent ? app.FlightLogEvent.INFLIGHT_ADJUSTMENT : 13, Log = app.FlightLog, events = new Map(), journals = new Map();
+    const PL = optional('./param_log.cjs');
     let current = null;
     app.FlightLog = function (data) {
         const log = new Log(data), get = log.getChunksInTimeRange, open = log.openLog;
-        log.openLog = function (i) { current = i; return open.apply(this, arguments); };
+        log.openLog = function (i) {
+            current = i; const ok = open.apply(this, arguments);
+            // a parameter journal: the C items after the log start (param_log.cjs journalChanges, as the worker has them: every stamp
+            // kind, the frame at or before the stamp, an interval stamp at its end), and the snapshot with the records before the log start
+            if (ok && PL && PL.isParamLog(this.getSysConfig()) && !journals.has(i)) try {
+                const sc = this.getSysConfig(), got = PL.collect(this), records = PL.assemble(got.strings), t0 = this.getMinTime();
+                const timeline = PL.buildTimeline({ sysConfig: sc, records, frames: got.frames, resumes: got.resumes }), frameS = Float64Array.from(got.frames.time, t => (t - t0) / 1e6);
+                const snapshot = PL.snapshotCli(sc, records); if (snapshot) PL.rememberSnapshot(sc, snapshot);
+                journals.set(i, { changes: PL.journalChanges(timeline, frameS).map(q => ({ t: t3(q.t), key: q.key, value: q.value, uncertain: q.uncertain })), snapshot });
+            } catch (e) { journals.set(i, null); }
+            return ok; };
         log.getChunksInTimeRange = function () {
             const chunks = get.apply(this, arguments), t0 = this.getMinTime(), list = events.get(current) || events.set(current, new Map()).get(current);
             for (const c of chunks || []) for (const e of c.events || []) if (e.event === ADJ && e.data && typeof e.time === 'number') list.set(`${e.time}|${e.data.func}|${e.data.value}`, { t: (e.time - t0) / 1e6, func: e.data.func, value: e.data.value });
@@ -1031,7 +1121,7 @@ function inputsOfFile(file, opts = {}) {
     try {
         for (const w of lib.segments(app, file, { whole: true, extra: [...new Set(['time'].concat(phase.EXTRA || []))] })) {
             if (w.skipped) continue;
-            const li = w.flight.log, L = logs.get(li) || logs.set(li, { log: li, header: w.flight.header, profileRuns: [], flights: [], phased: true, durationS: w.flight.durationS, rawStart: null }).get(li);
+            const li = w.flight.log, L = logs.get(li) || logs.set(li, { log: li, header: w.flight.header, profileRuns: [], flights: [], flightCount: 0, phased: true, durationS: w.flight.durationS, rawStart: null }).get(li);
             const T = w.extra && w.extra.time, at = (i) => T ? w.fromS + (T[Math.min(w.n - 1, i)] - T[0]) / 1e6 + (i >= w.n ? 1 / w.rate : 0) : w.fromS + i / w.rate;
             if (L.rawStart === null) { L.rawStart = w.profileAt[0];
                 const target = w.extra && w.extra.govTarget; // the toolkit's guess for the stretch before the first switch (lib.profilesOf): an estimate only
@@ -1039,7 +1129,12 @@ function inputsOfFile(file, opts = {}) {
             for (let i = 0; i < w.n;) { let j = i + 1; while (j < w.n && w.profileAt[j] === w.profileAt[i]) j++; L.profileRuns.push({ t0: t3(at(i)), t1: t3(at(j)), profile: w.profileAt[i] }); i = j; }
             try {
                 const P = phase.phases(w, { rate: w.flight.actualRate || w.rate, govState: w.govStateAt || null, flightRule: { headspeed: rpm }, airborneEvents: w.airborneAt.some(v => !v) });
-                for (const f of P.flights || []) L.flights.push({ t0: t3(at(f.i0)), t1: t3(at(f.i1)), seconds: f.seconds });
+                // a receiver signal loss (lib.cjs rxLoss, IMP-02): the flight data stops at its cut (the inferred last RC frame less guardS)
+                // and starts again after it (the RX return plus settleS): cutFlights. flight: the index of the flight in the log
+                const fl = P.flights || [];
+                for (const q of cutFlights(fl, w.rxLoss)) { const f = fl[q.flight], flight = L.flightCount + q.flight;
+                    L.flights.push(!q.rxLossCut ? { t0: t3(at(f.i0)), t1: t3(at(f.i1)), seconds: f.seconds, flight } : { t0: t3(at(q.i0)), t1: t3(at(q.i1)), seconds: t3(at(q.i1) - at(q.i0)), flight, rxLossCut: true }); }
+                L.flightCount += fl.length;
             } catch (e) { L.phased = false; L.flights = null; }
         }
     } finally { app.FlightLog = Log; }
@@ -1048,6 +1143,9 @@ function inputsOfFile(file, opts = {}) {
         const ev = [...(events.get(L.log) || new Map()).values()].sort((a, b) => a.t - b.t);
         const pidEv = ev.filter(e => e.func === 2);
         let arming = L.rawStart > 0 ? L.rawStart : 0, basis = arming ? 'event' : null;
+        // a complete parameter snapshot: param_pid_profile is the PID profile at the start (the worker's basis 'snapshot'), before the CLI
+        const J0 = journals.get(L.log), sp = J0 && J0.snapshot ? J0.snapshot.selectedProfile : null;
+        if (!arming && Number.isInteger(sp) && sp >= 0 && sp <= 5) { arming = sp + 1; basis = 'snapshot'; }
         if (!arming && CV && Object.keys(CV.profiles).length) {
             const hv = headerValues(L.header).values, agree = Object.keys(CV.profiles).map(Number).filter(p => fitOf(hv, CV, p).mismatches.filter(m => scopeOf(m.name) === 'profile').length === 0);
             const cands = [1, 2, 3, 4, 5, 6].filter(p => !pidEv.length || p !== pidEv[0].value).filter(p => agree.includes(p));
@@ -1057,7 +1155,7 @@ function inputsOfFile(file, opts = {}) {
         const bench = Array.isArray(L.flights) && L.flights.length === 0;
         out.push({ log: L.log, header: L.header, armingProfile: arming, armingBasis: basis, armingEstimate: arming || bench ? 0 : (L.estimate || 0), profileRuns: L.profileRuns.map(q => ({ t0: q.t0, t1: q.t1, profile: q.profile > 0 ? q.profile : arming })),
             rateChanges: ev.filter(e => e.func === 1).map(e => ({ t: t3(e.t), profile: e.value })), adjustments: ev.filter(e => e.func !== 1 && e.func !== 2).map(e => ({ t: t3(e.t), func: e.func, value: e.value })),
-            flights: L.flights, durationS: L.durationS });
+            flights: L.flights, durationS: L.durationS, ...(journals.get(L.log) ? { journal: journals.get(L.log).changes, snapshot: journals.get(L.log).snapshot } : {}) });
     }
     return out.sort((a, b) => a.log - b.log);
 }
@@ -1080,7 +1178,7 @@ function reportText(ds, logBase = 1) {
 }
 
 module.exports = { RULES, GROUPS, UNKNOWN, FEATURES, HEADER, ENUMS, DEFAULTS, ADJUST, PROFILE_NAMES, RATE_NAMES, classify, groupOf, scopeOf, isFlight, nameOrder, differ, table, groups,
-    headerValues, configurationHeader, parseCli, cliValues, fitOf, datasets, labelArray, datasetAt, profileMap, compare, resultsOf, predict, idOf, inputsOfFile, reportText };
+    headerValues, configurationHeader, parseCli, cliValues, fitOf, datasets, labelArray, datasetAt, profileMap, compare, resultsOf, predict, idOf, cutFlights, inputsOfFile, reportText };
 if (require.main !== module) return;
 
 // node tools/autotune/datasets.cjs <log file> [--cli <dump>] [--rpm <flight rpm>] [--json <out.json>] [--base 0|1] [--estimates]

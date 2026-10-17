@@ -762,7 +762,7 @@ together pass, and no value that a row shows as known is "unknown" in the CLI fi
 `{ id, type: 'governorTuned', result }`. DEVELOPMENT.md section 13 ("The governor model and the governor autotune") has the steps. In short:
 
 - It decodes each selected log whole with `gov_data.EXTRA`, the columns of `health_phase.cjs` and `govRequest`, classifies it
-  (`health_phase.cjs`: a bench run is left out, with one note that gives their count: "The governor analysis does not use bench runs
+  (`health_phase.cjs`: a bench run is left out, with one note that gives their count: "The governor autotune does not use bench runs
   (36 logs)."), and makes one run for each segment of each flight log (`gov_data.fromSegment`, all phases, the DISARM events of the
   part, the adjustment events of the log, the PID profile at the start of the log from `armingFinal`).
 - `gov_tune.autotune(runs, { cli, progress, budgetMs, cancelled })` makes the result. **The runs of the model** (`gov_tune.modelRunsOf`):

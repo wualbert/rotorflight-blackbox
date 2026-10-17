@@ -331,3 +331,74 @@ test('the firmware time is exact and does not stop or wrap after 2^32 microsecon
     assert.throws(()=>g.step({...s,timeS:4400}),/out of the range of the firmware clock/);assert.throws(()=>g.step({...s,timeS:NaN}),/not correct/);
     g.reset();g.step({...s,timeS:5});g.step(s);assert.throws(()=>g.step({...s,timeS:5.0005}),/before/);g.step({...s,timeS:5.001});
 });
+
+// ---- audited builds with the same replayed source (IMP-06, firmware/equivalence.cjs) ------------------------------------------
+const EQ=require('../tools/autotune/firmware/equivalence.cjs');
+const build47=(overrides={},extra={})=>({...config(overrides),firmwareVersion:'4.7.0',firmwareRevision:'Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X',...extra});
+test('4.7.0-bbp-pr 85d7049a9: accepted only with error_decay_gain_cyclic 0, no level mode and servo speed 0; an unknown build is refused',()=>{
+    const ok=F.compatibility(build47({error_decay_gain_cyclic:0}));
+    assert.equal(ok.supported,true,JSON.stringify(ok.reasons));
+    assert.equal(ok.equivalence.revision,'85d7049a9');assert.equal(ok.equivalence.base,F.COMMIT);
+    assert.deepEqual(ok.equivalence.parity,EQ.RULES,'the per-log parity of the build');
+    assert.ok(ok.equivalence.conditions.some(c=>c.id==='errorDecayGain'&&c.holds===true));
+    assert.equal(F.compatibility(build47({error_decay_gain_cyclic:20})).supported,false);
+    assert.match(F.compatibility(build47({error_decay_gain_cyclic:20})).reasons.join(' '),/error_decay_gain_cyclic/);
+    assert.equal(F.compatibility(build47({})).supported,false,'an unknown error_decay_gain_cyclic');
+    assert.equal(F.compatibility(build47({error_decay_gain_cyclic:0},{modes:['angle']})).supported,false);
+    const servo=(speed)=>({count:1,parameters:[[1500,-700,700,500,500,333,speed,0]],sources:[],unknown:[],verified:true});
+    assert.equal(F.compatibility(build47({error_decay_gain_cyclic:0},{servos:servo(0)})).supported,true);
+    assert.equal(F.compatibility(build47({error_decay_gain_cyclic:0},{servos:servo(100)})).supported,false);
+    const bad=F.compatibility(build47({error_decay_gain_cyclic:0},{firmwareRevision:'Rotorflight 4.7.0 (deadbee) STM32G47X'}));
+    assert.deepEqual(bad.reasons,['The app cannot use this firmware version.','The log does not identify the firmware source version.']);assert.equal(bad.equivalence,null);
+    assert.equal(F.compatibility(build47({error_decay_gain_cyclic:0},{firmwareVersion:'4.6.0'})).supported,false,'the version of the build');
+    // the value comes through fromHeader from the configuration values
+    assert.equal(F.fromHeader({},{error_decay_gain_cyclic:0},{valueSources:{error_decay_gain_cyclic:'log snapshot'}}).values.error_decay_gain_cyclic,0);
+});
+// review IMP-05/IMP-06: in 4.7 the battery values are lists of the 6 battery profiles (bat_profile in force). The configuration has
+// the list (a CLI or a snapshot value) or its elements name[0..5] (datasets.cjs): the replay gets the element of bat_profile
+test('4.7 battery lists: the governor gets the cell count of the battery profile in force',()=>{
+    const elems={bat_profile:1,gov_use_voltage_comp:'ON'};for(let k=0;k<6;k++){elems[`battery_cell_count[${k}]`]=k===1?12:6;elems[`vbat_min_cell_voltage[${k}]`]=330+k;}
+    const a=F.fromHeader({},elems,{});assert.equal(a.values.battery_cell_count,12);assert.ok(!a.unknown.includes('battery_cell_count'));
+    const b=F.fromHeader({},{bat_profile:2,battery_cell_count:[6,6,8,6,6,6]},{});assert.equal(b.values.battery_cell_count,8,'the list of a CLI or snapshot value');
+    assert.equal(F.fromHeader({},{battery_cell_count:6},{}).values.battery_cell_count,6,'4.6: one value');
+    // with gov_use_voltage_comp ON, the governor of a 4.7 configuration has its cell count: not unknown
+    const c=F.compatibility(build47({...F.defaults(),error_decay_gain_cyclic:0,gov_mode:3,gov_flags:8,battery_cell_count:a.values.battery_cell_count},{executeGovernor:true}),{step:'governor'});
+    assert.ok(!c.reasons.some(r=>/unknown values/.test(r)),JSON.stringify(c.reasons));
+});
+test('4.6.0-bbp 58a4bd5cc and 874f369d5: the same replayed algorithm as 118e912, with no condition; a 118e912 log as before',()=>{
+    for(const rev of ['Rotorflight 4.6.0-bbp (58a4bd5cc) STM32G47X','Rotorflight 4.6.0-bbp-bench (874f369d5) STM32G47X']) {
+        const c=F.compatibility({...config(),firmwareRevision:rev});
+        assert.equal(c.supported,true,rev);assert.deepEqual(c.equivalence.conditions,[],rev);
+        assert.equal(F.compatibility({...config(),firmwareRevision:rev,executeGovernor:true},{step:'governor'}).supported,true,'the governor: journal hooks only');
+        assert.equal(F.compatibility({...config(),firmwareRevision:rev,firmwareVersion:'4.7.0'}).supported,false);
+    }
+    const stock=F.compatibility({...config(),firmwareRevision:'Rotorflight 4.6.0 (118e912) STM32G47X'});
+    assert.equal(stock.supported,true);assert.equal(stock.equivalence,null);
+    assert.deepEqual(F.compatibility({...config(),firmwareRevision:'abcdef0'}).reasons,['The log does not identify the firmware source version.']);
+    assert.deepEqual(EQ.match('Rotorflight 4.6.0 (118e912) STM32G47X'),{base:true});assert.equal(EQ.match('Rotorflight 4.6.0 (abcdef0) X'),null);
+    assert.equal(EQ.match('85d7049a9377af53b1ce9564248139d9ceb854c1').id,'85d7049a9');
+});
+test('equivalent builds: the controller window and the governor prefix must agree within the rules of the build',()=>{
+    const P=require('../tools/autotune/control_pipeline.cjs'),eq=F.compatibility(build47({error_decay_gain_cyclic:0}));
+    const rows=[{pass:true,metrics:[{rmse:.01,relative:.04},{rmse:.01,relative:.02},{rmse:.01,relative:.01}]},{pass:true,metrics:[{rmse:.01,relative:.06},{rmse:.01,relative:.02},{rmse:.01,relative:.01}]},
+        {pass:true,metrics:[{rmse:.0008,relative:.3},{rmse:.0005,relative:.2},{rmse:.0009,relative:.1}]}];
+    P.equivalentParity(eq,rows);
+    assert.deepEqual(rows.map(r=>r.pass),[true,false,true],'5 % per window, or the logging step of a still window');
+    const stock=[{pass:true,metrics:[{rmse:.01,relative:.06}]}];P.equivalentParity(F.compatibility(config()),stock);
+    assert.equal(stock[0].pass,true);assert.equal(stock[0].equivalence,undefined,'a 118e912 log keeps the rules of the pipeline');
+    const gov=(agreement,rmse)=>{const row={pass:true,reasons:[],stateAgreement:agreement,throttle:{rmse}};P.equivalentGovernorParity(eq,row);return row.pass;};
+    assert.deepEqual([gov(.9999,.0007),gov(.99,.0007),gov(.9999,.003),gov(null,.0007)],[true,false,false,false]);
+});
+test('equivalence table: every listed hash is the file of that build, and the other manifest files are the 118e912 files',(t)=>{
+    const repo=process.env.ROTORFLIGHT_FIRMWARE||path.join(os.homedir(),'exp/rotorflight-firmware');
+    if(!fs.existsSync(path.join(repo,'.git')))return t.skip('no rotorflight-firmware repository (ROTORFLIGHT_FIRMWARE)');
+    const manifest=require('../tools/autotune/firmware/manifest.json'),sha=(rev,file)=>require('node:crypto').createHash('sha256').update(cp.execFileSync('git',['-C',repo,'show',`${rev}:src/main/${file}`])).digest('hex');
+    for(const [id,e] of Object.entries(EQ.REVISIONS)) {
+        assert.equal(cp.execFileSync('git',['-C',repo,'rev-parse',id]).toString().trim(),e.commit,id);
+        for(const [file,hash] of Object.entries(manifest.files)) {
+            const got=sha(e.commit,file),listed=e.files[file];
+            if(listed)assert.equal(got,listed.sha256,`${id} ${file}`);else assert.equal(got,hash,`${id} ${file}: the 118e912 file`);
+        }
+        for(const f of Object.values(e.files))assert.ok(f.scopes.length&&f.hunks.length&&f.hunks.every(h=>h.condition===null||EQ.CONDITIONS[h.condition]),id);
+    }
+});

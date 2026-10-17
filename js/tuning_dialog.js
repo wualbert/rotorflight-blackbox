@@ -54,7 +54,7 @@ var TuningDialog = (function () {
     // Checks whose notes report a measurement rather than a problem: the notes that tools/autotune/catalog.cjs status()
     // gives "information". Only for a finding without the worker's status (findingStatus); test/tuning_dialog.test.cjs
     // keeps it equal to the catalog. F10: a yaw note with a standard error is to monitor
-    var REPORT_ONLY = { C8: 1, C9: 1, C13: 1, C14: 1, D2: 1, D3: 1, D5: 1, D6: 1, D7: 1, F10: 1, F11: 1, G0: 1, G7: 1, G8: 1, G14: 1, H: 1, P2: 1, R1: 1,
+    var REPORT_ONLY = { C8: 1, C9: 1, C13: 1, C14: 1, D2: 1, D3: 1, D5: 1, D6: 1, D7: 1, D12: 1, F10: 1, F11: 1, G0: 1, G7: 1, G8: 1, G14: 1, H: 1, P2: 1, R1: 1,
         SETUP: 1, T12: 1, T13: 1, T14: 1 };
     // A finding that is information at most (catalog.cjs statusOf): C10 without an axis, the rotor at flight speed on the ground
     // (SPEC3 F: slow to take off, never a problem)
@@ -137,7 +137,7 @@ var TuningDialog = (function () {
     };
 
     // The phases of a flight log (SPEC2 D13), in the sequence of a flight
-    var PHASES = [["idle", "idle"], ["spoolup", "spool-up"], ["ground", "on the ground"], ["flight", "flight"], ["spooldown", "spool-down"]];
+    var PHASES = [["idle", "idle"], ["spoolup", "spool-up"], ["ground", "on the ground"], ["flight", "flight"], ["spooldown", "spool-down"], ["fall", "before the ground contact"], ["aftercontact", "after the ground contact"]];
 
     var TABS = [
         { key: "overview", title: "Overview" },
@@ -959,8 +959,13 @@ var TuningDialog = (function () {
         opts = opts || {};
         var c = selectionCounts(rows), none = !c.flightsOn && !c.otherOn, open = typeof opts.open === "boolean" ? opts.open : none, sub = opts.subOpen || {};
         var head = selectionHead(c), at = head.indexOf(": ");
-        var help = c.other ? (hasKnown ? "The list shows the flights of a log after an analysis of that log. For the other logs, select the full log." :
-            "The list shows the flights of a log after an analysis of that log. Before that, select the full log.") : "Select the flights for the analysis. The analysis does not use bench runs.";
+        // opts.scan: the scan of the flights of each log (ensureScan): { running, text } or { failed }. Without it, the logs whose
+        // flights the app does not know have no scan (a host without workers) or a scan that has no result for them
+        var scan = opts.scan || null;
+        var help = !c.other ? esc('Select the flights for the analysis. Then click "Start analysis". The analysis does not use bench runs.') :
+            scan && scan.running ? esc("The app finds the flights in each log." + (scan.text ? " " + scan.text : "") + " Before the list shows the flights of a log, you can select only the full log.") :
+            scan && scan.failed ? esc("The app cannot find the flights in the logs. The error is") + " " + quoted(esc(scan.failed)) + esc(". Select the full logs.") :
+            esc("The app does not know the flights of " + (hasKnown ? "some logs" : "the logs") + ". For these logs, select the full log.");
         var table = '<div class="tuning-fsel-wrap"><table class="tuning-table tuning-fsel-table"><thead><tr><th></th><th>Log</th><th>Date</th><th>Length</th><th>Flights</th></tr></thead><tbody>' +
             rows.map(function (r) {
                 var box = '<input type="checkbox" class="tuning-fsel-log" data-log="' + r.log + '"' + (r.selected ? " checked" : "") + (r.selectable ? "" : " disabled") +
@@ -988,7 +993,7 @@ var TuningDialog = (function () {
             "<strong>" + esc(head.slice(0, at + 1)) + '</strong> <span class="tuning-fsel-count">' + esc(head.slice(at + 2)) + "</span></summary>" +
             '<div class="tuning-fsel-body"><div class="tuning-fsel-actions"><button type="button" class="btn btn-default btn-xs tuning-fsel-all">Select all flights</button>' +
             '<button type="button" class="btn btn-default btn-xs tuning-fsel-none">Remove the selection</button></div>' +
-            '<p class="tuning-muted tuning-fsel-help">' + esc(help) + "</p>" + table + "</div></details>";
+            '<p class="tuning-muted tuning-fsel-help">' + help + "</p>" + table + "</div></details>";
     }
 
     // "PID profile 1: 2300 rpm, 3.3 min · PID profile 2: 2500 rpm, 50.0 s". The records keep the label of the modules (0: the
@@ -1015,7 +1020,7 @@ var TuningDialog = (function () {
     // that the pilot loaded ("cli", "cliTarget"). "govTarget" and "fileTarget" are estimates only (js/tuning_worker.js CONFIRMS)
 
     var START_NOTE = "The log header has the values of the PID profile that is active when a new log starts.";
-    var BASIS_SHORT = { event: "the log event", headspeed: '"govRequest"', cli: "the CLI dump", cliTarget: "the CLI dump" };
+    var BASIS_SHORT = { snapshot: "the log header", event: "the log event", headspeed: '"govRequest"', cli: "the CLI dump", cliTarget: "the CLI dump" };
 
     // The arming result of log li: { log, profile (1-6, 0 unknown), basis, confirmed, estimate, headspeed }, or null (a bench run,
     // a log that the worker did not analyse, a result without it)
@@ -1058,7 +1063,8 @@ var TuningDialog = (function () {
             return out.join(" ");
         }
         (Array.isArray(a.basis) ? a.basis : []).forEach(function (b) {
-            if (b === "event") out.push("The log records a change to " + profileLabel(p) + " at the first frame.");
+            if (b === "snapshot") out.push('The log header records the PID profile at the start of the log ("param_pid_profile").');
+            else if (b === "event") out.push("The log records a change to " + profileLabel(p) + " at the first frame.");
             else if (b === "cli") out.push("Only the CLI section of " + profileLabel(p) + " agrees with the log header.");
             else if (b === "cliTarget") out.push('At the start of the log, the governor target agrees with the "gov_headspeed" of ' + profileLabel(p) + " in the CLI dump.");
             else if (b === "headspeed") out.push(headspeedText(a.headspeed, p, where));
@@ -1174,7 +1180,8 @@ var TuningDialog = (function () {
     // The log is the only necessary input, and it wins: the worker does not use a value of the CLI dump that does not agree with
     // the log, and a conflict never makes a PID profile that the log confirms unknown
 
-    var CLI_STATUS = { conflict: "The CLI dump does not agree with the log.", logWins: "The analysis uses the values of the log.", unused: "The analysis does not use the CLI dump." };
+    var CLI_STATUS = { conflict: "The CLI dump has values that are different from the logs.", why: "This occurs if you changed values between the flights and the CLI dump.",
+        logWins: "The analysis uses the values in the logs.", unused: "The analysis does not use the CLI dump." };
     var CONFLICTS_SHOWN = 12;
 
     function cliConflicts(r) {
@@ -1187,7 +1194,7 @@ var TuningDialog = (function () {
     function cliStatusHtml(r) {
         var conf = cliConflicts(r), cs = r && r.cliStatus;
         if (conf.length) {
-            return notice("warn", "<strong>" + esc(CLI_STATUS.conflict) + "</strong> " + esc(CLI_STATUS.logWins) + '<ul class="tuning-cli-conflicts">' +
+            return notice("warn", "<strong>" + esc(CLI_STATUS.conflict) + "</strong> " + esc(CLI_STATUS.why + " " + CLI_STATUS.logWins) + '<ul class="tuning-cli-conflicts">' +
                 conf.slice(0, CONFLICTS_SHOWN).map(function (c) { return "<li>" + (c.text ? mdCode(c.text) : quoted(esc(oneLine(c.what)))) + "</li>"; }).join("") + // the text says what
                 (conf.length > CONFLICTS_SHOWN ? "<li>" + esc(plural(conf.length - CONFLICTS_SHOWN, "other difference") + ".") + "</li>" : "") + "</ul>");
         }
@@ -1217,11 +1224,19 @@ var TuningDialog = (function () {
         noCause: "No known cause"
     };
     // the causes (param_epochs.cjs reasons) as labels, in the order of the worker
+    // the reasons of a part of a log with a parameter journal (param_epochs.cjs fromTimeline, the worker's journal reasons) too
     var FRESH_CAUSE = { grace: "Disarmed", rearm: "Armed again", switched: "Different PID profile or rate profile", unlogged: 'Change of "govRequest"',
-        adjusted: "In-flight adjustment", resume: "Period with no data" };
-    var FRESH_ORDER = ["grace", "rearm", "switched", "unlogged", "adjusted", "resume"];
-    // the source of the values of a part (span.source.pid, .rate), as words: "log N" is the log header of log N (0-based)
-    var FRESH_SOURCE = { header: "log header", cli: "CLI dump", recovered: "calculated gains", adjustment: "in-flight adjustment", none: "unknown" };
+        adjusted: "In-flight adjustment", resume: "Period with no data",
+        mixed: "Parameter change during a frame", uncertain: "Parameter change at an unknown time", pending: "New value that is not in use",
+        unknown: "Unknown value", "effect-unknown": "Parameter change with an unknown effect", lost: "Missing record of a parameter change",
+        "snapshot-incomplete": "Parameter values in the log header not complete", "chain-mismatch": "Parameter changes that do not agree",
+        "order-unknown": "Parameter change in an unknown sequence", "unexplained-runtime": "Change of the values with no record", changed: "Recorded parameter change" };
+    var FRESH_ORDER = ["grace", "rearm", "switched", "unlogged", "adjusted", "resume", "mixed", "uncertain", "pending", "unknown", "effect-unknown", "lost",
+        "snapshot-incomplete", "chain-mismatch", "order-unknown", "unexplained-runtime", "changed"];
+    // the source of the values of a part (span.source.pid, .rate), as words: "log N" is the log header of log N (0-based); "journal": a
+    // log with a parameter snapshot, whose values are in its header and whose changes the log records
+    var FRESH_SOURCE = { header: "log header", cli: "CLI dump", recovered: "calculated gains", adjustment: "in-flight adjustment", none: "unknown",
+        journal: "parameter values in the log header and the recorded changes" };
     var FRESH_OLD_CLI = "CLI dump that does not agree with the log"; // a source "cli" of a dump that the log contradicts (cliDisagrees)
     var FRESH_SHOWN = 6;    // the periods of a result in its mark; the others as a count
     var PERIOD_PAD_S = 0.5; // "Show in the log" of a period: the period +- this, as the evidence spans of the limits checks
@@ -1890,6 +1905,31 @@ var TuningDialog = (function () {
             (p.success ? '<p class="tuning-muted"><strong>Result to look for:</strong> ' + mdCode(p.success) + '</p>' : '') + '</section>';
     }
 
+    // IMP-07: the flights to compare the previous and the new values (tools/autotune/validation_power.cjs plan): its text, its
+    // PID profile, its measurements (a lower-bound standard deviation and its number of flights are marked "minimum", else the
+    // number of flights has its range) and its rule. The label is neutral: the plan can say that flights cannot show the change.
+    // The selection and the CLI text of the change do not change
+    function validationPowerHtml(vp) {
+        if (!vp || !Array.isArray(vp.text) || !vp.text.length) return "";
+        var value = function (m, v) { return isNum(v) ? num(v) + (m.unit ? " " + m.unit : "") : "Unknown"; };
+        var flights = function (m) {
+            if (!isNum(m.n)) return "Unknown";
+            if (m.lowerBound) return m.n + " (minimum)";
+            var r = m.range;
+            return r && isNum(r.low) ? m.n + " (" + r.low + (isNum(r.high) ? " to " + r.high : " or more") + ")" : String(m.n);
+        };
+        var rows = (vp.metrics || []).filter(function (m) { return m && typeof m.label === "string" && (isNum(m.n) || isNum(m.sd)); });
+        return '<div class="tuning-rec-list tuning-power' + (vp.confirmable ? "" : " is-caveat") + '"><div class="tuning-label">' +
+            esc("Flights to compare the values" + (typeof vp.profileLabel === "string" && vp.profileLabel ? " · " + vp.profileLabel : "")) + "</div>" +
+            vp.text.map(function (t) { return "<p>" + esc(t) + "</p>"; }).join("") +
+            (rows.length ? '<div class="tuning-table-wrap"><table class="tuning-table tuning-power-metrics"><thead><tr><th>Measurement</th><th>Calculated change</th>' +
+                "<th>Flight-to-flight standard deviation</th><th>Flights for each set of values</th></tr></thead><tbody>" +
+                rows.map(function (m) { return "<tr><td>" + esc(cap(m.label)) + "</td><td>" + esc(value(m, m.delta)) + "</td><td>" + esc(value(m, m.sd)) +
+                    (m.lowerBound && isNum(m.sd) ? " (minimum)" : "") + (isNum(m.flights) ? " (" + esc(plural(m.flights, "flight")) + ")" : "") + "</td><td>" + esc(flights(m)) + "</td></tr>"; }).join("") +
+                "</tbody></table></div>" : "") +
+            (typeof vp.rule === "string" && vp.rule ? '<p class="tuning-muted">' + esc(vp.rule) + "</p>" : "") + "</div>";
+    }
+
     function recommendationBody(rec, hideProcedure) {
         var action = procedureHtml(rec);
         return action ? (hideProcedure ? '' : action) + '<details class="tuning-action-measurements"><summary>Measurements</summary>' +
@@ -1913,6 +1953,7 @@ var TuningDialog = (function () {
             recommendationBody(rec) + modelNoteHtml(rec, entry, env) +
             (rec.parameter ? '<div class="tuning-rec-param">' + parameterHtml(rec.parameter) + " " + esc(paramText(rec)) + "</div>" : "") +
             staleRecHtml(rec) + // r.stale: the caveat with its text (CLAUDE.md "Values that are possibly not current")
+            validationPowerHtml(rec.validationPower) +
             recConfigHtml(rec, entry.result) +
             (ruleText(rec) ? '<div class="tuning-rec-rule"><div class="tuning-label">Rule</div><div>' + esc(ruleText(rec)) + "</div></div>" : "") +
             sourcesHtml(rec) +
@@ -2142,13 +2183,14 @@ var TuningDialog = (function () {
     // Where the values of a configuration come from (datasets.cjs sources: header, cli, "log N", adjustment, none): "Values from
     // the log header and the CLI dump", or ""
     function configSources(d) {
-        var src = d && d.sources && typeof d.sources === "object" ? d.sources : null, kinds = {}, names = { header: "the log header", cli: "the CLI dump", log: "a different log", adjustment: "an adjustment in flight" };
+        var src = d && d.sources && typeof d.sources === "object" ? d.sources : null, kinds = {}, names = { header: "the log header", "log snapshot": "the parameter values in the log header",
+            "log journal": "the parameter changes that the log records", cli: "the CLI dump", log: "a different log", adjustment: "an adjustment in flight" };
         if (!src) return "";
         Object.keys(src).forEach(function (k) {
             var v = String(src[k]);
             if (v !== "none") kinds[names[v] ? v : /^log \d+$/.test(v) ? "log" : "other"] = true;
         });
-        var parts = ["header", "cli", "log", "adjustment"].filter(function (k) { return kinds[k]; }).map(function (k) { return names[k]; });
+        var parts = ["header", "log snapshot", "log journal", "cli", "log", "adjustment"].filter(function (k) { return kinds[k]; }).map(function (k) { return names[k]; });
         return parts.length ? "Values from " + andText(parts) : "";
     }
 
@@ -3787,9 +3829,10 @@ var TuningDialog = (function () {
         var html = '<div class="tuning-ft-outcome"><h6 class="tuning-h">Next step</h6><p>Keep the recorded values. The checks of the calculated values are not all satisfactory. No CLI commands are available.</p>';
         if (rec.reasons && rec.reasons.length) html += '<ul>' + rec.reasons.map(function(reason){return '<li>' + esc(reason) + '</li>';}).join('') + '</ul>';
         if (excluded.length) {
+            // one line for each text: the segments of one log have the same reason
             html += '<h6 class="tuning-h">Flight periods not used</h6><ul>' + excluded.map(function(q){return '<li>' + esc('Log ' + logLabel(q.log) +
-                (isNum(q.fromS) && isNum(q.toS) ? ', ' + num(q.fromS) + ' s to ' + num(q.toS) + ' s' : '') + ': ' + q.reason) + '</li>';}).join('') + '</ul>';
-            html += '<p>Select a different flight with complete filter data.</p>';
+                (isNum(q.fromS) && isNum(q.toS) ? ', ' + num(q.fromS) + ' s to ' + num(q.toS) + ' s' : '') + ': ' + q.reason) + '</li>';}).filter(function(li,i,all){return all.indexOf(li) === i;}).join('') + '</ul>';
+            if (excluded.some(function(q){return !(q.cliValues && q.cliValues.length);})) html += '<p>Select a different flight with complete filter data.</p>';
             if (excluded.some(function(q){return /no complete filter window/.test(q.reason);})) html += '<p>For the next flight, keep each PID profile active for a longer flight period.</p>';
             if (excluded.some(function(q){return /no raw gyro/.test(q.reason);})) html += '<p>For the next flight, include the raw gyro data.</p>';
         }
@@ -3812,25 +3855,24 @@ var TuningDialog = (function () {
             var id = env.plotId(); plots.push({id:id,spec:comparison ? ftComparisonSpec(it.spec,opts.curves) : it.spec,filterComparison:comparison ? it.spec : null});
             return '<div class="tuning-ft-plotbox"><div class="tuning-plot"><canvas id="' + id + '" class="tuning-plot-canvas"></canvas></div></div>';
         }
-        var html = '<section class="tuning-ft' + (compact ? ' is-compact' : ' tuning-ft-workspace') + '" aria-label="' + esc(FT.title) + '"><div class="tuning-ft-heading"><div><h5 class="tuning-h">Filters</h5>' +
-            '<p class="tuning-muted">Autotune calculates the filter parameters. Change the values as necessary. Examine the filter checks and flight signals after replay.</p></div></div>';
+        var html = '<section class="tuning-ft' + (compact ? ' is-compact' : ' tuning-ft-workspace') + '" aria-label="' + esc(FT.title) + '"><div class="tuning-ft-heading"><div>' +
+            (compact ? '' : '<span class="tuning-ct-eyebrow">FILTER AUTOTUNE</span>') + '<h5 class="tuning-h">Filters</h5>' +
+            '<p class="tuning-muted">Autotune calculates the filter parameters. Change the values as necessary. Examine the filter checks and flight signals after replay.</p></div>' +
+            '<div class="tuning-ft-actions">' + autotuneBarHtml({ cls: 'ft', state: m.state, fraction: m.fraction, text: m.text || FT.running, current: autotuned, disabled: !!opts.disabled,
+                reason: m.unavailable || (opts.disabled ? 'Open a log in the log viewer.' : '') }) + '</div></div>';
         if (m.source) html += compact ? '<p class="tuning-ft-source-title">' + esc(m.source.title) + '</p>' :
             '<div class="tuning-ft-source"><label>Flight data for this tune<select class="form-control tuning-ft-source-select"' + (running ? ' disabled' : '') + '>' +
             options((m.sources || []).map(function(s){return [s.key,s.title];}),m.source.key) + '</select></label></div>';
         if (!compact) html += filterBaselineHtml(baseline);
         html += '<section class="tuning-ft-editor"><div class="tuning-ft-section-head"><h5 class="tuning-h">Filter parameters</h5><div class="tuning-ft-actions">';
-        if (running) {
-            var frac = isNum(m.fraction) ? Math.max(0,Math.min(1,m.fraction)) : 0;
-            html += '<div class="tuning-ft-progress" role="status"><div class="tuning-progress-track"><div class="tuning-progress-bar tuning-ft-bar" style="width:' + (100*frac).toFixed(1) + '%"></div></div><span class="tuning-ft-progress-text">' + esc(m.text || FT.running) + '</span></div><button type="button" class="btn btn-default btn-sm tuning-ft-cancel">Cancel</button>';
-        } else {
-            if (!autotuned) html += '<button type="button" class="btn btn-primary btn-sm tuning-ft-start"' + (opts.disabled ? ' disabled' : '') + '>Autotune</button>';
-            if (res) html += '<button type="button" class="btn btn-primary btn-sm tuning-ft-simulate"' + (opts.disabled ? ' disabled' : '') + '>Simulate again</button>';
-        }
+        if (!running && res) html += '<button type="button" class="btn btn-primary btn-sm tuning-ft-simulate"' + (opts.disabled ? ' disabled' : '') + '>Simulate again</button>';
         html += '</div></div>';
-        if (m.unavailable) return {html:html + '<p class="tuning-na">' + esc(m.unavailable) + '</p></section></section>',plots:plots};
+        if (m.unavailable) return {html:html + '</section></section>',plots:plots}; // the reason is next to the button of the heading
         if (m.state === 'failed') html += notice('error',esc(FT.failed) + ' ' + quoted(esc(m.error && (m.error.detail || m.error.message) || '')));
         if (m.state === 'canceled') html += '<p class="tuning-muted">' + esc(FT.canceled) + '</p>';
         if (m.stale) html += notice('info','The inputs or time delay limit changed. Click Autotune to calculate new values, or simulate the selected values.');
+        // the replay needs values that the log does not record (result.cliNeeded): ask for the CLI dump (user 2026-10-15)
+        if (res && res.cliNeeded && !m.cli) html += notice('warn', mdCode(res.cliNeeded.text) + ' <button type="button" class="btn btn-default btn-xs tuning-cli-load">Load CLI dump</button>');
         if (compact) return {html:html + (res ? '<p>' + ftRecText(res) + '</p>' : '') + '</section><a href="#" class="tuning-tab-link" data-tab="filters">Open filter tuning</a></section>',plots:plots};
         var controls = '<div class="tuning-ft-controls"><label>Maximum added time delay (ms) <input class="tuning-ft-delay" type="number" min="0" max="20" step="0.05" value="' + esc(String(delay)) + '"' + (running ? ' disabled' : '') + '></label>' +
             '<span class="tuning-muted">Default: 0.5 ms. The limit applies to the increase from the recorded configuration at 10–30 Hz.</span></div>';
@@ -4019,6 +4061,8 @@ var TuningDialog = (function () {
     }
 
     var CONTROL_STEPS = ['governor','cyclic','tail','cycomp','tailcomp'];
+    // The steps that the helicopter model (controlTune) can tune: not the governor, which only the governor model tunes (user, 2026-10-15)
+    function isModelStep(step) { return step !== 'governor' && CONTROL_STEPS.indexOf(step) >= 0; }
     var controlCliAuthorization = new WeakMap(), recordedConfigurationCli = new WeakSet();
     function automaticControlChange(rec) {
         if (!Array.isArray(rec.cli) || !rec.cli.length) return false;
@@ -4305,22 +4349,22 @@ var TuningDialog = (function () {
         title: "Governor model",
         about: "The app makes a model of the motor, the ESC, the rotor load and the battery from the flight logs. " +
             "Then the app uses the model and the governor code of the firmware to test the governor parameters.",
-        start: "Start the governor analysis",
+        start: "Autotune",
         running: "The app makes and tests the governor model.",
-        canceled: "You canceled the governor analysis.",
-        failed: "The governor analysis stopped because of an error.",
-        stale: "This result is for different flights or a different CLI dump. To use the selected inputs, start the governor analysis again.",
-        staleRecs: "To select changes of the governor model for the CLI file, start the governor analysis again.",
+        canceled: "You canceled the governor autotune.",
+        failed: "The governor autotune stopped because of an error.",
+        stale: "This result is for different flights or a different CLI dump. To use the selected inputs, click \"Autotune\" again.",
+        staleRecs: 'To select changes of the governor model for the CLI file, click "Autotune" again.',
         noFile: "The log file is not open in the log viewer.",
-        otherFile: "The analysis on display is for a different file. Start the analysis again.",
-        noFlight: "The logs have no flight. The governor analysis does not use bench runs.",
+        otherFile: 'The analysis on display is for a different file. Click "Start analysis".',
+        noFlight: "The logs have no flight. The governor autotune does not use bench runs.",
         flightTest: "The model calculates the effect of a change. A new flight must test each change.",
         table: "Parameter table",
         rows: "The table shows each governor parameter for each PID profile. It shows the value at this time, the source of the value and the result of the analysis.",
         noRows: "The result has no parameter rows.",
         changes: "Changes for the CLI file",
         picks: "Select the changes for the CLI file. The app selects each change with CLI text first. It does not select a check. You can select a check that has CLI text.",
-        noChange: "The governor analysis has no change with CLI text.",
+        noChange: "The governor autotune has no change with CLI text.",
         optIn: "The app does not select this change. If you use the governor condition BYPASS, select this change.",
         optInLead: "The app does not select this change. The cause is as follows:",
         checks: "Checks and information",
@@ -4330,11 +4374,11 @@ var TuningDialog = (function () {
         params: "Model parameters",
         reasons: "Causes",
         limits: "Model limits",
-        unused: "Logs that the governor analysis does not use",
+        unused: "Logs that the governor autotune does not use",
         trial: "Changes of the governor model",
         blocked: "A step before the governor in the tuning sequence has a problem. Thus, the changes have no CLI text until you correct it.",
         noCliModel: "The governor model does not agree with the test flights. Thus, this change from the model has no CLI text.",
-        noCliOld: "This result of the governor model is for different flights or a different CLI dump. Thus, this change has no CLI text. To get CLI text, start the governor analysis again.",
+        noCliOld: "This result of the governor model is for different flights or a different CLI dump. Thus, this change has no CLI text. To get CLI text, click \"Autotune\" again.",
         inPanel: "The changes of the governor model are in the \"Governor model\" part of this tab.",
         notByConfig: "The changes of the governor model do not use this selection. To remove one of them from the CLI file, clear its box in the Governor tab."
     };
@@ -4544,6 +4588,24 @@ var TuningDialog = (function () {
         return '<p class="tuning-muted tuning-gm-optin">' + esc(GM.optInLead) + " " + (cause ? quoted(esc(cause)) : esc(GM_OPT_IN[rec.parameter] || GM_OPT_IN.other)) + "</p>";
     }
 
+    // The autotune of a tab, the same on each tab at the right of its heading (user, 2026-10-17): the button, else the progress bar with
+    // its text and "Cancel", else "Autotune completed". The reason of a disabled button is next to it. o: { cls: "ft" | "gm" | "ct" (the
+    // classes of the button, the bar and "Cancel" that the handlers use), state ("running" ...), fraction (null: not known), text (the
+    // progress), current (a current result of this autotune), disabled, reason }
+    var AT = { running: "Autotune operates.", done: "Autotune completed. The result is below.",
+        text: function (text, f) { return (text ? oneLine(text) : AT.running) + (f !== null ? " (" + Math.round(f * 100) + " %)" : ""); } };
+    function autotuneBarHtml(o) {
+        if (o.state === "running") {
+            var f = isNum(o.fraction) ? Math.max(0, Math.min(1, o.fraction)) : null;
+            return '<div class="tuning-at" role="status"><div class="tuning-ft-progress"><div class="tuning-progress-track' + (f === null ? " is-busy" : "") + '"><div class="tuning-progress-bar tuning-' + o.cls +
+                '-bar" style="width: ' + (f === null ? 100 : f * 100).toFixed(1) + '%"></div></div><span class="tuning-at-text tuning-' + o.cls + '-progress-text">' +
+                esc(AT.text(o.text, f)) + '</span></div><button type="button" class="btn btn-default btn-sm tuning-' + o.cls + '-cancel">Cancel</button></div>';
+        }
+        if (o.current) return '<div class="tuning-at"><span class="tuning-at-done">' + esc(AT.done) + "</span></div>";
+        return '<div class="tuning-at"><button type="button" class="btn btn-primary btn-sm tuning-' + o.cls + '-start"' + (o.disabled ? " disabled" : "") + ">Autotune</button>" +
+            (o.disabled && o.reason ? '<span class="tuning-at-why">' + esc(o.reason) + "</span>" : "") + "</div>";
+    }
+
     function govProgressText(m) {
         var frac = isNum(m.fraction) ? Math.max(0, Math.min(1, m.fraction)) : null;
         return (m.text ? oneLine(m.text) : GM.running) + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "");
@@ -4584,22 +4646,20 @@ var TuningDialog = (function () {
     // first): with env.details they go to the plots of the pane, else to env.extra. opts: { log (the only log of the analysis, for
     // the time plots without their own when the result does not name its only log), graph (the tuning sequence, for the links of
     // "Blocked"), plotsOpen }
+    // The autotune bar of the Governor tab (autotuneBarHtml) from the model of govModelHtml
+    function govBarHtml(m) {
+        m = m || { state: "none" };
+        return autotuneBarHtml({ cls: "gm", state: m.state, fraction: m.fraction, text: m.text || GM.running, current: !!m.result && !m.stale && m.state === "done",
+            disabled: !!(m.disabled || m.unavailable), reason: m.unavailable || "" });
+    }
+
     function govModelHtml(m, env, opts) {
         m = m || { state: "none" }; env = env || {}; opts = opts || {};
         var res = m.result && typeof m.result === "object" ? m.result : null, running = m.state === "running", st = res ? GM_STATUS[res.status] || GM_STATUS.unavailable : null;
         var log = res && Array.isArray(res.logs) && res.logs.length === 1 && isNum(res.logs[0]) ? res.logs[0] : isNum(opts.log) ? opts.log : null; // the logs of the runs (worker)
         var html = '<section class="tuning-ct-section tuning-gm" aria-label="' + esc(GM.title) + '"><div class="tuning-ct-section-head"><h5 class="tuning-h">' + esc(GM.title) + "</h5>" +
-            (st && !running && !m.stale ? badge(st[0], st[1]) : "") + "</div>" + '<p class="tuning-muted">' + esc(GM.about) + '</p><div class="tuning-ft-actions">';
-        if (running) {
-            var frac = isNum(m.fraction) ? Math.max(0, Math.min(1, m.fraction)) : null;
-            html += '<div class="tuning-ft-progress" role="status"><div class="tuning-progress-track"><div class="tuning-progress-bar tuning-gm-bar" style="width: ' + (frac === null ? 100 : frac * 100).toFixed(1) + '%"></div></div>' +
-                '<span class="tuning-ft-progress-text tuning-gm-progress-text">' + esc(govProgressText(m)) + "</span></div>" +
-                '<button type="button" class="btn btn-default btn-sm tuning-gm-cancel">Cancel</button>';
-        } else if (!res || m.stale || m.state === "failed" || m.state === "canceled") {
-            html += '<button type="button" class="btn btn-primary btn-sm tuning-gm-start"' + (m.disabled || m.unavailable ? " disabled" : "") + ">" + esc(GM.start) + "</button>";
-        }
-        html += "</div>";
-        if (m.unavailable && !running) html += '<p class="tuning-na">' + esc(m.unavailable) + "</p>";
+            (st && !running && !m.stale ? badge(st[0], st[1]) : "") + "</div>" + '<p class="tuning-muted">' + esc(GM.about) + "</p>";
+        // the button, the progress and the reason of a disabled button: the autotune bar of the tab heading (govBarHtml)
         if (m.state === "canceled") html += '<p role="status">' + esc(GM.canceled) + "</p>";
         if (m.state === "failed") html += notice("error", esc(GM.failed) + (m.error && (m.error.detail || m.error.message) ? " " + quoted(esc(oneLine(m.error.detail || m.error.message))) : ""));
         if (!res) return { html: html + "</section>", plots: [] };
@@ -4681,15 +4741,17 @@ var TuningDialog = (function () {
             }).join('') + '</tbody></table></div>';
         }
         var disabled = !d || !d.pidProfile || d.analysed === false || !(configFlight(d) > 0) || m.stale;
+        // The governor has its own model: the governor model of this tab is its only autotune, never the helicopter model (user, 2026-10-15)
+        var model = isModelStep(step);
         var html = '<section class="tuning-ct tuning-ft-workspace" aria-label="Control loop tuning"><div class="tuning-ft-heading"><div>' +
-            '<span class="tuning-ct-eyebrow">CONTROL LOOP AUTOTUNE</span><h5 class="tuning-h">' + esc(title) + '</h5>' +
-            '<p class="tuning-muted">Examine the recorded problems and the changes that can help.</p></div><div class="tuning-ft-actions">' +
-            (running ? '<span role="status">The app makes and tests the helicopter model.</span><button type="button" class="btn btn-default btn-sm tuning-ct-cancel">Cancel</button>' :
-                res ? '' : '<button type="button" class="btn btn-primary btn-sm tuning-ct-start"' + (disabled ? ' disabled' : '') + '>Autotune</button>') + '</div></div>' +
+            '<span class="tuning-ct-eyebrow">' + (model ? 'CONTROL LOOP AUTOTUNE' : 'GOVERNOR AUTOTUNE') + '</span><h5 class="tuning-h">' + esc(title) + '</h5>' +
+            '<p class="tuning-muted">' + (model ? 'Examine the recorded problems and the changes that can help.' : 'Examine the recorded problems. The governor model tunes the governor parameters.') +
+            '</p></div><div class="tuning-ft-actions">' +
+            (!model ? (env.governorBar ? env.governorBar() : '') : autotuneBarHtml({ cls: 'ct', state: m.state, fraction: m.last && m.last.fraction, text: m.last && m.last.text || 'The app makes and tests the helicopter model.',
+                current: !!res, disabled: disabled, reason: !disabled ? '' : m.stale ? 'The analysis uses different inputs. Click "Start analysis" for the selected inputs. Then click "Autotune".' :
+                    !d ? 'Select one recorded configuration before autotune.' : !d.pidProfile ? 'The PID profile is unknown. No control change is available.' : 'This configuration has no flight data in the analysis.' })) + '</div></div>' +
             '<p class="tuning-ct-limit"><strong>Flight test necessary.</strong> The log measures the response with the recorded values. A new flight must test the recommended values.</p>' +
-            (env.parameterEvidence ? env.parameterEvidence() : '');
-        if (disabled) html += '<p class="tuning-na">' + esc(m.stale ? 'The analysis uses different inputs. Start analysis for the selected inputs before autotune.' :
-            !d ? 'Select one recorded configuration before autotune.' : !d.pidProfile ? 'The PID profile is unknown. No control change is available.' : 'This configuration has no flight data in the analysis.') + '</p>';
+            (model && env.parameterEvidence ? env.parameterEvidence() : '');
         if (m.state === 'failed') html += notice('error','The control analysis failed. ' + quoted(esc(m.error || '')));
         if (m.state === 'canceled') html += '<p role="status">The control analysis was canceled.</p>';
         // Keep the next action above the supporting measurements. Diagnostics
@@ -4708,19 +4770,33 @@ var TuningDialog = (function () {
         html += '<section class="tuning-ct-section"><div class="tuning-ct-section-head"><h5 class="tuning-h">Recorded problems</h5>' +
             badge(bad.length ? plural(bad.length,'result') + ' to examine' : 'Recorded checks',bad.length ? 'monitor' : 'information') + '</div>';
         if (d) html += '<p class="tuning-muted">' + esc(configLabel(d.id) + ' · ' + profileLabel(d.pidProfile)) + '</p>';
-        html += bad.length ? '<div class="tuning-ct-problems">' + bad.slice(0,4).map(function(f){
-            return '<article class="st-' + cls(findingStatus(f)) + '">' + badge(STATUS[findingStatus(f)],findingStatus(f)) +
-                '<h6>' + esc(f.noun || f.id) + '</h6>' + ftParas(summaryOf(f)) + evidenceHtml(f) + '</article>';
+        // one card for each check and output (user, 2026-10-16): the text of its first result, then where each result occurs
+        var groups = [];
+        bad.forEach(function(f){
+            var k = [f.id, f.channel || '', findingAxis(f) || ''].join('|'), g = groups.filter(function(q){return q.key === k;})[0];
+            if (!g) groups.push(g = {key:k, list:[]});
+            g.list.push(f);
+        });
+        html += groups.length ? '<div class="tuning-ct-problems">' + groups.slice(0,4).map(function(g){
+            var f = g.list[0], st = worstStatus(g.list), more = g.list.slice(3);
+            return '<article class="st-' + cls(st) + '">' + badge(STATUS[st],st) + '<h6>' + esc(f.noun || f.id) + (g.list.length > 1 ? ' (' + esc(plural(g.list.length,'result')) + ')' : '') + '</h6>' + ftParas(summaryOf(f)) +
+                (g.list.length > 1 ? '<p class="tuning-muted">' + esc('The same result occurs ' + g.list.length + ' times. The text above is about the first result.') + '</p>' : '') +
+                g.list.slice(0,3).map(evidenceHtml).join('') +
+                (more.length ? deferredDetails(env, step + ':places:' + g.key, esc('Show ' + plural(more.length,'other result')), 'tuning-ct-more', false, function(){ return { html: more.map(evidenceHtml).join(''), plots: [] }; }) : '') + '</article>';
         }).join('') + '</div>' : '<p class="tuning-muted">' + (fs.length ? 'No measured control problem is available for this selection. The recorded checks give the data limits.' : 'No recorded checks are available for this selection.') + '</p>';
-        if (bad.length > 4) html += '<p class="tuning-muted">' + esc('The first 4 of ' + bad.length + ' results are shown. All recorded checks are available below.') + '</p>';
+        if (groups.length > 4) html += '<p class="tuning-muted">' + esc('The first 4 of ' + groups.length + ' problem types are shown. All recorded checks are available below.') + '</p>';
         var open = view.compare && view.compare.where === step ? env.findingOf(view.compare.key) : null;
         if (open) html += '<div class="tuning-order-compare">' + env.compareHtml(open,step) + '</div>';
         html += '</section>';
         var recordedProblems = html.slice(beforeProblems);
         html = html.slice(0, beforeProblems);
         html += '<section class="tuning-ct-section tuning-ct-recommendations"><h5 class="tuning-h">Tuning result</h5>';
-        if (res) html += '<p role="status">' + esc(res.reason) + '</p>';
-        else if (!disabled && !running) html += '<p class="tuning-muted">Start autotune to make a helicopter model from selected flight data. The app tests control values with this model.</p>';
+        if (!model && env.governorModel) { // the governor model of the flight logs (docs/GOVERNOR_AUTOTUNE.md section 8): govModelHtml, its plots with the plots of the pane
+            var gmOut = env.governorModel(entry);
+            html += gmOut.html;
+            gmOut.plots.forEach(function(q){plots.push(q);});
+        } else if (res) html += '<p role="status">' + esc(res.reason) + '</p>';
+        else if (!disabled && !running) html += '<p class="tuning-muted">Click &quot;Autotune&quot; to make a helicopter model from the selected flight data. The app tests control values with this model.</p>';
         if (res && res.twin) {
             var twin=res.twin, current=twinIsCurrent(twin), validation=twin.validation && twin.validation.test, coverage=twin.coverage || {},
                 excluded=coverage.excluded || [], accepted=coverage.intervals || [];
@@ -4732,7 +4808,7 @@ var TuningDialog = (function () {
             var channels=twin.channels || {}, inputs=Array.isArray(channels.inputs) ? channels.inputs.filter(function(f){return typeof f==='string' && f;}) : [],
                 outputs=Array.isArray(channels.outputs) && channels.outputs.length ? channels.outputs : TWIN_OUTPUT_FIELDS;
             var stepTitle=function(k){var t=TABS.filter(function(q){return q.key===k;})[0];return t ? t.title : k;};
-            var eligible=Array.isArray(twin.eligibleSteps) ? twin.eligibleSteps.filter(function(k){return CONTROL_STEPS.indexOf(k)>=0;}) : [];
+            var eligible=Array.isArray(twin.eligibleSteps) ? twin.eligibleSteps.filter(isModelStep) : [];
             var loop=twinLoopNotes(twin);
             var statusText=twin.status === 'validated' ? 'Model checks satisfactory.' : twin.status === 'partial' ? 'Model checks satisfactory for some axes only.' : 'Model checks not satisfactory.';
             html += '<section class="tuning-ct-section tuning-ct-twin"><h6 class="tuning-h">Digital twin</h6>' +
@@ -4892,7 +4968,8 @@ var TuningDialog = (function () {
                     recommendationBody(rec) + staleRecHtml(rec) +
                     '<div class="tuning-label">Results for this change</div>' + (rec.evidence || []).map(evidenceHtml).join('') +
                     detail('change-' + i,'Rule and limits',function(){return ftParas(ruleText(rec)) + sourcesHtml(rec) +
-                        bulletList((rec.caveats || []).map(function(c){return esc(oneLine(c));}), 'Note', 'is-caveat');}) + '</article>';}).join('');
+                        bulletList((rec.caveats || []).map(function(c){return esc(oneLine(c));}), 'Note', 'is-caveat');}) + '</article>';}).join('') +
+                validationPowerHtml(res.validationPower);
             html += '<div class="tuning-ft-actions"><button type="button" class="btn btn-primary btn-sm tuning-ct-trial">Export only this test</button><button type="button" class="btn btn-default btn-sm tuning-ct-reset">Use recorded values</button><a href="#" class="tuning-tab-link" data-tab="export">Examine all CLI changes and flight maneuvers</a></div>' +
                 '<p class="tuning-muted">Export only this test selects this change group and its recorded configuration. Test other changes in different flights.</p>' +
                 detail('flight','Flight test necessary',flightPlanHtml(res.flightPlan));
@@ -4985,12 +5062,6 @@ var TuningDialog = (function () {
             });
         } else html += plot({na:whyMissing(r,null,step === 'governor' ? 'governor' : step === 'tail' ? 'tail' : 'tracking error')});
         html += '</section>';
-        // the governor model of the flight logs (docs/GOVERNOR_AUTOTUNE.md section 8): govModelHtml, its plots with the plots of the pane
-        if (step === 'governor' && env.governorModel) {
-            var gmOut = env.governorModel(entry);
-            html += gmOut.html;
-            gmOut.plots.forEach(function(q){plots.push(q);});
-        }
         if (pair) html += detail('history','Compare recorded configurations',function(){
             var html = '<label>Other recorded configuration <select class="form-control input-sm tuning-ct-reference">' +
                 options(pairs.map(function(p){var id = p.a === view.dataset ? p.b : p.a;return [id,configLabel(id) + ' (recorded)'];}),reference) + '</select></label>' +
@@ -5262,7 +5333,7 @@ var TuningDialog = (function () {
         out.push("> **WARNING:** " + WARNING, ">", "> **NOTE:** " + NO_SEND, "",
             "The log numbers start at 1, as in the log list of the log viewer. Only the toolkit report at the end starts at 0.", "");
         var conflicts = cliConflicts(r);
-        if (conflicts.length) out.push("> **" + CLI_STATUS.conflict + "** " + CLI_STATUS.logWins, "", conflicts.map(function (c) { return "- " + oneLine(c.text || c.what); }).join("\n"), "");
+        if (conflicts.length) out.push("> **" + CLI_STATUS.conflict + "** " + CLI_STATUS.why + " " + CLI_STATUS.logWins, "", conflicts.map(function (c) { return "- " + oneLine(c.text || c.what); }).join("\n"), "");
         var starts = startRows(r);
         if (starts.length) {
             out.push("## PID profile at the start of each log", "", START_NOTE);
@@ -5372,20 +5443,45 @@ var TuningDialog = (function () {
     var CLI_ABOUT = "A CLI dump is the text of <code>diff all</code> from the CLI tab of the Configurator. The analysis is complete without a CLI dump. " +
         "A CLI dump can add values that the log does not record, for example the rescue mode and the servo limits.";
 
+    // The CLI dump block of the Tuning view and of the "Logs" bar of the Analysis view (user 2026-10-15: make the lack of a CLI
+    // dump clear and ask for one, with instructions; the helicopter is not always available). s: { name: the loaded file | null,
+    // off: true when the analysis does not use it (another craft name) }
+    var CLI_STEPS = [
+        'If you have a CLI dump file of this helicopter, click &quot;Load CLI dump&quot; and select the newest file.',
+        'If you do not have a CLI dump file, connect the helicopter to the Rotorflight Configurator.',
+        'In the ' + quoted('&quot;CLI&quot;') + ' tab, write <code>diff all</code> and push the Enter key.',
+        'Click ' + quoted('&quot;Save to File&quot;') + '. Keep the file with the logs of this helicopter.',
+        'Click &quot;Load CLI dump&quot; and select the file.'
+    ];
+    // s.snapshot: every analysed flight log has a parameter snapshot (result.paramSnapshot.all, firmware with "blackbox_params"). Its
+    // header records the values of all PID profiles and rate profiles, the gear ratios, the mixer, the servos and the rescue values.
+    // It does not record the modes (aux), the adjustment ranges (adjfunc), the serial ports and the resources (param_semantics.cjs NAMES)
+    var CLI_MISSING = 'The log does not record some values. Examples are the gear ratios, the rescue mode, the servo limits and the gains of other PID profiles. ' +
+        'Without a CLI dump, the app does not examine these values, and some results are not available.';
+    var CLI_MISSING_SNAPSHOT = 'The log header records the parameter values of all PID profiles and rate profiles, the gear ratios, the mixer and the servos. ' +
+        'The log does not record the modes, the adjustment ranges and the serial ports. A CLI dump can add these values.';
+    function cliBlockHtml(s) {
+        var load = '<button type="button" class="btn ' + (s.name ? 'btn-default' : 'btn-primary') + ' btn-xs tuning-cli-load">' + (s.name ? 'Load a different CLI dump' : 'Load CLI dump') + '</button>';
+        if (s.name) return '<span class="tuning-cli-label">CLI dump</span> <span class="tuning-cli-name">' + quoted(esc(s.name)) + (s.off ? ' <span class="tuning-cli-off">(not used)</span>' : '') +
+            ' <a href="#" class="tuning-cli-clear" title="Remove the CLI dump">&times;</a></span> ' + load +
+            (s.off ? '' : '<div class="tuning-cli-about tuning-muted">The app uses the values of this CLI dump that the log does not record. If the log and the CLI dump do not agree, the app uses the log.</div>');
+        return '<div class="tuning-notice is-warn tuning-cli-missing"><p><strong>No CLI dump.</strong> ' + (s.snapshot ? CLI_MISSING_SNAPSHOT : CLI_MISSING) + '</p>' + load +
+            '<ol class="tuning-cli-steps">' + CLI_STEPS.map(function (t) { return '<li>' + t + '</li>'; }).join('') + '</ol>' +
+            '<p class="tuning-muted">After each change of the configuration, save a new CLI dump. Then the app can use it when the helicopter is not available.</p></div>';
+    }
+
     var SKELETON =
         '<div class="tuning-context"></div>' +
         '<div class="tuning-controls">' +
-            '<label class="tuning-field">Logs ' + scopeSelectHtml("file") + "</label>" +
+            '<label class="tuning-field">Logs ' + scopeSelectHtml("flights") + "</label>" +
             '<span class="tuning-scope-text tuning-muted"></span>' +
             '<span class="tuning-actions">' +
                 '<button type="button" class="btn btn-primary btn-sm tuning-analyse">Start analysis</button>' +
-                '<button type="button" class="btn btn-default btn-sm tuning-cancel">Cancel</button></span>' +
+                '<button type="button" class="btn btn-default btn-sm tuning-cancel">Cancel</button>' +
+                '<button type="button" class="btn btn-default btn-sm tuning-autotune-all" disabled>Autotune all</button></span>' +
         "</div>" +
-        // The CLI dump: an optional input on its own line (user rule 2026-10-06: the log is the only necessary input)
-        '<div class="tuning-cli-line"><span class="tuning-cli-label">Optional: CLI dump</span>' +
-            '<button type="button" class="btn btn-default btn-xs tuning-cli-load" title="The app reads the text of &quot;diff all&quot; from a file. The app does not save the file.">Load</button>' +
-            '<span class="tuning-cli-name tuning-muted"></span><input type="file" class="tuning-cli-input tuning-hide" accept=".txt,.cli,.diff,.dump,text/plain">' +
-            '<div class="tuning-cli-about tuning-muted">' + CLI_ABOUT + "</div></div>" +
+        // The CLI dump on its own line, after the controls (cliBlockHtml, drawn by renderChrome)
+        '<div class="tuning-cli-line"></div><input type="file" class="tuning-cli-input tuning-hide" accept=".txt,.cli,.diff,.dump,text/plain">' +
         '<div class="tuning-fsel tuning-hide"></div>' +
         '<section class="tuning-configuration tuning-hide" aria-label="Recorded configurations"></section>' + // "Selected flights": the flight list (SPEC3 D)
         '<div class="tuning-progress"><div class="tuning-progress-track"><div class="tuning-progress-bar"></div></div><div class="tuning-progress-text"></div>' +
@@ -5393,7 +5489,8 @@ var TuningDialog = (function () {
         '<div class="tuning-notices"></div>' +
         '<section class="tuning-log-preview analysis-compare tuning-hide" aria-label="Data from the log" tabindex="-1"></section>' +
         '<div class="tuning-tabs tuning-hide">' + TABS.filter(function (t) { return !t.auxiliary; }).map(function (t) {
-            return '<a href="#" class="tuning-tab" data-tab="' + t.key + '">' + esc(t.title) + '<span class="tuning-tab-count"></span><span class="tuning-tab-status"></span></a>';
+            return '<a href="#" class="tuning-tab" data-tab="' + t.key + '">' + esc(t.title) + '<span class="tuning-tab-count"></span><span class="tuning-tab-status"></span>' +
+                '<span class="tuning-tab-bar" aria-hidden="true"><span></span></span></a>'; // the progress of its autotune (autoBars)
         }).join("") + "</div>" +
         '<div class="tuning-panes tuning-hide">' + TABS.map(function (t) { return '<div class="tuning-pane" data-pane="' + t.key + '"></div>'; }).join("") + "</div>" +
         '<div class="tuning-empty"></div>';
@@ -5414,13 +5511,14 @@ var TuningDialog = (function () {
             cli = null,                 // { name, text, hash, craft, fileKey }: the CLI dump, for the file that was open when it was loaded
             cliGone = null,             // { name, fileKey }: the CLI dump that the app removed because a different file opened
             hint = null,                // a message of the last action, until the next render of the notices
-            view = { tab: "overview", axis: "roll", segment: null, vibProfile: null, scope: "file", sev: "issues", area: "all", query: "", sort: "severity", dir: 1,
+            view = { tab: "overview", axis: "roll", segment: null, vibProfile: null, scope: "flights", sev: "issues", area: "all", query: "", sort: "severity", dir: 1,
                 node: null, compare: null, profile: "all", dataset: "all" },  // profile: the PID profile of the diagram and the lists ("all" or its number); dataset: the configuration ("all" or its id)
             rendered = {}, handles = {}, pending = {}, visible = false, plotSeq = 0, copyTexts = [], queryTimer = null,
             details = {}, detailSeq = 0, detailOpen = {}, configurationRendered = null,
             listeners = [], configListeners = [], reader = null, compares = {}, cmpSlots = {}, preview = null,
             fsel = { fileKey: null, map: null }, // "Selected flights" (SPEC3 D): the selection map of the file of fileKey (null: the default, all flights)
             fselOpen = { list: null, sub: {} }, // the open state of the flight lists for the session (toggleList)
+            scan = null,                    // the flights of each log before an analysis (ensureScan): { fileKey, worker, last, result, error }
             settingsListeners = [],         // the Analysis view: cb() after each change of the settings of the analysis (onSettings)
             ft = { job: null, worker: null, workerKey: null, seq: 0, cache: [], failure: null, cancelled: null, sources: {}, limits: {}, drafts: {}, auto: {} }, // one filter draft per log/flight
             gm = { job: null, seq: 0, cache: [], failure: null, cancelled: null }, // the governor model (gmStart): one run at a time, results by gmKey
@@ -5437,7 +5535,7 @@ var TuningDialog = (function () {
             return (hooks.getFlightLog ? hooks.getFlightLog() : cachedLog) || null;
         }
 
-        var context = part("context"), fselBox = part("fsel"), scopeSelect = part("scope"), cliName = part("cli-name"),
+        var context = part("context"), fselBox = part("fsel"), scopeSelect = part("scope"), cliLine = part("cli-line"),
             analyseButton = part("analyse"), cancelButton = part("cancel"), saveButton = part("save"), progress = part("progress"),
             progressBar = part("progress-bar"), progressText = part("progress-text"), notices = part("notices"), empty = part("empty");
 
@@ -5526,6 +5624,7 @@ var TuningDialog = (function () {
                 return out.html;
             },
             // the "Governor model" panel of the Governor tab (gmModel): of the result on display, the file is the unit of the run
+            governorBar: function () { return govBarHtml(gmModel(shown)); },
             governorModel: function () {
                 var logs = shown ? gmLogs(shown.result) : [];
                 return govModelHtml(gmModel(shown), env, { log: logs.length === 1 ? logs[0] : null, graph: shown ? graphOf(shown.result) : null });
@@ -5582,6 +5681,13 @@ var TuningDialog = (function () {
             return cli && cli.craft && head && !sameCraft(cli.craft, head) ? { dump: cli.craft, log: head } : null;
         }
 
+        // the result on display has a parameter snapshot in the header of each flight log (result.paramSnapshot.all): the "No CLI dump"
+        // block names the values that such a log does not record (cliBlockHtml)
+        function snapshotShown() {
+            var r = shown && shown.result;
+            return !!(r && r.paramSnapshot && r.paramSnapshot.all);
+        }
+
         // The CLI dump that the analysis uses: none for another file, or when its craft name is not that of the log header
         function usedCli() {
             return syncCli() && !cliConflict() ? cli : null;
@@ -5616,10 +5722,17 @@ var TuningDialog = (function () {
 
         // The selection for the run: [{ log, flight }], without the logs that the app knows as a bench run or a log with no data
         function selection() {
+            var bad = unusedLogs();
+            return selectionList(selectionMap()).filter(function (x) { return !bad[x.log]; });
+        }
+
+        // { [log]: true } for the logs that a run leaves out: no data in the viewer, or a result or the scan knows them as a bench
+        // run, a log with no data or a log with no flight
+        function unusedLogs() {
             var known = knownFlights(), bad = {};
             fileLogs().forEach(function (L) { if (L.error) bad[L.log] = true; });
             Object.keys(known).forEach(function (k) { if (known[k].noData || known[k].bench || !known[k].flights.length) bad[k] = true; });
-            return selectionList(selectionMap()).filter(function (x) { return !bad[x.log]; });
+            return bad;
         }
 
         // The open state of the flight lists for the session: the list (null: open only with no selection) and the flights of
@@ -5641,7 +5754,7 @@ var TuningDialog = (function () {
                 var c = selectionCounts(rows);
                 fselOpen.list = !c.flightsOn && !c.otherOn;
             }
-            return selectionHtml(rows, Object.keys(known).length > 0, { open: fselOpen.list, subOpen: subOpenOf(info) });
+            return selectionHtml(rows, Object.keys(known).length > 0, { open: fselOpen.list, subOpen: subOpenOf(info), scan: scanState() });
         }
 
         // The pilot opens or closes a flight list: { kind: "open", on } (the list), { kind: "sub", log, on } (the flights of a log)
@@ -5688,7 +5801,67 @@ var TuningDialog = (function () {
                     });
                 });
             });
+            var fs = scan && scan.result && info && scan.fileKey === info.key ? flightsOf(scan.result) : null;
+            if (fs) Object.keys(fs.logs).forEach(function (k) {
+                var L = fs.logs[k];
+                if (!out[L.log]) out[L.log] = { bench: L.bench, flights: L.flights, noData: !!L.noData, why: L.why || null };
+            });
             return out;
+        }
+
+        // The flights of each log before an analysis (2026-10-15): the analysis starts only when the pilot clicks "Start
+        // analysis", so the flight list needs the flights first. The worker command scanFlights finds them with no checks (Node:
+        // Fireball 2026-10-05, 16 logs, 17 s against 103 s for the analysis; Gaui X4 2026-10-04, 59 logs, 23 s against 59 s). One
+        // scan for each open file, not for "This log"
+        function ensureScan() {
+            var info = fileInfo();
+            if (!info || view.scope === "log" || (scan && scan.fileKey === info.key)) return;
+            stopScan();
+            var s = scan = { fileKey: info.key, worker: null, last: null, result: null, error: null }, msg = { cmd: "scanFlights", id: 1, bytes: info.bytes.slice().buffer, fileName: info.name, options: {} };
+            function done(error, result) {
+                if (s.worker) s.worker.terminate();
+                s.worker = null;
+                s.error = error;
+                s.result = result;
+                if (scan === s) renderChrome();
+            }
+            try {
+                s.worker = new Worker("js/tuning_worker.js");
+                s.worker.onmessage = function (e) {
+                    var m = e.data || {};
+                    if (scan !== s || m.id !== msg.id) return;
+                    if (m.type === "progress") { s.last = m; renderSelection(); renderProgress(); notifySettings(); }
+                    else if (m.type === "flightsScanned" && m.result) done(null, m.result);
+                    else done(oneLine(m.message || "unknown error"), null);
+                };
+                s.worker.onerror = function (e) {
+                    if (e && e.preventDefault) e.preventDefault();
+                    if (scan === s) done(e && e.message || "script error", null);
+                };
+                s.worker.postMessage(msg, [msg.bytes]);
+            } catch (e) {
+                done(e && e.message || String(e), null);
+            }
+        }
+
+        function stopScan() {
+            if (scan && scan.worker) scan.worker.terminate();
+            scan = null;
+        }
+
+        // The state of the scan for the flight list: { running, text } (the progress), { failed } or null
+        function scanState() {
+            var info = fileInfo();
+            if (!scan || !info || scan.fileKey !== info.key) return null;
+            if (scan.worker) return { running: true, text: scan.last && scan.last.text ? oneLine(scan.last.text) : "" };
+            return scan.error ? { failed: scan.error } : null;
+        }
+
+        // "Start analysis" waits for the scan: the flight list and the flight counts are not complete before it ends
+        var SCAN_WAIT = 'The app finds the flights in each log. When this is complete, click "Start analysis".';
+        function scanning() {
+            var st = view.scope !== "log" && scanState(); // "This log" uses no flight list
+            return !!(st && st.running);
         }
 
         // { [log]: the number of flights } that the app knows, for selectionText
@@ -5768,6 +5941,10 @@ var TuningDialog = (function () {
             var info = fileInfo(), rpm = null, c = usedCli();
             failure = cancelled = null;
             if (!info) return renderChrome();
+            if (scanning()) {
+                failure = { input: true, message: SCAN_WAIT };
+                return renderChrome();
+            }
             var list = view.scope === "flights" ? selection() : null;
             if (list && !list.length) {
                 failure = { input: true, message: 'Select one or more flights in the list. Then click "Start analysis".' };
@@ -5839,7 +6016,15 @@ var TuningDialog = (function () {
                     finishedAt: Date.now(), result: m.result, label: j.scope === "log" ? "Log " + (j.logIndex + 1) + " of " + j.logCount :
                         j.scope === "flights" ? "Selected flights in " + plural(selectedLogs(j.flights), "log") : "All flights in the file (" + plural(j.logCount, "log") + ")" };
                 cache = cache.filter(function (e) { return e.key !== entry.key; }).concat([entry]).slice(-CACHE_MAX);
-                if (entry.scope === "flights") entry.counts = flightCounts(knownFlights()); // with the flights of this result
+                if (entry.scope === "flights") {
+                    entry.counts = flightCounts(knownFlights()); // with the flights of this result
+                    // the key of the selection without the logs that this result finds as bench runs or logs with no data (selection()
+                    // leaves them out from now on): else the result is not current for its own selection, and "Start analysis", "Autotune"
+                    // and "Autotune all" do not agree with it (a run before the scan ends, or a log that the scan gives as a flight log)
+                    var bad = unusedLogs(), kept = selectionKey((entry.flights || []).filter(function (x) { return !bad[x.log]; }));
+                    entry.key = entry.key.replace(/\|flights:[^|]*\|/, function () { return "|flights:" + kept + "|"; }); // the file key has "|" too
+                    cache = cache.filter(function (e) { return e === entry || e.key !== entry.key; });
+                }
                 var info = fileInfo(), same = !!(info && info.key === entry.fileKey);
                 if (same) display(entry);
                 else renderChrome();
@@ -6184,11 +6369,13 @@ var TuningDialog = (function () {
             CONTROL_STEPS.concat(['export','recs']).forEach(function(k){rendered[k]=null;});
             if (shown) { shown.exported=null; showTab(view.tab); }
         }
-        function ctStart() {
-            var entry=shown, step=view.tab, d=entry && configOf(entry.result,view.dataset);
-            if (!ctCurrent(entry) || CONTROL_STEPS.indexOf(step)<0 || !d || !d.pidProfile || !(configFlight(d)>0)) return;
+        // step and id: the tab and the configuration (default: the ones on display). The model of the run, else null
+        function ctStart(step,id) {
+            step=step || view.tab;
+            var entry=shown, d=entry && configOf(entry.result,id || view.dataset);
+            if (!ctCurrent(entry) || !isModelStep(step) || !d || !d.pidProfile || d.analysed===false || !(configFlight(d)>0)) return null;
             var assertions=ctAssertions();
-            var key=d.id+'|'+step, models=entry.control || (entry.control={}), model=models[key]={state:'running',evidenceSignature:JSON.stringify(assertions)};
+            var key=d.id+'|'+step, models=entry.control || (entry.control={}), model=models[key]={state:'running',step:step,key:key,evidenceSignature:JSON.stringify(assertions)};
             ctRefresh();
             var info=fileInfo(), c=usedCli(), bytes=info && info.bytes.slice().buffer;
             var request={cmd:'controlTune',configuration:d.id,step:step,bytes:bytes,fileName:info && info.name,
@@ -6209,7 +6396,7 @@ var TuningDialog = (function () {
                 }
                 model.stop=function(){finish(new Error('The control analysis was canceled.'));};
                 worker.onmessage=function(e){var message=e.data||{};
-                    if(message.type==='progress')return;
+                    if(message.type==='progress'){model.last=message;autoBars();return;}
                     if(message.type==='error')finish(new Error(message.message||'The control analysis failed.'));
                     else finish(null,message.result);
                 };
@@ -6227,11 +6414,14 @@ var TuningDialog = (function () {
                             model.evidenceSignature===JSON.stringify(ctAssertions()) && acceptedControlResult(model,d.id,step);});
                 });
             }).catch(function(e){if(models[key]===model){model.state='failed';model.error=String(e.message||e);}}).then(function(){if(shown===entry && models[key]===model) ctRefresh();});
+            return model;
         }
-        function ctClear(state) {
-            if (!shown || CONTROL_STEPS.indexOf(view.tab)<0) return;
+        // key: the configuration and step of the model (default: the ones on display)
+        function ctClear(state,key) {
+            if (!shown || !key && CONTROL_STEPS.indexOf(view.tab)<0) return;
             var models=shown.control || (shown.control={});
-            var key=view.dataset+'|'+view.tab, old=models[key];
+            key=key || view.dataset+'|'+view.tab;
+            var old=models[key];
             models[key]={state:state || 'none'};
             if(old&&old.stop)old.stop();
             ctRefresh();
@@ -6338,6 +6528,7 @@ var TuningDialog = (function () {
             var m = ftModel(), frac = isNum(m.fraction) ? Math.max(0, Math.min(1, m.fraction)) : null;
             body.find(".tuning-ft-progress-text").text((m.text ? oneLine(m.text) : FT.running) + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : ""));
             body.find(".tuning-ft-bar").css("width", (frac === null ? 100 : frac * 100).toFixed(1) + "%");
+            autoBars();
         }
 
         function ftStop() {
@@ -6532,6 +6723,7 @@ var TuningDialog = (function () {
             var last = gm.job && gm.job.last || {}, frac = isNum(last.fraction) ? Math.max(0, Math.min(1, last.fraction)) : null;
             body.find(".tuning-gm-progress-text").text(govProgressText({ text: last.text, fraction: frac }));
             body.find(".tuning-gm-bar").css("width", (frac === null ? 100 : frac * 100).toFixed(1) + "%");
+            autoBars();
         }
 
         function gmStop() {
@@ -6547,7 +6739,7 @@ var TuningDialog = (function () {
             gmRefresh();
         }
 
-        // "Start the governor analysis": the whole file (a copy, transferred) and the logs, flights, flight rpm and gates of the
+        // "Autotune" of the Governor tab (the governor model): the whole file (a copy, transferred) and the logs, flights, flight rpm and gates of the
         // result on display (the Governor step of the tuning sequence: blockedBy and gatedBy), and the CLI dump when there is one
         function gmStart() {
             var info = fileInfo(), log = viewerLog(), entry = shown, key = gmKey(entry);
@@ -6600,6 +6792,81 @@ var TuningDialog = (function () {
             gm.cancelled = { key: gm.job.key };
             gmStop();
             gmRefresh();
+        }
+
+        // --- "Autotune all" and the progress of each autotune on its tab, also while a different tab or view shows
+
+        var AUTO_STEPS = ["filters", "governor", "cyclic", "tail", "cycomp", "tailcomp"]; // the tuning sequence
+        // "Autotune all": { jobs: the runs that it started or found }. All steps start at once, each in its own worker. A step with
+        // a current result or no data is skipped. null: no "Autotune all" runs
+        var all = null;
+
+        function ctRunning(step) {
+            var models = shown && shown.control || {};
+            return Object.keys(models).map(function (k) { return models[k]; }).filter(function (m) { return m.state === "running" && m.step === step; })[0] || null;
+        }
+        // The run of the autotune of a tab (the filter job, the governor job or a helicopter model), else null
+        function autoJob(step) { return step === "filters" ? ft.job : step === "governor" ? gm.job : ctRunning(step); }
+        function jobFraction(j) { var f = j && j.last && j.last.fraction; return isNum(f) ? Math.max(0, Math.min(1, f)) : null; }
+        function jobLive(j) { return !!j && (j === ft.job || j === gm.job || j.state === "running" && !!shown && !!shown.control && shown.control[j.key] === j); }
+
+        // The bar on each tab with an autotune, the "Autotune all" button and the bar on the view tab (hooks.autotuneProgress:
+        // { fraction (null: not known) }, or null). The view tab of "Autotune all": the mean of its runs, 1 for a run that stopped
+        function autoBars() {
+            var fractions = [];
+            AUTO_STEPS.forEach(function (step) {
+                var j = autoJob(step), f = jobFraction(j), sel = '.tuning-tab[data-tab="' + step + '"]';
+                body.find(sel).toggleClass("is-autotune", !!j).toggleClass("is-busy", !!j && f === null);
+                body.find(sel + " .tuning-tab-bar > span").css("width", (f === null ? 100 : 100 * f).toFixed(1) + "%");
+                if (j && isModelStep(step)) { // the bar of the control pane (the filter and governor panes update theirs)
+                    var ps = '.tuning-pane[data-pane="' + step + '"] ';
+                    body.find(ps + ".tuning-ct-bar").css("width", (f === null ? 100 : 100 * f).toFixed(1) + "%");
+                    body.find(ps + ".tuning-ct-progress-text").text(AT.text(j.last && j.last.text || "The app makes and tests the helicopter model.", f));
+                }
+                if (j) fractions.push(f);
+            });
+            var p = all ? all.jobs.reduce(function (sum, j) { return sum + (jobLive(j) ? jobFraction(j) || 0 : 1); }, 0) / all.jobs.length :
+                fractions.length === 1 ? fractions[0] : null;
+            var allOk = !!all || ctCurrent(shown);
+            body.find(".tuning-autotune-all").text(all ? "Cancel autotune all" : "Autotune all").prop("disabled", !allOk)
+                .attr("title", allOk ? "Start the autotune of each tab" : !shown ? 'Click "Start analysis" first.' : 'The analysis uses different inputs. Click "Start analysis" for the selected inputs.');
+            if (hooks.autotuneProgress) hooks.autotuneProgress(all || fractions.length ? { fraction: p } : null);
+        }
+
+        // The run of one step, else null (a current result, no data, or the autotune cannot start). A run of the pilot is used
+        function allRun(step, dataset) {
+            if (step === "filters") {
+                var fm = ftModel(); // a current autotune result, as the Filters tab has (filterWorkspaceHtml autotuned)
+                return ft.job || (fm.hasAutotune || fm.result && !fm.stale && fm.result.mode !== "simulation" || !ftStart() ? null : ft.job);
+            }
+            if (step === "governor") return gm.job || (gmFor(shown) || !gmStart() ? null : gm.job);
+            var m = shown.control && shown.control[dataset + "|" + step];
+            if (m && m.state === "done") return null;
+            return m && m.state === "running" ? m : ctStart(step, dataset);
+        }
+
+        // The control steps use the configuration on display. all stays null while the steps start: each start draws the tabs again
+        function allStart() {
+            if (all || !ctCurrent(shown)) return;
+            var dataset = view.dataset, jobs = AUTO_STEPS.map(function (step) { return allRun(step, dataset); }).filter(Boolean);
+            all = jobs.length ? { jobs: jobs } : null;
+            autoBars();
+        }
+
+        // At each refresh of a tab (showTab): "Autotune all" ends when its last run stops (done, failed or canceled)
+        function allNext() {
+            if (all && !all.jobs.some(jobLive)) all = null;
+        }
+
+        function allCancel() {
+            var jobs = all ? all.jobs.filter(jobLive) : [];
+            all = null;
+            jobs.forEach(function (j) {
+                if (j === ft.job) ftCancel();
+                else if (j === gm.job) gmCancel();
+                else ctClear("canceled", j.key);
+            });
+            autoBars();
         }
 
         // --- panes and plots
@@ -6730,6 +6997,8 @@ var TuningDialog = (function () {
             if (rendered[view.tab] !== shown) renderPane(view.tab);
             else if (visible) attachPlots(view.tab);
             renderTabStatus();
+            allNext(); // each refresh of a tab: the end of "Autotune all" when its last run has stopped
+            autoBars();
             // A new step starts at its heading, below the sticky navigation.
             // Same-step progress and parameter edits retain the current view.
             var root = dialog[0], target = pane(view.tab)[0], tabs = body.find('.tuning-tabs')[0];
@@ -7059,7 +7328,7 @@ var TuningDialog = (function () {
                 var li = shownLog(), key = currentKey(), head = fileLike(r) && isNum(r.headerLog) && isNum(li) && r.headerLog !== li ? r.headerLog : null;
                 if (info && shown.fileKey !== info.key) { // log numbers and settings of two files do not compare
                     out.push(notice("warn", 'These results are for a different file. To examine the open file, click "Start analysis".'));
-                } else if (isNum(li) && li !== currentLog()) {
+                } else if (isNum(li) && li !== nextRunLog()) { // a new run gives the curves of the log on display
                     out.push(notice("info", esc((r.scope === "log" ? "These results are" : head !== null ? "The curves and the log data are" : "The curves, the log data and the header values of the recommendations are") +
                         " for log " + (li + 1) + ". The log viewer shows log " + (currentLog() + 1) + ". To examine log " + (currentLog() + 1) + ', click "Start analysis".')));
                 } else if (key && key !== shown.key && !job && !sameFlights()) {
@@ -7102,6 +7371,11 @@ var TuningDialog = (function () {
                 frac = 1;
                 text = "Analysis completed: " + shown.label + (shown.result.timing && isNum(shown.result.timing.totalS) ? " in " + secs(shown.result.timing.totalS) : "");
                 state = "is-done";
+            } else if (scanState() && scanState().running) { // the scan of the flights (ensureScan): its progress, no result yet
+                var sm = scan.last || {};
+                frac = isNum(sm.fraction) ? Math.max(0, Math.min(1, sm.fraction)) : null;
+                text = (sm.text ? oneLine(sm.text) : "The app finds the flights in each log.") + (frac !== null ? " (" + Math.round(frac * 100) + " %)" : "");
+                state = frac === null ? "is-busy" : "is-running";
             } else {
                 text = viewerLog() ? "No result" : "No log is open";
             }
@@ -7112,6 +7386,7 @@ var TuningDialog = (function () {
 
         function renderChrome() {
             syncCli(); // a different file: the CLI dump goes before the notices say what the analysis uses
+            ensureScan(); // the flights of each log of the open file, for the flight list and the "Logs" control
             var r = shown && shown.result, log = viewerLog(), count = log ? log.getLogCount() : 0;
             context.html(contextHtml());
             notices.html(noticesHtml());
@@ -7128,14 +7403,14 @@ var TuningDialog = (function () {
                 configurationRendered = { entry: shown, dataset: view.dataset };
             }
             scopeSelect.prop("disabled", !log);
-            analyseButton.prop("disabled", !log); // V9: also while a run operates (requestStart)
+            analyseButton.prop("disabled", !log || isCurrent() || scanning()).attr("title", scanning() ? SCAN_WAIT : null); // V9: also while a run operates (requestStart). No new run of the result on display
             cancelButton.prop("disabled", !job);
             saveButton.prop("disabled", !shown);
-            cliName.html(cli ? quoted(esc(cli.name)) + (cliConflict() ? ' <span class="tuning-cli-off">(not used)</span>' : "") +
-                ' <a href="#" class="tuning-cli-clear" title="Remove the CLI dump">&times;</a>' : "");
+            cliLine.html(cliBlockHtml({ name: cli ? cli.name : null, off: !!cliConflict(), snapshot: snapshotShown() }));
             body.find(".tuning-tabs, .tuning-panes").toggleClass("tuning-hide", !shown);
             renderTabStatus();
             empty.toggleClass("tuning-hide", !!shown).html(shown ? "" : '<div class="tuning-intro"><p>' + (job ? "Wait for the result of the analysis." :
+                (view.scope === "flights" ? 'Select the flights in the list. Then click "Start analysis". ' : 'Click "Start analysis". ') +
                 "The analysis examines the filters, the governor, the PID loops, the feedforward, the tail precompensation, the rates and the limits. " +
                 "For each result, it shows the measured value, the limit and the part of the log that the result comes from. " +
                 "It recommends changes and gives the CLI text for them.") + "</p>" +
@@ -7338,9 +7613,13 @@ var TuningDialog = (function () {
         function settingsChanged() {
             var hit = !job && cached(currentKey());
             // the filter calculation of these settings (or none) for the Filters tab, the side panel and the CLI file
-            if (ft.cache.length || ft.job || ft.failure || ft.cancelled || gm.cache.length || gm.failure || gm.cancelled) TABS.forEach(function (t) { rendered[t.key] = null; }); // and the governor model (gmKey has the CLI dump)
+            var redraw = !!(ft.cache.length || ft.job || ft.failure || ft.cancelled || gm.cache.length || gm.failure || gm.cancelled);
+            if (redraw) TABS.forEach(function (t) { rendered[t.key] = null; }); // and the governor model (gmKey has the CLI dump)
             if (hit && hit !== shown) display(hit);
-            else renderChrome(); // display() renders the chrome too, and renderChrome tells the Analysis view
+            else {
+                renderChrome(); // display() renders the chrome too, and renderChrome tells the Analysis view
+                if (redraw && shown) showTab(view.tab); // the open tab with the settings of now: a CLI dump loaded from the Filters tab
+            }
             if (shown && shown.control) ctRefresh();
         }
 
@@ -7412,7 +7691,22 @@ var TuningDialog = (function () {
                 hint = "The analysis for these values operates at this time. Wait for the result.";
                 return renderChrome();
             }
+            if (!job && isCurrent()) return renderChrome(); // the result on display is of these values (the button is disabled)
             start();
+        }
+
+        // The result on display is of the open file, of the values that the pilot selected (the scope, the flights, the CLI dump) and
+        // of the log whose curves and header a new run takes (the notice of noticesHtml says "To examine log N, click ...")
+        function isCurrent() {
+            var info = fileInfo(), key = currentKey(), li = shown ? shownLog() : null;
+            return !!(shown && info && shown.fileKey === info.key && key && (key === shown.key || sameFlights()) && (!isNum(li) || li === nextRunLog()));
+        }
+
+        // The log of the curves and the header of a new run: for "Selected flights" the open log when it is selected, else the first
+        // selected log (runLog). A bench run on display does not give a run of its own
+        function nextRunLog() {
+            var list = view.scope === "flights" ? selection() : null;
+            return list && list.length ? runLog(list) : currentLog();
         }
 
         dialog.on("click", ".tuning-analyse", function (e) { e.preventDefault(); requestStart(); });
@@ -7551,6 +7845,7 @@ var TuningDialog = (function () {
         // the governor model (Governor tab): start, cancel, and a time of its evidence in the log viewer
         dialog.on("click", ".tuning-gm-start", function (e) { if (e && e.preventDefault) e.preventDefault(); gmStart(); });
         dialog.on("click", ".tuning-gm-cancel", function (e) { if (e && e.preventDefault) e.preventDefault(); gmCancel(); });
+        dialog.on("click", ".tuning-autotune-all", function (e) { if (e && e.preventDefault) e.preventDefault(); if (all) allCancel(); else allStart(); });
         dialog.on("click", ".tuning-gm-seek", function (e) {
             if (e && e.preventDefault) e.preventDefault();
             var li = +this.getAttribute("data-log"), t = +this.getAttribute("data-t");
@@ -7717,12 +8012,9 @@ var TuningDialog = (function () {
             if (shown && (!info || shown.fileKey !== info.key)) drop();
             if (reader && reader.sync) reader.sync(); // the log of another file that it kept
             var key = !job && currentKey(), hit = key && cached(key);
-            if (hit && hit !== shown) {
-                display(hit);
-            } else if (key && !hit && view.scope !== "flights" && !(failure && failure.key === key) && !(cancelled && cancelled.key === key)) {
-                start(); // the analysis starts at once: by default all flights of the file (2026-10-06), or "This log". For "Selected
-                // flights" the pilot clicks "Start analysis" after the selection
-            }
+            if (hit && hit !== shown) display(hit);
+            // the analysis starts only when the pilot clicks "Start analysis" (user, 2026-10-15: some flights are possibly not usable).
+            // renderChrome starts the scan of the flights for the flight list (ensureScan)
             renderChrome();
             attachPlots(view.tab); // a result that came while the view was hidden
         };
@@ -7777,11 +8069,13 @@ var TuningDialog = (function () {
         // the analysis uses, and for "Selected flights" the flight list), stale (the result on display is for other settings),
         // running }. The Analysis view sends the pilot's actions to scopeAction and draws it again after onSettings
         this.scopePanel = function () {
+            ensureScan(); // the Analysis view can be the first view of a file
             var info = fileInfo(), key = currentKey(), text = scopeText();
             var html = '<div class="tuning-scope-bar"><label class="tuning-field">Logs ' + scopeSelectHtml(view.scope) + "</label>" +
                 (text ? ' <span class="tuning-scope-text tuning-muted">' + esc(text) + "</span>" : "") + "</div>" +
-                (view.scope === "flights" && info ? '<div class="tuning-fsel">' + selectionListHtml() + "</div>" : "");
-            return { scope: view.scope, html: html, running: !!job, stale: !!(shown && info && shown.fileKey === info.key && key && key !== shown.key && !sameFlights()) };
+                (view.scope === "flights" && info ? '<div class="tuning-fsel">' + selectionListHtml() + "</div>" : "") +
+                '<div class="tuning-cli-line">' + cliBlockHtml({ name: cli ? cli.name : null, off: !!cliConflict(), snapshot: snapshotShown() }) + "</div>";
+            return { scope: view.scope, html: html, running: !!job, scanning: scanning(), stale: !!(shown && info && shown.fileKey === info.key && key && key !== shown.key && !sameFlights()) };
         };
 
         // An action of the Analysis view: { kind: "scope", value } (the "Logs" control), { kind: "log" | "flight" | "all" |
@@ -7796,6 +8090,12 @@ var TuningDialog = (function () {
                 changeSelection(act);
             } else if (act.kind === "open" || act.kind === "sub") {
                 toggleList(act);
+            } else if (act.kind === "cli") { // the CLI dump block of the Analysis view: the file input of this view
+                var input = body.find(".tuning-cli-input")[0];
+                if (input) input.click();
+            } else if (act.kind === "cliClear") {
+                cli = cliGone = null;
+                settingsChanged();
             } else return false;
             return true;
         };
@@ -7840,7 +8140,7 @@ var TuningDialog = (function () {
                 a.filter(function (x, i) { return i !== a.length - 3; }).join("|") === b.filter(function (x, i) { return i !== b.length - 3; }).join("|"));
         }
 
-        // "Start the analysis" of the Analysis view: the cached result of the current settings, else a run for them. A run
+        // "Start analysis" of the Analysis view: the cached result of the current settings, else a run for them. A run
         // for other settings or another log (a log moved to, a file dropped since) stops first. A Promise of the
         // TuningResult: it rejects with an Error (reason "failed", "canceled" or "replaced") when the run does not give
         // one. false when no file is open
@@ -7869,7 +8169,7 @@ var TuningDialog = (function () {
         twinAssessment: twinAssessment, twinClosedItems: twinClosedItems, twinLoopNotes: twinLoopNotes, TWIN_OUTPUTS: TWIN_OUTPUTS,
         tabStatus: tabStatus, filterTabStates: filterTabStates,
         controlWorkspaceHtml: controlWorkspaceHtml, controlPairs: controlPairs, flightPlanHtml: flightPlanHtml,
-        govModelHtml: govModelHtml, govPlotSpec: govPlotSpec, govOptInHtml: govOptInHtml, govOptInCause: govOptInCause, staleTextHtml: staleTextHtml, govPlotList: govPlotList, govRowGroups: govRowGroups, govRowsHtml: govRowsHtml, govEvidenceHtml: govEvidenceHtml,
+        govModelHtml: govModelHtml, govBarHtml: govBarHtml, autotuneBarHtml: autotuneBarHtml, govPlotSpec: govPlotSpec, govOptInHtml: govOptInHtml, govOptInCause: govOptInCause, staleTextHtml: staleTextHtml, govPlotList: govPlotList, govRowGroups: govRowGroups, govRowsHtml: govRowsHtml, govEvidenceHtml: govEvidenceHtml,
         govNumbers: govNumbers, govValue: govValue, govTwinParams: govTwinParams, GM: GM, GM_STATUS: GM_STATUS, GM_FAMILIES: GM_FAMILIES, GM_ROW_STATUS: GM_ROW_STATUS, pickDefault: pickDefault,
         esc: esc, parameterLabel: parameterLabel, parameterHtml: parameterHtml, num: num, valueSe: valueSe, threshold: threshold, logLabel: logLabel, paramText: paramText, findingStatus: findingStatus,
         areaOf: areaOf, findingWhere: findingWhere, findingAxis: findingAxis, rpmText: rpmText, lookFor: lookFor, toFrame: toFrame,
@@ -7888,7 +8188,7 @@ var TuningDialog = (function () {
         profilesText: profilesText, notchFitTexts: notchFitTexts, notchFitRows: notchFitRows, fitUsed: fitUsed, cliStatusHtml: cliStatusHtml, cliConflicts: cliConflicts,
         staleOf: staleOf, staleHtml: staleHtml, staleRecHtml: staleRecHtml, stalePeriods: stalePeriods, spanStale: spanStale, causeText: causeText, epochsOf: epochsOf,
         epochSummary: epochSummary, epochHtml: epochHtml, freshCounts: freshCounts, freshLine: freshLine, freshnessHtml: freshnessHtml, freshnessRows: freshnessRows,
-        sourceLabel: sourceLabel, armText: armText, recBadges: recBadges, evidenceLinks: evidenceLinks, FRESH: FRESH, FRESH_CAUSE: FRESH_CAUSE,
+        sourceLabel: sourceLabel, armText: armText, recBadges: recBadges, evidenceLinks: evidenceLinks, FRESH: FRESH, FRESH_CAUSE: FRESH_CAUSE, FRESH_ORDER: FRESH_ORDER, FRESH_SOURCE: FRESH_SOURCE, cliBlockHtml: cliBlockHtml,
         COVERAGE: COVERAGE, CLI_ABOUT: CLI_ABOUT, CLI_STATUS: CLI_STATUS,
         TABS: TABS, STATUS: STATUS, NODE_STATUS: NODE_STATUS, PREREQ_STATUS: PREREQ_STATUS, NO_DATA: NO_DATA, FT: FT
     };

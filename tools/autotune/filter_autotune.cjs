@@ -10,6 +10,7 @@ const reconstruct = require('./filter_reconstruct.cjs');
 const setup = require('./health_setup.cjs');
 const checklist = require('./filter_checklist.cjs');
 const optimizer = require('./filter_optimizer.cjs');
+const EQ = require('./firmware/equivalence.cjs');
 const AXES = ['roll', 'pitch', 'yaw'];
 const RULES = Object.freeze({ window: 1024, leadS: 2, blockS: 30, noiseHz: 30,
     nyquistShare: 0.8, parityDb: 1, parityDelayMs: 0.3, maxAddMs: 0.5,
@@ -36,6 +37,25 @@ function masks(item, opts) {
     return more.normalMask(w, Object.assign({ flying: mask, phases: ph, header: w.flight.header, profile: w.profileAt, govState: w.govStateAt }, ctx)).mask;
 }
 
+// The CLI values that give what the log does not record, for a log that the replay cannot use without them
+function cliValuesOf(model, cfg, dynGap) {
+    if (dynGap) return ['gov_mode', 'gov_rpm_filter', 'gov_headspeed'];   // filter_reconstruct governorRatio
+    const out = new Set();
+    for (const x of model.leftOut) {
+        if (x.label === 'main motor') out.add('main_rotor_gear_ratio');
+        else { out.add('tail_rotor_gear_ratio'); if (x.label === 'tail motor') out.add('tail_rotor_mode'); }
+    }
+    FT.effectiveBanks(cfg.s).forEach((b, a) => { if (b === null && cfg.s.RPM_FILTER !== false) out.add(`gyro_rpm_notch_source_${AXES[a]}`).add(`gyro_rpm_notch_q_${AXES[a]}`); });
+    return [...out];
+}
+// The call for the CLI dump (user 2026-10-15: no silent failure without a CLI dump): the values that the replay needs, in STE
+function cliNeeded(P) {
+    const values = [...new Set(P.excluded.flatMap(e => e.cliValues || []))], code = values.map(v => '`' + v + '`');
+    if (!values.length) return null;
+    const list = code.length > 1 ? code.slice(0, -1).join(', ') + ' and ' + code[code.length - 1] : code[0];
+    return { values, text: `The log does not record ${list}. To calculate the filter values, load a CLI dump of this helicopter.` };
+}
+
 function prepare(items, opts) {
     const cli = opts.cli ? typeof opts.cli === 'string' ? setup.parseCli(opts.cli) : opts.cli : null;
     let fit = opts.tailFit || null;
@@ -59,21 +79,31 @@ function prepare(items, opts) {
         if (!(cfg.rates.logHz > 0)) { excluded.push({ log: w.flight.log, reason: 'The log has no sample rate.' }); continue; }
         cfg.rates.scale=reconstruct.schedulerScale(w.extra.time,cfg.rates.logHz,cfg.rates.scale);
         const model = FT.compile(cfg), firmware = w.flight.firmware || w.flight.header['Firmware revision'] || '';
-        const unsupported = !/Rotorflight 4\.6\.0\b/.test(firmware);
+        // the replay is the 4.6.0 source (118e912): a 4.6.0 log as before, or a build of firmware/equivalence.cjs whose sensor hunks
+        // have no effect (4.6.0-bbp 58a4bd5cc and 874f369d5, 4.7 a88bec8f8 and 85d7049a9: the journal hook of rpm_filter.c only). The
+        // parity of each log (parity(): EQ.RULES.filterBandDb and filterDelayMs for a listed build, RULES.parityDb and parityDelayMs for
+        // 4.6.0) still decides. Another build: refused
+        const version = (/Rotorflight (\d+\.\d+\.\d+)\b/.exec(firmware) || [])[1] || null, listed = EQ.match(firmware), eq = listed && !listed.base ? EQ.check(listed.entry, 'sensor', {}) : null;
+        const unsupported = version !== '4.6.0' && !(eq && eq.supported && version === listed.entry.version);
         const originalProfiles = w.profileAt || new Uint8Array(w.n);
         const firstProfile = item.armingProfile || opts.armingProfile || originalProfiles[0] || 0;
         const prof = Uint8Array.from(originalProfiles, p => p || firstProfile);
         const seg = { id: segments.length, w, cfg, model, raw, n: w.n, hs: w.hs, tail: w.extra.tailspeed,
             filt: w.gyro, time: w.extra.time, prof, mask, ratio: item.fullHeadSpeedRatio || null,
-            firstProfile, firmware, unsupported, log: w.flight.log, file: w.flight.file, fromS: w.fromS || 0 };
+            firstProfile, firmware, unsupported, equivalence: eq ? { revision: listed.id, build: listed.entry.build, files: eq.files, rules: { bandDb: EQ.RULES.filterBandDb, delayMs: EQ.RULES.filterDelayMs } } : null,
+            log: w.flight.log, file: w.flight.file, fromS: w.fromS || 0 };
         // fullHeadSpeed is a profile specification, not the changing governor
         // request. Never substitute govRequest for it.
+        // a parameter snapshot in the log header (blackbox_params FULL) gives the values of a CLI dump, of the time of this log
+        const snap = typeof setup.snapshotOfHeader === 'function' ? setup.snapshotOfHeader(w.flight.header) : null;
         if (!seg.ratio) {
-            const recovered = reconstruct.governorRatio(cfg, w, prof, cli);
+            const recovered = reconstruct.governorRatio(cfg, w, prof, snap || cli);
             if (recovered) { seg.ratio = recovered.values; seg.ratioSource = recovered.source; }
         }
         if (model.leftOut.length || model.rpm.some((b, a) => cfg.s.RPM_FILTER !== false && FT.effectiveBanks(cfg.s)[a] === null) || (model.dynLpf && !seg.ratio)) {
-            excluded.push({ log: seg.log, reason: model.dynLpf && !seg.ratio ? 'The dynamic low-pass filter needs the governor settings to calculate its headspeed ratio.' : 'The frequency of an active RPM notch filter is unknown.' }); continue;
+            const dynGap = model.dynLpf && !seg.ratio, fitText = dynGap ? '' : FT.notchFitText(fit, model.leftOut);
+            excluded.push({ log: seg.log, reason: dynGap ? 'The dynamic low-pass filter needs the governor settings to calculate its headspeed ratio.' : 'The frequency of an active RPM notch filter is unknown.' + (fitText ? ' ' + fitText : ''),
+                cliValues: cli || snap ? [] : cliValuesOf(model, cfg, dynGap) }); continue;
         }
         const firstWindow = windows.length;
         const N = 2 ** Math.round(Math.log2(cfg.rates.logHz)), lead = Math.ceil(RULES.leadS * cfg.rates.logHz);
@@ -307,7 +337,7 @@ function parity(base, P) {
     const groups = new Map();
     for (const r of base.results) {
         const k = `${r.w.seg.file}:${r.w.seg.log}`; let g = groups.get(k);
-        if (!g) groups.set(k, g = { log: r.w.seg.log, seconds: 0, axes: {}, agg: AXES.map(() => ({ observed: [0, 0, 0, 0], predicted: [0, 0, 0, 0], raw: [0, 0, 0, 0], error: 0, n: 0, windows: 0, heldError:0, priorError:0, heldSamples:0,
+        if (!g) groups.set(k, g = { log: r.w.seg.log, eq: r.w.seg.equivalence || null, seconds: 0, axes: {}, agg: AXES.map(() => ({ observed: [0, 0, 0, 0], predicted: [0, 0, 0, 0], raw: [0, 0, 0, 0], error: 0, n: 0, windows: 0, heldError:0, priorError:0, heldSamples:0,
             spectrum: Object.fromEntries(['raw', 'logged', 'predicted', 'matchRe', 'matchIm'].map(k => [k, new Float64Array(r.w.N / 2 + 1)])), df: r.w.rate / r.w.N })) });
         g.seconds += r.w.N / r.w.rate;
         for (let a = 0; a < 3; a++) {
@@ -348,12 +378,14 @@ function parity(base, P) {
             }
             const delayError = median(delays), lineError = median(lineErrors);
             const reconstructionDb = A.heldSamples ? db(A.heldError,Math.max(A.priorError,A.heldSamples/6)) : null;
-            g.axes[AXES[a]] = { passed: max <= RULES.parityDb && A.windows >= RULES.minWindows && (lineError === null || lineError <= RULES.parityDb) && (delayError !== null && Math.abs(delayError) <= RULES.parityDelayMs) && (reconstructionDb===null||reconstructionDb<=RULES.parityDb),
+            // a build of firmware/equivalence.cjs: the limits of its RULES (one source for them), else the limits of this module
+            const limDb = g.eq ? EQ.RULES.filterBandDb : RULES.parityDb, limMs = g.eq ? EQ.RULES.filterDelayMs : RULES.parityDelayMs;
+            g.axes[AXES[a]] = { passed: max <= limDb && A.windows >= RULES.minWindows && (lineError === null || lineError <= limDb) && (delayError !== null && Math.abs(delayError) <= limMs) && (reconstructionDb===null||reconstructionDb<=limDb),
                 windows: A.windows, maxBandErrorDb: round(max), medianLineErrorDb: round(lineError), maxLineErrorDb: lineErrors.length ? round(Math.max(...lineErrors)) : null,
                 delayErrorMs: round(delayError), delayMeasuredMs: null, delayPredictedMs: null, rmseDegS: round(Math.sqrt(A.error / A.n)), bandErrorsDb: errors.map(x => round(x)),
-                reconstruction: A.heldSamples ? { samples:A.heldSamples, withheldRmsDegS:round(Math.sqrt(A.heldError/A.heldSamples)), interpolationRmsDegS:round(Math.sqrt(A.priorError/A.heldSamples)), errorChangeDb:round(reconstructionDb), passed:reconstructionDb<=RULES.parityDb } : null };
+                reconstruction: A.heldSamples ? { samples:A.heldSamples, withheldRmsDegS:round(Math.sqrt(A.heldError/A.heldSamples)), interpolationRmsDegS:round(Math.sqrt(A.priorError/A.heldSamples)), errorChangeDb:round(reconstructionDb), passed:reconstructionDb<=limDb } : null };
         }
-        g.passed = AXES.every(a => g.axes[a].passed); delete g.agg;
+        g.passed = AXES.every(a => g.axes[a].passed); delete g.agg; delete g.eq;
     }
     return [...groups.values()];
 }
@@ -837,7 +869,8 @@ function tune(items, opts = {}) {
         capabilities: capabilities(P), bench: P.excluded, unmeasuredPeriods:P.unmeasured||[], notes: P.notes, model: { passed: false, parity: [], leftOut: [], rules: { bandDb: RULES.parityDb, delayMs: RULES.parityDelayMs } },
         recommended: { status: 'no flight log', reasons: [], rows: [], cli: [], validation: {} }, curves: null,
         units: { kind: 'block', n: P.units.length }, tailFit: P.fit ? Object.assign({}, P.fit, { used: P.segments.some(s => s.cfg.gear && s.cfg.gear.source === 'log notch') }) : null };
-    if (!P.windows.length) { result.recommended.reasons.push('There are no complete flight windows with the necessary filter inputs.'); result.cliExport = cliExportStatus(result); result.ms = { total: Date.now() - started }; return result; }
+    const needs = cliNeeded(P); if (needs) result.cliNeeded = needs;
+    if (!P.windows.length) { result.recommended.reasons.push(needs ? 'The log does not record all the values that are necessary for the filter replay.' : 'There are no complete flight windows with the necessary filter inputs.'); result.cliExport = cliExportStatus(result); result.ms = { total: Date.now() - started }; return result; }
     const training = P.windows.filter(w => !w.held), heldout = P.windows.filter(w => w.held);
     const short = sample(training, opts.screenWindows || 8), medium = sample(training, 24);
     let reconstructedWindows=0;

@@ -191,6 +191,35 @@ html.has-log .rf-view-tabs {
     color: #181818;
 }
 
+/* The progress of an autotune of the Tuning view (js/main.js autotuneProgress), also while a different view shows */
+.rf-view-tab.is-autotune {
+    position: relative;
+}
+
+.rf-view-tab.is-autotune::after {
+    content: "";
+    position: absolute;
+    left: 8px;
+    bottom: 2px;
+    width: calc((100% - 16px) * var(--autotune, 1));
+    height: 2px;
+    border-radius: 1px;
+    background: var(--rf-accent);
+    transition: width 0.3s ease;
+}
+
+.rf-view-tab.is-active.is-autotune::after {
+    background: #181818;
+}
+
+.rf-view-tab.is-busy::after {
+    animation: rf-autotune-busy 0.8s ease-in-out infinite alternate;
+}
+
+@keyframes rf-autotune-busy {
+    from { opacity: 0.3; }
+}
+
 /* The text size of the Analysis and Tuning views (js/main.js setTextSize): next to the view tabs, only with those views */
 .rf-view-text {
     display: none;

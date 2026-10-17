@@ -83,7 +83,8 @@ const DEFAULT_RULES = {
         note: 'note (information); note with higher (monitor): the battery value is more than relHigh x the median of the other batteries by 2 SE (2 or more batteries with a result)' },
 };
 const UNITS = { P1: 'V', P2: 'mOhm' };
-const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown'];  // health_phase PHASES
+const PHASES = ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'];  // health_phase PHASES
+const NO_LOAD = new Set(['fall', 'aftercontact']); // after an in-flight cut (health_phase IMP-03): the motor is cut, then the rotor touches the ground: no load step of a flight
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -164,8 +165,8 @@ function analyse(w, ctx = {}) {
 
     // cells: the CLI (ctx), else the rule of the firmware on the resting voltage at the start (else the first valid second)
     const L = out.limits;
-    // cellsBasis { kind: 'cli' | 'firmware' | 'none', volts, at: 'rest' (motor at rest.motor or less) | 'first' (the first second with a voltage) }
-    if (num(ctx.cells) && ctx.cells > 0 && !/^inferred/.test(String(ctx.cellsSource || '')) && !ctx.cellsAmbiguous) { out.cells = ctx.cells; out.cellsSource = ctx.cellsSource || 'CLI battery_cell_count'; out.cellsBasis = { kind: 'cli', volts: null, at: null }; }
+    // cellsBasis { kind: 'cli' | 'snapshot' (the parameter snapshot of the log header) | 'firmware' | 'none', volts, at: 'rest' (motor at rest.motor or less) | 'first' (the first second with a voltage) }
+    if (num(ctx.cells) && ctx.cells > 0 && !/^inferred/.test(String(ctx.cellsSource || '')) && !ctx.cellsAmbiguous) { out.cells = ctx.cells; out.cellsSource = ctx.cellsSource || 'CLI battery_cell_count'; out.cellsBasis = { kind: ctx.paramSnapshot ? 'snapshot' : 'cli', volts: null, at: null }; }
     else {
         let v0 = out.restStart ? out.restStart.v : null, at0 = 'rest';
         if (v0 === null) { let a = 0; while (a < n && !okV(V[a])) a++; const m = medianIn(V, a, a + S(RULE.rest.s), okV); v0 = m === null ? null : m / 100; at0 = 'first'; }
@@ -198,6 +199,7 @@ function analyse(w, ctx = {}) {
             if (anyI) { const q = medianIn(I, j - half, j + half + 1, okI); if (q !== null && q > iMax) iMax = q; } }
         for (let j = i1; j < end; j++) if (mot[j] > peak) peak = mot[j];
         if (lowAt < 0) continue;
+        if (code && NO_LOAD.has(PHASES[code[i0]])) { out.noLoadSteps = (out.noLoadSteps || 0) + 1; next = end + gap; continue; }
         const ib = anyI ? medianIn(I, i0 - before, i0 + 1, okI) : null, dA = ib !== null && isFinite(iMax) ? (iMax - ib) / 100 : null, sag = (vb - low) / 100;
         out.stepsFound++;
         if (out.steps.length < RULE.maxEvents) out.steps.push({ t: t(i0), t1: t(end - 1), tS: r(F(i0), 3), t1S: r(F(end - 1), 3), lowS: r(F(lowAt), 3), riseS: r((i1 - i0) / rate, 3),
@@ -207,6 +209,7 @@ function analyse(w, ctx = {}) {
         next = end + gap;
     }
     if (out.stepsFound > out.steps.length) out.notes.push(`The log has ${out.stepsFound} load steps. The analysis keeps the first ${out.steps.length}.`);
+    if (out.noLoadSteps) out.notes.push(`The analysis does not use ${out.noLoadSteps === 1 ? '1 load step' : `${out.noLoadSteps} load steps`} after a motor cut in flight (check D11).`);
     return out;
 }
 
@@ -278,7 +281,7 @@ function judge(flights, RULES = DEFAULT_RULES) {
             vBefore: s.vBefore, vMin: s.vMin, throttleBefore: s.throttleBefore, throttlePeak: s.throttlePeak, dA: s.dA, mOhm: s.mOhm, phase: s.phase, profile: null,
             bad: s.beforeCell >= lim.warning && s.minCell < lim.min, low: s.minCell < lim.warning }));
         const cb = g.cellsBasis || {}, cellsText = cb.kind === 'firmware' ? `The battery has ${c} cells. The firmware gives this cell count for ${fmt(cb.volts, 2)} V, ${cb.at === 'rest' ? 'the voltage at the start of the log before the motor starts' : 'the voltage in the first second of the log'}.`
-            : `The battery has ${c} cells (\`battery_cell_count\` in the CLI).`;
+            : cb.kind === 'snapshot' ? `The battery has ${c} cells (\`battery_cell_count\` in the parameter values of the log header).` : `The battery has ${c} cells (\`battery_cell_count\` in the CLI).`;
         const what = 'When the throttle increases quickly, the battery voltage decreases. A weak battery cannot hold its voltage, and then the headspeed can decrease.';
         const meanText = !nSteps ? 'The log has no load step with the governor in ACTIVE.' : nSteps === 1 ? `At 1 load step, the voltage for each cell decreases by ${fmt(m.mean, 3)} V.`
             : `At ${many(nSteps, 'load step')}, the voltage for each cell decreases by ${fmt(m.mean, 3)} ± ${fmt(m.se, 3)} V on average. The largest decrease is ${fmt(worst.sagCell, 3)} V at ${fmt(worst.tS, 1)} s.`;

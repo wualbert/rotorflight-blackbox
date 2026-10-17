@@ -91,7 +91,14 @@ Missing settings remain unknown; diagnostic
 execution supplies release defaults but retains failed compatibility status.
 Inactive controller paths and servo-only settings do not block a model whose
 plant input is the stabilized mixer. A firmware version string alone does not
-confirm the source revision. The exact release hash is required.
+confirm the source revision. The exact release hash, or a build of `equivalence.cjs`, is required.
+
+`equivalence.cjs` lists the other builds that execute the same replayed source: for each build, the manifest files that
+differ (with their sha256 at that build), the scopes that execute them (controller, governor, servo, sensor) and each hunk with
+the condition that makes it inactive. `compatibility` accepts a listed build only when every condition of the executed hunks
+holds, and returns `equivalence` with the per-log parity rules of the build (`RULES`), which the caller must apply. Re-audit with
+`git diff 118e912 <build> -- src/main/<manifest file>` and run `node --test test/firmware_controller.test.cjs` with the
+firmware repository at `~/exp/rotorflight-firmware` (or `ROTORFLIGHT_FIRMWARE`).
 
 `calibrate` searches finite candidate grids for missing PID mode and I-term
 relax levels by replaying the native controller against each logged PID term.

@@ -4,6 +4,7 @@
 // Ground truth: closed-form filter responses, a sine through the time domain, and synthetic flight logs whose gyroADC is
 // made by the replica with known settings (so parity must pass) or with other settings than the header (so it must fail).
 // AUTOTUNE_FILTER_LOG=<Fireball fireball_0929_3.bbl> [AUTOTUNE_FILTER_CLI=<fireball_cli_dump.txt>] adds a real-log test.
+// PARAM_EPOCHS_LOG=analysis/fireball-crash-20261015/crash.bbl adds the 4.7 log with a parameter snapshot (IMP-05, IMP-06; about 1 min).
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -438,4 +439,48 @@ test('real log (AUTOTUNE_FILTER_LOG): parity passes, the tail rotor notch order 
     assert.ok(T && T.passed, JSON.stringify(T && T.reasons));
     if (!cli) assert.ok(T.used && res.model.passed, JSON.stringify(res.model.parity.map(p => [p.log, Object.values(p.axes).map(A => A.passed)])));
     if (T.cli && T.cli.tailOrder) assert.ok(Math.abs(T.order - T.cli.tailOrder) <= T.limitDevOrder, `fit ${T.order} ± ${T.se}, dump ${T.cli.tailOrder}`);
+});
+
+// ---- the firmware builds of firmware/equivalence.cjs (IMP-06) -----------------------------------------------------------
+const build = (items, firmware, scale) => items.map(it => Object.assign({}, it, { w: Object.assign({}, it.w, { flight: Object.assign({}, it.w.flight, { firmware }),
+    gyro: scale ? it.w.gyro.map(g => Float64Array.from(g, x => x * scale)) : it.w.gyro }) }));
+test('firmware builds: an audited 4.7 or 4.6.0-bbp build is replayed and must pass the parity; a 2 dB miss is refused; an unknown build is not replayed', () => {
+    const A = require('../tools/autotune/filter_autotune.cjs');
+    const parity = (items) => { const P = A.prepare(items, { gear: GEAR }); return { P, par: P.windows.length ? A.parity(A.evaluate(P, {}, P.windows.slice(0, 12)), P) : [] }; };
+    for (const fw of ['Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X', 'Rotorflight 4.6.0-bbp (58a4bd5cc) STM32G47X', 'Rotorflight 4.6.0-bbp-bench (874f369d5) STM32G47X', 'Rotorflight 4.6.0 (118e912) STM32G47X']) {
+        const { P, par } = parity(build(synthetic(), fw));
+        assert.ok(P.segments.length && P.segments.every(q => !q.unsupported), fw);
+        assert.ok(par.length && par.every(p => p.passed), `${fw}: ${JSON.stringify(par.map(p => Object.values(p.axes).map(X => X.maxBandErrorDb)))}`);
+        assert.strictEqual(P.segments[0].equivalence ? P.segments[0].equivalence.revision : null, /118e912/.test(fw) ? null : /\(([0-9a-f]+)\)/.exec(fw)[1]);
+    }
+    // the logged gyroADC 2 dB over the replay of the recorded settings: the parity fails, so the replay gives no recommendation
+    const miss = parity(build(synthetic(), 'Rotorflight 4.7.0-bbp-pr (85d7049a9) STM32G47X', 10 ** (2 / 20)));
+    assert.ok(miss.P.segments.every(q => !q.unsupported));
+    assert.ok(miss.par.length && miss.par.every(p => !p.passed && Object.values(p.axes).every(X => X.maxBandErrorDb > 1.5)), JSON.stringify(miss.par.map(p => Object.values(p.axes).map(X => X.maxBandErrorDb))));
+    for (const fw of ['Rotorflight 4.7.0 (deadbee) STM32G47X', 'Rotorflight 4.8.0 (85d7049a9) STM32G47X', 'Rotorflight 4.7.0-bbp-pr (58a4bd5cc) STM32G47X'])
+        assert.ok(parity(build(synthetic(), fw)).P.segments.every(q => q.unsupported), fw);
+});
+
+test('the 4.7 crash log: the snapshot gives the RPM notch gear ratios, the replay is supported and agrees within 0.2 dB', { skip: !process.env.PARAM_EPOCHS_LOG && 'PARAM_EPOCHS_LOG not set' }, (t) => {
+    const lib = require('../tools/autotune/lib.cjs'), A = require('../tools/autotune/filter_autotune.cjs'), app = lib.loadApp(), items = [];
+    for (const w of lib.segments(app, process.env.PARAM_EPOCHS_LOG, { whole: true, extra: FT.EXTRA, logs: [0] })) {
+        if (w.skipped) continue;
+        if (!/85d7049a9/.test(w.flight.firmware || '')) return t.skip('PARAM_EPOCHS_LOG is not the 4.7.0-bbp-pr crash log');
+        // the flight before the receiver loss (68.44 s): airborne and governor ACTIVE (fa_parity.cjs of the crash analysis)
+        const T = w.extra.time, mask = Uint8Array.from({ length: w.n }, (_, i) => w.airborneAt[i] === 1 && w.govStateAt[i] === 4 && (T[i] - T[0]) / 1e6 < 68.44 ? 1 : 0);
+        items.push({ w, mask, flight: true });
+    }
+    const res = A.tune(items, { simulate: {}, progress: () => {} });
+    assert.ok(!res.cliNeeded, 'no CLI dump is necessary: the snapshot has tail_rotor_gear_ratio');
+    assert.strictEqual(res.model.supported, true);
+    assert.ok(res.model.parity.length > 0);
+    for (const p of res.model.parity) for (const [ax, X] of Object.entries(p.axes)) assert.ok(X.maxBandErrorDb <= 0.2, `${ax}: ${X.maxBandErrorDb} dB`);
+});
+
+// IMP-02 (review 2026-10-16): without a mask of the caller, maskOf is the flight phase less rescue and the cut of a receiver signal loss
+test('maskOf: the cut of a receiver signal loss (lib.cjs rxLossAt) is not in the flight mask', () => {
+    const n = 4000, w = { n, rate: 1000, rescueAt: new Uint8Array(n), rxLossAt: new Uint8Array(n).fill(1, 1500, 2600) };
+    const item = { phases: { class: 'flight', code: new Uint8Array(n).fill(3, 500, 3500) } }, m = FT._t.maskOf(w, item, {});
+    let inCut = 0, out = 0; for (let i = 0; i < n; i++) { if (i >= 1500 && i < 2600) inCut += m.mask[i]; else if (i >= 500 && i < 3500) out += 1 - m.mask[i]; }
+    assert.strictEqual(inCut, 0); assert.strictEqual(out, 0); assert.match(m.source, /receiver signal loss out/); assert.strictEqual(m.flight, true);
 });

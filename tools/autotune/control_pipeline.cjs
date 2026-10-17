@@ -13,6 +13,7 @@ const filters = require('./filter_tune.cjs');
 const sensor = require('./filter_replay.cjs');
 const nativeSensor = require('./firmware_sensor.cjs');
 const datasets = require('./datasets.cjs');
+const power = require('./validation_power.cjs');
 const AXES = ['roll', 'pitch', 'yaw'];
 // controller*: native PID replay against the logged terms (no model). baselineRelativeRmse: closed-loop agreement of the
 // twin flown by the native controller from the end of the recorded prefix (warmupS) to the end of the period, in the
@@ -43,6 +44,7 @@ const RULES = Object.freeze({ controllerRelativeRmse:0.12, controllerAbsoluteRms
     baselineRelativeRmse:0.30, minImprovement:0.03, maxAxisRegression:0.02,
     maxRelativeStep:0.20, maxCandidates:60, warmupS:2, maxRate:2000, envelopeMargin:0.05, traceHz:50,
     closedLoopFit:CLOSED_LOOP_FIT, governorWarmupS:20, governorThrottleRmse:0.02, governorHeadspeedRmse:100, closedLoopThrottleRmse:0.04,
+    validation:power.RULES, // IMP-07: the flights that can show a selected change (validation_power.cjs: alpha, power, maxFlights)
     source:'Analysis check limits. These are not helicopter flight limits.' });
 const finite = x => typeof x === 'number' && Number.isFinite(x);
 const clone = x => JSON.parse(JSON.stringify(x, (k,v)=>ArrayBuffer.isView(v)?Array.from(v):v));
@@ -94,6 +96,37 @@ function datasetFor(input,id) {
 // A merged dataset describes equal values, not where each flight recorded them.
 // Preserve the interval-level source before any synthetic header is constructed.
 const GAIN_NAMES=AXES.flatMap(axis=>['p','i','d','f','b'].map(term=>axis+'_'+term+'_gain')).concat(['roll_o_gain','pitch_o_gain']);
+// A CLI dump that the pilot selects (options.cliText, else the parsed input.cli) supplies the values that the log header does
+// not record: the global values and the section of each PID profile (user, 2026-10-15). The header wins where it records the
+// PID profile at the start of the log. The controller parity check then examines the values against the recorded PID terms.
+const CLI_SOURCE='CLI dump that the pilot selected';
+const cliCache=new WeakMap();
+function userCli(input,profile) {
+    const text=input&&input.options&&input.options.cliText,key=typeof text==='string'&&text.trim()?input.options:input&&input.cli;
+    if(!key||typeof key!=='object'||!Number.isInteger(profile))return null;
+    if(!cliCache.has(key))cliCache.set(key,datasets.cliValues(key===input.cli?key:datasets.parseCli(text)));
+    const CV=cliCache.get(key),section=CV&&CV.profiles[profile];
+    if(!section)return null;
+    const values={...CV.global,...section},config=firmware.fromHeader({},values,{valueSources:Object.fromEntries(Object.keys(values).map(k=>[k,CLI_SOURCE]))});
+    return {values:config.values,servos:config.servos&&!config.servos.unknown.length?{...config.servos,verified:true}:null,
+        name:input.options&&input.options.cliName||null};
+}
+// The gains of a configuration interval that the log header does not record (a later PID profile): the CLI section of its PID
+// profile. A header interval keeps the header gains, also when the CLI dump has different values.
+function cliEvidence(result,item,input) {
+    const record=item.w&&item.w.recordedConfiguration||{},cli=!result.known&&result.interval&&userCli(input,record.profile||item.profile);
+    if(!cli)return result;
+    const header=result.interval.source&&result.interval.source.profile==='header'&&!result.interval.assumed&&!record.assumed,values={},sources={};
+    for(const name of GAIN_NAMES) {
+        const fromHeader=header&&finite(result.values[name]),value=fromHeader?result.values[name]:cli.values[name];
+        if(!finite(value))return result;
+        values[name]=value;sources[name]=fromHeader?'original log header':CLI_SOURCE;
+    }
+    return {...result,known:true,values,sources,reasons:[],missing:[],mismatched:[],declaredMismatched:result.mismatched,
+        profileSource:header?'header':'user-cli',userCli:true};
+}
+// The epochs whose values come from the user (parameter continuity or a selected CLI dump) instead of the log header.
+const covered=evidence=>!!(evidence.continuity&&evidence.continuity.applied||evidence.userCli);
 function sourceIdentity(input,item) {
     const w=item.w||{},files=input.source&&input.source.files||[],log=(item.source&&item.source.logIndex)??w.recordedConfiguration?.interval?.log??w.flight?.log,
         matches=files.filter(file=>Number.isInteger(log)&&Number.isInteger(file.logOffset)&&log>=file.logOffset&&log<file.logOffset+file.logs),
@@ -107,9 +140,20 @@ function continuityAssertion(input,item) {
         a.sourceSha256===identity.sha256&&typeof a.statement==='string'&&a.statement.trim()&&Array.isArray(a.localLogIndexes)&&
         a.localLogIndexes.every(i=>Number.isInteger(i)&&i>=0)&&a.localLogIndexes.includes(identity.localLogIndex))||null;
 }
+// a configuration interval whose values come from the parameter snapshot of its log (datasets.cjs source 'log snapshot',
+// blackbox_params FULL): the values of every PID profile at the log start, recorded in the log header (IMP-05)
+const SNAPSHOT_SOURCE='log snapshot',JOURNAL_SOURCE='log journal';
+function snapshotGainEvidence(record,interval) {
+    const values={},sources={},missing=GAIN_NAMES.filter(name=>!finite(record.values&&record.values[name]));
+    for(const name of GAIN_NAMES)if(!missing.includes(name)){values[name]=record.values[name];sources[name]=SNAPSHOT_SOURCE;}
+    const reasons=missing.length?['The parameter values of the log header do not have all PID gains.']:[];
+    return {known:!reasons.length,values,sources,missing,mismatched:[],reasons,profileSource:SNAPSHOT_SOURCE,interval,
+        scope:'P, I, D, F, B and cyclic O gains only; other flight controller parameters require their own source checks'};
+}
 function recordedGainEvidence(item={},input) {
     const w=item.w||{},record=w.recordedConfiguration||{},interval=record.interval,
         raw=w.originalHeader,header=raw?firmware.fromHeader(raw):null,values={},sources={},reasons=[];
+    if(interval&&interval.source&&interval.source.profile===SNAPSHOT_SOURCE&&!interval.assumed&&!record.assumed&&!continuityAssertion(input,item))return snapshotGainEvidence(record,interval);
     if(!raw||!interval)reasons.push('The log header or configuration interval is missing.');
     if(!interval||!interval.source||interval.source.profile!=='header'||interval.assumed||record.assumed)
         reasons.push('The log does not record the PID gains for this configuration interval.');
@@ -124,7 +168,7 @@ function recordedGainEvidence(item={},input) {
     const result={known:reasons.length===0,values,sources,missing,mismatched,reasons,
         profileSource:interval&&interval.source&&interval.source.profile||'unknown',interval:interval||null,
         scope:'P, I, D, F, B and cyclic O gains only; other flight controller parameters require their own source checks'};
-    const assertion=continuityAssertion(input,item);if(!assertion)return result;
+    const assertion=continuityAssertion(input,item);if(!assertion)return cliEvidence(result,item,input);
     const profile=record.profile||item.profile,donors=[],seen=new Set(),globalHeaders=[];
     for(const candidate of input.items||[]) {
         if(continuityAssertion(input,candidate)!==assertion)continue;
@@ -134,7 +178,7 @@ function recordedGainEvidence(item={},input) {
         if(!evidence.known||seen.has(identity.localLogIndex))continue;
         seen.add(identity.localLogIndex);donors.push({item:candidate,evidence,identity});
     }
-    if(!donors.length)return {...result,continuity:{assertion:clone(assertion),donors:[],applied:false}};
+    if(!donors.length)return cliEvidence({...result,continuity:{assertion:clone(assertion),donors:[],applied:false}},item,input);
     const donor=donors[0],conflicts=GAIN_NAMES.filter(name=>donors.some(d=>d.evidence.values[name]!==donor.evidence.values[name]));
     const provenance={assertion:clone(assertion),donors:donors.map(d=>({sourceSha256:d.identity.sha256,localLogIndex:d.identity.localLogIndex,
         profile,configuration:itemConfiguration(d.item)})),applied:conflicts.length===0,conflicts};
@@ -150,12 +194,27 @@ function recordedGainEvidence(item={},input) {
         reasons:[],profileSource:'header-with-user-continuity',continuity:provenance,profileValues:profileHeader.values,globalValues:globalHeader.values,
         parameterConflicts:profileHeader.conflicts.concat(globalHeader.conflicts)};
 }
+// A journal epoch (a log with a parameter snapshot, js/tuning_worker.js spanInfo, check 'journal'): a reason with keys counts only
+// when one of its keys is a value that the replay reads. These are the names of firmware/schema.cjs and the PID gains of the PID
+// profile of the epoch (p<k>.), the mixer inputs, the mixer rules and the servos (el.*), and the global names of the schema. A rate
+// value does not count: the setpoint is a measured input. A change of debug_mode or blackbox_log_esc does not stop the replay.
+// 'changed' (a recorded change before the epoch): datasets.cjs applies every journal change from its time (source 'log journal'),
+// and targetConfig keeps these values, so only a change of an element (el.*: datasets.cjs keeps the snapshot values) counts
+const REPLAY_NAMES=new Set(firmware.SCHEMA.map(f=>String(f.name).replace(/\[\d+\]$/,'')).concat(GAIN_NAMES));
+const JOURNAL_KEYED=['mixed','uncertain','pending','unknown','changed'];
+function replayReads(key,epoch) {
+    const m=/^([pr])([0-5])\.(.+)$/.exec(String(key));
+    if(m)return m[1]==='p'&&!(epoch.pidProfile>0&&+m[2]!==epoch.pidProfile-1)&&REPLAY_NAMES.has(m[3].replace(/\[\d+\]$/,''));
+    return /^el\.(?:mixin|mixrule|servo)\./.test(key)||REPLAY_NAMES.has(String(key).replace(/\[\d+\]$/,''));
+}
 function gainEpochReasons(epoch,continuity=false) {
     if(!epoch)return ['missing-parameter-epoch'];
+    const keyed=reason=>epoch.check==='journal'&&JOURNAL_KEYED.includes(reason)&&epoch.keys&&Array.isArray(epoch.keys[reason]);
     // A rate-profile switch alone cannot invalidate recorded PID gains; its
     // resulting setpoint is a measured input at this execution boundary.
     return (epoch.reasons||[]).filter(reason=>!(reason==='switched'&&epoch.source&&epoch.source.pid==='header')&&
-        !(continuity&&['rearm','resume','switched'].includes(reason)));
+        !(continuity&&['rearm','resume','switched'].includes(reason))&&
+        !(keyed(reason)&&!epoch.keys[reason].some(key=>replayReads(key,epoch)&&(reason!=='changed'||/^el\./.test(key)))));
 }
 function recordedGainMask(item,input) {
     const w=item.w||{},evidence=recordedGainEvidence(item,input),n=w.n||0,base=item.mask||item.ctx&&(item.ctx.eligible||item.ctx.flying)||w.filterMask,
@@ -166,7 +225,7 @@ function recordedGainMask(item,input) {
     for(let i=0;i<n;i++) {
         const t=at(i);while(epochIndex<epochs.length&&epochs[epochIndex].t1<=t)epochIndex++;
         const epoch=epochs[epochIndex],epochAt=epoch&&epoch.t0<=t&&epoch.t1>t?epoch:null;
-        const stale=gainEpochReasons(epochAt,evidence.continuity&&evidence.continuity.applied),active=!!(base&&base[i]);
+        const stale=gainEpochReasons(epochAt,covered(evidence)),active=!!(base&&base[i]);
         if(active)counts.flight++;
         const reason=!active?'outside-eligible-flight':!evidence.known?'unrecorded-pid-gains':stale.length?'unconfirmed-parameter-epoch':null;
         if(!reason){mask[i]=1;counts.known++;}
@@ -201,15 +260,24 @@ function targetConfig(input,periods,d=input.configuration||{}) {
     const original=first.w.originalHeader||first.w.flight.header, recordedHeader={...original};
     for(const name of Object.keys(recordedHeader))if(datasets.classify(name).scope==='profile'&&!Object.prototype.hasOwnProperty.call(d.values||{},name))recordedHeader[name]=null;
     const header=datasets.configurationHeader(recordedHeader,d);
-    const stale=selected.flatMap(item=>{const known=recordedGainEvidence(item,input),confirmed=known.continuity&&known.continuity.applied;
-        return (item.stale||[]).filter(span=>gainEpochReasons(span,confirmed).length&&(!periods||periods.some(s=>contextFor(input,s).item===item&&
-            (!finite(span.t0)||!finite(span.t1)||span.t0<s.fromS+s.n/s.rate&&span.t1>s.fromS))));});
+    // stale: the spans with values that nothing confirms. userCovered: the spans whose values the user supplies (parameter
+    // continuity or the selected CLI dump); they are possibly not current, and each result gives this flag.
+    const spans=selected.flatMap(item=>{const evidence=recordedGainEvidence(item,input),user=covered(evidence);
+        return (item.stale||[]).filter(span=>gainEpochReasons(span).length&&(!periods||periods.some(s=>contextFor(input,s).item===item&&
+            (!finite(span.t0)||!finite(span.t1)||span.t0<s.fromS+s.n/s.rate&&span.t1>s.fromS)))).map(span=>({span,open:gainEpochReasons(span,user).length>0,
+            source:evidence.userCli?CLI_SOURCE:'parameter continuity'}));});
+    const stale=spans.filter(x=>x.open).map(x=>x.span);
     const result=firmware.fromHeader(header,d.values||{},{profile:d.pidProfile,valueSources:d.sources,stale:stale.length?stale:null});
+    result.userCovered=spans.filter(x=>!x.open).map(x=>({...x.span,source:x.source}));
     if(first.w.originalHeader) {
         const raw=firmware.fromHeader(original),known=recordedGainEvidence(first,input);
         result.intervalProvenance=known;
         const confirmed=known.continuity&&known.continuity.applied,profileRecorded=confirmed||known.profileSource==='header'&&!(known.interval&&known.interval.assumed);
+        const snapshot=known.profileSource===SNAPSHOT_SOURCE;
         for(const name of new Set(Object.keys(result.values).concat(confirmed?Object.keys(known.profileValues).concat(Object.keys(known.globalValues)):[]))) {
+            // a value of the parameter snapshot of this log, or a change that its parameter journal records (datasets.cjs 'log journal'),
+            // is recorded: it stays (the classic header has only the PID profile at the start, and the values before the change)
+            if(snapshot&&(result.sources[name]===SNAPSHOT_SOURCE||result.sources[name]===JOURNAL_SOURCE)&&finite(result.values[name])){result.unknown=result.unknown.filter(value=>value!==name);continue;}
             const isProfile=datasets.classify(name).scope==='profile',recorded=confirmed?(isProfile?known.profileValues:known.globalValues):raw.values;
             if(finite(recorded[name])&&(!isProfile||profileRecorded)) {
                 result.values[name]=recorded[name];result.sources[name]=confirmed?'original log header with user-confirmed parameter continuity':'original log header';
@@ -218,6 +286,14 @@ function targetConfig(input,periods,d=input.configuration||{}) {
                 if(!result.unknown.includes(name))result.unknown.push(name);
                 result.sources[name]='unverified historical '+(result.sources[name]||'configuration');
             }
+        }
+        // battery_cell_count 0 is the firmware auto rule, not a cell count: the governor path calculates it from the rest voltage
+        const cli=userCli(input,d.pidProfile),usable=name=>finite(cli.values[name])&&!(name==='battery_cell_count'&&cli.values[name]===0);
+        if(cli) {
+            for(const name of result.unknown)if(usable(name)){result.values[name]=cli.values[name];result.sources[name]=CLI_SOURCE;}
+            result.unknown=result.unknown.filter(name=>!usable(name));
+            if(cli.servos)result.servos=cli.servos;
+            result.cli={name:cli.name,source:CLI_SOURCE};
         }
         result.assumptions=result.unknown.map(name=>({name,value:result.values[name]===undefined?firmware.defaults()[name]:result.values[name],source:result.sources[name]||'unverified release default'}));
     }
@@ -426,19 +502,46 @@ async function governorReplay(input,segments,configOf,runtimeOptions={}) {
         if(!path.pass){rows.push({id:s.id,configuration:s.configuration,pass:false,reasons:path.reasons});continue;}
         const {w,offset}=contextFor(input,s),runtime=await firmware.create(Object.assign({config},runtimeOptions)),
             start=Math.min(s.n-1,Math.ceil(RULES.warmupS*s.rate)),from=Math.max(0,offset-Math.round(RULES.governorWarmupS*s.rate));
-        const recorded=new Float64Array(start),output=new Float64Array(start);let state=null;
+        const recorded=new Float64Array(start),output=new Float64Array(start);let state=null,agree=0,compared=0;
         try {
             for(let k=from;k<offset+start;k++) {
                 const r=runtime.step(sampleAt(input,s,k-offset,w.gyro.map(c=>c[k]),k===from,config));
                 if(k>=offset){recorded[k-offset]=w.extra['motor[0]'][k]*.001;output[k-offset]=r.throttle;state=r.governor&&r.governor.state;}
+                // the logged governor state (GOVERNOR_STATE events) against the calculated state, for the rules of an equivalent build: in
+                // the recorded prefix only (k >= offset, the samples of the throttle RMS). In the warm-up the replay starts in THROTTLE_OFF
+                // with no recorded state, so a period that starts in flight has OFF, IDLE and SPOOLUP there (review IMP-06)
+                if(k>=offset&&w.govStateAt&&r.governor&&finite(w.govStateAt[k])){compared++;if(w.govStateAt[k]===r.governor.state)agree++;}
             }
         } catch(e){rows.push({id:s.id,configuration:s.configuration,pass:false,error:String(e.message),reasons:['The governor code cannot use the recorded governor inputs.']});continue;}
         const [m]=errorsOf([recorded],[output]),pass=m.rmse<=RULES.governorThrottleRmse&&state===4;
-        rows.push({id:s.id,configuration:s.configuration,throttle:m,state,warmupS:(offset-from)/s.rate,pass,
+        rows.push({id:s.id,configuration:s.configuration,throttle:m,state,warmupS:(offset-from)/s.rate,pass,stateAgreement:compared?agree/compared:null,
             reasons:pass?[]:[state!==4?'The calculated governor is not active when the closed loop starts.':
                 'The calculated governor throttle does not agree with the recorded throttle before the closed loop starts.']});
     }
     return {pass:rows.length>0&&rows.every(r=>r.pass),rows,reasons:[...new Set(rows.flatMap(r=>r.reasons))]};
+}
+// A build of firmware/equivalence.cjs (compatibility.equivalence): each window must also agree within its RULES (IMP-06). The
+// controller: the relative RMS error of mixer[0..2] (or its floor, the logging step); the governor: the share of samples with the
+// logged governor state and the throttle RMS error in the recorded prefix. A release 118e912 log keeps the rules above
+function equivalentParity(compatibility,rows) {
+    const eq=compatibility&&compatibility.equivalence;if(!eq)return;
+    // each axis: its relative RMS error at most the limit, or its RMS error at most the floor (a quiet axis has a large relative
+    // error at the logging step). The window passes when every axis passes (review IMP-06)
+    for(const row of rows) {
+        const metrics=row.metrics||[],axisPass=m=>(finite(m.relative)&&m.relative<=eq.parity.controllerMixerRelative)||(finite(m.rmse)&&m.rmse<=eq.parity.controllerMixerFloor);
+        const worst=metrics.length?Math.max(...metrics.map(m=>finite(m.relative)?m.relative:Infinity)):null;
+        row.equivalence={revision:eq.revision,mixerRelative:worst,limit:eq.parity.controllerMixerRelative,floor:eq.parity.controllerMixerFloor,
+            axes:metrics.map(m=>({relative:finite(m.relative)?m.relative:null,rmse:finite(m.rmse)?m.rmse:null,pass:axisPass(m)})),pass:metrics.length>0&&metrics.every(axisPass)};
+        if(!row.equivalence.pass)row.pass=false;
+    }
+}
+function equivalentGovernorParity(compatibility,row) {
+    const eq=compatibility&&compatibility.equivalence;if(!eq||!row||row.equivalenceChecked)return;
+    row.equivalenceChecked=true;
+    const agreement=finite(row.stateAgreement)?row.stateAgreement:null,throttle=row.throttle&&finite(row.throttle.rmse)?row.throttle.rmse:null;
+    const pass=agreement!==null&&agreement>=eq.parity.governorStateAgreement&&throttle!==null&&throttle<=eq.parity.governorThrottleRms;
+    row.equivalence={revision:eq.revision,stateAgreement:agreement,throttleRms:throttle,limits:{stateAgreement:eq.parity.governorStateAgreement,throttleRms:eq.parity.governorThrottleRms},pass};
+    if(!pass&&row.pass){row.pass=false;row.reasons=(row.reasons||[]).concat(['The calculated governor does not agree with the recorded governor in the limits for this firmware.']);}
 }
 function controllerInputs(input,segment,config) {
     const {w,offset,item}=contextFor(input,segment),x=w.extra||{},v=config.values||{},reasons=[],sources={
@@ -864,7 +967,7 @@ async function closedLoopFit(input,periods,configOf,fit,runtimeOptions={},hooks=
 }
 
 function candidates(input) {
-    const d=input.configuration, values=d.values||{}, patterns={cyclic:/^(roll|pitch)_[pidfbo]_gain$/,tail:/^yaw_[pidfb]_gain$/,governor:/^gov_(?:[pidf]_gain|gain)$/,
+    const d=input.configuration, values=d.values||{}, patterns={cyclic:/^(roll|pitch)_[pidfbo]_gain$/,tail:/^yaw_[pidfb]_gain$/,
         cycomp:/^(pitch_collective_ff_gain|cyclic_cross_coupling_gain|cyclic_cross_coupling_ratio)$/,
         tailcomp:/^yaw_(cw_stop_gain|ccw_stop_gain|collective_ff_gain|cyclic_ff_gain|inertia_precomp_gain)$/};
     if(!patterns[input.step])return [];
@@ -893,8 +996,20 @@ function axisRegression(before,after,axes=[0,1,2]) {
 // The same for the fraction of samples at a mixer limit: its mean over the periods must not increase by more than 0.001.
 function moreSaturation(before,after) {return average(after.map(r=>r.saturation))>average(before.map(r=>r.saturation))+0.001;}
 function objective(rows,step) {
-    if(step==='governor')return average(rows.map(r=>r.governor&&finite(r.governor.tracking)?r.governor.tracking:Infinity));
     const axes=stepAxes(step);return average(rows.map(r=>average(axes.map(a=>r.tracking[a]))));
+}
+// The flag of a result whose flight periods use values that the user supplies (CLAUDE.md "Values that are possibly not
+// current"): { reasons, text, findings }, the shape of r.stale in js/tuning_worker.js, else null.
+const COVER_CAUSE=Object.freeze({rearm:'a second arm in the same log',switched:'a different PID profile or rate profile',resume:'a period with no data'});
+function userFlag(config) {
+    const spans=config&&config.userCovered||[],reasons=[...new Set(spans.flatMap(s=>(s.reasons||[]).filter(r=>COVER_CAUSE[r])))];
+    if(!reasons.length)return null;
+    const causes=reasons.map(r=>COVER_CAUSE[r]),list=causes.length>1?causes.slice(0,-1).join(', ')+' and '+causes[causes.length-1]:causes[0],
+        cli=spans.some(s=>s.source===CLI_SOURCE),name=config.cli&&config.cli.name;
+    const source=cli?(name?`the CLI dump "${name}".`:'the CLI dump that you selected.'):
+        'the log header. You selected the check for constant parameter values.';
+    return {reasons,findings:[],text:`The log does not record the values of some flight periods. ${causes.length>1?'The causes are':'The cause is'} ${list}. `+
+        `The app uses the values of ${source}`};
 }
 // The text when a partial twin cannot test a step (fit.validation.assessment: the yaw frequency check). measured false: the
 // test flights do not have sufficient yaw inputs. measured true: the yaw response was measured but does not agree.
@@ -905,17 +1020,39 @@ function stepRefusal(step,fit) {
         'The yaw response of the helicopter model does not agree with the test flights. No tail gain change is available.';
 }
 
+// The validation plan of a selected change (IMP-07): rows of the frozen test (model 0) give the model gyro with the
+// recorded and with the selected values from the end of the recorded prefix. selection: the periods of each flight that the
+// app uses (system_id.prepareSegments). A failure gives the plan with no measurement (its STE text says that the app cannot
+// calculate the number of flights) and the error, never a refusal of the change.
+function validationPlan(recorded,test,rows,step,improvement,selection) {
+    try {
+        const byId=new Map(test.map(s=>[s.id,s]));
+        const predicted=rows.filter(q=>byId.has(q.id)).map(q=>{const s=byId.get(q.id);
+            return {flight:s.flight,rate:s.rate,n:s.n,sp:s.sp,before:q.before.y,after:q.after.y,from:q.before.initialization.predictionStart};});
+        return power.forModel({recorded,predicted,axes:stepAxes(step),change:improvement,selection});
+    } catch(e){return Object.assign(power.plan([]),{error:String(e&&e.message||e)});}
+}
+// The recorded periods of the validation plan: the target configuration, and the other configurations of its PID profile.
+// With a PID profile that the app cannot find, the target configuration only (CLAUDE.md "PID profiles": an unknown PID
+// profile is not a match of other unknown PID profiles).
+function profilePeriods(input,segments,d) {
+    const known=ID.profileNumber(d.pidProfile)!==null;
+    return segments.filter(s=>{const x=datasetFor(input,s.configuration);return s.configuration===d.id||known&&!!x&&x.pidProfile===d.pidProfile;});
+}
+
 async function tune(input,hooks={}) {
     const d=input.configuration, base=proposals.tune({analysis:input.analysis||{},configuration:input.configurationId||d&&d.id,step:input.step});
     const out=Object.assign({},base,{version:2,status:'model-required',recommendations:[],rows:[],prediction:null,
         limitation:'The model estimates the response. A new flight must test the selected values.',rules:RULES,
         twin:null,controller:null,search:null,flightPlan:proposals.flightPlan([])});
+    // The governor model (gov_tune.cjs, worker command governorTune) tunes the governor, never this model (user, 2026-10-15)
+    if(input.step==='governor'){out.status='unsupported-step';out.reason='The governor model of the Governor tab tunes the governor. This model does not change the governor values.';return out;}
     if(!d||!(input.items||[]).length){out.reason='No selected flight data is available for the helicopter model.';return out;}
     const spec=fitInput(input,hooks);if(hooks.progress)hooks.progress('The app identifies the helicopter response from selected flight periods.');
     let fit=await ID.fit(spec);out.twin=makeTwin(input,fit);out.twin.coverage.decodeExcluded=input.excluded||[];
     if(fit.status==='rejected'){out.status='model-rejected';out.reason='The helicopter model does not agree with different flight data. No gain change is available.';return out;}
     // A partial model agrees on some axes only: cyclic steps need roll and pitch, tail steps need yaw.
-    if(input.step!=='governor'&&!(fit.eligibleSteps||[]).includes(input.step)){out.status='model-rejected';out.reason=stepRefusal(input.step,fit);return out;}
+    if(!(fit.eligibleSteps||[]).includes(input.step)){out.status='model-rejected';out.reason=stepRefusal(input.step,fit);return out;}
     if(out.twin.recordedGains.conditionalPlantOnly){out.status='model-required';out.reason='Recorded PID gains are not necessary for this model fit. Control changes are not available.';return out;}
     if(!fit.controlEligible){out.status='model-required';out.reason=(fit.controlReasons||[]).join(' ')||'The model checks are not satisfactory for control changes.';return out;}
     if(blocked(input)){out.status='prerequisites-required';out.reason='Complete the prerequisite checks before control tuning.';return out;}
@@ -936,7 +1073,7 @@ async function tune(input,hooks={}) {
             designSplit.test=allSplit.test;
             calibration=await calibrateController(input,designSplit,config,runtimeOptions);config=calibration.config;
         }
-        const compatibility=firmware.compatibility(config,{step:input.step==='governor'?undefined:input.step});
+        const compatibility=firmware.compatibility(config,{step:input.step});
         configurations.set(id,{configuration:config,compatibility,calibration});
     }
     const target=configurations.get(d.id);
@@ -966,6 +1103,7 @@ async function tune(input,hooks={}) {
     for(const [id,record] of configurations) {
         const ownPeriods=periods.filter(s=>s.configuration===id);if(!ownPeriods.length)continue;
         const parity=await controllerReplay(input,ownPeriods,record.configuration,runtimeOptions);parityRows.push(...parity.rows);
+        equivalentParity(record.compatibility,parity.rows);
     }
     out.controller.parity={pass:parityRows.length>0&&parityRows.every(r=>r.pass),rows:parityRows};
     if(!out.controller.parity.pass){out.status='controller-rejected';out.reason='The firmware replay does not agree with the recorded control output. No gain change is available.';return out;}
@@ -976,14 +1114,14 @@ async function tune(input,hooks={}) {
     const recordedConfig=s=>configurations.get(s.configuration).configuration;
     const governorChecks=periods.map(s=>governorInputs(input,s,recordedConfig(s))),inputsKnown=governorChecks.every(g=>g.pass);
     const governorParity=inputsKnown?await governorReplay(input,periods,recordedConfig,runtimeOptions):null;
+    if(governorParity){for(const row of governorParity.rows){const c=configurations.get(row.configuration);equivalentGovernorParity(c&&c.compatibility,row);}
+        governorParity.pass=governorParity.rows.length>0&&governorParity.rows.every(r=>r.pass);governorParity.reasons=[...new Set(governorParity.rows.flatMap(r=>r.reasons))];}
     const governor={active:!!(governorParity&&governorParity.pass),inputsKnown,parity:governorParity,
         reasons:inputsKnown?governorParity.pass?[]:governorParity.reasons:[...new Set(governorChecks.flatMap(g=>g.reasons))]};
     governor.text=governor.active?'The closed loop calculates the governor. The governor throttle sets the rotor speed of the model.':
         'The closed loop does not calculate the governor. It uses the recorded throttle and the recorded headspeed.';
     out.controller.governor=governor;
     const loopConfig=config=>governor.active?{...config,executeGovernor:true}:config,configOf=s=>loopConfig(recordedConfig(s)),config=loopConfig(target.configuration);
-    if(input.step==='governor'&&!governor.active){out.twin=makeTwin(input,fit,{governor});out.twin.coverage.decodeExcluded=input.excluded||[];
-        out.status='unsupported-loop';out.reason='The closed loop does not calculate the governor. It uses the recorded headspeed. The app cannot tune the governor gains with this model.';return out;}
     const design=split.train.concat(split.selection);
     // Closed-loop refinement on the design periods only. The refined model replaces the model for the closed-loop checks,
     // the search and the test flights. The reserved test flights decide: the model checks run again on them.
@@ -1001,7 +1139,7 @@ async function tune(input,hooks={}) {
     out.twin.controller=target.configuration;out.twin.pitchLimits=firmware.pitchLimits(target.configuration);
     if(refined.record.applied) {
         if(fit.status==='rejected'){out.status='model-rejected';out.reason='After the closed-loop fit, the helicopter model does not agree with the test flights. No gain change is available.';return out;}
-        if(input.step!=='governor'&&!(fit.eligibleSteps||[]).includes(input.step)){out.status='model-rejected';out.reason=stepRefusal(input.step,fit);return out;}
+        if(!(fit.eligibleSteps||[]).includes(input.step)){out.status='model-rejected';out.reason=stepRefusal(input.step,fit);return out;}
         if(!fit.controlEligible){out.status='model-required';out.reason=(fit.controlReasons||[]).join(' ')||'The model checks are not satisfactory for control changes.';return out;}
     }
     const model=fit.model,models=[model];
@@ -1056,7 +1194,7 @@ async function tune(input,hooks={}) {
     const improvement=stats([...flightDeltas.values()].map(average));out.search.holdout={improvement,rows:holdoutRows,axisRegression:regression,moreSaturation:saturation,
         pass:improvement.n>=3&&improvement.se!==null&&improvement.mean>2*improvement.se&&holdoutRows.every(q=>q.pass)&&regression.every(r=>!r.some(Boolean))&&!saturation.some(Boolean)};
     if(!out.search.holdout.pass){out.status='candidate-rejected';out.reason='The selected gains do not agree with the model checks on test flights. No gain change is available.';return out;}
-    const group='twin:'+out.twin.id+':'+input.step,names=Object.keys(best.changes),unit=input.step==='governor'?'rpm':'deg/s';
+    const group='twin:'+out.twin.id+':'+input.step,names=Object.keys(best.changes),unit='deg/s';
     // CLAUDE.md: a PID profile that the app cannot find gives no CLI text and no export ("PID profile unknown")
     const profile=ID.profileNumber(d.pidProfile);
     out.recommendations=names.map(name=>({id:group+':'+name,group,groupSize:names.length,node:input.step,area:input.step,
@@ -1067,12 +1205,20 @@ async function tune(input,hooks={}) {
         rule:`The calculated error decrease is ${improvement.mean.toFixed(3)} ${unit}. Its standard error is ${improvement.se.toFixed(3)} ${unit}.`,
         evidence:[{id:'SYSID',value:improvement.mean,se:improvement.se,unit,n:improvement.n}],
         cli:profile===null?[]:[`profile ${profile-1}`,`set ${name} = ${best.changes[name]}`],controlTune:true,verifiedInFlight:false,
-        caveats:[out.limitation],twinId:out.twin.id}));
+        caveats:[out.limitation],twinId:out.twin.id,stale:userFlag(config)}));
     out.rows=out.recommendations.map(r=>({name:r.parameter,from:r.from,to:r.to,delta:r.to-r.from,profile:r.profile,source:r.fromSource}));
+    // IMP-07: can flights show this change, and how many flights (validation_power.cjs)? The recorded periods give the
+    // flight-to-flight spread, the test flights the calculated change. Selection and CLI stay as they are.
+    // The spread uses every configuration of the PID profile, pooled inside each configuration (group).
+    const idRules=Object.assign({},ID.RULES,spec.options&&spec.options.rules),selection={periodsPerFlight:idRules.maxWindowsPerFlight,periodS:idRules.windowS};
+    out.validationPower=validationPlan(profilePeriods(input,prepared.segments,d).map(s=>({flight:s.flight,group:s.configuration,rate:s.rate,n:s.n,sp:s.sp,y:s.y})),
+        split.test,validation.filter(q=>q.model===0),input.step,improvement,selection);
+    Object.assign(out.validationPower,{profile,profileLabel:profile===null?'PID profile unknown':'PID profile '+profile});
+    for(const r of out.recommendations)r.validationPower=out.validationPower;
     out.status='flight-test-required';out.reason='The model checks agree with the selected gain set. Test these values in a new flight.';
     out.flightPlan=proposals.flightPlan(out.recommendations);return out;
 }
-module.exports={RULES,GAIN_NAMES,sensorContext,closedLoopFit,fitWindows,subPeriod,closedLoopResiduals,governorInputs,governorReplay,governorSample,recordedGainEvidence,recordedGainMask,continuityAssertion,mechanicalCohort,prepareIdentificationInputs,identify,makeTwin,validateTwin,replayTwin,tune,candidates,controllerReplay,sensorReplay,simulate,errorsOf,
+module.exports={RULES,GAIN_NAMES,CLI_SOURCE,SNAPSHOT_SOURCE,JOURNAL_SOURCE,gainEpochReasons,equivalentParity,equivalentGovernorParity,snapshotGainEvidence,userCli,userFlag,sensorContext,closedLoopFit,fitWindows,subPeriod,closedLoopResiduals,governorInputs,governorReplay,governorSample,recordedGainEvidence,recordedGainMask,continuityAssertion,mechanicalCohort,prepareIdentificationInputs,identify,makeTwin,validateTwin,replayTwin,tune,candidates,controllerReplay,sensorReplay,simulate,errorsOf,
     sampleAt,seedController,targetConfig,calibrateController,controllerInputs,scenarioPath,controlBand,closedLoopAgreement,controllerSchedule,
-    CHANNELS,STEP_AXES,stepRefusal,recordedOutputs,replayRun,replayRules,prepareReplay,outside,inRange,fitInput};
+    CHANNELS,STEP_AXES,stepRefusal,recordedOutputs,replayRun,replayRules,prepareReplay,outside,inRange,fitInput,validationPlan,profilePeriods};
 if(require.main!==module)return;

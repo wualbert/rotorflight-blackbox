@@ -14,6 +14,8 @@
  *
  *   main -> worker  { cmd: 'analyseLog', id, bytes (ArrayBuffer of ONE log), logIndex, logCount, fileName, options }
  *                   { cmd: 'analyseFile', id, bytes (ArrayBuffer of the whole file), fileName, selectedLog, options }
+ *                   { cmd: 'scanFlights', id, bytes (the whole file), fileName, options: { flightRpm } }   (the flights of each log, no
+ *                     checks: scanFlights below)
  *                   { cmd: 'cancel', id }   (honoured between logs; terminating the worker always works)
  *                   { cmd: 'init', id }     (loads the toolkit and the derive modules now)
  *                   { cmd: 'derive', id, kind, rate, cols: { name: Float32Array }, params }   (DERIVE below)
@@ -36,6 +38,7 @@
  *                     the stretch before the first change gets the profile that flies its governor target later). Else the
  *                     modules get the raw label 0 there (labelsOf).
  *   worker -> main  { id, type: 'progress', stage, fraction, text } | { id, type: 'result', result } | { id, type: 'error', message, stack }
+ *                   | { id, type: 'flightsScanned', result } (scanFlights: records, flights, benchRuns and noData as in the TuningResult)
  *                   | { id, type: 'ready', result: { modules, notes } } | { id, type: 'derived', result } | { id, type: 'exported', result: CLI text }
  *                   | { id, type: 'filterTuned', result } (the filter search: filter_tune.cjs tune() with text, recommendations (each with stale:
  *                     filterStale), logs, blockedBy)
@@ -47,7 +50,7 @@
  *   profile, seconds, logs: [the logs the basis was pooled from] }, cli,
  *   timing: { decodeS, analyseS, judgeS, gainsS, totalS }, records, flights, benchRuns, profiles, header, headerLog, fields,
  *   findings, decisions, groups, advice: { recommendations, coverage, notes, script }, hierarchy, curves, datasets, issues, top, areas,
- *   noData, notchFit, epochs, freshness, cliStatus, reportMarkdown, notes }
+ *   noData, notchFit, epochs, freshness, cliStatus, paramSnapshot (paramSnapshotOf), reportMarkdown, notes }
  *   epochs      the parameter epochs of each analysed log (param_epochs.cjs, freshnessOf): [{ log, spans: [{ t0, t1, arm, armed, pidProfile,
  *               rateProfile, fresh, reasons, adjust, check, source: { pid, rate }, text }] }], null without param_epochs.cjs. adjust and the
  *               reason 'adjusted' keep only the adjustments that can change a value of the span (of its PID profile or rate profile, or
@@ -118,17 +121,20 @@ var TuningWorker = (function () {
     const DIR = '../tools/autotune/';
     const REQUIRED = ['lib', 'health', 'health_setup', 'health_gov', 'health_loop', 'health_report'];
     const GAINS = ['extract', 'report'];                                   // needed for options.gains only
-    const OPTIONAL = { track: 'health_track', more: 'health_more', phase: 'health_phase', rescue: 'health_rescue', limits: 'health_limits', config: 'health_config', power: 'health_power', advice: 'advice', catalog: 'catalog', hierarchy: 'hierarchy', evidence: 'evidence', datasets: 'datasets', epochs: 'param_epochs' };
+    const OPTIONAL = { track: 'health_track', more: 'health_more', phase: 'health_phase', rescue: 'health_rescue', limits: 'health_limits', config: 'health_config', power: 'health_power', advice: 'advice', catalog: 'catalog', hierarchy: 'hierarchy', evidence: 'evidence', datasets: 'datasets', epochs: 'param_epochs', plog: 'param_log' };
     const CHECK_LABELS = { setup: 'the recorded configuration', gov: 'the governor response', loop: 'the control loops',
         track: 'the response to inputs', more: 'the filters and the governor', phase: 'the flight phases',
         rescue: 'the rescue response', limits: 'the control limits', config: 'the configuration', power: 'the power system' };
-    const LOST = { track: 'its checks', more: 'its checks', phase: 'the flight phases and the ground checks', rescue: 'the rescue checks', limits: 'the checks of the control limits', config: 'the rescue check of each PID profile (D9)',
+    const LOST = { track: 'its checks', more: 'its checks', phase: 'the flight phases and the ground checks', rescue: 'the rescue checks', limits: 'the checks of the control limits', config: 'the rescue check of each PID profile (D9) and the failsafe throttle check (D12)',
         power: 'the battery checks at the load steps (P1, P2)', advice: 'recommendations', catalog: 'the STE summaries',
         hierarchy: 'the tuning sequence', evidence: 'the part of the log that gave each result', datasets: 'the configurations of the flights',
-        epochs: 'the parts of the log in which the values are possibly not the values of the log header' }; // without that module
+        epochs: 'the parts of the log in which the values are possibly not the values of the log header',
+        plog: 'the parameter values and the parameter changes that a log of firmware with "blackbox_params" records' }; // without that module
     const ON_DEMAND = ['filter_math', 'filter_tune', 'filter_replay', 'filter_reconstruct', 'filter_solve', 'filter_autotune', 'filter_checklist', 'filter_optimizer', 'optimizer/nomad', 'control_tune',
         'helicopter_model', 'heli_twin', 'twin_fit', 'system_id', 'firmware_sensor', 'firmware_controller', 'firmware/schema', 'control_pipeline',
-        'gov_twin', 'gov_data', 'gov_params', 'gov_sim', 'gov_fit', 'gov_search', 'gov_scenarios', 'gov_tune']; // gov_*: the governor model (governorTune)
+        'gov_twin', 'gov_data', 'gov_params', 'gov_sim', 'gov_fit', 'gov_search', 'gov_scenarios', 'gov_tune', // gov_*: the governor model (governorTune)
+        'param_semantics', 'cli_defaults', 'firmware/equivalence', // param_log.cjs, D4 with a parameter snapshot, the audited firmware builds (IMP-05, IMP-06)
+        'validation_power']; // IMP-07: the flights that can show a calculated change (control_pipeline.cjs, advice.cjs C7)
     const CORE = ['setup', 'gov', 'loop'];                                 // health.cjs MODULES, in its order
     const JUDGED = ['track', 'more', 'phase', 'rescue', 'limits', 'config', 'power']; // the new modules, judged after health_report.cjs
     const ALL_PHASE = new Set(['rescue', 'limits', 'config', 'power']);    // modules that use all phases of a flight log, rescue included, with no guard time
@@ -242,7 +248,7 @@ var TuningWorker = (function () {
     const kits = new Map();
     function kit(src, rpm) {
         const key = rpm || 0;
-        if (kits.has(key)) return kits.get(key);
+        if (kits.has(key)) { kitPlog = kits.get(key).plog || null; return kits.get(key); }
         const reg = registry(src.texts, { rpm }), K = { rpm: rpm || null, files: reg.files, calls: reg.calls, notes: [], require: reg.require }; // require: a module on demand (filter_tune.cjs)
         K.lib = reg.require('./lib.cjs'); K.health = reg.require('./health.cjs');
         K.core = Object.fromEntries(CORE.map(m => [m, reg.require(`./health_${m}.cjs`)]));
@@ -252,9 +258,10 @@ var TuningWorker = (function () {
         if (K.phase && typeof K.phase.phases !== 'function') { K.notes.push('The toolkit file "health_phase.cjs" has no function "phases". Thus, the results do not include the flight phases and the ground checks.'); delete K.phase; }
         K.analysers = Object.assign({}, K.phase ? { phase: K.phase } : {}, K.core, K.track ? { track: K.track } : {}, K.more ? { more: K.more } : {},
             K.rescue ? { rescue: K.rescue } : {}, K.limits ? { limits: K.limits } : {}, K.config ? { config: K.config } : {}, K.power ? { power: K.power } : {}); // health_phase first; rescue and limits after health_loop (the T8 limits)
-        kits.set(key, K);
+        kits.set(key, K); kitPlog = K.plog || null;
         return K;
     }
+    let kitPlog = null; // param_log.cjs of the kit in use (armingCore: the PID profile at the start from a parameter snapshot)
 
     // ---------------------------------------------------------------------------------------------
     // Flight rpm (auto): from every flown log of the file, never from the one on screen
@@ -366,12 +373,26 @@ var TuningWorker = (function () {
     // order: SYNC_BEEP, INFLIGHT_ADJUSTMENT, LOGGING_RESUME, DISARM, FLIGHT_MODE and LOG_END as js/flightlog_parser.js decodes them
     const ADJUSTMENT = 13; // FlightLogEvent.INFLIGHT_ADJUSTMENT (js/flightlog_fielddefs.js)
     const EPOCH_EVENTS = new Set([0, 13, 14, 15, 30, 255]); // FlightLogEvent SYNC_BEEP, INFLIGHT_ADJUSTMENT, LOGGING_RESUME, DISARM, FLIGHT_MODE, LOG_END
+    // param: a log of firmware with "blackbox_params" (param_log.cjs, K.plog): the frames of the S fields and the event-101 strings, as
+    // param_log.collect gives them, from the same chunks; then { timeline (buildTimeline), frameS (frame s of each frame, the clock of
+    // epochEvents), snapshot (snapshotCli with the records before the log start), journal ([{ t, key, value }]: the C items after the
+    // log start, frame s) }, null for a stock log or without param_log.cjs
     function decode(K, bytes, fileName, li, extra = K.extraAll) {
-        const file = `/v/${fileName}`, segs = [], events = [], epochEvents = [], Log = self.FlightLog;
+        const file = `/v/${fileName}`, segs = [], events = [], epochEvents = [], Log = self.FlightLog, PL = K.plog && typeof K.plog.buildTimeline === 'function' ? K.plog : null;
+        let pcol = null; // false: a stock log; else { sc, t0, iter, time, cols, data, strings, resumeT, last }
         self.FlightLog = function (data) {
             const log = new Log(data), get = log.getChunksInTimeRange;
             log.getChunksInTimeRange = function () {
                 const chunks = get.apply(this, arguments), t0 = this.getMinTime(), seen = new Set(events.map(e => e.key)), seenE = new Set(epochEvents.map(e => e.key));
+                if (PL && pcol === null) { const sc = this.getSysConfig(), idx = (n) => this.getMainFieldIndexByName(n);
+                    pcol = PL.isParamLog(sc) ? { sc, t0, iter: [], time: [], cols: { pidProfile: idx('pidProfile'), rateProfile: idx('rateProfile'), armed: idx('armed'), paramSeq: idx('paramSeq') },
+                        data: { pidProfile: [], rateProfile: [], armed: [], paramSeq: [] }, strings: [], seenS: new Set(), resumeT: [], last: -Infinity } : false; }
+                if (pcol) for (const c of chunks || []) {
+                    for (const f of c.frames || []) { if (!(f[0] > pcol.last)) continue; pcol.last = f[0]; pcol.iter.push(f[0]); pcol.time.push(f[1]);
+                        for (const k in pcol.cols) if (pcol.cols[k] !== undefined) pcol.data[k].push(f[pcol.cols[k]]); }
+                    for (const e of c.events || []) { const k = `${e.event}|${e.time}|${e.data && e.data.string}`; if (pcol.seenS.has(k)) continue; pcol.seenS.add(k);
+                        if (e.event === 101 && e.data && typeof e.data.string === 'string') pcol.strings.push({ text: e.data.string, time: e.time }); else if (e.event === 14) pcol.resumeT.push(e.time); }
+                }
                 for (const c of chunks || []) for (const e of c.events || []) {
                     if (typeof e.time !== 'number') continue;
                     if (EPOCH_EVENTS.has(e.event)) { const key = `${e.event}|${e.time}|${JSON.stringify(e.data || null)}`;
@@ -386,8 +407,25 @@ var TuningWorker = (function () {
         finally { self.FlightLog = Log; K.files.delete(file); delete self.__bytes; }
         let err = false;
         if (!segs.length) { const log = new FlightLog(bytes); err = log.getLogCount() ? log.getLogError(0) : 'no log in these bytes'; }
+        let param = null;
+        if (pcol && pcol.iter.length) try { param = paramOf(PL, pcol); } catch (e) { K.notes.push(`The app cannot read the parameter changes of log ${li + 1}. The error is "${message(e)}".`); }
+        // every module that reads the snapshot of a header (param_log.cjs snapshotOf) gets this one, with the records before the log start
+        if (param && param.snapshot && typeof PL.rememberSnapshot === 'function') { PL.rememberSnapshot(pcol.sc, param.snapshot);
+            for (const w of segs) if (w.flight && w.flight.header) PL.rememberSnapshot(w.flight.header, param.snapshot); }
         return { segs, events: events.sort((a, b) => a.t - b.t).map(e => ({ t: e.t, func: e.func, name: e.name, value: e.value })),
-            epochEvents: epochEvents.sort((a, b) => a.t - b.t).map(e => ({ event: e.event, t: e.t, data: e.data })), error: err ? `parser: ${err}` : null };
+            epochEvents: epochEvents.sort((a, b) => a.t - b.t).map(e => ({ event: e.event, t: e.t, data: e.data })), error: err ? `parser: ${err}` : null, param };
+    }
+    // the timeline of a param log from the columns of decode (param_log.cjs collect, buildTimeline, snapshotCli)
+    function paramOf(PL, c) {
+        // compact columns (the timeline keeps them): loopIteration and paramSeq as 32-bit integers, the profiles and armed as bytes
+        const frames = { iter: Uint32Array.from(c.iter), time: Float64Array.from(c.time) }, TYPE = { pidProfile: Uint8Array, rateProfile: Uint8Array, armed: Uint8Array, paramSeq: Uint32Array };
+        for (const k in c.cols) frames[k] = c.cols[k] === undefined ? null : TYPE[k].from(c.data[k]);
+        const lower = (t) => { let lo = 0, hi = frames.time.length; while (lo < hi) { const m = (lo + hi) >> 1; if (frames.time[m] < t) lo = m + 1; else hi = m; } return lo; };
+        const resumes = c.resumeT.filter(t => isFinite(t)).map(lower).filter(i => i < frames.iter.length), records = PL.assemble(c.strings);
+        const timeline = PL.buildTimeline({ sysConfig: c.sc, records, frames, resumes }), frameS = Float64Array.from(frames.time, t => (t - c.t0) / 1e6);
+        // the C items after the log start, every stamp kind (an interval stamp: its end, uncertain), as datasets.inputsOfFile has them
+        const journal = PL.journalChanges(timeline, frameS).map(q => ({ t: r(q.t, 4), key: q.key, value: q.value, uncertain: q.uncertain }));
+        return { timeline, frameS, snapshot: PL.snapshotCli(c.sc, records), journal };
     }
 
     // Frame seconds (the viewer clock: frame time less the log start) of samples 0, every, 2 every, ... and of the last sample
@@ -493,16 +531,21 @@ var TuningWorker = (function () {
     //     when the log records GOVSTATE (its act mask): the headspeed error, the collective steps, the throttle headroom, the
     //     governor spectra and gains (G0, G2 to G11). The headspeed floor keeps out a rotor that the throttle cannot hold
     //     (Fireball 2026-09-29 #3, 376.3-377.2 s: 2446 rpm against 3500 at full throttle, a G6 run, which G2 would count as
-    //     a steady error of -30 %).
+    //     a steady error of -30 %). The cut of a receiver signal loss (lib.cjs rxLossAt, IMP-02) is not in it: the throttle there
+    //     is the held or the rxfail value, not the pilot's. The masks all and rotor keep it (the governor and power checks).
     // { all, rotor, tracking, seconds: { all, rotor, tracking } }
     const GOV_ALL = ['D5', 'G13', 'G12', 'G21', 'states'];   // health_gov metrics measured over all phases (G21: the governor states decide)
     const GOV_ROTOR = ['G1'];                         // over the ground and flight phases, at any headspeed
     const TRACK_PHASES = ['ground', 'flight'];
-    const PHASE_USE = { all: ['idle', 'spoolup', 'ground', 'flight', 'spooldown'], tracking: TRACK_PHASES, flight: ['flight'] };
+    // all: every phase (the control limits, rescue, D10); load: the phases of the governor and power checks of all phases, without the
+    // fall and the time after the ground contact of an in-flight cut (health_phase.cjs, IMP-03): there the motor is cut, then the rotor
+    // touches the ground, which is no flight load. The control limits keep them, with their cause (health_limits.cjs, IMP-12)
+    const NO_LOAD = ['fall', 'aftercontact'];
+    const PHASE_USE = { all: ['idle', 'spoolup', 'ground', 'flight', 'spooldown', 'fall', 'aftercontact'], load: ['idle', 'spoolup', 'ground', 'flight', 'spooldown'], tracking: TRACK_PHASES, flight: ['flight'] };
     function govMasks(K, w, ctx, ph, o, J) {
-        const n = w.n, all = new Uint8Array(n), rotor = new Uint8Array(n), tracking = new Uint8Array(n), rate = ctx.rate, floor = K.health.RULE.flight.headspeed;
-        for (const q of ph.P.spans) if (q && isFinite(q.i0) && isFinite(q.i1)) { const a = Math.max(0, q.i0), b = Math.min(n, q.i1);
-            all.fill(1, a, b); if (TRACK_PHASES.includes(q.phase)) { rotor.fill(1, a, b); for (let i = a; i < b; i++) tracking[i] = w.hs[i] >= floor ? 1 : 0; } }
+        const n = w.n, all = new Uint8Array(n), rotor = new Uint8Array(n), tracking = new Uint8Array(n), rate = ctx.rate, floor = K.health.RULE.flight.headspeed, rx = w.rxLossAt || null;
+        for (const q of ph.P.spans) if (q && isFinite(q.i0) && isFinite(q.i1) && !NO_LOAD.includes(q.phase)) { const a = Math.max(0, q.i0), b = Math.min(n, q.i1);
+            all.fill(1, a, b); if (TRACK_PHASES.includes(q.phase)) { rotor.fill(1, a, b); for (let i = a; i < b; i++) tracking[i] = w.hs[i] >= floor && !(rx && rx[i]) ? 1 : 0; } }
         const keep = o.excludeAbnormal && K.more ? noGround(K, w, ctx, tracking, J) : null;
         if (keep) for (let i = 0; i < n; i++) tracking[i] &= keep[i];
         const sec = (m) => { let c = 0; for (let i = 0; i < n; i++) c += m[i]; return r(c / rate, 1); };
@@ -524,7 +567,7 @@ var TuningWorker = (function () {
         const all = run(G.all), rotor = run(G.rotor), out = run(G.tracking);
         for (const k of GOV_ALL) if (k in all) out[k] = all[k];
         for (const k of GOV_ROTOR) if (k in rotor) out[k] = rotor[k];
-        out.phaseMasks = { all: { phases: PHASE_USE.all, seconds: G.seconds.all, checks: GOV_ALL.filter(k => k !== 'states') },
+        out.phaseMasks = { all: { phases: PHASE_USE.load, seconds: G.seconds.all, checks: GOV_ALL.filter(k => k !== 'states') },
             rotor: { phases: TRACK_PHASES, seconds: G.seconds.rotor, checks: GOV_ROTOR.slice() }, tracking: { phases: TRACK_PHASES, seconds: G.seconds.tracking, active: !!ctx.govState } };
         return out;
     }
@@ -535,6 +578,13 @@ var TuningWorker = (function () {
         const t8 = rec.metrics && rec.metrics.loop && rec.metrics.loop.T8 && rec.metrics.loop.T8.limits && rec.metrics.loop.T8.limits.yaw;
         const tail = t8 && (typeof t8.limitLow === 'number' || typeof t8.limitHigh === 'number') ? { tailLimits: { lo: t8.limitLow, hi: t8.limitHigh } } : {};
         return Object.assign({}, phaseCtx || Object.assign({}, ctx, { phases: false }), tail);
+    }
+
+    // the health_more metrics of a segment that health.cjs does not call flown: D10 only, and the reason of the other checks (judge gives
+    // them as skipped). F: health.cjs RULE.flight
+    function d10Metrics(m, F) {
+        return { module: m && m.module || 'health_more', rule: m && m.rule, rate: m && m.rate, fromS: m && m.fromS, seconds: m && m.seconds, notes: [], D10: m ? m.D10 : null, d10Only: true,
+            skipped: `The log does not have a flight of a minimum of ${F.minS} s at ${F.rate} deg/s rms (health.cjs RULE.flight). Thus, this check did not operate.` };
     }
 
     // runs of a mask in frame seconds [{ t0, t1 }]
@@ -592,11 +642,14 @@ var TuningWorker = (function () {
         const phaseCtx = ph ? Object.assign({}, ctx, { phases: ph.P, flightMask: ph.mask }) : null;
         for (const [name, M] of Object.entries(K.analysers)) {
             const run = name === 'phase' ? !!phaseCtx : ALL_PHASE.has(name) ? (fm ? true : !ph && flown) : name === 'setup' || (name === 'gov' && G) || (flown && !(thin && name === 'loop'));
-            if (!run) { rec.metrics[name] = null; continue; }
+            // D10 (IMP-01: every phase while armed) also in a flight log that health.cjs does not call flown (a short flight, a calm hover,
+            // a loss soon after the liftoff): health_more with the all-phase context, only its D10, and the other checks skipped (d10Only)
+            const d10Only = !run && name === 'more' && !flown && (!!fm || !ph);
+            if (!run && !d10Only) { rec.metrics[name] = null; continue; }
             J.progress(`Log ${fl.log + 1}: the app examines ${CHECK_LABELS[name] || 'the flight data'}.`);
-            const c = Object.assign({}, name === 'phase' ? phaseCtx : ALL_PHASE.has(name) ? allCtx(ctx, phaseCtx, rec) : name === 'gov' ? govCtx : name === 'track' || name === 'more' ? newCtx : attCtx);
+            const c = Object.assign({}, name === 'phase' ? phaseCtx : ALL_PHASE.has(name) || d10Only ? allCtx(ctx, phaseCtx, rec) : name === 'gov' ? govCtx : name === 'track' || name === 'more' ? newCtx : attCtx);
             if (name === 'setup' && c.pidLabels) c.profile = c.pidLabels; // D4 and the F5, F6 and F9 rows: the PID profile labels
-            try { rec.metrics[name] = name === 'gov' && G ? govAllPhases(M, w, c, flying, G) : M.analyse(w, c); } catch (e) { rec.errors[name] = String(e && e.stack || e); }
+            try { rec.metrics[name] = name === 'gov' && G ? govAllPhases(M, w, c, flying, G) : d10Only ? d10Metrics(M.analyse(w, c), H.RULE.flight) : M.analyse(w, c); } catch (e) { rec.errors[name] = String(e && e.stack || e); }
         }
         rec.excluded = excluded; rec.normalS = normalS;
         rec.timeMap = mapOf(K, w, J);
@@ -673,7 +726,7 @@ var TuningWorker = (function () {
     //   profile, profiles, values, observations: { switches, logs } of that headspeed, map: { [PID profile]: rpm | [rpm] },
     //   dumpSections (only when the header agrees with the CLI sections of other PID profiles than the one found: those) }) }
     const TARGET_STEP = 50; // rpm: lib.profilesOf rounds the governor target to 50 rpm
-    const CONFIRMS = ['event', 'cli', 'cliTarget', 'headspeed']; // the bases that confirm a PID profile (advice.cjs, hierarchy.cjs CONFIRMED)
+    const CONFIRMS = ['snapshot', 'event', 'cli', 'cliTarget', 'headspeed']; // the bases that confirm a PID profile (advice.cjs, hierarchy.cjs CONFIRMED)
     // The D12 result is armingFinal(armingCore(preps, events), hs). armingCore: the steps that read the decoded log (preps), the
     // result without the headspeed step and the govTarget step, with what they need. Small (no samples): the worker keeps it for each log (J.armCore) and does the last steps again
     // when the map of the headspeeds has more logs (armingFinal)
@@ -685,8 +738,14 @@ var TuningWorker = (function () {
         // the header against the CLI sections (D4): d4 { sections, agree } in PID profiles (result.cliStatus reads it), null without them
         const D = first.rec.metrics && first.rec.metrics.setup && first.rec.metrics.setup.D4, by = D && D.mismatchesByProfile, keys = by ? Object.keys(by) : [];
         const agree = keys.filter(k => by[k] === 0).map(k => +k + 1), d4 = keys.length ? { sections: keys.map(k => +k + 1), agree } : null;
-        const gh = (first.ctxPid || first.ctx).govHeadspeed; // by PID profile (ctxPid: before relabel)
+        if (d4 && D.basis === 'snapshot') d4.snapshot = D.mismatches.length; // D4 with a parameter snapshot: the values that the dump does not agree with
+        // the gov_headspeed of the CLI dump by PID profile (ctxPid: before relabel). A log with a parameter snapshot has the values of its
+        // header in ctx (health.cjs snapshotContext): they are not the dump, and cliCheck compares only the dump with the log
+        const ctx0 = first.ctxPid || first.ctx, gh = ctx0.paramSnapshot ? null : ctx0.govHeadspeed;
         const raw0 = first.w.profileAt[0]; if (raw0 > 0) return { out: Object.assign(out, { profile: raw0, basis: ['event'], candidates: [raw0], confirmed: true }), done: true, d4, gh: gh ? Object.assign({}, gh) : null };
+        // a parameter snapshot (blackbox_params FULL, complete): param_pid_profile is the PID profile at the start of the log (basis 'snapshot')
+        const snap = kitPlog && typeof kitPlog.snapshotOf === 'function' && first.w.flight ? kitPlog.snapshotOf(first.w.flight.header) : null, sp = snap ? snap.selectedProfile : null;
+        if (Number.isInteger(sp) && sp >= 0 && sp <= 5) return { out: Object.assign(out, { profile: sp + 1, basis: ['snapshot'], candidates: [sp + 1], confirmed: true }), done: true, d4, gh: gh ? Object.assign({}, gh) : null };
         let cands = [1, 2, 3, 4, 5, 6].filter(p => !pid.length || p !== pid[0].value);
         if (agree.length && agree.length < keys.length) { cands = cands.filter(p => agree.includes(p)); out.basis.push('cli'); } // none left: unknown
         const excluded = pid.length > 0 && inf === pid[0].value, uniqueT = inf > 0 && !excluded && !Object.keys(t).some(k => +k > 0 && +k !== inf && t[k] === t[inf]);
@@ -913,6 +972,7 @@ var TuningWorker = (function () {
         for (const p of [...flown].sort((a, b) => a - b)) {
             const h = M.table[p];
             if (starts.has(p) || [].concat(h).every(v => M.identify(v).profile !== p) || cli[p - 1]) continue; // one of its values identifies it
+            if ([...(J.dsInputs || new Map()).values()].some(x => x && x.snapshot && x.snapshot.profiles && x.snapshot.profiles[String(p - 1)])) continue; // a parameter snapshot has its values
             J.notes.add(`No flight log in the analysis starts in PID profile ${p}. The log header records the values of the PID profile that is active when a new log starts. ` +
                 `Thus, the log header has the values of PID profile ${p} only when a new log starts in PID profile ${p}.`);
         }
@@ -1003,14 +1063,20 @@ var TuningWorker = (function () {
     function dsInput(J, K, d, li, preps, cls) {
         const live = preps.filter(p => p && p.ctx), head = d.segs.find(w => w.flight && w.flight.header);
         const out = { log: li, header: head ? head.flight.header : null, armingProfile: 0, armingEstimate: 0, profileRuns: [], rateChanges: [], adjustments: [], flights: null, durationS: null };
+        // a param log: the parameter snapshot with the records before the log start, and the parameter changes after it (decode param)
+        if (d.param) { out.snapshot = d.param.snapshot; out.journal = d.param.journal; }
         if (!live.length) return out; // no data that the app can read (round 3 M4): its header only, no stretch
         armingInput(out, armingLite(K, preps, d.events, J.cliParsed, J, li));
         for (const p of live) { const w = p.w, at = frameOf(w), pa = w.profileAt;
             for (let i = 0; i < w.n;) { let j = i + 1; while (j < w.n && pa[j] === pa[i]) j++; out.profileRuns.push({ t0: at(i), t1: at(j), profile: pa[i] }); i = j; } }
         out.rateChanges = d.events.filter(e => e.func === 1 && e.value > 0).map(e => ({ t: e.t, profile: e.value }));
         out.adjustments = d.events.filter(e => e.func !== 1 && e.func !== 2).map(e => ({ t: e.t, func: e.func, value: e.value }));
-        out.flights = cls === 'bench' ? [] : cls === 'flight' ? [].concat(...live.map(p => { const at = frameOf(p.w), P = p.ph && p.ph.P;
-            return (P && Array.isArray(P.flights) ? P.flights : []).filter(q => q && isFinite(q.i0) && isFinite(q.i1)).map(q => ({ t0: at(q.i0), t1: at(q.i1) })); })) : null;
+        // the flights without the cut of a receiver signal loss (datasets.cjs cutFlights, IMP-02: as inputsOfFile), flight: the index in the log
+        let k0 = 0;
+        out.flights = cls === 'bench' ? [] : cls === 'flight' ? [].concat(...live.map(p => { const at = frameOf(p.w), P = p.ph && p.ph.P, fl = (P && Array.isArray(P.flights) ? P.flights : []).filter(q => q && isFinite(q.i0) && isFinite(q.i1)), base = k0;
+            k0 += fl.length;
+            const parts = J.DS && typeof J.DS.cutFlights === 'function' ? J.DS.cutFlights(fl, p.w.rxLoss) : fl.map((q, k) => ({ i0: q.i0, i1: q.i1, flight: k }));
+            return parts.map(q => Object.assign({ t0: at(q.i0), t1: at(q.i1), flight: base + q.flight }, q.rxLossCut ? { rxLossCut: true } : {})); })) : null;
         return out;
     }
     // the PID profile at arming of an input of datasets(): only a confirmed one (D12), else the estimate apart
@@ -1058,7 +1124,8 @@ var TuningWorker = (function () {
             // per-profile CLI values (health.cjs cliContext: gov_headspeed, gov_max_throttle) for the labels of their PID profile
             const byLabel = (o) => { const out = {}; for (const [L, x] of J.dsReg.info) if (x.pid > 0 && o[x.pid] !== undefined) out[L] = o[x.pid]; return out; };
             p.ctxPid = p.ctx; // the ctx of the PID profiles (armingCore reads its gov_headspeed of each PID profile)
-            const mt = p.ctx.maxThrottle ? cliMaxThrottle(J, li, p.ctx.maxThrottle) : null;
+            // a parameter snapshot of the log header (health.cjs snapshotContext, ctx.paramSnapshot) gives the values of this log: no CLI filter
+            const mt = p.ctx.maxThrottle ? (p.ctx.paramSnapshot ? p.ctx.maxThrottle : cliMaxThrottle(J, li, p.ctx.maxThrottle)) : null;
             p.ctx = Object.assign({}, p.ctx, { profile: lab, pidLabels: p.ctx.profile, pidProfileOf: pidOf },
                 p.ctx.govHeadspeed ? { govHeadspeed: byLabel(p.ctx.govHeadspeed) } : {}, p.ctx.maxThrottle ? { maxThrottle: mt ? byLabel(mt) : null } : {});
         }
@@ -1130,6 +1197,7 @@ var TuningWorker = (function () {
     // A span or an event: its label, its PID profile label (pidProfile: 1-6, null when not known; evidence.cjs gives a span a label of
     // 1-6 as its PID profile, review 2026-10-15) and its configuration
     function pidLabelConv(J, o) {
+        if (o && typeof o === 'object' && Array.isArray(o.parts)) for (const q of o.parts) pidLabelConv(J, q); // D10: the flight phase and PID profile of each part of a loss
         if (!o || typeof o !== 'object' || !Number.isInteger(o.profile) || o.profile < 0) return;
         const d = o.profile > 0 && J.dsMap ? J.dsMap.get(o.profile) || null : null; o.profile = pidLabelOf(J, o.profile); o.dataset = d ? d.id : null;
         if ('pidProfile' in o) o.pidProfile = o.profile > 0 ? o.profile : null;
@@ -1188,7 +1256,7 @@ var TuningWorker = (function () {
             if (cls === 'bench') continue;
             if (rec.flown && !airborneEvents) J.notes.add(`The log does not record AIRBORNE_STATE. Thus, the toolkit (lib.cjs) sets all frames as airborne, and the app finds the flight only from the headspeed (${J.rpm.value} rpm or more) and the gyro rate. The log can be a test on the ground.`, li);
             if (!head.fields && !p.w.skipped && rec.metrics) { head.header = p.w.flight.header; head.fields = fieldsOf(K, p.w, rec); }
-            if (head.flight && ctx && rec.metrics && rec.metrics.more && !(selected && J.o.curves)) vibOf(J, p.w, ctx, rec);
+            if (head.flight && ctx && rec.metrics && rec.metrics.more && !rec.metrics.more.d10Only && !(selected && J.o.curves)) vibOf(J, p.w, ctx, rec);
             if (J.o.curves && (selected || ctx && J.DS)) {
                 const curves=curvesOf(J,p.w,ctx,rec,phaseCtx,selected);
                 if (selected) J.curves.push(curves);
@@ -1243,7 +1311,7 @@ var TuningWorker = (function () {
         const out = { log: rec.log, segment: rec.segment, fromS: r(w.fromS, 3), seconds: r(w.seconds, 1), track: null, more: null, phase: null };
         for (const name of includeOriginal ? CURVED : []) {
             const M = J.K[name];
-            if (!M || typeof M.curves !== 'function' || !rec.metrics || !rec.metrics[name]) continue;
+            if (!M || typeof M.curves !== 'function' || !rec.metrics || !rec.metrics[name] || rec.metrics[name].d10Only) continue;
             try { out[name] = M.curves(w, Object.assign({}, pidCtx(name === 'phase' ? phaseCtx : ctx)), rec.metrics[name]); } catch (e) { J.notes.add(`The app cannot make the curves of "${OPTIONAL[name]}.cjs". The error is "${message(e)}".`, rec.log); }
         }
         // Keep spectra and time traces specific to each contiguous configuration
@@ -1303,7 +1371,9 @@ var TuningWorker = (function () {
             const M = K[name], file = `${OPTIONAL[name]}.cjs`;
             if (!M || (name === 'phase' && !phasesOn(J, K))) continue;
             const flights = JSON.parse(toJson(all.filter(l => l.metrics && l.metrics[name]).map(l => ({ log: l.log, segment: l.segment, start: l.start, header: l.header, metrics: l.metrics[name] })))), add = []; // a bench run: health_phase only; segment: D7 lists the flights of each segment
-            const extra = name === 'config' ? { cli: J.cliParsed || null, arming: Object.fromEntries([...J.arming].map(([l, a]) => [l, { profile: a.profile, confirmed: !!a.confirmed }])) } : undefined;
+            // D9: the parameter snapshot of each log header (param_log.cjs snapshotOf of the original header: with the records before the log start)
+            const snapshots = kitPlog && typeof kitPlog.snapshotOf === 'function' ? Object.fromEntries(records.filter(l => l.header).map(l => [l.log, kitPlog.snapshotOf(l.header)])) : null;
+            const extra = name === 'config' ? { cli: J.cliParsed || null, snapshots, arming: Object.fromEntries([...J.arming].map(([l, a]) => [l, { profile: a.profile, confirmed: !!a.confirmed }])) } : undefined;
             try { for (const f of M.judge(flights, M.DEFAULT_RULES, extra)) add.push(Object.assign({ module: name }, f)); }
             catch (e) { add.push({ module: name, id: name.toUpperCase(), severity: 'error', log: null, text: `The app cannot compare the results of "${file}" with the limits. The error is "${message(e)}".` }); }
             for (const l of all) if (l.errors && l.errors[name]) add.push({ module: name, id: name.toUpperCase(), severity: 'error', log: l.log, text: `The analysis of "${file}" stopped. The error is "${l.errors[name].split('\n')[0]}".` });
@@ -1322,7 +1392,11 @@ var TuningWorker = (function () {
             count = selected ? selected.length : J.logCount || 1, D = J.K.lib.DEFAULTS;
         try {
             let found = null; // extract.cjs ends with "<n> flights, <n> segments, <n> skipped -> <file>"
-            runCli(src, J.K.rpm, 'extract.cjs', ['/v/out', `/v/${J.fileName}`].concat(selected ? ['--logs=' + selected.join(',')] : []), files, (l) => {
+            // the flights of the flight logs (records[].flights, frame seconds): extract.cjs cuts each segment to its flight (IMP-04), so that a
+            // segment that ends after the touchdown or at a cut in flight is kept (flightSegments, SEGMENT). The CLI's view has no flights
+            const clip = clipSpans(J);
+            if (clip) files.set('/v/clip.json', JSON.stringify(clip));
+            runCli(src, J.K.rpm, 'extract.cjs', ['/v/out', `/v/${J.fileName}`].concat(selected ? ['--logs=' + selected.join(',')] : [], clip ? ['--clip=/v/clip.json'] : []), files, (l) => {
                 const s = /^\d+ flights, (\d+) segments,/.exec(l); if (s) found = +s[1];
                 const m = /#(\d+)/.exec(l), position = m ? selected ? selected.indexOf(+m[1]) + 1 : +m[1] + 1 : 0;
                 J.progress(m ? `The app calculates gain segments for log ${+m[1] + 1}.` : 'The app calculates the gains from the selected flight data.', 'gains', m ? 0.6 + 0.3 * Math.min(1, position / count) : null); });
@@ -1366,6 +1440,14 @@ var TuningWorker = (function () {
         const a = k * E, b = k + 1 < F.length ? (k + 1) * E : last, sb = k + 1 < F.length ? F[k + 1] : tm.endS, u = sb > F[k] ? a + (s.fromS - F[k]) / (sb - F[k]) * (b - a) : a;
         return { t0: s.fromS, t1: frameAtSample(tm, u + n) };
     }
+    // { log: [[t0, t1], ...] }: the flights of each flight log from the liftoff (- SEGMENT.liftoffS) to the touchdown, frame seconds (the end
+    // of extract.cjs --clip; flightSegments allows SEGMENT.touchdownS after it), or null when no record has flights
+    function clipSpans(J) {
+        const out = {};
+        for (const l of J.records || []) if (typeof l.log === 'number' && l.logClass === 'flight' && Array.isArray(l.flights))
+            for (const q of l.flights) if (q && typeof q.t0 === 'number' && typeof q.t1 === 'number' && q.t1 > q.t0) (out[l.log] = out[l.log] || []).push([q.t0 - SEGMENT.liftoffS, q.t1]);
+        return Object.keys(out).length ? out : null;
+    }
     function flightSegments(J, files) {
         const file = '/v/out/segments.json', text = files.get(file);
         if (typeof text !== 'string') return true;
@@ -1382,7 +1464,11 @@ var TuningWorker = (function () {
             return !flight || recs.some(l => (l.flights || []).some(q => t0 >= q.t0 - SEGMENT.liftoffS - 1e-3 && t1 <= q.t1 + SEGMENT.touchdownS)); };
         const keep = list.filter(s => s && typeof s.fromS === 'number' && typeof s.seconds === 'number' ? keepOf(s) : true);
         const arm = (s) => s.profile === 'arm' ? confirmedArming(J, s.log) || 0 : s.profile;
-        J.segments = keep.map(s => ({ log: s.log, profile: arm(s), fromS: s.fromS, seconds: s.seconds, headspeed: { median: s.headspeed ? s.headspeed.median : null } }));
+        // seconds in frame time (segmentSpan): extract.cjs gives the sample count / rate, and the frame clock can run slower (Gaui X4 #58:
+        // 1.28 %, 1.3 s in a segment of 104 s). evidence.cjs forDecision shows fromS to fromS + seconds
+        const frameSeconds = (s) => { const recs = byLog.get(s.log) || [], q = typeof s.fromS === 'number' && typeof s.seconds === 'number' ? segmentSpan(recs, s) : null;
+            return q && q.t1 > q.t0 ? r(q.t1 - q.t0, 3) : s.seconds; };
+        J.segments = keep.map(s => ({ log: s.log, profile: arm(s), fromS: s.fromS, seconds: frameSeconds(s), headspeed: { median: s.headspeed ? s.headspeed.median : null } }));
         if (keep.length === list.length) return true;
         J.notes.add(`${list.length - keep.length} of the ${list.length} segments of "extract.cjs" are not in a flight, or they have rescue, a level mode or failsafe. Thus, the app does not use them to calculate the gains.`);
         if (!keep.length) { J.notes.add('The app did not calculate the gains, because no segment of "extract.cjs" is in a flight without rescue, level modes and failsafe.'); return false; }
@@ -1523,13 +1609,18 @@ var TuningWorker = (function () {
             const logs = logsOf(f);
             f.phase = !(logs.length ? logs.some(phased) : anyPhased) ? null : f.phase !== undefined ? f.phase : headerCheck(K, f.id) ? null
                 : f.module === 'gov' ? (GOV_ALL_IDS.has(f.id) ? 'all' : 'ground+flight') : /^G/.test(f.id) || f.id === 'D2' ? 'all' : 'flight';
-            f.phases = ALL_PHASE.has(f.module) && f.phase !== null && f.phase !== undefined ? PHASE_USE.all.slice() : ALL_PHASE.has(f.module) && (logs.length ? logs.some(phased) : anyPhased) && f.severity !== 'skipped' ? PHASE_USE.all.slice()
-                : f.phase === null || f.phase === undefined ? null : f.phase === 'ground+flight' ? PHASE_USE.tracking.slice() : f.phase === 'all' ? PHASE_USE.all.slice() : [f.phase];
+            const allOf = (f.module === 'gov' || f.module === 'power' ? PHASE_USE.load : PHASE_USE.all).slice(); // the governor and power checks: no fall, no time after a ground contact (IMP-03)
+            // a check of health_phase.cjs with more than one phase gives them (PHASES_OF, as catalog.cjs CHECKS[id].phases: D11 the flight, the fall
+            // and the time after the ground contact)
+            const own = f.module === 'phase' && Array.isArray(f.phases) && f.phases.length && f.phase !== null ? f.phases.slice() : null;
+            f.phases = own ? own : ALL_PHASE.has(f.module) && f.phase !== null && f.phase !== undefined ? allOf : ALL_PHASE.has(f.module) && (logs.length ? logs.some(phased) : anyPhased) && f.severity !== 'skipped' ? allOf
+                : f.phase === null || f.phase === undefined ? null : f.phase === 'ground+flight' ? PHASE_USE.tracking.slice() : f.phase === 'all' ? allOf : [f.phase];
             f.pidProfile = pidProfileOf(J, f);
             if (f.id === 'D4') f.cliSection = recs[i] ? J.cliSections.get(recs[i]) || null : null;
             const rate = f.id === 'R1' ? logs.reduce((n, l) => n + (byLog[l] || []).reduce((m, rec) => m + (rec.profiles ? rec.profiles.rate.length : 0), 0), 0) : 0;
             if (rate) f.rateChanges = rate;
-            if (K.hierarchy) try { f.node = K.hierarchy.homeOf(f.id, f.axis ?? null); f.tuner = !!(f.node && typeof K.hierarchy.isBlock === 'function' && K.hierarchy.isBlock(f.node)); } catch (e) { fail('find the tuning step', f, e); }
+            // IMP-12: a result with a cause (a receiver signal loss, a fall) has the item of D10 (hierarchy.cjs nodeOfFinding)
+            if (K.hierarchy) try { f.node = typeof K.hierarchy.nodeOfFinding === 'function' ? K.hierarchy.nodeOfFinding(f) : K.hierarchy.homeOf(f.id, f.axis ?? null); f.tuner = !!(f.node && typeof K.hierarchy.isBlock === 'function' && K.hierarchy.isBlock(f.node)); } catch (e) { fail('find the tuning step', f, e); }
             if (K.catalog && typeof K.catalog.areaOf === 'function') try { f.area = K.catalog.areaOf(f); } catch (e) { fail('find the subsystem', f, e); }
             if (K.evidence) try { f.evidence = K.evidence.forFinding(f, { record: recs[i], others: byLog, curves: curvesOf(recs[i]), findings }) || null; } catch (e) { fail('find the part of the log', f, e); }
             if (f.datasetLabel !== undefined) asPidLabels(J, f); // after the evidence: it reads the metrics by the label of the module
@@ -1677,6 +1768,8 @@ var TuningWorker = (function () {
     // A span with no reason (fresh) is not proven: an MSP write while armed (the Lua script of the transmitter, the Configurator) leaves
     // no record in firmware 4.6.0, and freshness.caveat says so
     const REASONS = ['grace', 'rearm', 'switched', 'unlogged', 'adjusted', 'resume'];
+    // with the reasons of a journal epoch (param_epochs.cjs fromTimeline), in this order
+    const ALL_REASONS = REASONS.concat(['mixed', 'uncertain', 'pending', 'unknown', 'effect-unknown', 'lost', 'snapshot-incomplete', 'chain-mismatch', 'order-unknown', 'unexplained-runtime', 'changed']);
     const FRESH = {
         caveat: 'The log does not record a change that the transmitter or the Configurator makes after the pilot arms the helicopter.',
         reasons: {
@@ -1686,17 +1779,53 @@ var TuningWorker = (function () {
             unlogged: '"govRequest" changes, and the log records no PID profile change at that time. Thus, the pilot possibly changed a value, and the log does not show the change.',
             adjusted: 'An in-flight adjustment changed a value. The log header has the value before the change.',
             resume: 'The log has a period with no data. The log does not record a change in that period.' },
+        // the reasons of an epoch of the parameter journal (param_log.cjs buildTimeline, firmware with "blackbox_params"): in
+        // result.freshness.reasons only when a log has a journal
+        journalReasons: {
+            mixed: 'A parameter changed during this frame. Thus, the frame has the previous value and the new value.',
+            uncertain: 'The log records a parameter change, but not its accurate time. Thus, the value in this part is the previous value or the new value.',
+            pending: 'The log records a new value that the flight controller does not use at this time. The flight controller uses it after its next update.',
+            unknown: 'The log does not give a value that the flight controller uses in this part.',
+            'effect-unknown': 'The log records a parameter change. The app does not know when the flight controller uses the new value.',
+            lost: 'The log does not have all records of the parameter changes. Thus, the values after the missing record are unknown.',
+            'snapshot-incomplete': 'The parameter values in the log header are not complete. Thus, some values are unknown.',
+            'chain-mismatch': 'The parameter changes that the log records do not agree with each other. Thus, some values are unknown.',
+            'order-unknown': 'The log does not show if a parameter change came before or after an update of the flight controller.',
+            'unexplained-runtime': 'The values that the flight controller uses changed, and the log records no parameter change for this.',
+            changed: 'The log records a change of a parameter value before this part. Some checks use the values at the start of the log.' },
         // the causes as nouns ("The causes are ... and ..."): f.stale, r.stale, issues[].stale
         cause: { grace: 'the time after a disarm', rearm: 'a second arm in the same log', switched: 'a different PID profile or rate profile',
             unlogged: 'a change of "govRequest"', adjusted: 'an in-flight adjustment', resume: 'a period with no data' },
+        journalCause: {
+            mixed: 'a parameter change during a frame', uncertain: 'a parameter change at an unknown time',
+            pending: 'a new value that the flight controller does not use', unknown: 'a value that the log does not give',
+            'effect-unknown': 'a parameter change with an unknown effect', lost: 'a missing record of the parameter changes',
+            'snapshot-incomplete': 'parameter values in the log header that are not complete', 'chain-mismatch': 'parameter changes that do not agree',
+            'order-unknown': 'a parameter change in an unknown sequence', 'unexplained-runtime': 'a change of the values with no record', changed: 'a recorded parameter change' },
+        journalCaveat: 'The log records each parameter change. Only the parts of the log that have a cause can have values that the log does not show.',
     };
-    // the causes in sentences of 3 causes or less (Rule 6.3: 25 words)
-    const causeText = (reasons) => { const c = reasons.map(k => FRESH.cause[k]), a = c.slice(0, 3), b = c.slice(3);
-        return `The ${a.length === 1 ? 'cause is' : 'causes are'} ${and(a)}.${b.length ? ` ${b.length === 1 ? 'One more cause is' : 'Other causes are'} ${and(b)}.` : ''}`; };
+    // the reasons of a journal epoch that list their keys (param_epochs.cjs keys): the other journal reasons apply to every value
+    const JOURNAL_KEYS = { mixed: 'mixed', uncertain: 'uncertain', pending: 'pending', unknown: 'unknown', changed: 'changed' };
+    // the causes in sentences of 3 causes or less and of STE_WORDS words or less (Rule 6.3: 25 words in a description): a sentence
+    // takes the next cause while it stays in these limits, then the next sentence starts ("Other causes are ..."). CAUSE_SENTENCES
+    // at most (Rule 6.6: a paragraph of 6 sentences or less, with the lead and the source of a flag): the last one gives the count of
+    // the causes that are not in the text (the views list every cause with its label)
+    const STE_WORDS = 25, CAUSE_SENTENCES = 2, wordsOf = (t) => String(t).split(/\s+/).filter(Boolean).length;
+    const causeText = (reasons) => {
+        const c = reasons.map(k => FRESH.cause[k] || FRESH.journalCause[k] || k), out = [];
+        for (let i = 0; i < c.length;) {
+            const head = (n) => !out.length ? (n === 1 ? 'The cause is' : 'The causes are') : (n === 1 ? 'One more cause is' : 'Other causes are'), text = (n) => `${head(n)} ${and(c.slice(i, i + n))}.`;
+            let n = 1; while (i + n < c.length && n < 3 && wordsOf(text(n + 1)) <= STE_WORDS) n++;
+            if (out.length === CAUSE_SENTENCES - 1 && i + n < c.length) { out.push(`The app found ${c.length - i} more causes.`); break; }
+            out.push(text(n)); i += n;
+        }
+        return out.join(' ');
+    };
     const sec1 = (t) => numText(+(+t).toFixed(1)); // a time in a text, s
     // a name in quotation marks in a text: its own double quotes as single quotes (a function, so that no quote is in a template expression)
     const unquote = (v) => String(v).replace(/"/g, "'");
     const logWords = (list) => list.length === 1 ? `log ${list[0] + 1}` : `logs ${and(spans(list.slice().sort((a, b) => a - b).map(l => l + 1)))}`;
+    const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
 
     // What each check reads (CLAUDE.md "Values that are possibly not current": use only the causes that can change the value): the
     // parameters (datasets.cjs names, whose scope datasets.cjs scopeOf gives: profile, rate or global; {ax} the axis of the result, the
@@ -1714,7 +1843,7 @@ var TuningWorker = (function () {
     const SETPOINT = ['{ax}_response', '{ax}_accel_limit', 'setpoint_boost_gain'];
     const VBAT = ['vbat_min_cell_voltage', 'vbat_warning_cell_voltage'];
     const READS = {
-        D1: [], D2: [], D3: [], D4: [], D6: [], D7: [], H: [],
+        D1: [], D2: [], D3: [], D4: [], D6: [], D7: [], D10: [], D11: [], H: [], D12: ['@global'],   // D10: a check of the log itself; D12: global values (rxfail, rc_*, gov_*)
         F1: FILTERS, F2: FILTERS, F3: FILTERS, F5: FILTERS, F6: FILTERS, F7: FILTERS, F8: FILTERS, F9: FILTERS, F11: FILTERS, C15: FILTERS,
         F4: ['{ax}_d_cutoff'], F10: AX_GAINS.concat(['{ax}_d_cutoff'], FILTERS), C11: AX_GAINS.concat(['{ax}_d_cutoff'], FILTERS),
         D5: VBAT, G13: VBAT, P1: VBAT, P2: VBAT,
@@ -1747,6 +1876,9 @@ var TuningWorker = (function () {
     for (const n of GOV_NAMES) READS[`G:${n}`] = [n];
     const AXIS_NAMES = ['roll', 'pitch', 'yaw'];
     const baseName = (n) => String(n).replace(/\[\d+\]$/, '');
+    // a journal key ('p1.yaw_p_gain', 'r0.roll_rc_rate', 'debug_mode', 'battery_cell_count[0]') that a result of reads R reads (readsOf)
+    const keyRead = (key, R) => { const m = /^([pr])[0-5]\.(.+)$/.exec(key), name = baseName(m ? m[2] : key), scope = m ? (m[1] === 'p' ? 'profile' : 'rate') : 'global';
+        return R.names.has(name) || R.generic.has(scope); };
     // the scope of a parameter name (datasets.cjs scopeOf), null without datasets.cjs
     const scopeOfName = (J, n) => { const D = J.K && J.K.datasets || J.DS; return D && typeof D.scopeOf === 'function' ? D.scopeOf(n) : null; };
     // { none } | { scopes: Set, names: Set (base names), generic: Set (the scopes of '@' items) } of check id on axis, null: every cause
@@ -1765,6 +1897,10 @@ var TuningWorker = (function () {
         const s = meta.span;
         if (!R) return s.reasons.slice();
         if (R.none) return [];
+        // a journal epoch: a reason with keys counts when one of its keys is a name that R reads (or of a scope that R reads with no
+        // name); the other reasons count for every value
+        if (meta.journal) return s.reasons.filter(k => { const list = JOURNAL_KEYS[k] && s.keys ? s.keys[JOURNAL_KEYS[k]] || [] : null; if (!list) return true;
+            return list.some(key => keyRead(key, R)); });
         return s.reasons.filter(k => k === 'switched' ? (R.scopes.has('profile') && meta.pidSw) || (R.scopes.has('rate') && meta.rateSw)
             : k === 'unlogged' ? R.scopes.has('profile') // govRequest: the gov_headspeed of the active PID profile
                 : k === 'adjusted' ? meta.adj.some(a => a.param ? R.names.has(a.param) || R.generic.has(a.scope) : R.scopes.has(a.scope))
@@ -1779,7 +1915,9 @@ var TuningWorker = (function () {
         const has = live.some(w => w.extra && w.extra.govRequest), t = [], g = [];
         for (const w of live) { const T = frameTimes(w), G = has && w.extra ? w.extra.govRequest : null, n = w.n;
             for (let i = 0; i < n; i++) if (i === 0 || i === n - 1 || (G && (G[i] !== G[i - 1] || G[i] !== G[i + 1]))) { t.push(T[i]); if (has) g.push(G ? G[i] : 0); } }
-        J.epochIn.set(li, { events: d.epochEvents || [], frameS: Float64Array.from(t), govRequest: has ? Float64Array.from(g) : null });
+        // a param log with a complete FULL snapshot: the epochs of its timeline (param_epochs.cjs fromTimeline) in place of the spans of the events
+        const P = d.param, tl = P && P.timeline, journal = tl && tl.mode === 'FULL' && tl.header && tl.header.complete ? { timeline: tl, frameS: P.frameS, changes: P.journal || [] } : null;
+        J.epochIn.set(li, { events: d.epochEvents || [], frameS: Float64Array.from(t), govRequest: has ? Float64Array.from(g) : null, journal });
     }
 
     // what spanInfo needs of one log: the disarms, the logging resumes, the arm starts, the govRequest steps that no adjustment explains
@@ -1805,7 +1943,7 @@ var TuningWorker = (function () {
         const cli = J.cliParsed && J.cliStatus && J.cliStatus.used ? J.cliParsed : null, st = J.cliStatus;
         // a CLI dump that the log contradicts for PID profile p (its gov_headspeed), or for every log (no section agrees with a header)
         const cliOld = (p) => !!st && (!st.used || st.conflicts.some(x => x.what === 'gov_headspeed' && x.profile === p));
-        return { li, steps, armAt, scope, adjInfo, recovered, cliOld, rate0: r0 ? r0.data.value : 0, rateEvents: rate.filter(e => e.t > t0).map(e => ({ t: e.t, value: e.data.value })),
+        return { li, steps, armAt, scope, adjInfo, recovered, cliOld, rate0: r0 ? r0.data.value : 0, changes: x.journal ? x.journal.changes : [], rateEvents: rate.filter(e => e.t > t0).map(e => ({ t: e.t, value: e.data.value })),
             disarms: ev.filter(e => e.event === PE.EV.DISARM).map(e => e.t), resumes: ev.filter(e => e.event === PE.EV.LOGGING_RESUME).map(e => e.t),
             labels: J.dsFull ? J.dsFull.labels.filter(q => q.log === li) : null,
             cliPid: (p) => !!(cli && cli.profiles && cli.profiles[String(p - 1)]) && !cliOld(p), cliRate: (q) => !!(cli && cli.rateprofiles && cli.rateprofiles[String(q - 1)]) };
@@ -1817,6 +1955,20 @@ var TuningWorker = (function () {
     // fresh, adjust (the adjustments that can change a value of the span), source, text, meta (for f.stale: reasonsFor, sourceFor) }.
     // The source of a switched PID profile stays when an adjustment also changed one of its values: the adjustment is one more sentence
     function spanInfo(s, c, p0) {
+        // a journal epoch: the values of every PID profile and rate profile come from the parameter snapshot and the journal of the log
+        if (s.check === 'journal') {
+            // a value in force in this part that the journal records as changed before it: the checks that use the values at the start of the
+            // log do not have it (reason 'changed', with its keys). The profile switches are not values, and a value of a PID profile or a
+            // rate profile that this part does not fly cannot change its values (CLAUDE.md: only the causes that can change the value)
+            const inForce = (key) => { const m = /^([pr])([0-5])\./.exec(key), q = m ? (m[1] === 'p' ? s.pidProfile : s.rateProfile) : 0; return !m || !(q > 0) || +m[2] === q - 1; };
+            const changed = [...new Set(c.changes.filter(q => q.t <= s.t0 + 1e-6 && !/^(?:pid_profile|rate_profile)$/.test(q.key) && inForce(q.key)).map(q => q.key))];
+            // 'mixed' with no key: an A record of the slot in force that loads the values that the journal already has (param_log.cjs
+            // epochs). No value changes during the frame, so the part has no cause for it
+            const own = s.reasons.filter(k => !(k === 'mixed' && s.keys && Array.isArray(s.keys.mixed) && !s.keys.mixed.length));
+            const reasons = own.concat(changed.length ? ['changed'] : []), fresh = !reasons.length, source = { pid: 'journal', rate: 'journal' }, adjust = s.adjust.filter(a => a.func !== null && a.func > 2).map(a => ({ t: a.t, func: a.func, name: a.name, value: a.value }));
+            const keys = Object.assign({}, s.keys, { changed }), span = Object.assign({}, s, { reasons, fresh, adjust, keys }), meta = { c, span, p0, src: source, pidSw: false, rateSw: false, adj: [], journal: true };
+            return { reasons, fresh, adjust, source, keys, text: fresh ? '' : journalText(span, c, reasons, null).join(' '), meta };
+        }
         const startPid = p0 > 0 ? s.pidProfile === p0 : s.pidProfile === 0;
         const rateNow = c.rateEvents.filter(e => e.t <= s.t0 + 1e-6).pop(), rateSwitched = !!rateNow && !(c.rate0 > 0 && rateNow.value === c.rate0);
         // an adjustment changes a value of the PID profile or the rate profile that is active then (or a global value): a span of another
@@ -1856,6 +2008,30 @@ var TuningWorker = (function () {
         }
         return out.concat(sourceSentences(c, s, src, s.reasons.includes('adjusted'), Math.max(1, 6 - out.length)));
     }
+    // The sentences of a journal epoch (a log with a parameter snapshot) for the reasons that count (all, or those of a result that
+    // reads R), then the source of the values that the app uses there. The modules (health_*.cjs, filter_tune.cjs, gov_tune.cjs, the
+    // control replay) read the snapshot of the log header: the values at the start of the log. The configurations (datasets.cjs) apply
+    // each recorded change from its time. Six sentences or less
+    const UNKNOWN_KINDS = ['lost', 'snapshot-incomplete', 'chain-mismatch'];
+    const keyWords = (key) => { const m = /^([pr])([0-5])\.(.+)$/.exec(key); return m ? `"${unquote(m[3])}" of ${m[1] === 'p' ? 'PID' : 'rate'} profile ${+m[2] + 1}` : `"${unquote(key)}"`; };
+    const keysOfKind = (s, kind, R) => { const list = s.keys && Array.isArray(s.keys[kind]) ? s.keys[kind] : []; return R && !R.none ? list.filter(key => keyRead(key, R)) : list; };
+    function journalText(s, c, reasons, R) {
+        const out = [], N = c.li + 1;
+        for (const k of reasons) {
+            if (k === 'changed') { const keys = keysOfKind(s, 'changed', R), one = keys.length === 1; if (!keys.length) continue;
+                const at = c.changes.filter(q => q.t <= s.t0 + 1e-6 && keys.includes(q.key)).map(q => q.t), t0 = Math.min(...at), t1 = Math.max(...at);
+                out.push(`For ${keys.length <= 2 ? and(keys.map(keyWords)) : `${keys.length} values`}, some checks use the ${one ? 'value' : 'values'} at the start of log ${N}.`);
+                out.push(t0 === t1 ? `The log records ${one ? 'a new value' : 'new values'} at ${sec1(t1)} s, and the configurations use ${one ? 'it' : 'them'} from that time.`
+                    : `The log records new values from ${sec1(t0)} s to ${sec1(t1)} s, and the configurations use them from these times.`); }
+            else if (k === 'unknown') { const keys = keysOfKind(s, 'unknown', R);
+                out.push(!keys.length ? FRESH.journalReasons.unknown : keys.length === 1 ? `In this part, the value of ${keyWords(keys[0])} is unknown.`
+                    : keys.length === 2 ? `In this part, the values of ${and(keys.map(keyWords))} are unknown.` : `In this part, ${keys.length} values are unknown.`); }
+            else if (k === 'resume') { const t = lastAt(c.resumes || [], s.t0); out.push(`The log has no data for a period before ${sec1(t === null ? s.t0 : t)} s, and the log does not record a change in that period.`); }
+            else if (FRESH.journalReasons[k]) out.push(...FRESH.journalReasons[k].split(/(?<=\.) (?=[A-Z])/)); // every sentence of the reason
+        }
+        const some = reasons.some(k => k === 'changed' || k === 'unknown' || UNKNOWN_KINDS.includes(k));
+        return out.slice(0, 5).concat([`${some ? 'For the other values, the app uses' : 'The app uses'} the parameter values in the log header of log ${N}.`]);
+    }
     // The source of the values of a span (CLAUDE.md: each flag gives the source of the values that the app uses for that part, or
     // "unknown"): the switched PID profile and rate profile, the values that an adjustment changed, then the other values (the header of
     // this log). room: the sentences, 1 or more
@@ -1864,12 +2040,12 @@ var TuningWorker = (function () {
     function sourceSentences(c, s, src, adjusted, room) {
         const N = s.pidProfile, Rp = s.rateProfile;
         const obj = (v, p) => v === 'cli' ? `the values of ${c.cliOld(p) ? 'a CLI dump that does not agree with the log' : 'the CLI dump'}` : /^log \d+$/.test(v) ? `the values of the log header of log ${+v.slice(4) + 1}`
-            : v === 'calculated' ? 'the values that it calculated from the flights' : null;
+            : v === 'calculated' ? 'the values that it calculated from the flights' : v === 'journal' ? 'the parameter values of the log header and the parameter changes that the log records' : null;
         const phrase = (v, what, p) => v && typeof v === 'object' && Array.isArray(v.list) ? `for ${what}, the app uses ${and(v.list.map(k => obj(k, p)).filter(Boolean))}`
-            : v === 'cli' || /^log \d+$/.test(v) || v === 'calculated' ? `for ${what}, the app uses ${obj(v, p)}`
+            : v === 'cli' || /^log \d+$/.test(v) || v === 'calculated' || v === 'journal' ? `for ${what}, the app uses ${obj(v, p)}`
                 : v === 'recovered' ? `for ${what}, the app uses the gains that it calculated from the flights` : v === 'none' ? `the values of ${what} are unknown` : null;
         const pw = N > 0 ? `PID profile ${N}` : 'the PID profile', a = phrase(src.pid, pw, N), b = phrase(src.rate, Rp > 0 ? `rate profile ${Rp}` : 'the rate profile', 0);
-        const parts = [a, b].filter(Boolean), cap = (t) => t.charAt(0).toUpperCase() + t.slice(1), out = [];
+        const parts = [a, b].filter(Boolean), out = [];
         if (parts.length) out.push(parts.length === 2 ? `${cap(parts[0])}, and ${parts[1]}.` : `${cap(parts[0])}.`);
         if (src.pid && typeof src.pid === 'object' && src.pid.unknown) out.push(`Some values of ${pw} are unknown.`);
         if (adjusted) out.push('For the values that an in-flight adjustment changed, the app uses the values of the log.');
@@ -1880,6 +2056,8 @@ var TuningWorker = (function () {
     // the values of the header for it, and the adjustment sentence only when an adjustment counts (eff: reasonsFor)
     // pidSource (governorTune: govSources): the source of the values of a switched PID profile that the app does not find for the span
     function sourceFor(meta, R, eff, pidSource) {
+        // the snapshot and the journal of the log: the values of the keys of the reasons that count, then the source of the other values
+        if (meta.journal) { const t = journalText(meta.span, meta.c, eff.filter(k => k === 'changed' || k === 'unknown'), R); return t.join(' '); }
         const own = pidSource && meta.pidSw && meta.src.pid === 'none' ? pidSource(meta.span, meta.c.li) : null;
         const src = { pid: R && !R.none && !R.scopes.has('profile') ? 'header' : own || meta.src.pid, rate: R && !R.none && !R.scopes.has('rate') ? 'header' : meta.src.rate };
         return sourceSentences(meta.c, meta.span, src, eff.includes('adjusted'), 3).join(' ');
@@ -1960,7 +2138,7 @@ var TuningWorker = (function () {
     function staleFrom(J, hits, what, R, pidSource, own) {
         const items = mergeHits(hits).map(h => { const meta = J.spanMeta.get(h.span); return { h, meta, eff: meta ? reasonsFor(meta, R) : h.span.reasons.slice() }; }).filter(x => x.eff.length);
         if (!items.length) return null;
-        const reasons = REASONS.filter(k => items.some(x => x.eff.includes(k))), byOv = items.sort((a, b) => b.h.ov - a.h.ov);
+        const reasons = ALL_REASONS.filter(k => items.some(x => x.eff.includes(k))), byOv = items.sort((a, b) => b.h.ov - a.h.ov);
         const source = own || sourceOf(byOv.map(x => x.meta ? sourceFor(x.meta, R, x.eff, pidSource) : ''), 'Other parts have other sources.');
         const text = [STALE_LEAD[what] || STALE_LEAD.result, causeText(reasons)].concat(source ? [source] : []).join(' ');
         return { reasons, text, source, spans: byOv.slice(0, 3).map(x => ({ log: x.h.log, t0: x.h.span.t0, t1: x.h.span.t1 })) };
@@ -2008,7 +2186,7 @@ var TuningWorker = (function () {
     // r.stale, issues[].stale: { reasons, text, findings (how many of its results have stale) } over the results it cites, or null
     function staleUnion(list, what) {
         const hit = list.filter(x => x && x.stale), n = hit.length; if (!n) return null;
-        const reasons = REASONS.filter(k => hit.some(x => x.stale.reasons.includes(k))), source = sourceOf(hit.map(x => x.stale.source), 'Other results have other sources.');
+        const reasons = ALL_REASONS.filter(k => hit.some(x => x.stale.reasons.includes(k))), source = sourceOf(hit.map(x => x.stale.source), 'Other results have other sources.');
         return { reasons, findings: n, source, text: `${n === 1 ? '1 result' : `${n} results`} of this ${what} ${n === 1 ? 'uses' : 'use'} a part of the log in which the values are possibly not the values of the log header. ` +
             causeText(reasons) + (source ? ` ${source}` : '') };
     }
@@ -2032,11 +2210,12 @@ var TuningWorker = (function () {
     function epochsOfLog(J, PE, li, p0, recovered) {
         const x = J.epochIn.get(li);
         let list;
-        try { list = PE.paramEpochs({ events: x.events, frameS: x.frameS, govRequest: x.govRequest, profileAtStart: p0 }); }
+        try { list = x.journal ? PE.paramEpochs({ timeline: x.journal.timeline, frameS: x.journal.frameS }) : PE.paramEpochs({ events: x.events, frameS: x.frameS, govRequest: x.govRequest, profileAtStart: p0 }); }
         catch (e) { J.notes.add(`The function "paramEpochs" of "param_epochs.cjs" stopped. The error is "${message(e)}". Thus, the app does not show the parts of the log in which the values are possibly not the values of the log header.`, li); return null; }
         const c = Object.assign(epochCtx(J, li, x, list, PE, recovered, p0), { p0 });
         const spans = list.map(s => { const info = spanInfo(s, c, p0), meta = info.meta;
-            const o = Object.assign({}, s, { t0: r(s.t0, 4), t1: r(s.t1, 4), reasons: info.reasons, fresh: info.fresh, adjust: info.adjust.map(a => Object.assign({}, a, { t: r(a.t, 4) })), source: info.source, text: info.text });
+            const o = Object.assign({}, s, { t0: r(s.t0, 4), t1: r(s.t1, 4), reasons: info.reasons, fresh: info.fresh, adjust: info.adjust.map(a => Object.assign({}, a, { t: r(a.t, 4) })), source: info.source, text: info.text },
+                info.keys ? { keys: info.keys } : {}); // a journal epoch: the keys of its reasons, 'changed' included (control_pipeline.cjs gainEpochReasons)
             J.spanMeta.set(o, meta); return o; });
         J.epochs.set(li, { p0, spans });
         return spans;
@@ -2057,7 +2236,9 @@ var TuningWorker = (function () {
         for (const x of recs) x.stale = on ? staleUnion((x.evidence || []).map(e => e && e.fid ? byFid.get(e.fid) : null), 'recommendation') : null;
         J.byFid = byFid;
         comparisonStale(J, findings);
-        return on ? { epochs: out, freshness: { caveat: FRESH.caveat, reasons: Object.assign({}, FRESH.reasons) } } : { epochs: null, freshness: null };
+        // the parameter journal records every change: its own caveat when every analysed log has one
+        const used = [...J.epochIn.entries()].filter(([li]) => J.epochs.has(li)), journal = on && used.every(([, x]) => !!x.journal), anyJournal = used.some(([, x]) => !!x.journal);
+        return on ? { epochs: out, freshness: { caveat: journal ? FRESH.journalCaveat : FRESH.caveat, reasons: Object.assign({}, FRESH.reasons, anyJournal ? FRESH.journalReasons : {}) } } : { epochs: null, freshness: null };
     }
 
     // result.cliStatus: null without a CLI dump, else { name, used (the header of an analysed flight log agrees with a section of the
@@ -2093,16 +2274,19 @@ var TuningWorker = (function () {
         const bench = new Set(J.records.filter(l => l.logClass === 'bench').map(l => l.log)); // a bench run: not analysed
         const cores = coresOf(J, bench), { M, gh, stale, used } = cliCheck(J, cores);
         for (const q of stale) conflicts.push({ what: 'gov_headspeed', profile: q, cli: gh[q], log: [].concat(M.table[q]),
-            text: `In the CLI dump, \`gov_headspeed\` of \`profile ${q - 1}\` is ${gh[q]}. The PID profile changes in ${mapScope(J)} show ${rpmText([].concat(M.table[q]))} for PID profile ${q}. The app uses the values of the log.` });
+            text: `PID profile ${q}: \`gov_headspeed\` is ${gh[q]} rpm in the CLI dump, but the PID profile changes in ${mapScope(J)} show ${rpmText([].concat(M.table[q]))}.` });
         const none = [], other = new Map();
         for (const [li, c] of cores) { if (!c.d4) continue; const a = J.arming.get(li);
             if (!c.d4.agree.length) none.push(li);
             else if (!c.done && a && a.confirmed && a.basis.includes('headspeed') && !c.cliCands.includes(a.profile)) {
                 const k = `${a.profile}|${c.d4.agree.join(',')}`; (other.get(k) || other.set(k, { p: a.profile, agree: c.d4.agree, logs: [] }).get(k)).logs.push(li); } }
-        if (none.length) conflicts.push({ what: 'header', logs: none, text: `No section of the CLI dump agrees with the log header of ${logWords(none)}.` });
+        if (none.length) conflicts.push({ what: 'header', logs: none, text: `${cap(logWords(none))}: the values at the start of ${none.length > 1 ? 'each log' : 'the log'} do not agree with the CLI dump.` });
+        // a log with a parameter snapshot (D4 basis 'snapshot'): the dump is of a different time when one of its values is different
+        for (const [li, c] of cores) if (c.d4 && c.d4.snapshot > 0) conflicts.push({ what: 'snapshot', logs: [li], count: c.d4.snapshot,
+            text: `Log ${li + 1}: ${c.d4.snapshot} parameter ${c.d4.snapshot === 1 ? 'value in the log header is' : 'values in the log header are'} different from the CLI dump.` });
         for (const { p, agree, logs } of other.values()) conflicts.push({ what: 'profile', profile: p, sections: agree.slice(), logs,
-            text: `The log header of ${logWords(logs)} agrees with the CLI ${agree.length > 1 ? 'sections' : 'section'} ${and(agree.map(q => `\`profile ${q - 1}\``))}. But "govRequest" at the start of the log shows PID profile ${p}. The app uses PID profile ${p}.` });
-        if (conflicts.length) J.notes.add(`The CLI dump${name ? ` "${unquote(name)}"` : ''} does not agree with the log. The app uses the values of the log.`);
+            text: `${cap(logWords(logs))}: the governor headspeed shows PID profile ${p}, and the app uses it. But the values at the start of ${logs.length > 1 ? 'each log' : 'the log'} agree with PID ${agree.length > 1 ? 'profiles' : 'profile'} ${and(agree)} in the CLI dump.` });
+        if (conflicts.length) J.notes.add(`The CLI dump${name ? ` "${unquote(name)}"` : ''} has values that are different from the logs. The analysis uses the values in the logs.`);
         return { name, used, conflicts };
     }
 
@@ -2223,6 +2407,9 @@ var TuningWorker = (function () {
     // CLAUDE.md; without health_more (or when it stops: a note) the flight phases less rescue
     function gearAdd(J, preps, cls, li, K) {
         if (!J.gearAcc || J.tailFit || cls === 'bench') return;
+        // a parameter snapshot in the log header gives the gear ratios (health_setup gearOf): no fit for this log
+        const first = preps.find(p => p && p.w && p.w.flight);
+        if (first && kitPlog && typeof kitPlog.snapshotOf === 'function' && kitPlog.snapshotOf(first.w.flight.header)) { (J.gearSnap = J.gearSnap || new Set()).add(li); return; }
         const items = [], more = K && K.more;
         for (const p of preps) {
             if (!p || !p.ctx || p.w.skipped || !GEAR_EXTRA.every(k => p.w.extra && p.w.extra[k])) continue;
@@ -2230,7 +2417,7 @@ var TuningWorker = (function () {
             let mask = null;
             if (more) try { mask = more.normalMask(p.w, Object.assign({}, p.ctx, { flying: base }, p.ph ? { phases: p.ph.P, flightMask: base } : { phases: false })).mask; }
                 catch (e) { J.notes.add(`The function "normalMask" of "health_more.cjs" stopped. The error is "${message(e)}". Thus, the frequency of the tail rotor notch filters comes from all of the flight phase.`, li); }
-            if (!mask) { mask = Uint8Array.from(base); const rs = p.w.rescueAt; if (rs) for (let i = 0; i < mask.length; i++) if (rs[i]) mask[i] = 0; }
+            if (!mask) { mask = Uint8Array.from(base); const rs = p.w.rescueAt, rx = p.w.rxLossAt; for (let i = 0; i < mask.length; i++) if ((rs && rs[i]) || (rx && rx[i])) mask[i] = 0; }
             items.push({ w: p.w, mask, flight: true });
         }
         if (!items.length) return;
@@ -2240,6 +2427,7 @@ var TuningWorker = (function () {
     // the fit of the logs added, once; J.gear when a group passed
     function gearFit(J) {
         if (!J.gearAcc || J.tailFit) return;
+        if (!J.gearLogs.length && J.gearSnap && J.gearSnap.size) { J.gearAcc = null; return; } // every flight log has the gear ratios of its snapshot
         const { FT, acc } = J.gearAcc; J.gearAcc = null;
         try { J.tailFit = FT.tailOrderFit(acc); }
         catch (e) { J.notes.add(`The function "tailOrderFit" of "filter_tune.cjs" stopped. The error is "${message(e)}". Thus, the app does not find the frequency of the tail rotor notch filters in the log.`); return; }
@@ -2247,7 +2435,7 @@ var TuningWorker = (function () {
         J.gear = g ? Object.assign({}, g, { motorisedTail: J.tailFit.passed ? false : null }) : null; // no tail fit: a motorised tail is possible (source 20)
     }
     // the gear of the modules, for the segments of one log
-    const gearInto = (J, preps) => { if (J.gear) for (const p of preps) if (p && p.ctx) p.ctx.gear = Object.assign({}, J.gear); };
+    const gearInto = (J, preps) => { if (J.gear) for (const p of preps) if (p && p.ctx && !(kitPlog && typeof kitPlog.snapshotOf === 'function' && p.w && p.w.flight && kitPlog.snapshotOf(p.w.flight.header))) p.ctx.gear = Object.assign({}, J.gear); };
     // The notes of the fit (STE, from the log only; no text about a gear ratio): for the tail rotor and for the main motor notch
     // filters when the header has them, the order that the checks use with its SE, else the cause from the log
     const GEAR_UNIT = { flight: ['flight log', 'flight logs'], block: ['period of 30 s of flight', 'periods of 30 s of flight'] };
@@ -2436,10 +2624,18 @@ var TuningWorker = (function () {
             records, flights: J.records.flatMap(l => (l.logClass === 'flight' && l.flights || []).map(q => Object.assign({ log: l.log, segment: l.segment }, q))), benchRuns: bench, noData: empty.map(e => ({ log: e.log, reason: e.why })), profiles: profilesSummary(J),
             header: J.header, headerLog: J.headerLog, fields: J.fields, findings: judged.findings, decisions: gained ? gained.decisions : null, groups: gained ? gained.groups : null,
             advice, hierarchy, curves: J.o.curves ? J.curves : null, datasets: J.dsOut || null, issues: iss.issues, top: iss.top, areas: iss.areas, notchFit: notchFitOut(J),
-            epochs: fresh.epochs, freshness: fresh.freshness, cliStatus: J.cliStatus,
+            epochs: fresh.epochs, freshness: fresh.freshness, cliStatus: J.cliStatus, paramSnapshot: paramSnapshotOf(J),
             reportMarkdown: (selection ? `${selection.text}\n\n` : '') + judged.markdown + labelLine(J) + (gained ? `\n\n${gained.markdown}` : ''), notes: J.notes.list() };
     }
 
+    // result.paramSnapshot: { logs (the flight logs whose header has a complete parameter snapshot, blackbox_params FULL), all (every
+    // analysed flight log has one) }. The views tell the pilot which values the log does not record (CLAUDE.md "No access to the flight
+    // controller"): with a snapshot, the log header records the values of all PID profiles and rate profiles
+    function paramSnapshotOf(J) {
+        const flight = (l) => l.logClass === 'flight' || (l.logClass == null && l.flown), has = (l) => !!(kitPlog && typeof kitPlog.snapshotOf === 'function' && l.header && kitPlog.snapshotOf(l.header));
+        const logs = [...new Set(J.records.filter(flight).map(l => l.log))].sort((a, b) => a - b), withSnap = logs.filter(li => J.records.some(l => l.log === li && has(l)));
+        return { logs: withSnap, all: logs.length > 0 && withSnap.length === logs.length };
+    }
     // the profile numbers of the toolkit report are the labels of the configurations when the modules pooled by configuration
     function labelLine(J) {
         if (!J.dsMap || !relabelOn(J) || !J.dsMap.size) return '';
@@ -2517,7 +2713,11 @@ var TuningWorker = (function () {
     // samples [a, b) of a decoded whole-log segment as a segment of its own (lib.segments fields; fromS the frame second of a)
     function sliceSegment(w, a, b) {
         const cut = (v) => v ? v.subarray(a, b) : v, three = (x) => Array.isArray(x) ? x.map(cut) : x, T = w.extra && w.extra.time, rate = w.flight && w.flight.actualRate || w.rate;
+        // lib.cjs rxLoss in the samples of the slice: a loss with a frame in it (not only its guard or settle time), and the cut of the slice
+        const rxLoss = Array.isArray(w.rxLoss) ? w.rxLoss.filter(s => s.i1 > a && s.i0 < b).map(s => Object.assign({}, s, { i0: Math.max(0, s.i0 - a), i1: Math.min(b - a, s.i1 - a),
+            returned: s.returned && s.i1 < b, cut0: Math.max(0, s.cut0 - a), cut1: Math.min(b - a, s.cut1 - a) })) : w.rxLoss, rxCut = w.rxLossAt ? cut(w.rxLossAt) : null;
         return Object.assign({}, w, { n: b - a, cutAt: (w.cutAt || 0) + a, fromS: T ? w.fromS + (T[a] - T[0]) / 1e6 : w.fromS + a / rate, seconds: (b - a) / w.rate,
+            rxLoss, rxLossAt: rxCut && rxCut.indexOf(1) >= 0 ? rxCut : null,
             sp: three(w.sp), gyro: three(w.gyro), u: three(w.u), P: three(w.P), I: three(w.I), D: three(w.D), F: three(w.F), B: three(w.B), hs: cut(w.hs), coll: cut(w.coll),
             profileAt: cut(w.profileAt), airborneAt: cut(w.airborneAt), govStateAt: cut(w.govStateAt), rescueAt: cut(w.rescueAt), filterMask: cut(w.filterMask),
             extra: Object.fromEntries(Object.entries(w.extra || {}).map(([k, v]) => [k, cut(v)])) });
@@ -2556,6 +2756,37 @@ var TuningWorker = (function () {
         let gained = null;
         if (J.o.gains) { await checkpoint(J.id); const t = Date.now(); J.progress('The app calculates the gains from the selected flight data.', 'gains', 0.6); gained = gains(J, J.src, J.bytes); J.ms.gains += Date.now() - t; }
         return finish(J, judged, gained);
+    }
+
+    // scanFlights (2026-10-15): the flights of each log of the file, with no checks, so that the pilot can select the flights
+    // before the analysis. The first pass gives the flight rpm of every log, as analyseFile with no selection. Then each log is
+    // decoded again with the same columns, and its phases at that rpm are found as selectFlights finds them, so that flight k of
+    // a log in the list is flight k of the analysis. { version: 1, scope: 'scan', fileName, logs, flightRpm, records (log,
+    // segment, logClass, phases, flights, phaseSeconds, noData), flights, benchRuns, noData, timing, notes }: the shapes of finish
+    async function scanFlights(msg, post) {
+        const J = await begin(Object.assign({}, msg, { options: Object.assign({}, msg.options || {}, { datasets: false, curves: false, gains: false }) }), post, 'file');
+        const idx = new FlightLogIndex(J.bytes), count = idx.getLogCount(), slice = (i) => J.bytes.subarray(idx.getLogBeginOffset(i), idx.getLogBeginOffset(i + 1));
+        J.logs = [...Array(count).keys()]; J.logCount = count;
+        const rpm = userRpm(J); if (rpm) settle(J, rpm); else await firstPass(J, count, slice, 0.02, 0.5, null, true);
+        const K = J.K, usePh = phasesOn(J, K), extra = rpmExtra(J, K);
+        for (const li of J.logs) {
+            await checkpoint(J.id);
+            J.progress(`The app finds the flights in log ${li + 1} of ${count}.`, 'decode', 0.5 + 0.5 * li / Math.max(1, count));
+            const d = timedDecode(J, K, slice(li), li, extra);
+            if (d.error) { J.errorRecords.push({ log: li, segment: 0, skipped: d.error }); continue; }
+            const live = d.segs.filter(w => !w.skipped), airborneEvents = live.some(w => w.airborneAt.some(v => !v));
+            const preps = d.segs.map((w, k) => prepare(K, w, { segment: k, cli: null, cliParsed: null, phases: usePh, airborneEvents }, J)); // selectFlights
+            const cls = usePh ? classOf(preps.filter(p => p.ctx).map(p => p.ph)) : null;
+            for (const p of preps) { if (p.ctx) { p.rec.logClass = cls; if (p.ph) phaseRecord(p.rec, p.w, p.ph, J); } J.records.push(p.rec); }
+        }
+        const empty = emptyLogsOf(J), emptyLogs = new Set(empty.map(e => e.log));
+        for (const l of J.records.concat(J.errorRecords)) if (emptyLogs.has(l.log)) { l.noData = true; l.noDataReason = l.skipped ? String(l.skipped) : null; }
+        const keep = ['log', 'segment', 'durationS', 'skipped', 'logClass', 'phases', 'flights', 'phaseSeconds', 'noData', 'noDataReason'];
+        return { version: 1, scope: 'scan', fileName: J.fileName, logs: J.logs, flightRpm: J.rpm,
+            records: J.records.concat(J.errorRecords).map(l => pick(l, keep)),
+            flights: J.records.flatMap(l => (l.logClass === 'flight' && l.flights || []).map(q => Object.assign({ log: l.log, segment: l.segment }, q))),
+            benchRuns: benchRunsOf(J), noData: empty.map(e => ({ log: e.log, reason: e.why })),
+            timing: { decodeS: seconds(J.ms.decode), totalS: seconds(Date.now() - J.t0) }, notes: J.notes.list() };
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2600,9 +2831,11 @@ var TuningWorker = (function () {
             if (classOf(preps.map(p => p.ph)) !== 'flight') continue; // a bench run, or no flight phases
             // Detect flight and excluded modes in the whole segment. A profile
             // change must not restart phase detection and discard flight data.
-            for (const p of preps) { if (!p.ph || !p.ctx) continue; let mask = p.ph.mask;
+            for (const p of preps) { if (!p.ph || !p.ctx) continue; let mask = null;
                 if (K.more) try { mask = K.more.normalMask(p.w, Object.assign({}, p.ctx, { flying: p.ph.mask, phases: p.ph.P, flightMask: p.ph.mask })).mask; }
-                    catch (e) { J.notes.add(`The function "normalMask" of "health_more.cjs" stopped. The error is "${message(e)}". Thus, the analysis of the filter values uses all of the flight phase.`, li); }
+                    catch (e) { J.notes.add(`The function "normalMask" of "health_more.cjs" stopped. The error is "${message(e)}". Thus, the analysis of the filter values uses the flight phase, but not rescue and not the periods with no receiver signal.`, li); }
+                // without normalMask: the flight phase less rescue and the cut of a receiver signal loss (lib.cjs rescueAt, rxLossAt), as gearAdd
+                if (!mask) { mask = Uint8Array.from(p.ph.mask); const rs = p.w.rescueAt, rx = p.w.rxLossAt; for (let i = 0; i < mask.length; i++) if ((rs && rs[i]) || (rx && rx[i])) mask[i] = 0; }
                 p.w.filterMask = mask; }
             if (sel) d.segs = selectFlights(J, d, li, sel.get(li));
             if (configuration) d.segs = filterConfigurationSegments(K, d.segs, configuration, li);
@@ -2773,19 +3006,21 @@ var TuningWorker = (function () {
     const GOV_PROGRESS = { decode: [0.15, 0.4], headspeed: [0.4, 0.45], model: [0.45, 0.99] };
     const GOV_DISARM = 15; // FlightLogEvent.DISARM: the arm state of the runs (gov_data.cjs arming)
     const GOV_TEXT = {
-        noFlight: 'The selected logs have no flight. The governor analysis does not use bench runs.',
+        noFlight: 'The selected logs have no flight. The governor autotune does not use bench runs.',
         noRead: 'The app cannot read this log.',
         noData: 'The log has no data that the app can read.',
         noPhase: 'The app cannot find the flight phases of this log.',
         noRun: 'The log does not record all the values that the governor model uses.',
-        partFields: 'The governor analysis does not use all parts of this log. The other parts do not record all the values that the governor model uses.',
-        partPhase: 'The app cannot find the flight phases of a part of this log. Thus, the governor analysis does not use that part.',
+        partFields: 'The governor autotune does not use all parts of this log. The other parts do not record all the values that the governor model uses.',
+        partPhase: 'The app cannot find the flight phases of a part of this log. Thus, the governor autotune does not use that part.',
         // a log that lib.segments cannot read: the missing fields (quoted) and the settings that record them
-        noFields: (fields, settings) => `The log does not record ${fields.length > 1 ? 'the fields' : 'the field'} ${and(fields.map(x => `"${x}"`))}. Thus, the app cannot read the log for the governor analysis. ` +
+        noFields: (fields, settings) => `The log does not record ${fields.length > 1 ? 'the fields' : 'the field'} ${and(fields.map(x => `"${x}"`))}. Thus, the app cannot read the log for the governor autotune. ` +
             `To record ${fields.length > 1 ? 'them' : 'it'}, set ${and(settings.map(x => `"${x}"`))} to ON.`,
         noHsRecord: 'To record the headspeed, set "blackbox_log_rpm" to ON.',
+        // the samples of a log out of the runs: the cut of a receiver signal loss (gov_data partsOf, IMP-02)
+        rxLoss: (s) => `The governor autotune does not use ${s >= 10 ? Math.round(s) : +s.toFixed(1)} s of this log near a period with no receiver signal (check D10).`,
         lead: 'This value is possibly not the same in all logs.', // the lead of a flag of gov_tune.cjs (row.stale) when the worker has none
-        bench: (n) => `The governor analysis does not use bench runs (${n === 1 ? '1 log' : `${n} logs`}).`,
+        bench: (n) => `The governor autotune does not use bench runs (${n === 1 ? '1 log' : `${n} logs`}).`,
     };
     const GOV_FIELDS = [['setpoint', 'blackbox_log_setpoint', 3], ['gyroADC', 'blackbox_log_gyro', 3], ['mixer', 'blackbox_log_mixer', 3], ['axisP', 'blackbox_log_pid', 3],
         ['axisI', 'blackbox_log_pid', 3], ['axisD', 'blackbox_log_pid', 3], ['axisF', 'blackbox_log_pid', 3], ['headspeed', 'blackbox_log_rpm', 0]];
@@ -2817,17 +3052,17 @@ var TuningWorker = (function () {
         const idx = new FlightLogIndex(J.bytes), count = idx.getLogCount(), slice = (i) => J.bytes.subarray(idx.getLogBeginOffset(i), idx.getLogBeginOffset(i + 1));
         const sel = flightsWanted(J, count), list = Array.isArray(J.o.logs) && J.o.logs.length ? J.o.logs.filter(l => Number.isInteger(l) && l >= 0 && l < count) : [...Array(count).keys()];
         J.logs = sel ? [...sel.keys()].filter(l => list.includes(l)).sort((a, b) => a - b) : list; J.logCount = count; J.logIndex = J.logs[0] || 0;
-        if (sel && [...sel.values()].some(s => !s.has(ALL))) J.notes.add('The governor analysis uses all of each log with a selected flight, because the governor model starts when the pilot arms the helicopter.');
+        if (sel && [...sel.values()].some(s => !s.has(ALL))) J.notes.add('The governor autotune uses all of each log with a selected flight, because the governor model starts when the pilot arms the helicopter.');
         const rpm = userRpm(J); if (rpm) settle(J, rpm); else await firstPass(J, count, slice, 0.02, GOV_PROGRESS.decode[0], J.logs, true);
         const K = J.K;
-        if (!K.phase) throw new Error('For the governor analysis, the flight phases of "health_phase.cjs" are necessary, and that file is not available.');
+        if (!K.phase) throw new Error('For the governor autotune, the flight phases of "health_phase.cjs" are necessary, and that file is not available.');
         const GD = govModule(K, 'gov_data'), GT = govModule(K, 'gov_tune');
         if (typeof GT.autotune !== 'function') throw new Error('The toolkit file "gov_tune.cjs" has no function "autotune".');
         const extra = [...new Set(GD.EXTRA.concat(K.phase.EXTRA || [], ['time', 'govRequest']))]; // govRequest: the stale (epochCollect)
         const need = [GD.TEXT.noHs, GD.TEXT.noMotor, GD.TEXT.noGov], runs = [], bench = [], skipped = [], blockers = new Set(), read = new Set(), noV = new Set(), [d0, d1] = GOV_PROGRESS.decode;
         for (const [k, li] of J.logs.entries()) {
             await checkpoint(J.id);
-            J.progress(`The app loads log ${li + 1} of ${count} for the governor analysis.`, 'decode', d0 + (d1 - d0) * k / Math.max(1, J.logs.length));
+            J.progress(`The app loads log ${li + 1} of ${count} for the governor autotune.`, 'decode', d0 + (d1 - d0) * k / Math.max(1, J.logs.length));
             const d = timedDecode(J, K, slice(li), li, extra);
             read.add(li);
             if (d.error) { skipped.push({ log: li, reason: GOV_TEXT.noRead }); continue; }
@@ -2839,7 +3074,7 @@ var TuningWorker = (function () {
                 skipped.push({ log: li, reason: lacks || GOV_TEXT.noData }); continue; }
             epochCollect(J, d, li); armWhole(J, d.segs, d.events, li); // the PID profile at the start of the log and the stale: the whole log
             const airborneEvents = live.some(w => w.airborneAt.some(v => !v));
-            // a part whose phases stop is left out of the governor analysis (GOV_TEXT.partPhase), not analysed on its airborne time: the
+            // a part whose phases stop is left out of the governor autotune (GOV_TEXT.partPhase), not analysed on its airborne time: the
             // note of phasesOf keeps the error without its consequence for the checks
             const notes = J.notes, PHASE_NOTE = / Thus, the app does not find the flight phases of the log, and the checks use all of the airborne time\.$/;
             J.notes = { add: (t, l) => notes.add(typeof t === 'string' ? t.replace(PHASE_NOTE, '') : t, l), list: notes.list };
@@ -2851,19 +3086,24 @@ var TuningWorker = (function () {
             // frame s from the log start, the clock of fromS. The adjustment events of the whole log (an adjustment before a part applies to
             // it: gov_params), the DISARM events of the part only (gov_data arming puts an earlier one at sample 0 of a later part)
             const disarms = d.epochEvents.filter(e => e.event === GOV_DISARM);
-            let lost = 0, noPhase = 0, kept = 0;
-            preps.forEach((p, s) => {
+            let lost = 0, noPhase = 0, kept = 0, part = 0, rxCutS = 0;
+            preps.forEach((p) => {
                 if (!p.ph) { noPhase++; return; } // phasesOf stopped: a note
                 const t = p.w.extra && p.w.extra.time, t0 = p.w.fromS, t1 = t && p.w.n ? p.w.fromS + (t[p.w.n - 1] - t[0]) / 1e6 : p.w.fromS + p.w.n / (p.w.flight.actualRate || p.w.rate), tol = 0.5 / (p.w.flight.actualRate || p.w.rate);
                 const events = d.events.concat(disarms.filter(e => e.t >= t0 - tol && e.t <= t1 + tol));
-                const run = GD.fromSegment(p.w, { phases: p.ph.P, segment: s, events, name: `log ${li + 1}, part ${s + 1}` }), miss = need.filter(x => run.reasons.includes(x));
-                // a run of a flight log is a flight run, all its phases included (GOVERNOR_AUTOTUNE.md section 2: one run per segment of a flight
-                // log); the class of the segment alone (a part with no flight of its own is 'bench') stays in segmentClass
-                run.segmentClass = run.class || (p.ph.flight ? 'flight' : 'bench'); run.class = 'flight';
-                for (const x of run.reasons) if (x === GD.TEXT.noVbat) noV.add(li); else J.notes.add(x, li); // noVbat: after the model (modelLogs)
-                if (miss.length) { lost++; miss.forEach(x => blockers.add(x)); return; }
-                runs.push(run); kept++;
+                // the parts out of the cut of a receiver signal loss (gov_data partsOf, IMP-02): one run for each part, numbered in the log
+                const P = typeof GD.partsOf === 'function' ? GD.partsOf(p.w) : { parts: [[0, p.w.n]], cutS: 0 }; rxCutS += P.cutS || 0;
+                for (const [i0, i1] of P.parts) {
+                    const s = part++, run = GD.fromSegment(p.w, { phases: p.ph.P, segment: s, events, name: `log ${li + 1}, part ${s + 1}`, i0, i1 }), miss = need.filter(x => run.reasons.includes(x));
+                    // a run of a flight log is a flight run, all its phases included (GOVERNOR_AUTOTUNE.md section 2: one run per segment of a flight
+                    // log); the class of the segment alone (a part with no flight of its own is 'bench') stays in segmentClass
+                    run.segmentClass = run.class || (p.ph.flight ? 'flight' : 'bench'); run.class = 'flight';
+                    for (const x of run.reasons) if (x === GD.TEXT.noVbat) noV.add(li); else J.notes.add(x, li); // noVbat: after the model (modelLogs)
+                    if (miss.length) { lost++; miss.forEach(x => blockers.add(x)); continue; }
+                    runs.push(run); kept++;
+                }
             });
+            if (rxCutS > 0) J.notes.add(GOV_TEXT.rxLoss(rxCutS), li);
             if (!kept) skipped.push({ log: li, reason: lost ? GOV_TEXT.noRun : GOV_TEXT.noPhase });
             else { if (lost) J.notes.add(GOV_TEXT.partFields, li); if (noPhase) J.notes.add(GOV_TEXT.partPhase, li); }
         }
@@ -3408,14 +3648,14 @@ var TuningWorker = (function () {
     function onmessage(ev) {
         const msg = ev.data || {}, id = msg.id, post = (m) => self.postMessage(m);
         if (msg.cmd === 'cancel') { cancelled.add(id); return; }
-        const job = { analyseLog, analyseFile, init, derive, export: exportCli, filterTune, filterReplay, controlTune, systemIdentify, governorTune }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned', systemIdentify:'systemIdentified', governorTune: 'governorTuned' }[msg.cmd] || 'result';
+        const job = { analyseLog, analyseFile, scanFlights, init, derive, export: exportCli, filterTune, filterReplay, controlTune, systemIdentify, governorTune }[msg.cmd], type = { init: 'ready', derive: 'derived', export: 'exported', filterTune: 'filterTuned', filterReplay: 'filterTuned', controlTune: 'controlTuned', systemIdentify:'systemIdentified', governorTune: 'governorTuned', scanFlights: 'flightsScanned' }[msg.cmd] || 'result';
         queue = queue.then(() => job ? job(msg, post) : Promise.reject(new Error(`The command "${msg.cmd}" is unknown.`)))
             .then(result => post({ id, type, result }))
             .catch(e => post({ id, type: 'error', message: message(e), stack: String(e && e.stack || '') }))
             .then(() => { cancelled.delete(id); delete self.__bytes; });
     }
 
-    return { onmessage, sources, kit, controlInputs, bindParameterContinuity, deriveKit, rpmEvidence, autoRpm, rpmWhy, viewerText, timeMapOf, hsInfo, hsMap, RPM, TIMEMAP, WINDOW, HS, READS, fresh: { readsOf, reasonsFor, measuredIn, placesIn, cutTo }, gov: { GOV_NAMES, GOV_TEXT, govJoin, govTimes }, CANCELED }; // all but onmessage for tests
+    return { onmessage, sources, kit, controlInputs, bindParameterContinuity, deriveKit, rpmEvidence, autoRpm, rpmWhy, viewerText, timeMapOf, hsInfo, hsMap, RPM, TIMEMAP, WINDOW, HS, READS, fresh: { readsOf, reasonsFor, measuredIn, placesIn, cutTo, causeText, spanInfo, journalText, FRESH, ALL_REASONS }, gov: { GOV_NAMES, GOV_TEXT, govJoin, govTimes }, sliceSegment, CANCELED }; // all but onmessage for tests
 })();
 
 self.onmessage = TuningWorker.onmessage;

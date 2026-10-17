@@ -67,6 +67,69 @@ function loadApp(root = path.resolve(__dirname, '../..')) {
 const FLIGHT_RPM = +process.env.AUTOTUNE_FLIGHT_RPM || 3000;
 const DEFAULTS = { minFlightS: 30, minSegmentS: 20, minHeadspeed: FLIGHT_RPM * 5 / 6, spoolFraction: 0.9, extra: [], whole: false };
 
+// Receiver signal loss (check D10 of health_more.cjs, IMP-01): a run of frames with rxSignalReceived or rxFlightChannelsValid at 0
+// while armed. During a loss the RC values are the last ones held, then the rxfail values, not the pilot's sticks: the analysis
+// segments end before it and start again only after it (`cut`, IMP-02). The governor, power and control-limit checks keep these
+// frames. Firmware 4.6.0 (118e912) and 4.7.0 (85d7049a9); rx/rx.c, rx/crsf.c, fc/rc.c and flight/failsafe.c of the bbp builds
+// 58a4bd5cc and 874f369d5 are those of 4.6.0, and 85d7049a9 only adds the wiring trial (MSP, disarmed) to rx.c
+const RX_LOSS = {
+    lastFrameLeadS: 0.1, holdS: 0.3, recheckS: 0.1, rssiTimeoutS: 0.25, stateLagS: 0.005, guardS: 0.01, settleS: 1.0, failsafeBit: 7,
+    source: {
+        lastFrameLeadS: 'firmware rx.c rxFrameCheck, DELAY_100_MS: rxSignalReceived goes to 0 when no RC frame comes for 100 ms',
+        holdS: 'firmware rx.c detectAndApplySignalLossBehaviour, MAX_INVALID_PULSE_TIME_MS 300: the last RC values stay for 300 ms after the last good frame, then the rxfail values. ' +
+            'With the failsafe switch (BOXFAILSAFE) rxFlightChannelsValid goes to 0 at once; with a control channel out of rx_pulse_min..rx_pulse_max (isPulseValid) it goes to 0 only at the rxfail values, 300 ms after the last good value',
+        failsafeBit: 'js/flightlog_fielddefs.js FLIGHT_LOG_FLIGHT_MODE_NAME_RF_4_6 (4.3 on): flightModeFlags bit 7 is the FAILSAFE switch (BOXFAILSAFE)',
+        recheckS: 'firmware rx.c rxFrameCheck: with no frame, the RC values are processed again each 100 ms (needRxSignalBefore + DELAY_100_MS)',
+        rssiTimeoutS: 'firmware rx/crsf.c crsfCheckRssi, CRSF_LINK_STATUS_UPDATE_TIMEOUT_US 250000: rssi 0 when no link-statistics frame comes for 250 ms',
+        stateLagS: 'firmware rx.c (RX task states MODES and UPDATE) and governor.c: the governor reads the rxfail values in the next PID cycles (crash log 2026-10-15: 0.9 ms after the predicted time)',
+        guardS: 'pipeline, unvalidated: the cut starts 10 ms (5 frames of a 500 Hz link) before the inferred last RC frame',
+        settleS: 'pipeline, unvalidated: the cut ends 1 s after the RX return; the sticks then go from the positions held during the loss (crash log 2026-10-15: collective at +500 for 1.13 s after the return)',
+    },
+};
+// The losses of n frames: lost(i) (a flag at 0), signal(i) (rxSignalReceived at 0; else only rxFlightChannelsValid), armed(i), timeUs(i),
+// switchOn(i) (the failsafe switch, flightModeFlags bit failsafeBit; null when the log does not record it). -> { spans: [{ i0 (first
+// frame of the loss), i1 (the RX return, or n), signal, cause ('signal': no RC frame; 'switch': the failsafe switch at i0; 'channel': a
+// control channel out of its pulse range, also without flightModeFlags), returned, lastFrameUs (the inferred last RC value of the
+// pilot: i0 less lastFrameLeadS for 'signal', i0 for 'switch', i0 less holdS for 'channel'), cut0, cut1 }], cut: Uint8Array (1 in
+// [lastFrameUs - guardS, return + settleS)) or null }. A loss with no armed frame (after a disarm) is not a span
+function rxLossSpans(n, timeUs, lost, signal, armed, rule = RX_LOSS, switchOn = null) {
+    const spans = [], at = (us) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (timeUs(m) < us) lo = m + 1; else hi = m; } return lo; };
+    let cut = null;
+    for (let i = 0; i < n;) {
+        if (!lost(i)) { i++; continue; }
+        let j = i, arm = false, sig = false; while (j < n && lost(j)) { if (armed(j)) arm = true; if (signal(j)) sig = true; j++; }
+        if (arm) {
+            const cause = sig ? 'signal' : switchOn && switchOn(i) ? 'switch' : 'channel';
+            const last = timeUs(i) - (cause === 'signal' ? rule.lastFrameLeadS : cause === 'channel' ? rule.holdS : 0) * 1e6, cut0 = at(last - rule.guardS * 1e6), cut1 = j < n ? Math.max(j, at(timeUs(j) + rule.settleS * 1e6)) : n;
+            spans.push({ i0: i, i1: j, signal: sig, cause, returned: j < n, lastFrameUs: last, cut0, cut1 });
+            (cut = cut || new Uint8Array(n)).fill(1, cut0, cut1);
+        }
+        i = j;
+    }
+    return { spans, cut };
+}
+// armed for each frame: the field `armed` of a blackbox_params log; else armed from the log start to each DISARM event (disarms:
+// frame indexes) and again from the next rise of the ARM switch (flightModeFlags bit 0, BOXARM) after it, and only with the ARM
+// switch on (a necessary condition of ARMED: a 4.6 log can start with the switch off, Fireball 2026-09-20 log 5)
+function armedOf(n, armIx, fmIx, get, disarms) {
+    const a = new Uint8Array(n);
+    if (armIx !== undefined) { for (let i = 0; i < n; i++) a[i] = get(i, armIx) ? 1 : 0; return a; }
+    a.fill(1);
+    for (const d of disarms) { let e = n; if (fmIx !== undefined) for (let k = Math.max(1, d); k < n; k++) if ((get(k, fmIx) & 1) && !(get(k - 1, fmIx) & 1)) { e = k; break; } a.fill(0, d, e); }
+    if (fmIx !== undefined) for (let i = 0; i < n; i++) if (!(get(i, fmIx) & 1)) a[i] = 0;
+    return a;
+}
+// the losses of the decoded frames of one log; spans null when the log has neither flag
+function rxLossOfFrames(frames, ixOf, disarms) {
+    const s = ixOf('rxSignalReceived'), v = ixOf('rxFlightChannelsValid'), n = frames.length;
+    if (s === undefined && v === undefined) return { spans: null, cut: null };
+    const lost = (i) => (s !== undefined && frames[i][s] === 0) || (v !== undefined && frames[i][v] === 0);
+    let any = false; for (let i = 0; i < n && !any; i++) any = lost(i);
+    if (!any) return { spans: [], cut: null };
+    const fm = ixOf('flightModeFlags'), armed = armedOf(n, ixOf('armed'), fm, (i, k) => frames[i][k], disarms);
+    return rxLossSpans(n, (i) => frames[i][1], lost, (i) => s !== undefined && frames[i][s] === 0, (i) => armed[i], RX_LOSS, fm === undefined ? null : (i) => (frames[i][fm] >> RX_LOSS.failsafeBit) & 1);
+}
+
 function* segments(app, file, options = {}) {
     const o = Object.assign({}, DEFAULTS, options);
     if (o.logs !== undefined && (!Array.isArray(o.logs) || o.logs.some(li => !Number.isInteger(li) || li < 0)))
@@ -116,6 +179,9 @@ function* segments(app, file, options = {}) {
             else if (e.event === EVENT.RESCUE_STATE && e.data) changes.push({ at, rescue: e.data.rescueState !== 0 });
         }
         const sawGov = events.some(e => e.event === EVENT.GOVERNOR_STATE);
+        // receiver signal losses (RX_LOSS): no analysis segment in their cut
+        const rx = rxLossOfFrames(frames, (name) => log.getMainFieldIndexByName(name), events.filter(e => e.event === EVENT.DISARM).map(e => indexAt(e.time === undefined ? tMax : e.time)));
+        for (const s of rx.spans || []) changes.push({ at: s.cut0, rxLoss: 1 }, { at: s.cut1, rxLoss: -1 });
         for (const at of cuts) changes.push({ at, cut: true });
         changes.sort((a, b) => a.at - b.at);
         changes.push({ at: frames.length, cut: true });
@@ -138,17 +204,22 @@ function* segments(app, file, options = {}) {
                 const i0 = bounds[b], n = bounds[b + 1] - i0; if (n < 2) continue;
                 const col = (idx, k = 1) => { const a = new Float64Array(n); for (let i = 0; i < n; i++) a[i] = frames[i0 + i][idx] * k; return a; };
                 const three = (idxs, k) => idxs.map(idx => idx === undefined ? null : col(idx, k));
+                // rxLoss: the losses of this segment (the frames with a flag at 0 in it, not only their cut), in its samples (null: the log
+                // has neither flag); rxLossAt: the cut in this segment (also the guard or the settle time of a loss of another segment), or null
+                const rxLoss = rx.spans === null ? null : rx.spans.filter(s => s.i1 > i0 && s.i0 < i0 + n).map(s => ({ i0: Math.max(0, s.i0 - i0), i1: Math.min(n, s.i1 - i0), signal: s.signal, cause: s.cause,
+                    returned: s.returned && s.i1 < i0 + n, lastFrameUs: s.lastFrameUs, cut0: Math.max(0, s.cut0 - i0), cut1: Math.min(n, s.cut1 - i0) }));
+                const rxCut = rx.cut ? rx.cut.subarray(i0, i0 + n) : null;
                 yield { flight, whole: true, fromS: (frames[i0][1] - tMin) / 1e6, seconds: n / rate, rate, n, profileAt: profileAt.subarray(i0, i0 + n), airborneAt: airborneAt.subarray(i0, i0 + n),
-                    govStateAt: govAt ? govAt.subarray(i0, i0 + n) : null, rescueAt: rescueAt.subarray(i0, i0 + n),
+                    govStateAt: govAt ? govAt.subarray(i0, i0 + n) : null, rescueAt: rescueAt.subarray(i0, i0 + n), rxLoss, rxLossAt: rxCut && rxCut.indexOf(1) >= 0 ? rxCut : null,
                     sp: three(I.sp), gyro: three(I.gyro), u: three(I.u, 1e-3), P: three(I.P, 1e-3), I: three(I.I, 1e-3), D: three(I.D, 1e-3), F: three(I.F, 1e-3), B: three(I.B, 1e-3),
                     hs: col(I.hs), coll: I.coll === undefined ? null : col(I.coll), extra: Object.fromEntries(o.extra.map(name => [name, ix(name) === undefined ? null : col(ix(name))])) };
             }
             continue;
         }
 
-        let from = 0, profile = 'arm', airborne = !sawAirborne, rescue = false, produced = 0;
+        let from = 0, profile = 'arm', airborne = !sawAirborne, rescue = false, rxl = 0, produced = 0;
         for (const ch of changes) {
-            if (airborne && !rescue && ch.at > from) {
+            if (airborne && !rescue && !rxl && ch.at > from) {
                 let i0 = from, i1 = ch.at;
                 const hsSorted = []; for (let i = i0; i < i1; i += 10) hsSorted.push(frames[i][I.hs]);
                 hsSorted.sort((a, b) => a - b);
@@ -171,6 +242,7 @@ function* segments(app, file, options = {}) {
             if (ch.profile !== undefined) profile = ch.profile;
             if (ch.airborne !== undefined) airborne = ch.airborne;
             if (ch.rescue !== undefined) rescue = ch.rescue;
+            if (ch.rxLoss !== undefined) rxl += ch.rxLoss;
             from = ch.at;
         }
         if (!produced) yield { flight, skipped: `no airborne, spooled-up stretch of ${o.minSegmentS} s on one profile` };
@@ -178,13 +250,14 @@ function* segments(app, file, options = {}) {
 }
 
 // The analysis segments of a whole log (see `whole`): airborne, one PID profile, headspeed settled, minSegmentS
-// or longer. Columns are views into the whole log, so nothing is copied.
+// or longer, out of rescue and of the cut of a receiver signal loss (rxLossAt). Columns are views into the whole log, so
+// nothing is copied.
 function* steadySegments(w, options = {}) {
-    const o = Object.assign({}, DEFAULTS, options), cut = (v) => v.subarray(i0, i1), rescue = (i) => w.rescueAt ? w.rescueAt[i] : 0; let i0 = 0, i1 = 0;
+    const o = Object.assign({}, DEFAULTS, options), cut = (v) => v.subarray(i0, i1), rescue = (i) => w.rescueAt ? w.rescueAt[i] : 0, rxl = (i) => w.rxLossAt ? w.rxLossAt[i] : 0; let i0 = 0, i1 = 0;
     for (let a = 0; a < w.n; a = i1) {
-        i1 = a + 1; while (i1 < w.n && w.profileAt[i1] === w.profileAt[a] && w.airborneAt[i1] === w.airborneAt[a] && rescue(i1) === rescue(a)) i1++;
+        i1 = a + 1; while (i1 < w.n && w.profileAt[i1] === w.profileAt[a] && w.airborneAt[i1] === w.airborneAt[a] && rescue(i1) === rescue(a) && rxl(i1) === rxl(a)) i1++;
         const end = i1; i0 = a;
-        if (!w.airborneAt[a] || rescue(a)) continue;
+        if (!w.airborneAt[a] || rescue(a) || rxl(a)) continue;
         const sorted = []; for (let i = i0; i < i1; i += 10) sorted.push(w.hs[i]);
         sorted.sort((p, q) => p - q);
         const median = sorted[sorted.length >> 1] || 0, floor = o.spoolFraction * median;
@@ -295,6 +368,7 @@ function difResponse(f, fc, rate) {
 
 // ordinary least squares y = X beta by normal equations; rows of X are observations
 function solve(X, y) {
+    if (!X || !X.length || !X[0] || !X[0].length) return null; // no observation (report.cjs section 5 with no yaw segment, IMP-04)
     const n = X.length, k = X[0].length, M = Array.from({ length: k }, (_, i) => Array.from({ length: 2 * k + 1 }, (_, j) => j === k + i ? 1 : 0));
     for (let i = 0; i < n; i++) { const x = X[i]; for (let p = 0; p < k; p++) { for (let q = 0; q < k; q++) M[p][q] += x[p] * x[q]; M[p][2 * k] += x[p] * y[i]; } }
     for (let c = 0; c < k; c++) {
@@ -920,5 +994,5 @@ function relaxResponse(rows) {
 // Feedback gain magnitude |fb| at a frequency, used to forbid raising loop gain where the plant is unmeasured
 function feedbackGain(a, gains, f) { return cx.abs(loop(a, gains, () => [1, 0], f).L); }
 
-module.exports = { FLIGHT_RPM, DEFAULTS, AXES, SCALE, SPEC, MODELS, BURST, cx, headspeedClass, loadApp, segments, steadySegments, profilesOf, byRevolution, spectralPeak, fftFor, bandpass, oscillationBursts, lpf1, dif, pt1, relaxFactor, relaxResponse, lpf1Response, difResponse, fitLine, solve, recoverGains,
+module.exports = { FLIGHT_RPM, DEFAULTS, RX_LOSS, rxLossSpans, armedOf, AXES, SCALE, SPEC, MODELS, BURST, cx, headspeedClass, loadApp, segments, steadySegments, profilesOf, byRevolution, spectralPeak, fftFor, bandpass, oscillationBursts, lpf1, dif, pt1, relaxFactor, relaxResponse, lpf1Response, difResponse, fitLine, solve, recoverGains,
     segmentSpectra, sumSpectra, pool, rowsOf, bandRms, spectralLine, crossAxisSpectra, sumCross, crossAxisGain, fitPlant, plantResponse, loop, margins, stepResponse, stepMetrics, delayFit, residualPsd, estimates, validBand, plantTable, predict, feedbackGain };

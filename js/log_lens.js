@@ -71,8 +71,8 @@ var LogLens = (function () {
 
     // The flight phases of SPEC2 D13 (records[].phases of the result): label and colour on the timeline
     var PHASES = { idle: ["Idle", "#6b6b6b"], spoolup: ["Spool-up", "#80b1d3"], ground: ["On the ground", "#bc80bd"], flight: ["Flight", "#b3de69"],
-        spooldown: ["Spool-down", "#fdb462"] };
-    var PHASE_ORDER = ["idle", "spoolup", "ground", "flight", "spooldown"];
+        spooldown: ["Spool-down", "#fdb462"], fall: ["Before the ground contact", "#fb8072"], aftercontact: ["After the ground contact", "#8d6e63"] }; // fall, aftercontact: an in-flight cut (health_phase.cjs, IMP-03)
+    var PHASE_ORDER = ["idle", "spoolup", "ground", "flight", "spooldown", "fall", "aftercontact"];
 
     // D4, F4 and H have no PID profile of the log (catalog.cjs NO_LOG_PROFILE)
     var NO_LOG_PROFILE = { D4: 1, F4: 1, H: 1 };

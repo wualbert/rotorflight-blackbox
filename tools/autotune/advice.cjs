@@ -110,6 +110,8 @@
  * gain decision of the gain model (C7), else 'advisory' (a value of the configuration, or no result).
  * From-values (review V11): fromSource names the loaded CLI dump when it gives the same value as the log header;
  * fromSources { name: source } when the names of one change have different sources.
+ * validationPower (IMP-07, C7 changes; control_pipeline.cjs sets it on the model changes): the plan of validation_power.cjs,
+ * how many flights with each set of values can show the calculated change. exportScript gives it once for each plan.
  *
  * Severity: action = change something (CLI when it is one known parameter); check = inspect, the cause is not one
  * parameter or lies outside the log; watch = borderline or below 2 SE, fly again; info = context.
@@ -262,6 +264,7 @@ const PHASE = optional(() => require('./health_phase.cjs'));
 const RESC = optional(() => require('./health_rescue.cjs')), LIMS = optional(() => require('./health_limits.cjs'));
 const CFGM = optional(() => require('./health_config.cjs')), POW = optional(() => require('./health_power.cjs'));
 const DSM = optional(() => require('./datasets.cjs'));   // the configurations (round 3 M1): A/B and slopes
+const POWER = optional(() => require('./validation_power.cjs')); // IMP-07: the flights that can show a calculated change
 const TR = (TRACK && TRACK.DEFAULT_RULES) || {}, MR = (MORE && MORE.DEFAULT_RULES) || {}, PR = (PHASE && PHASE.DEFAULT_RULES) || {};
 const RR = (RESC && RESC.DEFAULT_RULES) || {}, LR2 = (LIMS && LIMS.DEFAULT_RULES) || {}, RRULE = (RESC && RESC.RULE) || {};
 const CR = (CFGM && CFGM.DEFAULT_RULES) || {}, PWR = (POW && POW.DEFAULT_RULES) || {};
@@ -432,6 +435,7 @@ const COVERAGE = [
     '10|mechanical|Servos|servo n mid min max rneg rpos rate speed flags|L5|cli|The servo minimum and maximum are limits for the mechanical parts, not for the range (SERVO). Check L5 finds the periods with a servo at its limit. No check examines the servo speeds.',
     '11|precondition|Rescue|rescue_*|D9 D6 D8 G19 T15|cli|The log header does not record rescue_mode. The log records a rescue only when it occurs. Checks G19, T15 and D8 examine each rescue.',
     '11|precondition|Level modes|angle and horizon values (header levelPID)|D6||A log cannot show them, and the analysis does not use these parts of the log.',
+    '11|precondition|Receiver failsafe|rxfail,gov_throttle_hold_timeout,gov_autorotation_timeout,gov_spooldown_time|D10 D12||Check D10 finds the periods with no receiver signal. Check D12 gives the response of the firmware. The log header of a firmware with `blackbox_params` records `rxfail`.',
     '11|precondition|Battery and cells|battery_meter,battery_cell_count,vbat_min_cell_voltage,vbat_warning_cell_voltage,vbat_max_cell_voltage|D5 G13 G8 P1 P2||The log header records the cell voltage levels (`vbatcellvoltage`). The analysis finds the cell count from the battery voltage.',
     '11|precondition|Gyro range limit|gyro_overflow_detect|||If the gyro gets to the end of its range, the firmware sets the P-term, I-term, D-term and F-term to 0. No check examines it.',
 ];
@@ -445,8 +449,8 @@ const ELSEWHERE = ['T3', 'T10', 'F7'];  // section-10 checks that no module of t
 // D3 skip names of checks that exist in no module: battery current (Ibat) and G12 from the ESC rpm (EscRPM); no check
 // reads Ibat, Tesc or any ESC telemetry field (coverage row 'ESC telemetry')
 const NO_CHECK = /^(power\/current|G12 \(independent rpm\)) \(/;
-const NEW = { 'health_config.cjs': ['D9'], 'health_power.cjs': ['P1', 'P2'], 'health_track.cjs': ['C5', 'T1', 'C12', 'T11', 'C13', 'T12', 'R1'], 'health_more.cjs': ['D6', 'F10', 'F11', 'T13', 'C14', 'T14', 'G14'],
-    'health_phase.cjs': ['D7', 'G15', 'G16', 'G17', 'G18', 'C15'], 'health_rescue.cjs': ['G19', 'T15', 'D8'], 'health_limits.cjs': ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'] }; // the checks added for the Tuning dialog (docs/DEVELOPMENT.md section 13)
+const NEW = { 'health_config.cjs': ['D9', 'D12'], 'health_power.cjs': ['P1', 'P2'], 'health_track.cjs': ['C5', 'T1', 'C12', 'T11', 'C13', 'T12', 'R1'], 'health_more.cjs': ['D6', 'D10', 'F10', 'F11', 'T13', 'C14', 'T14', 'G14'],
+    'health_phase.cjs': ['D7', 'D11', 'G15', 'G16', 'G17', 'G18', 'C15'], 'health_rescue.cjs': ['G19', 'T15', 'D8'], 'health_limits.cjs': ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7'] }; // the checks added for the Tuning dialog (docs/DEVELOPMENT.md section 13)
 
 const UNITS = { D1: 'Hz', D2: 'frames', D3: 'checks', D4: 'values', D5: 'V', G0: 'samples', G1: 'entries', G2: 'fraction', G3: 'fraction', G4: 'fraction', G5: 's', G6: '%',
     G7: 'fraction', G8: 'ratio', G9: 'prominence', G10: 'coherence', G11: '% points per pack', G12: 'x headspeed/60', G13: 'V/cell', G21: 'count', C1: 's', C2: 's', C3: 'fraction', C4: '%',
@@ -461,7 +465,7 @@ const RATES_TYPES = ['NONE', 'BETAFLIGHT', 'RACEFLIGHT', 'KISS', 'ACTUAL', 'QUIC
 // id kind step row lane title | home checks (SETUP rules, C7, L5 and L6 by axis as hierarchy.cjs homeOf): the prerequisites
 // (step 0) and the tuning blocks (SPEC3 A, B)
 const NODES0 = ['logging prereq 0 0 prereq Blackbox log|D1 D2 D3 D4 H', 'rpm prereq 0 1 prereq RPM signal and motor poles|G1 G12 G20 G21', 'power prereq 0 2 prereq Battery and power|D5 G13 G11 P1 P2',
-    'mechanics prereq 0 3 prereq Mechanical parts|F7 C15 T4 SETUP:i_gain', 'rescue prereq 0 4 prereq Rescue|D9 D8 D6', 'controller prereq 0 5 prereq Flight controller|SETUP:pid_mode SETUP:rates_type D7 R1 L7',
+    'mechanics prereq 0 3 prereq Mechanical parts|F7 C15 T4 SETUP:i_gain', 'rescue prereq 0 4 prereq Rescue|D9 D8 D6 D10 D11 D12', 'controller prereq 0 5 prereq Flight controller|SETUP:pid_mode SETUP:rates_type D7 R1 L7',
     'filters block 1 0 main Filters|F1 F2 F3 F4 F5 F6 F8 F9 F10 F11 C11', 'governor block 2 0 main Governor|G0 G2 G3 G4 G5 G6 G7 G8 G9 G10 G14 G15 G16 G17 G18 G19 L1',
     'cyclic block 3 0 cyclic Cyclic gains|C1 C2 C3 C4 C5 C6 C9 C12 C13 C7:cyclic L2 L3', 'tail block 3 1 tail Tail gains|T1 T2 T3 T9 T10 T11 T12 C7:yaw',
     'cycomp block 4 0 cyclic Cyclic compensation|C8 C10 C14', 'tailcomp block 4 1 tail Tail compensation and authority|T5 T6 T7 T8 T13 T14 T15 L4'].map(s => { const [head, checks] = s.split('|'), [id, kind, step, row, lane, ...title] = head.split(' ');
@@ -543,7 +547,7 @@ const headerKeyOf = (f) => typeof f.headerKey === 'string' ? f.headerKey : Strin
 // gov_headspeed, or 'headspeed': the logged govRequest at the log start agrees with the gov_headspeed of exactly one PID
 // profile at the logged PID profile changes of the same file, user decision 2026-10-06), else null: then its profile 0 is
 // "PID profile unknown"
-const CONFIRMED = new Set(['event', 'cli', 'cliTarget', 'headspeed']);
+const CONFIRMED = new Set(['snapshot', 'event', 'cli', 'cliTarget', 'headspeed']); // snapshot: param_pid_profile of a parameter snapshot
 const armingOfLog = (l) => { const p = pidOk(l && l.armingProfile); return p !== null && (l.armingConfirmed === true || (Array.isArray(l.armingBasis) && l.armingBasis.some(b => CONFIRMED.has(b)))) ? p : null; };
 const axisOf = (f) => f.axis || (f.id === 'F4' ? f.profile : (/^(roll|pitch|yaw)\b/.exec(String(f.text || '')) || [])[1]) || null;
 const matchNum = (re, s) => { const m = re.exec(String(s || '')); return m ? +m[1] : null; };
@@ -670,19 +674,19 @@ function current(c, param, p) {
     const sc = !c.cli ? null : scope === 'global' ? c.cli.global : p > 0 ? c.cli.profiles[String(p - 1)] || null : null;
     if (hv !== null && own) {
         // review V11: a CLI dump with the same value is a source too
-        const same = sc && !c.staleCli.has(param) && sc[param] !== undefined && sc[param] !== null && String(sc[param]).replace(/\s+/g, '').toUpperCase() === String(hv).replace(/\s+/g, '').toUpperCase();
+        const same = sc && !cliStale(c, param, p) && sc[param] !== undefined && sc[param] !== null && String(sc[param]).replace(/\s+/g, '').toUpperCase() === String(hv).replace(/\s+/g, '').toUpperCase();
         const out = { value: hv, source: same ? bothSource(c, scope === 'global' ? null : `profile ${p - 1}`) : scope === 'global' ? 'log header' : `log header, ${prof(p)} at the start of the log`, log: c.headerLog };
         // the CLI dump gives another value (check D4): the value at this time is not known, thus no CLI text (SPEC2 C4)
-        const cv = sc && c.staleCli.has(param) ? (sc[param] !== undefined && sc[param] !== null ? sc[param] : c.cli.kind === 'diff' && def !== null ? def : null) : null;
+        const cv = sc && cliStale(c, param, p) ? (sc[param] !== undefined && sc[param] !== null ? sc[param] : c.cli.kind === 'diff' && def !== null ? def : null) : null;
         if (cv !== null && String(cv) !== String(hv)) Object.assign(out, { unconfirmed: true, conflict: { header: hv, cli: cv } });
         return out;
     }
-    if (sc && !c.staleCli.has(param)) {
+    if (sc && !cliStale(c, param, p)) {
         const cv = sc[param], where = `CLI dump${scope === 'global' ? '' : `, section \`profile ${p - 1}\``}`;
         if (cv !== undefined && cv !== null) return { value: cv, source: where };
         if (c.cli.kind === 'diff' && def !== null) return { value: def, source: `${where}, the default of 4.6, because \`diff\` does not show a default value` };
     }
-    const why = scope !== 'global' && !(p > 0) ? 'profile' : sc && c.staleCli.has(param) ? 'staleCli' : c.cli && scope !== 'global' && !sc ? 'noSection'
+    const why = scope !== 'global' && !(p > 0) ? 'profile' : sc && cliStale(c, param, p) ? 'staleCli' : c.cli && scope !== 'global' && !sc ? 'noSection'
         : scope !== 'global' && hv !== null ? 'otherProfile' : 'missing';
     return { value: null, unknown: why };
 }
@@ -780,7 +784,7 @@ function change(c, o) {
 function fromHeader(r, c, keys, headerOnly) {
     r.base = { source: 'log header', log: c.headerLog, headerOnly: !!headerOnly };
     r.headerKeys = (keys || []).slice();
-    const conflict = (r.sets || []).map(([k]) => k).filter(k => c.staleCli.has(k));
+    const conflict = (r.sets || []).map(([k]) => k).filter(k => cliStale(c, k, r.profile));
     if (conflict.length) { r.base.unconfirmed = true; r.caveats.push(`The CLI dump and the log header have different values of ${and(conflict)} (check D4). The app cannot find which value is correct at this time. Thus, there is no CLI text.`); }
     // review V11: the source of each previous value. A global value that the loaded CLI dump gives with the same value names
     // the CLI dump too; the from-values that differ keep "log header" (and D4 holds their CLI text, above)
@@ -914,7 +918,7 @@ const GEN = {
         // the loop stalls of the flags (health_setup D2 events, in ms): their number and the longest, the cause of the flag
         // when no frame is missing (review V5: the value of check D2 does not count them)
         const stallsOf = (f) => (Array.isArray(f.events) ? f.events : []).filter(e => e && /^loop stall/.test(String(e.kind || '')));
-        const WHEN = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
+        const WHEN = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down', fall: 'before the ground contact', aftercontact: 'after the ground contact' };
         const whenOf = (f, e) => { const s = f.evidence && Array.isArray(f.evidence.spans) ? f.evidence.spans.find(q => q && q.value === e.value) || f.evidence.spans[0] : null; return s && WHEN[s.phase] ? `, ${WHEN[s.phase]}` : ''; };
         if (stalls.length) { const all = stalls.flatMap(f => stallsOf(f).map(e => ({ f, e }))), top = all.filter(x => num(x.e.value) !== null).sort((a, b) => b.e.value - a.e.value)[0];
             const k = stalls.reduce((s, f) => s + (f.counts ? num(f.counts.loopStalls) || 0 : stallsOf(f).length || n(f, /(\d+) loop stalls/)), 0);
@@ -942,7 +946,7 @@ const GEN = {
     D4(L, c) {
         // the CLI dump is an optional input (user rule 2026-10-06): without one there is no D4 result and no recommendation
         if (!c.cli) return [];
-        const bad = L.filter(isFlag), keys = [...c.staleCli];
+        const bad = L.filter(isFlag), keys = [...new Set([...c.staleCli, ...[...(c.staleCliProfile || [])].map(k => k.split('|')[1])])];
         return one(bad, { id: 'D4', title: 'The CLI dump and the log header do not agree', rule: 'Check D4 has a problem if a value in the log header is different from the CLI dump. The app uses the log header for these values, and the data for the governor mode.', sources: [src(SR.D4.source)],
             text: `In ${logsText(bad, c)}, the CLI dump and the log header have different values${keys.length ? ` (${and(keys.slice(0, 6))}${keys.length > 6 ? ` and ${keys.length - 6} more` : ''})` : ''}. Possibly, the CLI dump is not from the time of the logs. The app does not use the CLI values that do not agree.` });
     },
@@ -952,6 +956,7 @@ const GEN = {
     D9(L, c) {
         const bad = L.filter(isFlag), unk = L.filter(f => f.severity === 'note' && thin(f)), list = new Set(unk.flatMap(f => Array.isArray(f.unknownProfiles) ? f.unknownProfiles : num(profileOf(f)) > 0 ? [profileOf(f)] : []));
         const rule = 'Check D9 has a problem if `rescue_mode` is OFF in a PID profile. The log header of Rotorflight 4.6 does not record `rescue_mode`. The log records a rescue only when it occurs.'
+            + (L.some(f => f.basis === 'snapshot') ? ' The parameter values in the log header of firmware with "blackbox_params" give it for each PID profile.' : '')
             + (c.cli ? ' The CLI dump gives the value of each PID profile that it has.' : ''), sources = [ruleSrc(CR, 'D9')];
         return [...group(bad, profileOf)].map(([p, l]) => { const f = l[0];
             return rec({ id: `D9:p${p}`, area: 'precondition', profile: p, severity: 'action', parameter: 'rescue_mode', scope: 'profile', direction: 'set', title: `Turn on the rescue in PID profile ${p}`, evidence: l.map(evidence), rule, sources,   // no CLI text: the pilot selects the mode and the switch
@@ -986,7 +991,7 @@ const GEN = {
     D6(L, c) {
         const bad = L.filter(isFlag), ex = L.filter(f => f.severity === 'note' && !thin(f));
         const reasons = (f) => { const s = new Map(); for (const e of f.events || []) if (e && e.reason && num(e.value) !== null) s.set(e.reason, (s.get(e.reason) || 0) + e.value); return s; };
-        const WHY = { rescue: 'rescue', levelMode: 'a level mode', failsafe: 'failsafe', ground: 'ground contact' };
+        const WHY = { rxLoss: 'periods with no receiver signal', rescue: 'rescue', levelMode: 'a level mode', failsafe: 'failsafe', ground: 'ground contact' }; // rxLoss: check D10 (IMP-02)
         // the rest of the time is the guard of health_more normalMask: RULE.spanGuardS before and after each period
         const guardS = num(MRULE.spanGuardS);
         const lines = ex.slice(0, 2).map(f => { const s = reasons(f), parts = [...s].filter(([, v]) => v > 0).map(([k, v]) => `${fmt(v, 1)} s of ${WHY[k] || k}`), rest = num(f.value) !== null ? f.value - [...s.values()].reduce((a, v) => a + v, 0) : null;
@@ -996,6 +1001,31 @@ const GEN = {
             text: `The failsafe was active for ${fmt(sum(bad), 1)} s in flight (${logsText(bad, c)}). Examine the receiver, its antennas and the failsafe adjustments before you tune.` })
             .concat(one(ex, { id: 'D6:excluded', severity: 'info', title: 'Parts of the logs that the analysis did not use', rule: 'Check D6: the analysis does not use rescue, level modes, failsafe and ground contact. The log records the setpoint before these modes change it.', sources: [ruleSrc(MR, 'D6'), RULES.source.firmware],
                 text: lines.join(' ') + (ex.length > 2 ? ` ${cap(many(ex.length - 2, 'more log'))} also ${ex.length - 2 === 1 ? 'has' : 'have'} parts of this type.` : '') }));
+    },
+    // D10 (health_more.cjs, IMP-01): no receiver signal while the rotor turns at the flight rpm is a check of the receiver (no CLI
+    // text); with a low headspeed, a value to monitor. D12 (health_config.cjs, IMP-11) is information in the result only: rxfail is
+    // a safety value, and the export has no line for it
+    D10(L, c) {
+        const bad = L.filter(isFlag), low = L.filter(f => f.severity === 'note' && !thin(f));
+        const when = (list) => list.slice(0, 2).map(f => { const e = (f.events || []).find(q => q && q.rotor) || (f.events || [])[0];
+            return e && num(e.startS) !== null ? `${whereOf(f, c) || 'the log'}, from ${fmt(e.startS, 2)} s to ${num(e.returnS) === null ? 'the end of the log' : `${fmt(e.returnS, 2)} s`}` : whereOf(f, c) || 'the log'; });
+        const rule = 'Check D10 has a problem if the flight controller gets no RC frames while the rotor turns at the flight rpm or more.';
+        return one(bad, { id: 'D10', area: 'precondition', title: 'No receiver signal in flight', rule, sources: [ruleSrc(MR, 'D10')],
+            text: `The flight controller gets no RC frames from the receiver in ${and(when(bad))}.\nBefore the next flight, examine the receiver, its power supply, its connectors and its antennas. Check D12 gives the response of the firmware.` })
+            .concat(one(low, { id: 'D10:low', area: 'precondition', severity: 'watch', title: 'No receiver signal with a low headspeed', rule, sources: [ruleSrc(MR, 'D10')],
+                text: `The flight controller gets no RC frames from the receiver in ${and(when(low))}. The headspeed is less than the flight rpm.\nBefore the next flight, examine the receiver link.` }));
+    },
+    // D11 (health_phase.cjs, IMP-03): a motor cut in flight and the ground contact after it: a check of the helicopter and of the receiver
+    // link (no CLI text); a cut by the pilot with a contact that is not strong, a value to monitor
+    D11(L, c) {
+        const bad = L.filter(isFlag), low = L.filter(f => f.severity === 'note' && !thin(f) && f.by === 'pilot'); // a loss with no ground contact: check D10
+        const when = (list) => list.slice(0, 2).map(f => num(f.cutS) !== null ? `${whereOf(f, c) || 'the log'}, at ${fmt(f.cutS, 2)} s${num(f.contactS) !== null ? ` (the ground contact at ${fmt(f.contactS, 2)} s)` : ''}` : whereOf(f, c) || 'the log');
+        const cf = fmt(ruleNum(PR, 'D11', 'crashFactor') ?? 2);
+        const rule = `Check D11 has a problem if the helicopter touches the ground in failsafe or with no receiver signal. At the ground contact, a rate step of ${cf} times the largest step of the flight or more is also a problem.`;
+        return one(bad, { id: 'D11', area: 'precondition', title: 'Motor cut in flight and ground contact', rule, sources: [ruleSrc(PR, 'D11')],
+            text: `${bad.every(f => f.motorCut === false) ? 'The flight ends in the air with no RC control' : 'The motor stops while the helicopter is in the air'} in ${and(when(bad))}.\nBefore the next flight, examine the helicopter for damage. ${bad.some(f => f.by === 'receiver loss') ? 'Examine the receiver, its power supply, its connectors and its antennas (check D10). ' : ''}Check D12 gives the response of the firmware when the receiver signal stops.` })
+            .concat(one(low, { id: 'D11:pilot', area: 'precondition', severity: 'watch', title: 'Motor cut in flight', rule, sources: [ruleSrc(PR, 'D11')],
+                text: `The motor stops while the helicopter is in the air in ${and(when(low))}.\nMake sure that the throttle switch or the throttle stick caused it, for example for an autorotation.` }));
     },
     H(L) {
         const ch = L.filter(f => f.severity === 'note'), keys = new Map(); for (const f of ch) { const k = headerKeyOf(f); keys.set(k, (keys.get(k) || 0) + 1); }
@@ -1247,8 +1277,10 @@ const GEN = {
             .concat(one(bad.length ? [] : amb, { id: 'G13:cells', severity: 'info', title: 'The cell count is not clear', rule: 'Check G13: the checks for each cell use the cell count.',
                 text: 'The battery voltage before the flight agrees with more than one cell count. The log does not record the cell count. Thus, checks D5, G8 and G13 did not examine each cell.' }));
     },
-    G14: diag('G14', 'governor', 'The governor is not ACTIVE in flight', `Check G14 has a problem if there is a BAILOUT in flight. It also has a problem if an AUTOROTATION in flight is longer than ${fmt(ruleNum(MR, 'G14', 'autoS'))} s with a collective of ${fmt(ruleNum(MR, 'G14', 'hover'), 0)} or more.`,
-        'With the defaults of 4.6 (gov_autorotation_timeout 15, gov_auto_throttle 0), a throttle that falls to less than the handover value causes AUTOROTATION. With gov_autorotation_timeout 0, the governor possibly does no bailout (no flight test).', { sources: [ruleSrc(MR, 'G14'), RULES.source.firmware] }),
+    // G14: a change in flight after the receiver signal stopped (f.cause, the rxfail values: IMP-12) is a result of checks D10, D11 and D12, which
+    // give their recommendations (the Rescue item): no governor recommendation for it
+    G14: (L, c) => (diag('G14', 'governor', 'The governor is not ACTIVE in flight', `Check G14 has a problem if there is a BAILOUT or a change from ACTIVE to HOLD in flight. It also has a problem if an AUTOROTATION in flight is longer than ${fmt(ruleNum(MR, 'G14', 'autoS'))} s with a collective of ${fmt(ruleNum(MR, 'G14', 'hover'), 0)} or more.`,
+        'With the defaults of 4.6 (gov_autorotation_timeout 15, gov_auto_throttle 0), a throttle that falls to less than the handover value causes AUTOROTATION. With gov_autorotation_timeout 0, the governor possibly does no bailout (no flight test).', { sources: [ruleSrc(MR, 'G14'), RULES.source.firmware] }))(L.filter(f => !f.cause), c),
     C1: perAxis('C1', 'cyclic', 'I-term at its limit', `Check C1 has a problem if the I-term is at ${LR.C1.level * 100} % or more of its limit (\`Ki × error_limit\`) for more than ${LR.C1.minS} s.`,
         'Examine the output saturation first (check C2). Then examine the trim, the center of gravity and the mixer calibration. A larger error_limit is possibly correct only if the I-term is at its limit with no saturation (no flight test).', { sources: [src(LR.C1.note)] }),
     C2: diag('C2', 'mechanical', 'Cyclic output at its limit', `Check C2 has a problem if the output is at a mixer, swash ring, servo or collective limit for ${LR.C2.minEpisodes} period or more.`,
@@ -1367,7 +1399,7 @@ const GEN = {
         const bench = L.filter(f => f.bench === true || f.class === 'bench'), fl = L.filter(f => !bench.includes(f) && (f.bench === false || f.class === 'flight'));
         const n = fl.reduce((a, f) => a + (Array.isArray(f.flights) ? f.flights.length : num(f.n) || 0), 0), ph = {};
         for (const f of fl) for (const [k, v] of Object.entries(f.phaseSeconds || {})) if (num(v) !== null) ph[k] = (ph[k] || 0) + v;
-        const NAME = { idle: 'idle', spoolup: 'spool-up', ground: 'ground', flight: 'flight', spooldown: 'spool-down' }, parts = Object.keys(NAME).filter(k => num(ph[k]) > 0).map(k => `${NAME[k]} ${fmt(ph[k], 1)} s`);
+        const NAME = { idle: 'idle', spoolup: 'spool-up', ground: 'ground', flight: 'flight', spooldown: 'spool-down', fall: 'before the ground contact', aftercontact: 'after the ground contact' }, parts = Object.keys(NAME).filter(k => num(ph[k]) > 0).map(k => `${NAME[k]} ${fmt(ph[k], 1)} s`);
         const rule = 'Check D7 finds the flights of each log, from liftoff to touchdown. A log with one or more flights is a flight log, and a log with no flight is a bench run.', sources = [ruleSrc(PR, 'D7')];
         return one(bench, { id: 'D7:bench', area: 'logging', severity: 'info', title: 'Bench runs (not in the analysis)', rule, sources,
             text: `${cap(logsText(bench, c))} ${bench.length === 1 ? 'has' : 'have'} no flight. Thus, the analysis does not use ${bench.length === 1 ? 'this bench run' : 'these bench runs'}.` })
@@ -1425,7 +1457,7 @@ const GEN = {
         const bad = L.filter(isFlag), kinds = (f) => f.byKind || {}, evs = (f) => Array.isArray(f.events) ? f.events : [];
         const drop = bad.filter(f => kinds(f)['headspeed decrease'] > 0 || evs(f).some(e => e.kind === 'headspeed decrease'));
         const kick = bad.filter(f => (kinds(f)['motor step'] || 0) + (kinds(f)['rotor turns with no motor output'] || 0) > 0 || evs(f).some(e => e.kind !== 'headspeed decrease') || (!f.byKind && !evs(f).length));
-        const WHEN = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
+        const WHEN = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down', fall: 'before the ground contact', aftercontact: 'after the ground contact' };
         const phasesOf = (l, k) => [...new Set(l.flatMap(f => evs(f).filter(k).map(e => e.phase).concat(evs(f).length ? [] : [f.phase])).map(p => WHEN[p]).filter(Boolean))];
         const rule = 'Check G17 finds a step of motor[0] or of the headspeed that the throttle does not command. It also finds a headspeed decrease at a throttle that does not decrease.', sources = [ruleSrc(PR, 'G17')];
         const kw = phasesOf(kick, e => e.kind !== 'headspeed decrease'), dw = phasesOf(drop, e => e.kind === 'headspeed decrease');
@@ -1542,30 +1574,48 @@ function tailLimitAdvice(c, profiles) {
 const LIMIT_DO = {
     L1: [],
     L2: ['Examine the collective range of the mixer (the mixer input SC) and the available blade pitch.', 'Compare the command and output at these times to identify the limit.', 'The log does not show a new mechanical range.'],
-    L3: ['Compare the cyclic error and output before each limit period.', 'Examine the cyclic mixer limits, swash ring and available mechanical travel.', 'Gains cannot increase the output range. Oscillation before the limit must be examined separately.'],
+    L3: ['Compare the cyclic error and output before each limit period.', 'Examine the cyclic mixer limits, swash ring and available mechanical travel.', 'Gains cannot increase the output range. If the output oscillates before the limit, examine the oscillation as a different item.'],
     L5: ['Examine the servo limits and the linkage for a mechanical stop.', 'Compare the servo command and movement before you change travel.', 'The log does not measure the available mechanical travel.'],
     L6: ['Examine the trim of this axis, the center of gravity and the mixer calibration (check C1).', 'An I-term at its limit does not identify which of these must change.'],
     L7: ['Examine the headspeed and output limits at these times (checks G19 and L1).', 'A full collective command does not identify a problem or a gain change.'],
 };
+// a rate command that the helicopter cannot get to (health_limits stuck.unreached, user 2026-10-16): the rate of the rate profile at full stick must
+// not be more than the rate that the helicopter gets to with the output at its limit. Text only: the rate curve depends on rates_type
+function rateCap(list) {
+    // each stuck period with a setpoint that the helicopter cannot get to (the events of the findings): the gyro rate at its end, for each
+    // direction. A short period can end before the gyro gets to its maximum: the median of each direction, then the lower one
+    const LS = num(LR2.longS) || 0.1, ps = list.flatMap(f => f.events || []).filter(e => num(e.seconds) >= LS && e.trend && e.trend.stuck && e.trend.unreached);
+    if (!ps.length) return '';
+    const med = (a) => a[a.length >> 1], dirs = [1, -1].map(d => ({ d, g: ps.filter(e => Math.sign(e.trend.sp) === d).map(e => Math.abs(e.trend.gyro)).sort((a, b) => a - b) })).filter(q => q.g.length);
+    const w = dirs.reduce((a, b) => med(a.g) <= med(b.g) ? a : b), axis = ps[0].trend.axis, sp = Math.max(...ps.map(e => Math.abs(e.trend.sp)));
+    return `\nIn ${many(ps.length, 'period')} at the limit, the gyro rate does not move to the setpoint, and the setpoint is up to ${fmt(sp, 0)} deg/s. The helicopter cannot get to this ${axis} rate. `
+        + `For a ${w.d > 0 ? 'positive' : 'negative'} setpoint, the gyro rate at the end is ${fmt(w.g[0], 0)} to ${fmt(w.g[w.g.length - 1], 0)} deg/s (median ${fmt(med(w.g), 0)} deg/s, ${many(w.g.length, 'period')}). `
+        + `Decrease the maximum ${axis} rate of the rate profile to ${fmt(med(w.g), 0)} deg/s or less. With rates_type 6 (ROTORFLIGHT), the maximum rate is ${axis}_rc_rate x 5 deg/s.`;
+}
 function limits(L, c, id) {
-    const sel = L.filter(f => f.severity === 'flag' || (f.severity === 'note' && !thin(f)));
+    // the periods with a cause (a receiver signal loss, the fall or the time after a ground contact, health_limits IMP-12) are a result of
+    // checks D10 and D11, which give their recommendations: no limit recommendation for them
+    // checks D10 and D11, which give their recommendations: no limit recommendation for them. The periods out of flight (f.outOfFlight: at IDLE,
+    // in the spool-up or the spool-down, or the rotor stopped) are a value to monitor with no recommendation
+    const sel = L.filter(f => !f.cause && !f.outOfFlight && (f.severity === 'flag' || (f.severity === 'note' && !thin(f))));
     return [...group(sel, f => `${f.channel}|${profileOf(f)}`)].map(([k, list]) => {
         const f0 = list[0], p = profileOf(f0), ch = f0.channel, flag = list.some(isFlag), periods = list.flatMap(f => (f.events || []).map(e => Object.assign({ log: logsOf(f)[0] }, e))).sort((a, b) => b.seconds - a.seconds);
         const total = list.reduce((s0, f) => s0 + (num(f.value) || 0), 0), n = list.reduce((s0, f) => s0 + (num(f.n) || 0), 0), with2 = [...new Set(list.flatMap(f => f.with || []))];
         const estimated = id === 'L1' && list.some(f => f.throttleLimit ? f.throttleLimit.estimated : f.limits && f.limits.source === 'data' && f.limits.hi < 1000);
         const title = LIMIT_TITLE[ch] || (/^servo/.test(ch) ? `Servo \`${ch}\` at its limit` : /^iterm/.test(ch) ? `${cap(f0.axis || 'axis')} I-term at its limit` : 'Output at its limit');
-        const PW = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down' };
+        const PW = { idle: 'at IDLE', spoolup: 'during the spool-up', ground: 'on the ground', flight: 'in flight', spooldown: 'during the spool-down', fall: 'before the ground contact', aftercontact: 'after the ground contact' };
         const lines = periods.slice(0, 3).map(e => `In log ${lab(e.log, c)}, the period from ${fmt(e.tS, 2)} s to ${fmt(e.t1S, 2)} s is ${fmt(e.seconds, 3)} s long${[PW[e.phase], e.rescue ? (e.rescue === 'rescue' ? 'in a rescue' : 'before a rescue') : null].filter(Boolean).map(x => `, ${x}`).join('')}.`);
         const subject = title.replace(/ at its (limit|maximum|end)$/, '');
         const text = [estimated ? 'The throttle limit is an estimate from recorded output. These periods do not show full throttle.' : '',
             `${subject.charAt(0) === '`' ? subject : `The ${subject.charAt(0).toLowerCase()}${subject.slice(1)}`} is at its limit in ${many(n, 'period')}, for a total of ${fmt(total, 3)} s (${logsText(list, c)}, ${prof(p)}).`, ...lines,
             `\n${with2.length ? `Other outputs are at their limits at the same time: ${and(with2.map(q => LIMIT_TITLE[q] ? LIMIT_TITLE[q].replace(/ at its (limit|maximum|end)$/, '').toLowerCase() : `\`${q}\``))}. ` : ''}`
-                + (flag ? 'This limit must be examined. The sequence of the output limit and the error is necessary to identify the cause.' : 'Examine these periods. They are short, and they come with no large error.'), `\n${id === 'L4' ? tailLimitAdvice(c, [p]) : (LIMIT_DO[id] || []).join(' ')}`];
+                + (flag ? 'This limit must be examined. The sequence of the output limit and the error is necessary to identify the cause.' : 'Examine these periods. Each period is short, or the output moves the gyro rate or the headspeed to its target.'),
+            rateCap(list), `\n${id === 'L4' ? tailLimitAdvice(c, [p]) : (LIMIT_DO[id] || []).join(' ')}`];
         return rec({ id: `${id}:${ch}:p${p}`, area: id === 'L1' ? 'governor' : id === 'L7' ? 'precondition' : id === 'L4' || f0.axis === 'yaw' ? 'tail' : 'cyclic', axis: f0.axis || null, profile: p, severity: flag && id !== 'L7' ? 'check' : 'watch',   // L7: a command of the pilot, never a problem of the flight controller
             title: estimated ? 'Examine the throttle limit' : title, evidence: list.map(evidence), sources: [ruleSrc(LR2, id)],
             procedure: id === 'L1' ? governorLimitProcedure(periods.length > 0, estimated) : null,
-            rule: `Check ${id} finds each period with the output at 0.5 % of its limit or nearer, in all flight phases and in the rescue. A period of ${fmt(num(LR2.longS) || 0.1)} s or more is a problem. `
-                + 'An error more than the limit of the related check is also a problem. Two outputs at their limits at the same time are also a problem.',
+            rule: `Check ${id} finds each period with the output at 0.5 % of its limit or nearer, in all flight phases and in the rescue. A period of ${fmt(num(LR2.longS) || 0.1)} s or more is a problem if the gyro rate does not move to the setpoint, or the headspeed to the target. `
+                + `At the end of that period, the error is more than ${fmt(num(LR2.stuck && LR2.stuck.rate) || 30)} deg/s, or the headspeed decrease is more than the limit of check G3.`,
             text: text.filter(Boolean).join(' ').replace(/ \n/g, '\n').trim() }); });
 }
 
@@ -1750,6 +1800,9 @@ function decisionRecs(D, c) {
         // the gains that the model changes together are one change (SPEC2 C3): group C7:<axis>:<bin>, and finish gives
         // CLI text to all of them or to none
         const joint = (d.changes || []).filter(s => PARAMS[`${ax}_${String(s.gain).toLowerCase()}_gain`]), group = joint.length > 1 ? `C7:${ax}:${d.bin}` : null;
+        // IMP-07: the flights that can show the calculated tracking change (validation_power.cjs); no effect on the change or its CLI
+        const power = POWER ? POWER.forDecision(d) : null;
+        if (power) Object.assign(power, { profile: p || null, profileLabel: p ? `PID profile ${p}` : 'PID profile unknown' });
         for (const s of d.changes || []) {
             const param = `${ax}_${String(s.gain).toLowerCase()}_gain`; if (!PARAMS[param]) continue;
             // yaw P is recovered as P x the mean stop gain (below): that product is not a from-value of yaw_p_gain
@@ -1758,6 +1811,7 @@ function decisionRecs(D, c) {
                 recovered: yawP ? undefined : s.from, title: `${s.multiplier > 1 ? 'Increase' : 'Decrease'} the ${ax} ${s.gain} gain to ${s.multiplier} of its value`,
                 text: `In the gain model, this change makes the ${s.improves ? `${s.improves} ` : ''}error smaller. The tracking error goes ${two(d.tracking)} deg/s, and the disturbance error goes ${two(d.disturbance)}.` });
             r.profileNote = !p;
+            if (power) r.validationPower = power;
             if (group) Object.assign(r, { group, groupSize: joint.length });
             if (d.changes.length > 1) r.caveats.push(`The model changes ${d.changes.length} gains together (${and(d.changes.map(x => `${ax} ${x.gain} to ${x.multiplier} of its value`))}). Thus, the CLI text of the ${d.changes.length} changes goes together, or there is none.`);
             // report.cjs evaluates the multipliers x0.8-x1.2 only: at the end of that grid nothing further was evaluated
@@ -2111,7 +2165,7 @@ function finish(r) {
 // sequence: GOVT F -> I -> P; TUNE D -> P -> I -> FF on each axis, pitch before roll; tail D -> P -> I -> FF, then the
 // collective FF, then the stop gains; then the severity
 const SEV = { action: 0, check: 1, watch: 2, info: 3 };
-const STEP = ['G1', 'G12', 'G21', 'D4', 'D9', 'D6', 'P1', 'P2', 'T8', 'C2', 'T13', 'T4', 'C10', 'D5', 'G13', 'D1', 'D2', 'D3', 'H', 'F1', 'F2', 'F3', 'F5', 'F6', 'F8', 'F10', 'C11', 'F11', 'F4', 'F9',
+const STEP = ['G1', 'G12', 'G21', 'D4', 'D9', 'D6', 'D10', 'D11', 'D12', 'P1', 'P2', 'T8', 'C2', 'T13', 'T4', 'C10', 'D5', 'G13', 'D1', 'D2', 'D3', 'H', 'F1', 'F2', 'F3', 'F5', 'F6', 'F8', 'F10', 'C11', 'F11', 'F4', 'F9',
     'G14', 'G6', 'G3', 'G4', 'G9', 'G5', 'G2', 'G10', 'G11', 'G8', 'G0', 'R1', 'SETUP'];
 const ITEM = { C5: 11, C6: 12, C1: 12, C3: 13, C4: 13, C14: 20, C12: 30, C13: 31, T1: 11, T2: 12, T9: 13, T6: 20, T7: 20, T14: 21, T5: 22, T11: 30, T12: 31 };
 const KIND = { d: 0, p: 1, i: 2, f: 3, o: 4, b: 5 };
@@ -2197,7 +2251,7 @@ function advise(input) {
     const ignored = all.filter(withdrawn).length + rawDecisions.length - decisions.length;
     if (ignored) notes.push(`The app ignores ${many(ignored, 'item')} from section 8 of the tail oscillation report, because its author does not use that section at this time.`);
     const flags = (id) => F.filter(f => f.id === id && isFlag(f));
-    const c = { F, header, cli, logs, fields: inp.fields || null, flags, filterIssues: new Set(), staleCli: new Set(), topLine: null, filterAction: [],
+    const c = { F, header, cli, logs, fields: inp.fields || null, flags, filterIssues: new Set(), staleCli: new Set(), staleCliProfile: new Set(), topLine: null, filterAction: [],
         start: new Map(logs.filter(l => l.start !== undefined && l.start !== null).map(l => [l.log, l.start])), headerLog: inp.headerLog === undefined ? null : inp.headerLog, logBase: num(inp.logBase) || 0,
         headerProfile: num(inp.headerProfile) !== null ? inp.headerProfile : logs.length === 1 && num(logs[0].startProfile) !== null ? logs[0].startProfile : null,
         headerConfirmed: inp.headerProfileInferred !== true, cliName: typeof inp.cliName === 'string' && inp.cliName ? inp.cliName : null,   // an inferred arming profile is the profile of no header value (SPEC2 D12)
@@ -2209,7 +2263,12 @@ function advise(input) {
     // tells it (cliSection.usable: true; false for the section of another profile, null when the arming profile is not
     // confirmed, js/tuning_worker.js sectionOf). Without cliSection, every value counts. The global values always count
     for (const f of flags('D4')) { const guessed = !!f.cliSection && typeof f.cliSection === 'object' && f.cliSection.usable !== true;
-        const names = Array.isArray(f.mismatches) ? f.mismatches.map(m => String(m.cli).replace(/\[\d\]$/, '')) : [...String(f.text).matchAll(/ vs ([a-z][a-z0-9_]*)(?:\[\d\])? /g)].map(m => m[1]);
+        // D4 with a parameter snapshot (basis 'snapshot'): each row has the CLI name in name
+        const names = Array.isArray(f.mismatches) ? f.mismatches.map(m => String(f.basis === 'snapshot' ? m.name : m.cli).replace(/\[\d\]$/, '')) : [...String(f.text).matchAll(/ vs ([a-z][a-z0-9_]*)(?:\[\d\])? /g)].map(m => m[1]);
+        // a snapshot row of a PID profile (m.pidProfile 1-6): only the value of that PID profile is stale (review IMP-05). A global row and
+        // a rate profile row count for every PID profile
+        if (f.basis === 'snapshot' && Array.isArray(f.mismatches)) { for (const m of f.mismatches) { const name = String(m.name).replace(/\[\d\]$/, '');
+            if (num(m.pidProfile) > 0) c.staleCliProfile.add(`${m.pidProfile}|${name}`); else c.staleCli.add(name); } continue; }
         for (const name of names) if (!guessed || D4_GLOBAL.test(name)) c.staleCli.add(name); }
     c.c2Axes = (f) => { const w = (/output limit \(([^)]*)\)/.exec(String(f.text)) || [])[1] || '', only = (a, b) => new RegExp(`mixer\\[${a}\\]`).test(w) && !new RegExp(`mixer\\[${b}\\]|ring|servo|collective`).test(w);
         return only(0, 1) ? ['roll'] : only(1, 0) ? ['pitch'] : ['roll', 'pitch']; };
@@ -2281,6 +2340,7 @@ function advise(input) {
     recs.sort(compare);
     const seen = new Map();
     const recommendations = recs.map((r, i) => { const o = {}; for (const k of OUT_KEYS) o[k] = r[k]; o.order = i + 1; const n = seen.get(o.id) || 0; seen.set(o.id, n + 1); if (n) o.id += `#${n + 1}`;
+        if (r.validationPower) o.validationPower = r.validationPower;   // IMP-07 (C7): the flights that can show the change
         // citedFids: the fid of every evidence row before the cut, for the diagram of the worker (hierarchy.cjs status cites them)
         if (o.evidence.length > RULES.maxEvidence) { o.citedFids = o.evidence.map(e => e.fid).filter(Boolean); o.caveats = o.caveats.concat(`There are ${o.evidence.length} results, and the list shows the first ${RULES.maxEvidence}.`); o.evidence = o.evidence.slice(0, RULES.maxEvidence); }
         return o; });
@@ -2322,6 +2382,9 @@ const dsList = (ids) => ids.length > 1 ? `configurations ${and(ids)}` : `configu
 // { value, source, dataset } (header, CLI dump, or the header of the nearest log armed in p when the logs before and after it
 // agree); an estimate, an in-flight adjustment or an assumed header: approx (no CLI); no value: unknown (no CLI). null when the
 // result has no configurations, the name is an array or a type, or the configuration does not have the name (the rules before)
+// a CLI value that check D4 contradicts: a name of every PID profile (staleCli), or the value of PID profile p only (staleCliProfile:
+// "p|name", D4 with a parameter snapshot)
+const cliStale = (c, param, p) => c.staleCli.has(param) || (num(p) > 0 && !!c.staleCliProfile && c.staleCliProfile.has(`${p}|${param}`));
 function dsValue(c, param, p) {
     const P = PARAMS[param]; if (!c.dsc || !P || P[2] === 'all' || /_type$/.test(param)) return null;
     const ds = c.dsc.ds, id = P[0] === 'global' ? ds.newest : ds.newestByProfile ? ds.newestByProfile[num(p) > 0 ? p : 'unknown'] : null;
@@ -2335,7 +2398,9 @@ function dsValue(c, param, p) {
     // rc_adjustments.c records the absolute newValue. Within that exact
     // configuration interval it is an observed setting, not an estimate of now.
     if (s === 'adjustment') return Object.assign({ value: v, source: `${where}, in-flight adjustment`, dataset: id },selected ? {} : { approx:true, why:'dsAdjustment' });
-    if (s === 'cli') return c.staleCli.has(param) ? { value: null, unknown: 'staleCli', dataset: id } : { value: v, source: `${where}, ${cliWords(c)}${P[0] === 'global' ? '' : `, section \`profile ${p - 1}\``}`, dataset: id };
+    if (s === 'log journal') return { value: v, source: `${where}, a parameter change that the log records`, dataset: id };
+    if (s === 'cli') return cliStale(c, param, p) ? { value: null, unknown: 'staleCli', dataset: id } : { value: v, source: `${where}, ${cliWords(c)}${P[0] === 'global' ? '' : `, section \`profile ${p - 1}\``}`, dataset: id };
+    if (s === 'log snapshot') return { value: v, source: `${where}, the parameter values of the log header of ${logs.length > 1 ? `logs ${and(logs)}` : `log ${logs[0]}`}`, dataset: id };
     const m = /^log (\d+)/.exec(String(s));
     if (m) { const from = +m[1], ok = (d.assumedFrom || []).filter(a => a.from === from).every(a => a.bracketed === true);
         return Object.assign({ value: v, source: `${where}, log header of log ${from + lb}`, dataset: id }, ok ? {} : { approx: true, why: 'dsAssumed' }); }
@@ -3003,6 +3068,7 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
         if (`# ${k}: ${val}`.length <= 240 && lines.length <= 6) out.push(`# ${k}: ${val}`); else out.push(`# ${k}:`, ...lines);
     }
     out.push('#');
+    const powerShown = new Map();
     ok.forEach((x, i) => {
         const { r, plan } = x;
         out.push(...commentLines(`Change ${i + 1} of ${ok.length}: ${r.title}`), `#   Recommendation \`${clean(r.id).replace(/`/g, "'")}\`.`);
@@ -3023,6 +3089,11 @@ function exportScript(recommendations, picks, meta, withPlan = false) {
         for (const e of ev.slice(0, 3)) out.push(...evidenceLines(e, base));
         if (ev.length > 3) out.push(`#   The recommendation has ${ev.length - 3} more results.`);
         if (r.rule) out.push(...commentLines(`Rule: ${r.rule}`, true));
+        // IMP-07: the flights to compare the values (validation_power.cjs plan), once for the changes with the same plan. The
+        // label and the back-reference are neutral: the plan can say that flights cannot show the change
+        const vp = r.validationPower && Array.isArray(r.validationPower.text) && r.validationPower.text.length ? r.validationPower.text.join(' ') : null;
+        if (vp && powerShown.has(vp)) out.push(`#   Change ${powerShown.get(vp)} has the same text about the flights.`);
+        else if (vp) { powerShown.set(vp, i + 1); out.push('#   Flights to compare the values:', ...commentLines(vp, true)); }
         if (r.replayValidated) for (const caveat of r.caveats || []) out.push(...commentLines(caveat, true));
         out.push('#');
     });

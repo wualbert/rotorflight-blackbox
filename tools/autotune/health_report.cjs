@@ -89,7 +89,10 @@ const MEASURED = [
 ];
 
 // Checks done elsewhere in the pipeline, listed so the check list is complete
-const ELSEWHERE = { C5: 'wag.cjs / wag_report.cjs', C7: 'report.cjs', T1: 'wag.cjs / wag_report.cjs', T3: 'wag.cjs / wag_report.cjs', T10: 'wag_report.cjs', F7: 'spectra.cjs / wag_report.cjs' };
+// D10, D11, D12 (IMP-01, IMP-03, IMP-11): the checks of a receiver signal loss and of a motor cut in flight run in the app (js/tuning_worker.js);
+// the in-flight mask of health.cjs already leaves out each loss (lib.cjs rxLossAt)
+const ELSEWHERE = { C5: 'wag.cjs / wag_report.cjs', C7: 'report.cjs', T1: 'wag.cjs / wag_report.cjs', T3: 'wag.cjs / wag_report.cjs', T10: 'wag_report.cjs', F7: 'spectra.cjs / wag_report.cjs',
+    D10: 'health_more.cjs (the app)', D11: 'health_phase.cjs (the app)', D12: 'health_config.cjs (the app)' };
 
 const SECTIONS = [
     ['Data validity', /^D[1235]$/],
